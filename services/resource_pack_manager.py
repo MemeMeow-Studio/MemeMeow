@@ -15,8 +15,7 @@ class ResourcePackManager:
     
     def __init__(self):
         """初始化资源包管理器"""
-        self.config = Config()
-        self.resource_packs_dir = os.path.join(self.config.base_dir, self.config.paths.resource_packs_dir)
+        self.resource_packs_dir = os.path.join(Config().base_dir, Config().paths.resource_packs_dir)
         verify_folder(self.resource_packs_dir)
         
         # 存储所有可用的资源包信息
@@ -165,7 +164,7 @@ class ResourcePackManager:
             return pack_info["cover"]
             
         # 生成默认封面
-        cover_cache_dir = self.config.get_abs_cover_cache_file()
+        cover_cache_dir = Config().get_abs_cover_cache_file()
         verify_folder(cover_cache_dir)
         
         default_cover_path = os.path.join(cover_cache_dir, f"{pack_id}_cover.png")
@@ -197,7 +196,7 @@ class ResourcePackManager:
             cache_files[pack_id] = cache_file
         return cache_files
     
-    def is_pack_cache_generated(self, pack_id: str, model_name: Optional[str] = None) -> bool:
+    def is_pack_cache_generated(self, pack_id: str, model_name) -> bool:
         """检查指定资源包的缓存是否已生成"""
         if pack_id not in self.available_packs:
             print(f"资源包 {pack_id} 不存在")
@@ -205,17 +204,6 @@ class ResourcePackManager:
             
         pack_info = self.available_packs[pack_id]
         cache_file = pack_info["cache_file"]
-        
-        # 使用传入的模型名称，如果没有则使用配置中的默认模型
-        # if model_name is None and self.config.models.default_model:
-        #     model_name = self.config.models.default_model
-            
-        # if model_name:
-        #     cache_file = cache_file.replace('.pkl', f'_{model_name}.pkl')
-            
-        # 确保路径是绝对路径
-        # if not os.path.isabs(cache_file):
-        #     cache_file = os.path.join(self.config.base_dir, cache_file)
             
         # 打印调试信息
         exists = os.path.exists(cache_file)
@@ -228,3 +216,5 @@ class ResourcePackManager:
         fp = os.path.join(Config().pack_embedding_cache_folder_path, f"{pack_id}.pkl")
         verify_folder(fp)
         return fp
+
+RESOURCE_PACK_MANAGER = ResourcePackManager()

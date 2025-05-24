@@ -191,10 +191,15 @@ class ResourcePackService:
         except Exception as e:
             raise ResourcePackError(f"解压ZIP文件失败: {str(e)}")
 
-    def import_resource_pack_from_url(self, url):
-        target_file  = url.replace("https://", "").replace("http://", "").replace("/", "_").replace("\\", "_")
+    def import_resource_pack_from_url(self, url, uuid=None):
+        if uuid is None:
+            target_file  = url.replace("https://", "").replace("http://", "").replace("/", "_").replace("\\", "_")
+        else:
+            target_file = f"{uuid}.json"
         target_dir = os.path.join(Config().paths.resource_packs_dir, os.path.splitext(target_file)[0])
         verify_folder(target_dir)
         return download_file(url, os.path.join(target_dir, "manifest.json"))
 
+
+RESOURCE_PACK_SERVICE = ResourcePackService()
 

@@ -8,8 +8,13 @@ api:
     window: 60           # 时间窗口（秒）
     storage: "memory"    # 存储方式（memory/redis）
   generate_cache: False
-  mode: "local"    # 模式（api/local）
+  mode: "api"    # 模式（api/local）
   api_mode_config:
     default_api_key: "your-key-here"
     default_base_url: "https://api.example.com"
   model: "bge-m3"
+  urls:
+    return_type: "rel_path" # 绝对路径，相对路径（rel_path）（相对于项目目录！），哈希值（sha256）（适用于外部图床）
+    path_replace_regex: ""
+    url_prefix: ""
+    url_postfix: ""

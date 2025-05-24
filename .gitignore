@@ -13,3 +13,6 @@ resource_packs/*
 !resource_packs/default_pack/
 temp/
 Logs/
+data/
+!data/static/
+**/.idea/

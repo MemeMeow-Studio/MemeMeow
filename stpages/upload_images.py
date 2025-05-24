@@ -12,7 +12,7 @@ import threading
 
 from services.image_search import ImageSearch
 from config.settings import Config
-from pages.utils import *
+from stpages.utils import *
 from services.label_memes import LabelMemes
 from services.utils import verify_folder
 

@@ -26,6 +26,12 @@ class APIModeConfig(BaseModel):
     default_api_key: str
     default_base_url: str
 
+class UrlsConfig(BaseModel):
+    return_type: str = "rel_path"
+    path_replace_regex: str = ""
+    url_prefix: str = ""
+    url_postfix: str = ""
+
 class APIConfig(BaseModel):
     protected_mode: bool
     allowed_endpoints: list[str]
@@ -34,6 +40,9 @@ class APIConfig(BaseModel):
     mode: str
     api_mode_config: APIModeConfig
     model: str
+    urls: UrlsConfig
+
+
 
 def load_config(config_path: str = "config/api_config.yaml") -> APIConfig:
     try:
