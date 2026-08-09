@@ -17,3 +17,4 @@ Logs/
 data/
 !data/static/
 **/.idea/
+AGENTS.md
