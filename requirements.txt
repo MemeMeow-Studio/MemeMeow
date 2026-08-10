@@ -1,20 +1,8 @@
-numpy
-requests
+# FastAPI 服务端运行依赖
+fastapi
+uvicorn[standard]
 python-dotenv
-tqdm
-streamlit
-confz
-opencv-python
-pyyaml
+python-multipart
+numpy
 pillow
 openai
-streamlit_cropper
-loguru
-fastapi
-redis
-starlette
-langchain
-duckduckgo_search
-langchain_openai
-uvicorn
-streamlit-authenticator==0.2.3

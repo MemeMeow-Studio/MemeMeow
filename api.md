@@ -1,214 +1,56 @@
-# VVQuest API 文档
+# MemeMeow API
 
-## 目录
+FastAPI 是唯一业务入口。模型密钥、Base URL 和路径只从服务端 `.env` 读取，前端不能修改配置或获得绝对路径。
 
-1. [接口概览](#接口概览)
-2. [接口详情](#接口详情)
-3. [API 配置文件说明](#api-配置文件说明)
+## 检索
 
-## 接口概览
+### `POST /search`
 
-| 接口路径           | 方法 | 描述                     |
-|--------------------|------|--------------------------|
-| `/search`          | POST | 执行图片搜索             |
-| `/generate-cache`  | POST | 触发缓存生成（后台任务） |
-| `/config`          | GET  | 获取当前配置             |
-| `/api-config`      | PUT  | 更新API配置              |
-| `/download-model`  | POST | 下载指定模型             |
-| `/models`          | GET  | 获取可用模型列表         |
-| `/mode/{mode}`     | PUT  | 切换运行模式             |
-| `/model/{model_id}`| PUT  | 切换本地模型             |
+请求体：
 
-## 接口详情
-
-### 1. 搜索图片
-
-- **路径**: `/search`
-- **方法**: POST
-- **描述**: 执行图片搜索
-- **请求体** (application/json):
-
-  ```json
-  {
-    "query": "搜索关键词",
-    "n_results": 5  // 可选，默认值 5
-  }
-  ```
-
-- **成功响应**
-  - 状态码: 200
-  - 内容: JSON 格式数据（具体字段需参考实现）
-
-- **错误响应**
-  - 状态码: 422 (请求体验证失败)
-
-### 2. 生成缓存
-
-- **路径**: `/generate-cache`
-- **方法**: POST
-- **描述**: 触发后台缓存生成任务
-- **成功响应**
-  - 状态码: 200
-  - 内容: JSON 格式空对象
-
-### 3. 获取配置
-
-- **路径**: `/config`
-- **方法**: GET
-- **描述**: 获取当前API配置
-- **成功响应**
-  - 状态码: 200
-  - 内容: JSON 格式配置信息
-
-### 4. 更新配置
-
-- **路径**: `/api-config`
-- **方法**: PUT
-- **描述**: 更新API配置
-- **请求体** (application/json):
-
-  ```json
-  {
-    "api_key": "新的API密钥",  // 可选（可为 null）
-    "base_url": "新的基础URL"  // 可选（可为 null）
-  }
-  ```
-
-- **成功响应**
-  - 状态码: 200
-  - 内容: JSON 格式空对象
-
-- **错误响应**
-  - 状态码: 422 (请求体验证失败)
-
-### 5. 下载模型
-
-- **路径**: `/download-model`
-- **方法**: POST
-- **描述**: 下载指定模型
-- **请求体** (application/json):
-
-  ```json
-  {
-    "model_id": "模型ID"
-  }
-  ```
-
-- **成功响应**
-  - 状态码: 200
-  - 内容: JSON 格式空对象
-
-- **错误响应**
-  - 状态码: 422 (请求体验证失败)
-
-### 6. 模型列表
-
-- **路径**: `/models`
-- **方法**: GET
-- **描述**: 获取可用模型列表
-- **成功响应**
-  - 状态码: 200
-  - 内容: JSON 格式模型列表
-
-### 7. 切换模式
-
-- **路径**: `/mode/{mode}`
-- **方法**: PUT
-- **描述**: 切换系统运行模式
-- **路径参数**
-  - `mode` (字符串): 目标模式名称
-- **成功响应**
-  - 状态码: 200
-  - 内容: JSON 格式空对象
-
-- **错误响应**
-  - 状态码: 422 (参数验证失败)
-
-### 8. 切换模型
-
-- **路径**: `/model/{model_id}`
-- **方法**: PUT
-- **描述**: 切换本地使用的模型
-- **路径参数**
-  - `model_id` (字符串): 目标模型ID
-- **成功响应**
-  - 状态码: 200
-  - 内容: JSON 格式空对象
-
-- **错误响应**
-  - 状态码: 422 (参数验证失败)
-
-## API 配置文件说明
-
-API 配置文件为 `/config/api_config.yaml` ，用于配置 API 的行为。
-
-### 全局配置
-
-```yaml
-api:
-  generate_cache: False      # 是否自动生成缓存（默认关闭）
+```json
+{"query":"开会时忘记准备材料","n_results":8,"llm_enhance":false}
 ```
 
-- **作用**
-  - 当 `generate_cache: True` 时，系统启动后自动执行缓存生成任务。
+`query` 必须非空，`n_results` 为 1 到 30 的整数，`llm_enhance` 默认 `false`。成功响应：
 
-### 端点权限控制
-
-```yaml
-protected_mode: False      # 是否启用保护模式（默认关闭）
-allowed_endpoints:
-  - "/search"                # 允许访问的API端点（仅保护模式开启时生效）
+```json
+{"results":["/media/a.png"]}
 ```
 
-- **作用**
-  - 当 `protected_mode: True` 时，仅列出的端点可被外部访问。
-  - 默认允许 `/search`，其他接口需手动添加（如 `/config`）。
+结果只包含受控媒体 URL，按相关性和稳定路径排序并去重。缓存不存在或正在生成时返回 `503`：
 
-### 请求限流配置
-
-```yaml
-rate_limit:
-  enabled: True              # 是否启用请求限流
-  requests: 10               # 每分钟最大请求数
-  window: 60                 # 时间窗口（单位：秒）
-  storage: "memory"          # 限流计数存储方式（支持 memory/redis）
+```json
+{"error":"cache_not_ready","message":"检索缓存尚未就绪"}
 ```
 
-- **参数说明**
+旧的 `GET /search?q=...` 不是兼容入口，返回 `405`。
 
-  | 字段       | 类型   | 可选值            | 说明                          |
-  |------------|--------|-------------------|-------------------------------|
-  | `enabled`  | bool   | `True`/`False`    | 是否启用限流                  |
-  | `requests` | int    | 正整数            | 单位时间窗口内允许的最大请求数 |
-  | `window`   | int    | 正整数（秒）      | 限流时间窗口长度              |
-  | `storage`  | string | `memory`/`redis`  | 计数器存储方式                |
+## 图片库和媒体
 
-- **示例场景**
-  - `requests: 10` + `window: 60` 表示每60秒最多处理 10 次请求。
-  - 若使用 `redis` 存储，需确保 Redis 服务已配置并连接。
+- `GET /images?directory=&search=&page=1&page_size=50`：列出图片元数据和一级子目录。
+- `GET /images/directories?parent=`：列出子目录。
+- `POST /images/directories`：请求 `{ "name": "work", "parent": "" }` 创建目录。
+- `POST /images/rename`：请求 `{ "directory": "", "filename": "old.png", "new_name": "new" }`，保留原扩展名且拒绝覆盖。
+- `POST /images/upload`：multipart 字段 `directory`、`auto_name`、多个 `files`，逐文件返回成功或失败。
+- `GET /media/{file_path}`：受控读取 PNG/JPG/JPEG/GIF，不接受绝对路径、`..` 或符号链接越界。
 
-### 运行模式配置
+## VLM 标注
 
-```yaml
-mode: "local"                # 系统运行模式（api/local）
-api_mode_config:
-  default_api_key: "your-key-here"     # API 默认密钥
-  default_base_url: "https://api.example.com"  # API 默认服务地址
-model: "bge-m3"            # 当前使用的模型ID（需与模型列表匹配）
-```
+- `POST /images/describe`：请求 `{ "directory": "", "filename": "a.png" }`，返回 `candidates`，不会修改文件。
+- `POST /images/label-batch`：请求 `{ "items": [{"directory":"", "filename":"a.png"}] }`，返回 `202` 和任务标识。
 
-- **模式说明**
+## 长任务
 
-  | 模式值    | 描述                                                                 |
-  |-----------|----------------------------------------------------------------------|
-  | `local`   | 本地模式，优先使用本地模型和资源                                     |
-  | `api`     | API 模式，依赖外部服务（需配置 `api_mode_config` 中的密钥和基础URL） |
+- `POST /generate-cache`：返回 `202`、`task_id`、`status=queued`；同类任务不会并发执行。
+- `GET /tasks/{task_id}`：返回任务类型、`queued/running/succeeded/failed`、进度、消息、时间和错误。
 
-- **API 模式专用配置**
-  - `default_api_key`: 调用外部 API 所需的身份凭证（建议通过环境变量注入）。
-  - `default_base_url`: 外部 API 服务的基础地址（例如 OpenAI 兼容接口）。
+任务状态仅保存在进程内存。服务重启后未完成任务视为失败，不会恢复或自动重试。
 
-- **本地模式专用配置**
-  - `model`: 当前使用的模型ID（需与 `models` 配置中的模型ID一致）。
+## 配置与访问策略
 
-> 修改配置后，请重启服务以生效。
+- `GET /config`：只返回模型名、Base URL 和 `*_api_key_configured` 布尔状态。
+- `.env` 关键字段：`EMBEDDING_API_KEY`、`EMBEDDING_BASE_URL`、`VLM_API_KEY`、`VLM_BASE_URL`、`MEMEMEOW_IMAGE_ROOT`。
+- `MEMEMEOW_PROTECTED_MODE=true` 时仅放行 `MEMEMEOW_ALLOWED_ENDPOINTS`；限流由 `MEMEMEOW_RATE_LIMIT_*` 控制，超限返回 `429` 和 `Retry-After`。
+
+系统不提供用户登录、注册、JWT、角色或多租户权限接口。资源包和社区同步功能已从生产入口移除。

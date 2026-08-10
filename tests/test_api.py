@@ -1,0 +1,252 @@
+"""FastAPI 公共契约、文件边界和上传行为测试。"""
+
+from __future__ import annotations
+
+import io
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+from PIL import Image
+
+from api import app
+
+
+@pytest.fixture
+def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """使用隔离图片目录启动完整应用生命周期。"""
+    monkeypatch.setenv("MEMEMEOW_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("MEMEMEOW_IMAGE_ROOT", str(tmp_path / "images"))
+    monkeypatch.delenv("EMBEDDING_API_KEY", raising=False)
+    monkeypatch.delenv("VLM_API_KEY", raising=False)
+    with TestClient(app) as test_client:
+        yield test_client, tmp_path
+
+
+def png_bytes(color: str = "red") -> bytes:
+    """生成可解码的小型 PNG 测试数据。"""
+    output = io.BytesIO()
+    Image.new("RGB", (4, 4), color=color).save(output, format="PNG")
+    return output.getvalue()
+
+
+def test_config_is_masked_and_search_requires_cache(client):
+    """配置响应不泄露密钥，缓存未就绪时搜索返回规范错误。"""
+    test_client, _ = client
+    config = test_client.get("/config")
+    assert config.status_code == 200
+    assert "embedding_api_key" not in config.json()
+    assert "vlm_api_key" not in config.json()
+    assert config.json()["embedding_api_key_configured"] is False
+    response = test_client.post("/search", json={"query": "开心"})
+    assert response.status_code == 503
+    assert response.json()["error"] == "cache_not_ready"
+
+
+@pytest.mark.parametrize("payload", [{"query": ""}, {"query": "x", "n_results": 0}, {"query": "x", "n_results": 31}, {"query": "x", "n_results": "5"}])
+def test_search_validation_is_consistent(client, payload):
+    """空查询和越界数量统一返回 400。"""
+    test_client, _ = client
+    response = test_client.post("/search", json=payload)
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_request"
+
+
+def test_get_search_is_not_an_alias(client):
+    """旧 GET 检索入口不会执行检索逻辑。"""
+    test_client, _ = client
+    assert test_client.get("/search", params={"q": "x"}).status_code == 405
+
+
+def test_upload_lists_and_serves_image(client):
+    """上传后的图片可立即列出并通过受控媒体接口读取。"""
+    test_client, _ = client
+    response = test_client.post("/images/upload", files=[("files", ("hello.png", png_bytes(), "image/png"))])
+    assert response.status_code == 200
+    assert response.json()["results"][0]["ok"] is True
+    listing = test_client.get("/images").json()
+    assert listing["total"] == 1
+    media_url = listing["items"][0]["media_url"]
+    media = test_client.get(media_url)
+    assert media.status_code == 200
+    assert media.headers["content-type"] == "image/png"
+
+
+def test_batch_upload_keeps_success_and_reports_failure(client):
+    """批量上传允许部分成功且不覆盖重复文件。"""
+    test_client, _ = client
+    response = test_client.post(
+        "/images/upload",
+        files=[
+            ("files", ("good.png", png_bytes(), "image/png")),
+            ("files", ("bad.png", b"not-an-image", "image/png")),
+            ("files", ("note.txt", b"text", "text/plain")),
+        ],
+    )
+    results = response.json()["results"]
+    assert [item["ok"] for item in results] == [True, False, False]
+    duplicate = test_client.post("/images/upload", files=[("files", ("good.png", png_bytes("blue"), "image/png"))])
+    assert duplicate.json()["results"][0]["error"] == "file_exists"
+
+
+def test_auto_name_is_optional_and_falls_back_per_file(client):
+    """自动命名成功时使用候选描述，失败时保留安全原名。"""
+    test_client, _ = client
+
+    class FakeLabeling:
+        def describe(self, path):
+            if path.name.startswith("fallback"):
+                raise RuntimeError("vlm timeout")
+            return ["一只开心的猫"]
+
+    test_client.app.state.labeling = FakeLabeling()
+    response = test_client.post(
+        "/images/upload",
+        data={"auto_name": "true"},
+        files=[
+            ("files", ("named.png", png_bytes(), "image/png")),
+            ("files", ("fallback.png", png_bytes("blue"), "image/png")),
+        ],
+    )
+    results = response.json()["results"]
+    assert results[0]["auto_named"] is True
+    assert results[0]["saved_filename"].endswith(".png")
+    assert results[1]["auto_named"] is False
+    assert results[1]["auto_name_error"] == "auto_name_failed"
+
+
+def test_describe_returns_candidates_without_renaming(client):
+    """描述接口只返回候选，不修改原图。"""
+    test_client, _ = client
+
+    class FakeLabeling:
+        def describe(self, path):
+            return ["候选一", "候选二"]
+
+    test_client.app.state.labeling = FakeLabeling()
+    test_client.post("/images/upload", files=[("files", ("current.png", png_bytes(), "image/png"))])
+    response = test_client.post("/images/describe", json={"filename": "current.png"})
+    assert response.status_code == 200
+    assert response.json()["candidates"] == ["候选一", "候选二"]
+    assert test_client.get("/images").json()["items"][0]["filename"] == "current.png"
+
+
+def test_batch_labeling_is_a_non_blocking_task(client):
+    """批量预生成返回任务标识，单张失败不影响任务终态。"""
+    test_client, _ = client
+
+    class FakeLabeling:
+        def describe(self, path):
+            if path.name == "bad.png":
+                raise RuntimeError("failed")
+            return ["ok"]
+
+    test_client.app.state.labeling = FakeLabeling()
+    test_client.post("/images/upload", files=[("files", ("good.png", png_bytes(), "image/png")), ("files", ("bad.png", png_bytes("blue"), "image/png"))])
+    response = test_client.post("/images/label-batch", json={"items": [{"filename": "good.png"}, {"filename": "bad.png"}]})
+    assert response.status_code == 202
+    task_id = response.json()["task_id"]
+    for _ in range(50):
+        status = test_client.get(f"/tasks/{task_id}").json()
+        if status["status"] in {"succeeded", "failed"}:
+            break
+    assert status["status"] == "succeeded"
+
+
+def test_directory_and_rename_conflicts(client):
+    """目录和重命名接口拒绝重复目标。"""
+    test_client, _ = client
+    assert test_client.post("/images/directories", json={"name": "work"}).status_code == 201
+    assert test_client.post("/images/directories", json={"name": "work"}).status_code == 409
+    test_client.post("/images/upload", files=[("files", ("one.png", png_bytes(), "image/png"))])
+    test_client.post("/images/upload", files=[("files", ("two.png", png_bytes("blue"), "image/png"))])
+    conflict = test_client.post("/images/rename", json={"filename": "one.png", "new_name": "two"})
+    assert conflict.status_code == 409
+    renamed = test_client.post("/images/rename", json={"filename": "one.png", "new_name": "first"})
+    assert renamed.status_code == 200
+    assert renamed.json()["filename"] == "first.png"
+
+
+def test_path_traversal_and_symlink_escape_are_blocked(client):
+    """目录穿越和指向根目录外的符号链接均不可读取。"""
+    test_client, tmp_path = client
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.png").write_bytes(png_bytes())
+    (tmp_path / "images" / "escape").symlink_to(outside, target_is_directory=True)
+    traversal = test_client.get("/images", params={"directory": "../outside"})
+    assert traversal.status_code == 403
+    escaped = test_client.get("/media/escape/secret.png")
+    assert escaped.status_code == 403
+
+
+def test_unknown_task_has_stable_error(client):
+    """未知或重启后丢失的任务返回 task_not_found。"""
+    test_client, _ = client
+    response = test_client.get("/tasks/unknown")
+    assert response.status_code == 404
+    assert response.json()["error"] == "task_not_found"
+
+
+def test_search_maps_results_to_media_urls(client):
+    """正常检索只返回受控媒体 URL 且不重复。"""
+    test_client, tmp_path = client
+    image_root = tmp_path / "images"
+    (image_root / "a.png").write_bytes(png_bytes())
+
+    class FakeSearch:
+        def has_cache(self):
+            return True
+
+        def search(self, *args, **kwargs):
+            return [str(image_root / "a.png"), str(image_root / "a.png"), str(image_root / "missing.png")]
+
+    test_client.app.state.search_engine = FakeSearch()
+    response = test_client.post("/search", json={"query": "x", "n_results": 3})
+    assert response.status_code == 200
+    assert response.json() == {"results": ["/media/a.png"]}
+
+
+def test_llm_failure_falls_back_to_original_query(client):
+    """LLM 增强异常时仍执行一次普通检索。"""
+    test_client, tmp_path = client
+    image_root = tmp_path / "images"
+    (image_root / "a.png").write_bytes(png_bytes())
+    calls = []
+
+    class FakeSearch:
+        def has_cache(self):
+            return True
+
+        def search(self, query, *args, **kwargs):
+            calls.append((query, kwargs.get("use_llm")))
+            if kwargs.get("use_llm"):
+                raise RuntimeError("llm unavailable")
+            return [str(image_root / "a.png")]
+
+    test_client.app.state.search_engine = FakeSearch()
+    response = test_client.post("/search", json={"query": "原始查询", "llm_enhance": True})
+    assert response.status_code == 200
+    assert calls == [("原始查询", True), ("原始查询", False)]
+
+
+def test_cache_generation_returns_pollable_task(client):
+    """缓存生成通过 202 和任务状态接口返回结果。"""
+    test_client, _ = client
+
+    class FakeSearch:
+        def generate_cache(self, progress):
+            progress(1.0, "done")
+
+        def has_cache(self):
+            return False
+
+    test_client.app.state.search_engine = FakeSearch()
+    response = test_client.post("/generate-cache")
+    assert response.status_code == 202
+    task_id = response.json()["task_id"]
+    for _ in range(50):
+        status = test_client.get(f"/tasks/{task_id}").json()
+        if status["status"] in {"succeeded", "failed"}:
+            break
+    assert status["status"] == "succeeded"

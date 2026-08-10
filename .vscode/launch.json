@@ -9,15 +9,16 @@
       "console": "integratedTerminal"
     },
     {
-      "name": "Python: Streamlit app",
+      "name": "Python: FastAPI server",
       "type": "debugpy",
       "request": "launch",
-      "module": "streamlit",
+      "module": "uvicorn",
       "args": [
-        "run",
-        "${workspaceFolder}/app.py",
-        "--server.port",
-        "8501"
+        "api:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8275"
       ],
       "console": "integratedTerminal",
       "justMyCode": true

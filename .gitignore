@@ -1,20 +1,55 @@
 .DS_Store
 **/__pycache__/
 *.pkl
+*.py[cod]
+
+# Python tooling and test artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+*.egg-info/
+
+# Local agent and provider state
+.codex/
+.impeccable/
+opencode.json
+.agents/skills/impeccable/
+.agents/skills/research-meme-context/
+.opencode/skills/impeccable/
+
+# Retired resource-pack binaries are preserved by the streamlit-v1 tag
+legacy/streamlit-v1/assets/
+
+# Frontend tooling output
+frontend/.vite/
+frontend/coverage/
+
+# Local logs and ad-hoc sample files
+*.log
+example_meme_1.jpg
+
 /data/models/*
-.env
-.env.*
-!.env.example
 config/config.yaml
 config/api_config.yaml
 config/auth_config.yaml
 cache/
 export/*
 resource_packs/*
-!resource_packs/default_pack/
 temp/
 Logs/
 data/
 !data/static/
 **/.idea/
 AGENTS.md
+.env
+.env.*
+!.env.example
+frontend/node_modules/
+frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
