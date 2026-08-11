@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 from pathlib import Path
 
 import pytest
@@ -70,6 +71,10 @@ def test_upload_lists_and_serves_image(client):
     media = test_client.get(media_url)
     assert media.status_code == 200
     assert media.headers["content-type"] == "image/png"
+    image_path = (client[1] / "images" / "hello.png")
+    sidecar = image_path.with_name("hello.png.json")
+    assert sidecar.is_file()
+    assert test_client.get("/images").json()["items"][0]["metadata"]["status"] == "pending"
 
 
 def test_batch_upload_keeps_success_and_reports_failure(client):
@@ -129,6 +134,24 @@ def test_describe_returns_candidates_without_renaming(client):
     assert response.status_code == 200
     assert response.json()["candidates"] == ["候选一", "候选二"]
     assert test_client.get("/images").json()["items"][0]["filename"] == "current.png"
+    assert test_client.get("/images").json()["items"][0]["metadata"]["status"] == "partial"
+    assert "候选一" in test_client.get("/images").json()["items"][0]["metadata"]["summary"]
+
+
+def test_describe_failure_records_metadata_error(client):
+    """视觉描述失败时保留 sidecar 并记录可诊断错误。"""
+    test_client, tmp_path = client
+
+    class FakeLabeling:
+        def describe(self, path):
+            raise RuntimeError("timeout")
+
+    test_client.app.state.labeling = FakeLabeling()
+    test_client.post("/images/upload", files=[("files", ("failed.png", png_bytes(), "image/png"))])
+    response = test_client.post("/images/describe", json={"filename": "failed.png"})
+    assert response.status_code == 503
+    payload = json.loads((tmp_path / "images" / "failed.png.json").read_text(encoding="utf-8"))
+    assert payload["provenance"]["last_error"] == "vlm_failed"
 
 
 def test_batch_labeling_is_a_non_blocking_task(client):
@@ -151,11 +174,12 @@ def test_batch_labeling_is_a_non_blocking_task(client):
         if status["status"] in {"succeeded", "failed"}:
             break
     assert status["status"] == "succeeded"
+    assert [item["ok"] for item in status["result"]["results"]] == [True, False]
 
 
 def test_directory_and_rename_conflicts(client):
     """目录和重命名接口拒绝重复目标。"""
-    test_client, _ = client
+    test_client, tmp_path = client
     assert test_client.post("/images/directories", json={"name": "work"}).status_code == 201
     assert test_client.post("/images/directories", json={"name": "work"}).status_code == 409
     test_client.post("/images/upload", files=[("files", ("one.png", png_bytes(), "image/png"))])
@@ -165,6 +189,37 @@ def test_directory_and_rename_conflicts(client):
     renamed = test_client.post("/images/rename", json={"filename": "one.png", "new_name": "first"})
     assert renamed.status_code == 200
     assert renamed.json()["filename"] == "first.png"
+    assert not (tmp_path / "images" / "one.png.json").exists()
+    assert (tmp_path / "images" / "first.png.json").is_file()
+
+
+def test_delete_removes_image_and_sidecar(client):
+    """删除接口不会留下孤立 sidecar。"""
+    test_client, tmp_path = client
+    test_client.post("/images/upload", files=[("files", ("remove.png", png_bytes(), "image/png"))])
+    response = test_client.post("/images/delete", json={"filename": "remove.png"})
+    assert response.status_code == 200
+    assert not (tmp_path / "images" / "remove.png").exists()
+    assert not (tmp_path / "images" / "remove.png.json").exists()
+
+
+def test_metadata_repair_is_pollable(client):
+    """元数据修复任务补齐图片 sidecar 并返回结构化结果。"""
+    test_client, tmp_path = client
+    image = tmp_path / "images" / "legacy.png"
+    image.write_bytes(png_bytes())
+    response = test_client.post("/images/metadata/repair")
+    assert response.status_code == 202
+    task_id = response.json()["task_id"]
+    for _ in range(50):
+        status = test_client.get(f"/tasks/{task_id}").json()
+        if status["status"] in {"succeeded", "failed"}:
+            break
+    assert status["status"] == "succeeded"
+    assert status["result"]["processed"] == 1
+    assert (image.with_name("legacy.png.json")).is_file()
+    second = test_client.post("/images/metadata/repair")
+    assert second.status_code == 202
 
 
 def test_path_traversal_and_symlink_escape_are_blocked(client):

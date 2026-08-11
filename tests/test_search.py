@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from backend.config import Settings
+from backend.metadata import MetadataService
 from backend.search import SearchService
 
 
@@ -71,3 +73,68 @@ def test_cache_generation_replaces_only_after_success(tmp_path: Path, monkeypatc
     service.generate_cache(lambda *_: None)
     assert service._items[0]["path"] == "one.png"
     assert calls["count"] == 1
+
+
+def test_cache_generation_uses_meme_context_whitelist(tmp_path: Path, monkeypatch):
+    """v3 缓存使用语境白名单，并保存图片与 sidecar 指纹。"""
+    settings = make_settings(tmp_path)
+    settings.image_root.mkdir(parents=True)
+    image = settings.image_root / "cat.png"
+    image.write_bytes(b"image")
+    metadata = MetadataService(settings.image_root)
+    metadata.create_pending(image)
+    metadata.update_context(
+        image,
+        {
+            "summary": "一只猫无奈地摊手",
+            "subjects": ["猫"],
+            "visible_text": ["为什么"],
+            "references": ["确认的模板"],
+            "meaning": "表达无奈",
+            "keywords": ["无奈"],
+            "search_queries": ["不得进入索引"],
+            "uncertainties": ["不确定出处"],
+            "source_urls": ["https://example.com/source"],
+        },
+        producer="research",
+        status="ready",
+    )
+    captured: list[str] = []
+    service = SearchService(settings, metadata)
+    monkeypatch.setattr(service, "_embedding", lambda text: captured.append(text) or [1.0])
+    service.generate_cache(lambda *_: None)
+    assert captured == ["摘要：一只猫无奈地摊手\n主体：猫\n图片文字：为什么\n已确认引用：确认的模板\n常见含义：表达无奈\n关键词：无奈"]
+    payload = json.loads((settings.data_root / "search-cache-v3.json").read_text(encoding="utf-8"))
+    assert payload["version"] == 3
+    assert payload["items"][0]["metadata_hash"]
+    assert "不得进入索引" not in payload["items"][0]["semantic_document"]
+
+
+def test_cache_is_rejected_after_metadata_change(tmp_path: Path, monkeypatch):
+    """sidecar 语义变化后，新服务不会加载旧索引。"""
+    settings = make_settings(tmp_path)
+    settings.image_root.mkdir(parents=True)
+    image = settings.image_root / "cat.png"
+    image.write_bytes(b"image")
+    metadata = MetadataService(settings.image_root)
+    metadata.create_pending(image)
+    metadata.update_context(image, {"summary": "原始摘要"}, producer="research", status="ready")
+    service = SearchService(settings, metadata)
+    monkeypatch.setattr(service, "_embedding", lambda text: [1.0])
+    service.generate_cache(lambda *_: None)
+    metadata.update_context(image, {"summary": "更新后的摘要"}, producer="research", status="ready")
+    assert not SearchService(settings, metadata).has_cache()
+
+
+def test_legacy_v2_cache_is_rejected(tmp_path: Path):
+    """旧文件名索引不会被当作 v3 语境索引加载。"""
+    settings = make_settings(tmp_path)
+    settings.image_root.mkdir(parents=True)
+    image = settings.image_root / "cat.png"
+    image.write_bytes(b"image")
+    settings.data_root.mkdir(parents=True)
+    (settings.data_root / "search-cache-v3.json").write_text(
+        json.dumps({"version": 2, "model": settings.embedding_model, "items": [{"path": "cat.png", "embedding": [1.0]}]}),
+        encoding="utf-8",
+    )
+    assert not SearchService(settings).has_cache()

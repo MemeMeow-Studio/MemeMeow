@@ -23,7 +23,7 @@ def now() -> datetime:
 
 @dataclass
 class TaskRecord:
-    """任务状态及诊断信息。"""
+    """任务状态、诊断信息和可选的结构化结果。"""
 
     task_id: str
     task_type: str
@@ -33,6 +33,7 @@ class TaskRecord:
     created_at: datetime = field(default_factory=now)
     completed_at: datetime | None = None
     error: dict[str, str] | None = None
+    result: Any = None
 
     def as_dict(self) -> dict[str, Any]:
         """序列化为稳定 JSON 结构。"""
@@ -45,6 +46,7 @@ class TaskRecord:
             "created_at": self.created_at,
             "completed_at": self.completed_at,
             "error": self.error,
+            "result": self.result,
         }
 
 
@@ -77,11 +79,11 @@ class TaskManager:
             self.update(task_id, progress=value, message=message)
 
         try:
-            fn(progress)
+            result = fn(progress)
         except Exception as exc:  # noqa: BLE001
             self.update(task_id, status="failed", message="任务执行失败", error={"error": "task_failed", "message": str(exc)})
         else:
-            self.update(task_id, status="succeeded", progress=1.0, message="任务完成")
+            self.update(task_id, status="succeeded", progress=1.0, message="任务完成", result=result)
 
     def update(self, task_id: str, **changes: Any) -> None:
         """在线程安全地更新任务字段。"""

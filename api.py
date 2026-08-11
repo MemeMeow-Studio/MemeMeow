@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field, StrictInt
 
 from backend.config import Settings
 from backend.errors import ErrorBody
+from backend.metadata import MetadataError, MetadataService
 from backend.paths import PathResolver, SUPPORTED_EXTENSIONS
 from backend.rate_limiter import RateLimiter
 from backend.search import SearchService
@@ -47,6 +48,13 @@ class RenameRequest(BaseModel):
     directory: str = ""
     filename: str = Field(min_length=1, max_length=255)
     new_name: str = Field(min_length=1, max_length=255)
+
+
+class DeleteRequest(BaseModel):
+    """删除图片及其 sidecar 的请求。"""
+
+    directory: str = ""
+    filename: str = Field(min_length=1, max_length=255)
 
 
 class DescribeRequest(BaseModel):
@@ -88,6 +96,13 @@ def _media_for_path(resolver: PathResolver, value: Any) -> str | None:
         return None
 
 
+def _invalidate_search(request: Request) -> None:
+    """通知检索服务丢弃受图片元数据变化影响的进程内索引。"""
+    invalidate = getattr(request.app.state.search_engine, "invalidate_cache", None)
+    if invalidate:
+        invalidate()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """初始化一次服务依赖，并在关闭时终止未完成任务。"""
@@ -95,8 +110,9 @@ async def lifespan(app: FastAPI):
     settings.ensure_directories()
     app.state.settings = settings
     app.state.resolver = PathResolver(settings.image_root)
+    app.state.metadata = MetadataService(settings.image_root)
     app.state.tasks = TaskManager()
-    app.state.search_engine = SearchService(settings)
+    app.state.search_engine = SearchService(settings, app.state.metadata)
     app.state.labeling = LabelingService(settings)
     try:
         yield
@@ -259,7 +275,16 @@ async def list_images(
             continue
         if search and search.casefold() not in path.name.casefold():
             continue
-        items.append({"directory": directory, "filename": path.name, "extension": path.suffix.lower(), "size": path.stat().st_size, "media_url": resolver.media_url(path)})
+        items.append(
+            {
+                "directory": directory,
+                "filename": path.name,
+                "extension": path.suffix.lower(),
+                "size": path.stat().st_size,
+                "media_url": resolver.media_url(path),
+                "metadata": request.app.state.metadata.status(path),
+            }
+        )
     start = (page - 1) * page_size
     return {"directory": directory, "directories": directories, "items": items[start : start + page_size], "total": len(items), "page": page, "page_size": page_size}
 
@@ -304,8 +329,27 @@ async def rename_image(request: Request, payload: RenameRequest) -> dict[str, st
     target = source.parent / clean
     if target.exists() and target != source:
         raise _error(409, "file_exists", "目标文件已存在")
-    source.rename(target)
+    try:
+        request.app.state.metadata.rename(source, target)
+    except MetadataError as exc:
+        if exc.code == "target_exists":
+            raise _error(409, "file_exists", "目标文件已存在")
+        raise _error(500, "metadata_rename_failed", "图片元数据同步失败")
+    _invalidate_search(request)
     return {"directory": payload.directory, "filename": target.name, "media_url": resolver.media_url(target)}
+
+
+@app.post("/images/delete", tags=["images"])
+async def delete_image(request: Request, payload: DeleteRequest) -> dict[str, object]:
+    """删除图片并同步删除同目录 sidecar。"""
+    resolver: PathResolver = request.app.state.resolver
+    image = resolver.resolve_file(payload.directory, payload.filename)
+    try:
+        request.app.state.metadata.remove(image)
+    except MetadataError as exc:
+        raise _error(500, exc.code, "图片及其元数据删除失败") from exc
+    _invalidate_search(request)
+    return {"directory": payload.directory, "filename": payload.filename, "deleted": True}
 
 
 @app.post("/images/upload", tags=["images"])
@@ -345,7 +389,13 @@ async def upload_images(
         except Exception:  # noqa: BLE001
             results.append({"filename": original, "ok": False, "error": "invalid_image"})
             continue
-        target.write_bytes(content)
+        try:
+            target.write_bytes(content)
+            request.app.state.metadata.create_pending(target)
+        except (OSError, MetadataError):
+            target.unlink(missing_ok=True)
+            results.append({"filename": original, "ok": False, "error": "metadata_write_failed"})
+            continue
         auto_name_error = None
         auto_named = False
         if auto_name:
@@ -354,8 +404,9 @@ async def upload_images(
                 candidate = _safe_filename(candidates[0])
                 candidate = f"{Path(candidate).stem}{target.suffix.lower()}"
                 renamed = target.parent / candidate
+                request.app.state.metadata.apply_visual_candidates(target, candidates, settings.vlm_model)
                 if not renamed.exists() or renamed == target:
-                    target.rename(renamed)
+                    request.app.state.metadata.rename(target, renamed)
                     target = renamed
                     auto_named = True
             except Exception as exc:  # noqa: BLE001
@@ -363,6 +414,8 @@ async def upload_images(
         result = {"filename": original, "ok": True, "saved_filename": target.name, "media_url": resolver.media_url(target), "auto_named": auto_named}
         if auto_name_error:
             result["auto_name_error"] = "auto_name_failed"
+        result["metadata_status"] = request.app.state.metadata.status(target)["status"]
+        _invalidate_search(request)
         results.append(result)
     return {"directory": directory, "results": results}
 
@@ -374,6 +427,10 @@ async def _describe_path(request: Request, path: Path) -> list[str]:
     except Exception as exc:  # noqa: BLE001
         code = "configuration_missing" if "vlm_not_configured" in str(exc) else "vlm_failed"
         message = "VLM 配置未完成" if code == "configuration_missing" else "VLM 描述生成失败"
+        try:
+            request.app.state.metadata.record_error(path, producer="vision", model=request.app.state.settings.vlm_model, error=code)
+        except MetadataError:
+            pass
         raise _error(503, code, message) from exc
 
 
@@ -385,7 +442,12 @@ async def describe_image(request: Request, payload: DescribeRequest) -> dict[str
         candidates = await _describe_path(request, path)
     except HTTPException as exc:
         return JSONResponse(status_code=exc.status_code, content=exc.detail)
-    return {"directory": payload.directory, "filename": payload.filename, "status": "succeeded", "candidates": candidates}
+    try:
+        request.app.state.metadata.apply_visual_candidates(path, candidates, request.app.state.settings.vlm_model)
+    except MetadataError as exc:
+        return JSONResponse(status_code=500, content={"error": exc.code, "message": "图片元数据写入失败"})
+    _invalidate_search(request)
+    return {"directory": payload.directory, "filename": payload.filename, "status": "succeeded", "candidates": candidates, "metadata_status": "partial"}
 
 
 @app.post("/images/label-batch", status_code=202, tags=["labeling", "tasks"])
@@ -395,15 +457,38 @@ async def label_batch(request: Request, payload: BatchLabelRequest) -> dict[str,
     paths = [resolver.resolve_file(item.directory, item.filename) for item in payload.items]
 
     def run(progress):
+        results = []
         total = len(paths)
         for index, path in enumerate(paths, start=1):
             try:
-                request.app.state.labeling.describe(path)
-            except Exception:
-                pass
+                candidates = request.app.state.labeling.describe(path)
+                request.app.state.metadata.apply_visual_candidates(path, candidates, request.app.state.settings.vlm_model)
+                results.append({"filename": resolver.relative(path), "ok": True})
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    request.app.state.metadata.record_error(path, producer="vision", model=request.app.state.settings.vlm_model, error=str(exc))
+                except MetadataError:
+                    pass
+                results.append({"filename": resolver.relative(path), "ok": False, "error": str(exc)})
             progress(index / total, f"正在描述 {index}/{total}")
+        _invalidate_search(request)
+        return {"results": results}
 
     record = request.app.state.tasks.submit("batch_labeling", run)
+    return {"task_id": record.task_id, "task_type": record.task_type, "status": record.status}
+
+
+@app.post("/images/metadata/repair", status_code=202, tags=["images", "tasks"])
+async def repair_metadata(request: Request) -> dict[str, object]:
+    """提交幂等的 sidecar 初始化和修复任务。"""
+    metadata: MetadataService = request.app.state.metadata
+
+    def run(progress):
+        result = metadata.repair(progress)
+        _invalidate_search(request)
+        return result
+
+    record = request.app.state.tasks.submit("metadata_repair", run)
     return {"task_id": record.task_id, "task_type": record.task_type, "status": record.status}
 
 

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 from threading import Lock
@@ -15,18 +16,20 @@ import numpy as np
 from openai import OpenAI
 
 from backend.config import Settings
+from backend.metadata import MetadataError, MetadataService
 from backend.paths import SUPPORTED_EXTENSIONS
 
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 
 class SearchService:
     """管理本地图片索引、缓存生成和稳定语义检索。"""
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, metadata: MetadataService | None = None):
         self.settings = settings
-        self.cache_path = settings.data_root / "search-cache-v2.json"
+        self.metadata = metadata or MetadataService(settings.image_root)
+        self.cache_path = settings.data_root / "search-cache-v3.json"
         self._lock = Lock()
         self._items: list[dict[str, object]] | None = self._load_cache()
 
@@ -45,16 +48,39 @@ class SearchService:
             if payload.get("version") != CACHE_VERSION or payload.get("model") != self.settings.embedding_model:
                 return None
             items = payload.get("items")
-            if not isinstance(items, list):
+            if not isinstance(items, list) or not items:
                 return None
+            paths = {
+                path.resolve().relative_to(self.settings.image_root.resolve()).as_posix()
+                for path in self.settings.image_root.rglob("*")
+                if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+            }
+            if {str(item.get("path")) for item in items if isinstance(item, dict)} != paths:
+                return None
+            for item in items:
+                if not isinstance(item, dict) or not isinstance(item.get("embedding"), list):
+                    return None
+                image = self.settings.image_root / str(item.get("path"))
+                try:
+                    image.resolve().relative_to(self.settings.image_root.resolve())
+                except ValueError:
+                    return None
+                current = self.metadata.embedding_record(image)
+                if item.get("image_sha256") != current["image_sha256"] or item.get("metadata_hash") != current["metadata_hash"]:
+                    return None
             return items
-        except (OSError, ValueError, TypeError):
+        except (MetadataError, OSError, ValueError, TypeError):
             return None
 
     def has_cache(self) -> bool:
         """判断是否存在已完整加载的当前版本缓存。"""
         with self._lock:
             return self._items is not None
+
+    def invalidate_cache(self) -> None:
+        """使当前进程不再使用受元数据变更影响的旧索引。"""
+        with self._lock:
+            self._items = None
 
     def _embedding(self, text: str) -> list[float]:
         """调用模型生成归一化向量。"""
@@ -78,8 +104,21 @@ class SearchService:
         total = len(paths)
         for index, path in enumerate(paths, start=1):
             relative = path.resolve().relative_to(self.settings.image_root.resolve()).as_posix()
-            label = path.stem.replace("-", " ").replace("_", " ").strip() or path.stem
-            items.append({"path": relative, "label": label, "embedding": self._embedding(label)})
+            record = self.metadata.embedding_record(path)
+            text = str(record["text"])
+            items.append(
+                {
+                    "path": relative,
+                    "label": text,
+                    "semantic_document": text,
+                    "semantic_document_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    "metadata_schema_version": record["metadata_schema_version"],
+                    "metadata_hash": record["metadata_hash"],
+                    "image_sha256": record["image_sha256"],
+                    "metadata_status": record["status"],
+                    "embedding": self._embedding(text),
+                }
+            )
             progress(index / total, f"正在处理 {index}/{total}")
         payload = {"version": CACHE_VERSION, "model": self.settings.embedding_model, "items": items}
         temporary = self.cache_path.with_suffix(".tmp")
