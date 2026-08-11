@@ -30,9 +30,10 @@ export const api = {
     files.forEach((file) => body.append('files', file))
     return request('/images/upload', { method: 'POST', body })
   },
-  describe: (payload) => request('/images/describe', { method: 'POST', body: JSON.stringify(payload) }),
-  batchLabel: (items) => request('/images/label-batch', { method: 'POST', body: JSON.stringify({ items }) }),
+  context: (payload) => request('/images/context', { method: 'POST', body: JSON.stringify(payload) }),
+  contextBatch: (payload = {}) => request('/images/context/batch', { method: 'POST', body: JSON.stringify(payload) }),
   task: (id) => request(`/tasks/${id}`),
+  tasks: (params = {}) => request(`/tasks?${new URLSearchParams(Object.entries(params).filter(([, value]) => value !== undefined && value !== ''))}`),
   generateCache: () => request('/generate-cache', { method: 'POST' }),
 }
 

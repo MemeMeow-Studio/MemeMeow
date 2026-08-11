@@ -1,6 +1,6 @@
 """图片 sidecar 元数据服务。
 
-该模块位于后端文件库与检索、标注服务之间，负责 meme_context 的 schema 校验、
+该模块位于后端文件库与检索、异步语境服务之间，负责 meme_context 的 schema 校验、
 图片指纹、生命周期同步和可恢复写入；embedding 向量不存放在 sidecar 中。
 """
 
@@ -21,9 +21,10 @@ from backend.paths import SUPPORTED_EXTENSIONS
 
 SCHEMA_VERSION = 1
 CONTEXT_STATUSES = {"pending", "partial", "ready", "repair_required"}
-EMBEDDING_FIELDS = ("summary", "subjects", "visible_text", "references", "meaning", "keywords")
+EMBEDDING_FIELDS = ("title", "summary", "subjects", "visible_text", "references", "meaning", "keywords")
 MAX_CONTEXT_ITEMS = 64
 MAX_CONTEXT_ITEM_LENGTH = 500
+MAX_TITLE_LENGTH = 120
 MAX_SUMMARY_LENGTH = 2000
 MAX_SEMANTIC_DOCUMENT_LENGTH = 6000
 
@@ -58,6 +59,7 @@ class MemeContext(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
+    title: str | None = Field(default=None, max_length=MAX_TITLE_LENGTH)
     summary: str = Field(default="", max_length=MAX_SUMMARY_LENGTH)
     subjects: list[str] = Field(default_factory=list)
     visible_text: list[str] = Field(default_factory=list)
@@ -79,6 +81,19 @@ class MemeContext(BaseModel):
         if not isinstance(value, str):
             raise ValueError("context_text_must_be_string")
         return value.strip()
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def clean_title(cls, value: str | None) -> str | None:
+        """把标题规范为可空单行文本，保留自然语言内容。"""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("context_text_must_be_string")
+        value = value.strip()
+        if any(ord(character) < 32 for character in value):
+            raise ValueError("title_must_be_single_line")
+        return value or None
 
     @field_validator("meaning", mode="before")
     @classmethod
@@ -148,6 +163,7 @@ class MetadataError(RuntimeError):
 def semantic_document(context: MemeContext) -> str:
     """按固定字段白名单构造 embedding 文本，排除研究辅助字段。"""
     sections: list[tuple[str, str | list[str] | None]] = [
+        ("标题", context.title),
         ("摘要", context.summary),
         ("主体", context.subjects),
         ("图片文字", context.visible_text),
@@ -216,6 +232,7 @@ class MetadataService:
             "image": self._identity(image),
             "context_status": status,
             "meme_context": {
+                "title": None,
                 "summary": "",
                 "subjects": [],
                 "visible_text": [],
@@ -239,7 +256,10 @@ class MetadataService:
         """通过同目录临时文件和原子替换提交完整 JSON。"""
         temporary = sidecar.with_name(f".{sidecar.name}.tmp")
         try:
-            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            with temporary.open("w", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(temporary, sidecar)
         except OSError as exc:
             try:
@@ -281,6 +301,7 @@ class MetadataService:
         context = metadata.meme_context
         return {
             "status": metadata.context_status,
+            "title": context.title,
             "summary": context.summary,
             "subjects": context.subjects,
             "meaning": context.meaning,
@@ -342,11 +363,11 @@ class MetadataService:
         return self.write(image, payload)
 
     def apply_visual_candidates(self, image: Path, candidates: list[str], model: str | None = None) -> SidecarMetadata:
-        """将视觉模型候选转为画面事实字段，不推定外部引用和含义。"""
+        """兼容旧迁移工具的候选写入；应用运行路径不会调用此方法。"""
         values = [value.strip() for value in candidates if isinstance(value, str) and value.strip()]
         if not values:
             raise MetadataError("metadata_context_empty")
-        return self.update_context(image, {"summary": values[0], "keywords": values}, producer="vision", model=model, status="partial", error=None)
+        return self.update_context(image, {"title": values[0], "summary": values[0], "keywords": values}, producer="legacy", model=model, status="partial", error=None)
 
     def record_error(self, image: Path, *, producer: str, model: str | None, error: str) -> SidecarMetadata:
         """保留已有语境并记录本次生成失败，供任务重试和诊断使用。"""
@@ -406,20 +427,37 @@ class MetadataService:
             raise MetadataError("image_delete_failed") from exc
 
     def embedding_record(self, image: Path) -> dict[str, object]:
-        """返回构造索引所需的语义文本、状态和指纹。"""
+        """返回 JSON-only 索引资格、语义文本和校验指纹。
+
+        缺失或不可用 sidecar 永远不再回退到文件名，调用方据此跳过 embedding。
+        """
         image_sha = self.image_sha256(image)
         try:
             metadata = self.load(image)
         except MetadataError as exc:
-            stem = image.stem.replace("-", " ").replace("_", " ").strip() or image.stem
-            return {"text": stem, "status": "repair_required", "metadata_schema_version": None, "metadata_hash": None, "image_sha256": image_sha, "error": exc.code}
+            return {
+                "text": "",
+                "indexable": False,
+                "skip_reason": "metadata_invalid" if exc.code != "metadata_missing" else "metadata_missing",
+                "status": "repair_required",
+                "metadata_schema_version": None,
+                "metadata_hash": None,
+                "image_sha256": image_sha,
+                "error": exc.code,
+            }
         context = metadata.meme_context
         text = semantic_document(context) if metadata.context_status in {"partial", "ready"} else ""
-        if not text:
-            text = image.stem.replace("-", " ").replace("_", " ").strip() or image.stem
         serialized = json.dumps(metadata.model_dump(mode="json", exclude_none=False), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if metadata.context_status not in {"partial", "ready"}:
+            reason = "metadata_pending" if metadata.context_status == "pending" else "metadata_unavailable"
+        elif not text:
+            reason = "semantic_text_empty"
+        else:
+            reason = None
         return {
             "text": text,
+            "indexable": reason is None,
+            "skip_reason": reason,
             "status": metadata.context_status,
             "metadata_schema_version": metadata.schema_version,
             "metadata_hash": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
@@ -439,6 +477,10 @@ class MetadataService:
                 self.create_pending(image)
                 counts["repaired" if sidecar_exists else "created"] += 1
                 metadata = self.load(image)
+            else:
+                if "title" not in metadata.meme_context.model_fields_set:
+                    metadata = self.write(image, metadata.model_dump(mode="json", exclude_none=False))
+                    counts["repaired"] += 1
             counts[metadata.context_status] += 1
             if progress:
                 progress(index / max(len(paths), 1), f"正在整理元数据 {index}/{len(paths)}")

@@ -5,7 +5,7 @@
 ## ADDED Requirements
 
 ### Requirement: 每张图片必须有对应的版本化 sidecar JSON
-系统 MUST 为每张受支持的图片维护同目录的 sidecar JSON，文件名为图片完整文件名追加 `.json`（例如 `cat.png.json`）。外层 JSON MUST 包含 `schema_version`、图片相对路径、文件扩展名、文件大小、内容指纹、语义状态和生成信息；`meme_context` MUST 包含 `summary`、`subjects`、`visible_text`、`references`、`meaning`、`keywords`、`search_queries`、`uncertainties` 以及可选 `source_urls`。未知扩展字段 MUST 被读取方保留并忽略。
+系统 MUST 为每张受支持的图片维护同目录的 sidecar JSON，文件名为图片完整文件名追加 `.json`（例如 `cat.png.json`）。外层 JSON MUST 包含 `schema_version`、图片相对路径、文件扩展名、文件大小、内容指纹、语义状态和生成信息；`meme_context` MUST 包含可为 `null` 的 Agent 生成 `title`，以及 `summary`、`subjects`、`visible_text`、`references`、`meaning`、`keywords`、`search_queries`、`uncertainties` 和可选 `source_urls`。未知扩展字段 MUST 被读取方保留并忽略。
 
 #### Scenario: 创建图片元数据
 - **WHEN** 一张合法图片成功进入图片库
@@ -20,11 +20,11 @@
 - **THEN** 系统将该图片标记为元数据待修复，并允许重新生成，不得将损坏 JSON 当作有效 meme 语境使用
 
 ### Requirement: meme 语境字段必须遵守证据边界
-系统 MUST 原样保存 `visible_text` 中可见文字，并将未经确认或可能过时的角色、出处、模板、引用和当前语用写入 `uncertainties`。`summary` MUST 可独立阅读且不得把猜测陈述为事实；`references` 只可包含已确认的外部引用；`meaning` 未确认时 MUST 为 `null`。`source_urls` 只可保存少量可回查的关键来源，不承担逐项证据图谱职责。
+系统 MUST 原样保存 `visible_text` 中可见文字，并将未经确认或可能过时的角色、出处、模板、引用和当前语用写入 `uncertainties`。`title` MUST 是简短、独立可读的自然语言标题，未知时为 `null`，且不得把未确认引用写成事实；`summary` MUST 可独立阅读且不得把猜测陈述为事实；`references` 只可包含已确认的外部引用；`meaning` 未确认时 MUST 为 `null`。`source_urls` 只可保存少量可回查的关键来源，不承担逐项证据图谱职责。
 
 #### Scenario: 视觉观察只能确认画面事实
 - **WHEN** 视觉标注流程只获得图片像素或 OCR 结果，未完成外部研究
-- **THEN** 系统只写入可由画面支持的主体、可见文字、摘要和关键词，并将未验证的外部推断记录为不确定项
+- **THEN** 系统只写入可由画面支持的标题、主体、可见文字、摘要和关键词，并将未验证的外部推断记录为不确定项
 
 #### Scenario: 研究结果确认外部引用
 - **WHEN** 研究流程以可信来源确认角色、作品、模板或当前会话含义

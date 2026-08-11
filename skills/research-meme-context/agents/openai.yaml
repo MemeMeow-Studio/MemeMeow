@@ -1,0 +1,4 @@
+interface:
+  display_name: "表情包语境检索"
+  short_description: "通过联网证据生成带出处与不确定性的表情包结构化表示"
+  default_prompt: "Use $research-meme-context to investigate this image meme and return cited structured metadata."

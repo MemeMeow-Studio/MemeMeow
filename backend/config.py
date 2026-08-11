@@ -22,16 +22,20 @@ class Settings:
     embedding_base_url: str | None
     embedding_model: str
     llm_enhance_model: str | None
-    vlm_api_key: str | None
-    vlm_base_url: str | None
-    vlm_model: str
-    vlm_max_attempts: int
     protected_mode: bool
     allowed_endpoints: tuple[str, ...]
     rate_limit_enabled: bool
     rate_limit_requests: int
     rate_limit_window: int
     max_upload_size: int
+    opencode_executable: str | None = "opencode"
+    opencode_model: str | None = None
+    opencode_base_url: str | None = None
+    opencode_api_key: str | None = None
+    opencode_runtime_root: Path | None = None
+    opencode_timeout_seconds: int = 300
+    opencode_max_output_bytes: int = 2 * 1024 * 1024
+    opencode_node_modules: Path | None = None
 
     @classmethod
     def from_env(cls, env_file: str | Path = ".env") -> "Settings":
@@ -52,10 +56,14 @@ class Settings:
             embedding_base_url=os.getenv("EMBEDDING_BASE_URL") or None,
             embedding_model=os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3"),
             llm_enhance_model=os.getenv("LLM_ENHANCE_MODEL") or None,
-            vlm_api_key=os.getenv("VLM_API_KEY") or None,
-            vlm_base_url=os.getenv("VLM_BASE_URL") or None,
-            vlm_model=os.getenv("VLM_MODEL", "Qwen/Qwen2-VL-72B-Instruct"),
-            vlm_max_attempts=min(3, max(1, int(os.getenv("VLM_MAX_ATTEMPTS", "2")))),
+            opencode_executable=os.getenv("MEMEMEOW_OPENCODE_EXECUTABLE", "opencode") or None,
+            opencode_model=os.getenv("MEMEMEOW_OPENCODE_MODEL") or None,
+            opencode_base_url=os.getenv("MEMEMEOW_OPENCODE_BASE_URL") or None,
+            opencode_api_key=os.getenv("MEMEMEOW_OPENCODE_API_KEY") or None,
+            opencode_runtime_root=Path(os.getenv("MEMEMEOW_OPENCODE_RUNTIME_ROOT", str(data_root / "opencode"))).expanduser(),
+            opencode_timeout_seconds=max(1, int(os.getenv("MEMEMEOW_OPENCODE_TIMEOUT_SECONDS", "300"))),
+            opencode_max_output_bytes=max(1024, int(os.getenv("MEMEMEOW_OPENCODE_MAX_OUTPUT_BYTES", str(2 * 1024 * 1024)))),
+            opencode_node_modules=(Path(value).expanduser() if (value := os.getenv("MEMEMEOW_OPENCODE_NODE_MODULES")) else None),
             protected_mode=boolean("MEMEMEOW_PROTECTED_MODE", False),
             allowed_endpoints=allowed,
             rate_limit_enabled=boolean("MEMEMEOW_RATE_LIMIT_ENABLED", False),
@@ -76,8 +84,9 @@ class Settings:
             "embedding_base_url": self.embedding_base_url,
             "embedding_api_key_configured": bool(self.embedding_api_key),
             "llm_enhance_model": self.llm_enhance_model,
-            "vlm_model": self.vlm_model,
-            "vlm_base_url": self.vlm_base_url,
-            "vlm_api_key_configured": bool(self.vlm_api_key),
+            "opencode_model": self.opencode_model,
+            "opencode_base_url": self.opencode_base_url,
+            "opencode_api_key_configured": bool(self.opencode_api_key),
+            "opencode_configured": bool(self.opencode_executable and self.opencode_model and self.opencode_base_url and self.opencode_api_key),
             "data_root_configured": True,
         }

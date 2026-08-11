@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: 系统必须执行受缓存保护的语义检索
-系统 MUST 使用已生成的图片检索缓存执行查询，并返回不超过请求数量的可访问图片引用。缓存不存在或尚未完成时，系统 MUST 不执行不完整检索，并返回明确的缓存未就绪错误。缓存生成时 MUST 从 `summary`、`subjects`、`visible_text`、已确认 `references`、非空 `meaning` 和 `keywords` 按固定格式构造语义文本；`search_queries`、`uncertainties` 和 `source_urls` MUST 不得进入 embedding。元数据发生影响上述字段的有效变化后，旧索引 MUST 被视为需要重建。
+系统 MUST 使用已生成的图片检索缓存执行查询，并返回不超过请求数量的可访问图片引用。缓存不存在或尚未完成时，系统 MUST 不执行不完整检索，并返回明确的缓存未就绪错误。缓存生成时 MUST 从非空 `title`、`summary`、`subjects`、`visible_text`、已确认 `references`、非空 `meaning` 和 `keywords` 按固定格式构造语义文本；`search_queries`、`uncertainties` 和 `source_urls` MUST 不得进入 embedding。元数据发生影响上述字段的有效变化后，旧索引 MUST 被视为需要重建。
 
 #### Scenario: 缓存就绪时返回结果
 - **WHEN** 客户端提交非空查询且缓存已就绪

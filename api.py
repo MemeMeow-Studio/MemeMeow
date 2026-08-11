@@ -1,12 +1,13 @@
 """MemeMeow FastAPI 应用入口。
 
-路由层只处理 HTTP 契约和安全边界，搜索、VLM 等现有服务在 lifespan 中初始化。
+路由层只处理 HTTP 契约和安全边界，搜索、持久任务与 OpenCode 服务在 lifespan 中初始化。
 """
 
 from __future__ import annotations
 
 import mimetypes
 import re
+import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -23,8 +24,8 @@ from backend.metadata import MetadataError, MetadataService
 from backend.paths import PathResolver, SUPPORTED_EXTENSIONS
 from backend.rate_limiter import RateLimiter
 from backend.search import SearchService
-from backend.labeling import LabelingService
-from backend.tasks import TaskManager
+from backend.opencode import OpenCodeError, OpenCodeRunner
+from backend.tasks import PersistentTaskService, TaskRecord
 
 
 class SearchRequest(BaseModel):
@@ -57,17 +58,18 @@ class DeleteRequest(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
 
 
-class DescribeRequest(BaseModel):
-    """单张图片描述请求。"""
+class ContextRequest(BaseModel):
+    """单张图片语境生成或重试请求。"""
 
     directory: str = ""
     filename: str = Field(min_length=1, max_length=255)
 
 
-class BatchLabelRequest(BaseModel):
-    """批量预生成描述请求。"""
+class ContextBatchRequest(BaseModel):
+    """批量补齐既有图片语境的请求。"""
 
-    items: list[DescribeRequest] = Field(min_length=1, max_length=500)
+    items: list[ContextRequest] = Field(default_factory=list, max_length=500)
+    include_unready: bool = True
 
 
 def _error(status: int, code: str, message: str) -> HTTPException:
@@ -82,6 +84,20 @@ def _safe_filename(name: str) -> str:
     suffix = Path(name).suffix.lower()
     stem = re.sub(r"[\x00-\x1f/\\:*?\"<>|]", "_", stem).strip(" .")
     return f"{stem or 'image'}{suffix}"
+
+
+def _filename_from_title(title: str, suffix: str) -> str:
+    """从自然语言标题派生安全文件名，并为同目录 sidecar 预留字节长度。"""
+    stem = unicodedata.normalize("NFKC", title).strip()
+    stem = re.sub(r"[\x00-\x1f/\\:*?\"<>|]", "_", stem).strip(" .")
+    if not stem:
+        raise ValueError("empty_title")
+    suffix = suffix.lower()
+    max_stem_bytes = 255 - len(f"{suffix}.json".encode("utf-8"))
+    stem = stem.encode("utf-8")[:max_stem_bytes].decode("utf-8", errors="ignore").rstrip(" .")
+    if not stem:
+        raise ValueError("empty_title")
+    return f"{stem}{suffix}"
 
 
 def _media_for_path(resolver: PathResolver, value: Any) -> str | None:
@@ -103,6 +119,29 @@ def _invalidate_search(request: Request) -> None:
         invalidate()
 
 
+def _context_payload(request: Request, image: Path, *, auto_name: bool = False) -> dict[str, object]:
+    """构造可持久化的图片语境任务输入，不保存密钥或提示词。"""
+    settings: Settings = request.app.state.settings
+    runner: OpenCodeRunner = request.app.state.opencode
+    relative = request.app.state.resolver.relative(image)
+    try:
+        skill_hash = runner.skill_hash()
+    except (OSError, OpenCodeError):
+        skill_hash = None
+    return {
+        "image_relative_path": relative,
+        "image_sha256": request.app.state.metadata.image_sha256(image),
+        "auto_name": auto_name,
+        "model": settings.opencode_model,
+        "skill_hash": skill_hash,
+    }
+
+
+def _submit_context_task(request: Request, image: Path, *, auto_name: bool = False) -> TaskRecord:
+    """提交或复用同一图片内容的语境生成任务。"""
+    return request.app.state.tasks.submit("meme_context_generation", _context_payload(request, image, auto_name=auto_name))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """初始化一次服务依赖，并在关闭时终止未完成任务。"""
@@ -111,19 +150,82 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     app.state.resolver = PathResolver(settings.image_root)
     app.state.metadata = MetadataService(settings.image_root)
-    app.state.tasks = TaskManager()
     app.state.search_engine = SearchService(settings, app.state.metadata)
-    app.state.labeling = LabelingService(settings)
+    app.state.opencode = OpenCodeRunner(settings)
+    tasks = PersistentTaskService(settings.data_root / "tasks")
+
+    def cache_handler(payload: dict[str, object], progress):
+        """从持久任务 payload 重建缓存生成工作。"""
+        result = app.state.search_engine.generate_cache(progress)
+        return result
+
+    def repair_handler(payload: dict[str, object], progress):
+        """从持久任务 payload 重建 sidecar 修复工作。"""
+        result = app.state.metadata.repair(progress)
+        app.state.search_engine.invalidate_cache()
+        return result
+
+    def context_handler(payload: dict[str, object], progress):
+        """执行 Agent 候选校验、指纹复核与受保护 sidecar 写回。"""
+        relative = payload.get("image_relative_path")
+        expected_sha = payload.get("image_sha256")
+        if not isinstance(relative, str) or not isinstance(expected_sha, str):
+            raise RuntimeError("target_changed")
+        try:
+            image = app.state.resolver.resolve_file(str(Path(relative).parent), Path(relative).name)
+        except HTTPException as exc:
+            raise RuntimeError("target_changed") from exc
+        if app.state.metadata.image_sha256(image) != expected_sha:
+            raise RuntimeError("target_changed")
+        try:
+            candidate, session_id = app.state.opencode.run(image, progress)
+        except OpenCodeError as exc:
+            try:
+                app.state.metadata.record_error(image, producer="research", model=app.state.settings.opencode_model, error=exc.code)
+            except MetadataError:
+                pass
+            raise RuntimeError(f"{exc.code}: {exc}") from exc
+        if app.state.metadata.image_sha256(image) != expected_sha:
+            raise RuntimeError("target_changed")
+        try:
+            metadata = app.state.metadata.update_context(image, candidate, producer="research", model=app.state.settings.opencode_model, status="ready", error=None)
+        except MetadataError as exc:
+            raise RuntimeError("agent_output_schema_invalid") from exc
+        app.state.search_engine.invalidate_cache()
+        result: dict[str, object] = {
+            "image_relative_path": relative,
+            "session_id": session_id,
+            "sidecar_hash": app.state.metadata.embedding_record(image)["metadata_hash"],
+            "auto_named": False,
+        }
+        if payload.get("auto_name") and metadata.meme_context.title:
+            try:
+                target = image.parent / _filename_from_title(metadata.meme_context.title, image.suffix)
+                if target != image:
+                    app.state.metadata.rename(image, target)
+                    result["auto_named"] = True
+                    result["saved_filename"] = target.name
+                    result["image_relative_path"] = app.state.resolver.relative(target)
+            except (MetadataError, ValueError):
+                result["auto_name_error"] = "auto_name_failed"
+        return result
+
+    tasks.register("cache_generation", cache_handler)
+    tasks.register("metadata_repair", repair_handler)
+    tasks.register("meme_context_generation", context_handler)
+    app.state.tasks = tasks
+    tasks.start()
     try:
         yield
     finally:
+        app.state.opencode.shutdown()
         app.state.tasks.shutdown()
 
 
 app = FastAPI(
     title="MemeMeow API",
     version="2.0.0",
-    description="MemeMeow 图片检索、图片库和标注 API。模型密钥只在服务端环境中读取。",
+    description="MemeMeow 图片检索、图片库和异步语境处理 API。模型密钥只在服务端环境中读取。",
     lifespan=lifespan,
     responses={400: {"model": ErrorBody}, 403: {"model": ErrorBody}, 404: {"model": ErrorBody}, 409: {"model": ErrorBody}, 422: {"model": ErrorBody}, 503: {"model": ErrorBody}},
 )
@@ -192,7 +294,11 @@ async def health(request: Request) -> dict[str, str]:
 @app.get("/config", tags=["system"])
 async def config_status(request: Request) -> dict[str, object]:
     """返回脱敏配置状态，绝不返回完整密钥。"""
-    return request.app.state.settings.status()
+    status = request.app.state.settings.status()
+    # embedding 缓存属于运行时状态，供前端判断当前是否可以直接检索。
+    engine = getattr(request.app.state, "search_engine", None)
+    status["embedding_cache_ready"] = bool(engine and engine.has_cache())
+    return status
 
 
 @app.post("/search", tags=["search"])
@@ -238,20 +344,44 @@ async def generate_cache(request: Request) -> dict[str, object]:
     if engine is None:
         raise _error(503, "service_unavailable", "检索服务未初始化")
 
-    def run(progress):
-        engine.generate_cache(progress)
-
-    record = request.app.state.tasks.submit("cache_generation", run)
+    record = request.app.state.tasks.submit("cache_generation", {})
     return {"task_id": record.task_id, "task_type": record.task_type, "status": record.status}
+
+
+def _task_summary(request: Request, record: TaskRecord) -> dict[str, object]:
+    """将任务转换为列表安全摘要，不返回完整 payload 或运行日志。"""
+    data = record.as_dict(include_payload=False)
+    payload = record.payload
+    related = payload.get("image_relative_path")
+    if isinstance(related, str):
+        try:
+            image = request.app.state.resolver.resolve_file(str(Path(related).parent), Path(related).name)
+            data["image"] = {"relative_path": related, "media_url": request.app.state.resolver.media_url(image), "filename": image.name}
+        except HTTPException:
+            data["image"] = {"relative_path": related}
+    return data
+
+
+@app.get("/tasks", tags=["tasks"])
+async def list_tasks(
+    request: Request,
+    status: list[str] = Query(default=[]),
+    task_type: list[str] = Query(default=[]),
+    cursor: str | None = Query(default=None, max_length=128),
+    limit: int = Query(default=50, ge=1, le=100),
+) -> dict[str, object]:
+    """按筛选条件分页列出任务安全摘要。"""
+    records, next_cursor = request.app.state.tasks.list(statuses=set(status) or None, task_types=set(task_type) or None, cursor=cursor, limit=limit)
+    return {"items": [_task_summary(request, record) for record in records], "next_cursor": next_cursor}
 
 
 @app.get("/tasks/{task_id}", tags=["tasks"])
 async def get_task(request: Request, task_id: str) -> dict[str, object]:
-    """查询进程内任务状态。"""
+    """查询持久任务详情。"""
     record = request.app.state.tasks.get(task_id)
     if record is None:
-        raise _error(404, "task_not_found", "任务不存在或服务已重启")
-    return record.as_dict()
+        raise _error(404, "task_not_found", "任务不存在")
+    return _task_summary(request, record)
 
 
 @app.get("/images", tags=["images"])
@@ -275,6 +405,14 @@ async def list_images(
             continue
         if search and search.casefold() not in path.name.casefold():
             continue
+        metadata_status = request.app.state.metadata.status(path)["status"]
+        embedding_record = request.app.state.metadata.embedding_record(path)
+        if metadata_status == "repair_required":
+            embedding_status = "blocked"
+        elif request.app.state.search_engine.has_cache():
+            embedding_status = "ready"
+        else:
+            embedding_status = "pending"
         items.append(
             {
                 "directory": directory,
@@ -283,6 +421,7 @@ async def list_images(
                 "size": path.stat().st_size,
                 "media_url": resolver.media_url(path),
                 "metadata": request.app.state.metadata.status(path),
+                "embedding_status": embedding_status,
             }
         )
     start = (page - 1) * page_size
@@ -396,86 +535,55 @@ async def upload_images(
             target.unlink(missing_ok=True)
             results.append({"filename": original, "ok": False, "error": "metadata_write_failed"})
             continue
-        auto_name_error = None
-        auto_named = False
-        if auto_name:
-            try:
-                candidates = await _describe_path(request, target)
-                candidate = _safe_filename(candidates[0])
-                candidate = f"{Path(candidate).stem}{target.suffix.lower()}"
-                renamed = target.parent / candidate
-                request.app.state.metadata.apply_visual_candidates(target, candidates, settings.vlm_model)
-                if not renamed.exists() or renamed == target:
-                    request.app.state.metadata.rename(target, renamed)
-                    target = renamed
-                    auto_named = True
-            except Exception as exc:  # noqa: BLE001
-                auto_name_error = str(exc)
-        result = {"filename": original, "ok": True, "saved_filename": target.name, "media_url": resolver.media_url(target), "auto_named": auto_named}
-        if auto_name_error:
-            result["auto_name_error"] = "auto_name_failed"
+        result = {"filename": original, "ok": True, "saved_filename": target.name, "media_url": resolver.media_url(target), "auto_named": False}
+        try:
+            task = _submit_context_task(request, target, auto_name=auto_name)
+            result["metadata_job_id"] = task.task_id
+            result["metadata_job_status"] = task.status
+        except (OSError, RuntimeError, MetadataError):
+            # 图片和 pending sidecar 已有效提交，语境任务可由批量补齐恢复。
+            result["metadata_job_error"] = "metadata_enqueue_failed"
         result["metadata_status"] = request.app.state.metadata.status(target)["status"]
         _invalidate_search(request)
         results.append(result)
     return {"directory": directory, "results": results}
 
 
-async def _describe_path(request: Request, path: Path) -> list[str]:
-    """调用当前应用的 VLM 服务，供单张和上传自动命名共用。"""
-    try:
-        return request.app.state.labeling.describe(path)
-    except Exception as exc:  # noqa: BLE001
-        code = "configuration_missing" if "vlm_not_configured" in str(exc) else "vlm_failed"
-        message = "VLM 配置未完成" if code == "configuration_missing" else "VLM 描述生成失败"
-        try:
-            request.app.state.metadata.record_error(path, producer="vision", model=request.app.state.settings.vlm_model, error=code)
-        except MetadataError:
-            pass
-        raise _error(503, code, message) from exc
+@app.post("/images/context", status_code=202, tags=["images", "tasks"])
+async def generate_context(request: Request, payload: ContextRequest) -> dict[str, object]:
+    """为单张图片显式创建或复用语境生成任务。"""
+    image = request.app.state.resolver.resolve_file(payload.directory, payload.filename)
+    task = _submit_context_task(request, image)
+    return {"task_id": task.task_id, "task_type": task.task_type, "status": task.status}
 
 
-@app.post("/images/describe", tags=["labeling"])
-async def describe_image(request: Request, payload: DescribeRequest) -> dict[str, object]:
-    """为图片生成候选描述，不修改图片文件。"""
-    path = request.app.state.resolver.resolve_file(payload.directory, payload.filename)
-    try:
-        candidates = await _describe_path(request, path)
-    except HTTPException as exc:
-        return JSONResponse(status_code=exc.status_code, content=exc.detail)
-    try:
-        request.app.state.metadata.apply_visual_candidates(path, candidates, request.app.state.settings.vlm_model)
-    except MetadataError as exc:
-        return JSONResponse(status_code=500, content={"error": exc.code, "message": "图片元数据写入失败"})
-    _invalidate_search(request)
-    return {"directory": payload.directory, "filename": payload.filename, "status": "succeeded", "candidates": candidates, "metadata_status": "partial"}
-
-
-@app.post("/images/label-batch", status_code=202, tags=["labeling", "tasks"])
-async def label_batch(request: Request, payload: BatchLabelRequest) -> dict[str, object]:
-    """提交批量 VLM 预生成任务，单张失败不会阻塞其他图片。"""
+@app.post("/images/context/batch", tags=["images", "tasks"])
+async def generate_context_batch(request: Request, payload: ContextBatchRequest) -> dict[str, object]:
+    """批量为缺失或未就绪图片提交独立语境任务，单项失败不影响其余项。"""
     resolver: PathResolver = request.app.state.resolver
-    paths = [resolver.resolve_file(item.directory, item.filename) for item in payload.items]
-
-    def run(progress):
-        results = []
-        total = len(paths)
-        for index, path in enumerate(paths, start=1):
-            try:
-                candidates = request.app.state.labeling.describe(path)
-                request.app.state.metadata.apply_visual_candidates(path, candidates, request.app.state.settings.vlm_model)
-                results.append({"filename": resolver.relative(path), "ok": True})
-            except Exception as exc:  # noqa: BLE001
-                try:
-                    request.app.state.metadata.record_error(path, producer="vision", model=request.app.state.settings.vlm_model, error=str(exc))
-                except MetadataError:
-                    pass
-                results.append({"filename": resolver.relative(path), "ok": False, "error": str(exc)})
-            progress(index / total, f"正在描述 {index}/{total}")
-        _invalidate_search(request)
-        return {"results": results}
-
-    record = request.app.state.tasks.submit("batch_labeling", run)
-    return {"task_id": record.task_id, "task_type": record.task_type, "status": record.status}
+    if payload.items:
+        paths = [(item.directory, item.filename) for item in payload.items]
+    else:
+        paths = [
+            (("" if path.relative_to(request.app.state.metadata.root).parent == Path(".") else path.relative_to(request.app.state.metadata.root).parent.as_posix()), path.name)
+            for path in request.app.state.metadata.root.rglob("*")
+            if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        ]
+    results = []
+    for directory, filename in paths:
+        try:
+            image = resolver.resolve_file(directory, filename)
+            state = request.app.state.metadata.status(image)["status"]
+            if payload.include_unready and state not in {"pending", "partial", "repair_required"}:
+                results.append({"filename": resolver.relative(image), "skipped": "already_ready"})
+                continue
+            if state == "repair_required":
+                request.app.state.metadata.create_pending(image)
+            task = _submit_context_task(request, image)
+            results.append({"filename": resolver.relative(image), "task_id": task.task_id, "status": task.status})
+        except (HTTPException, MetadataError, OSError, RuntimeError) as exc:
+            results.append({"filename": filename, "error": getattr(exc, "code", "context_enqueue_failed")})
+    return {"results": results}
 
 
 @app.post("/images/metadata/repair", status_code=202, tags=["images", "tasks"])
@@ -483,12 +591,7 @@ async def repair_metadata(request: Request) -> dict[str, object]:
     """提交幂等的 sidecar 初始化和修复任务。"""
     metadata: MetadataService = request.app.state.metadata
 
-    def run(progress):
-        result = metadata.repair(progress)
-        _invalidate_search(request)
-        return result
-
-    record = request.app.state.tasks.submit("metadata_repair", run)
+    record = request.app.state.tasks.submit("metadata_repair", {})
     return {"task_id": record.task_id, "task_type": record.task_type, "status": record.status}
 
 

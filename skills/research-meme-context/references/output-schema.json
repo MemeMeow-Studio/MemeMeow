@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Meme retrieval record",
+  "type": "object",
+  "required": [
+    "title",
+    "summary",
+    "subjects",
+    "visible_text",
+    "references",
+    "meaning",
+    "keywords",
+    "search_queries",
+    "uncertainties"
+  ],
+  "properties": {
+    "title": {
+      "type": ["string", "null"],
+      "description": "由 Agent 生成的简短、独立可读单行标题；未知时为 null。标题可作为自动重命名的输入，但不等同于实际文件名。",
+      "maxLength": 120,
+      "pattern": "^[^\\u0000-\\u001f]*$"
+    },
+    "summary": {
+      "type": "string",
+      "description": "一段独立可读的检索摘要，涵盖画面、已确认引用和常见含义，可直接用于文本 embedding。"
+    },
+    "subjects": {
+      "type": "array",
+      "description": "画面中的主体、角色或物品；无法确认名称时使用外观描述。",
+      "items": { "type": "string" }
+    },
+    "visible_text": {
+      "type": "array",
+      "description": "图片中可见的原始文字；保留原文。",
+      "items": { "type": "string" }
+    },
+    "references": {
+      "type": "array",
+      "description": "已确认或有保留地识别出的角色、作品、模板、台词、歌曲、事件等外部引用。",
+      "items": { "type": "string" }
+    },
+    "meaning": {
+      "type": ["string", "null"],
+      "description": "该图在对话中的常见表达作用；未知时为 null。"
+    },
+    "keywords": {
+      "type": "array",
+      "description": "用于文本检索或 embedding 扩展的短关键词，包含别名、原文、译名和相关情绪/场景。",
+      "items": { "type": "string" }
+    },
+    "search_queries": {
+      "type": "array",
+      "description": "可直接交给后续 Agent 或搜索引擎的查询语句。",
+      "items": { "type": "string" }
+    },
+    "uncertainties": {
+      "type": "array",
+      "description": "仍未确认、可能过时或不应当作为事实使用的项目。",
+      "items": { "type": "string" }
+    },
+    "source_urls": {
+      "type": "array",
+      "description": "可选的少量关键来源，供后续 Agent 回查，不承担逐项证据图谱职责。",
+      "items": { "type": "string", "format": "uri" }
+    }
+  }
+}

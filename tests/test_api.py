@@ -18,8 +18,9 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """使用隔离图片目录启动完整应用生命周期。"""
     monkeypatch.setenv("MEMEMEOW_DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("MEMEMEOW_IMAGE_ROOT", str(tmp_path / "images"))
-    monkeypatch.delenv("EMBEDDING_API_KEY", raising=False)
-    monkeypatch.delenv("VLM_API_KEY", raising=False)
+    monkeypatch.setenv("EMBEDDING_API_KEY", "")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "")
+    monkeypatch.setenv("MEMEMEOW_OPENCODE_MODEL", "")
     with TestClient(app) as test_client:
         yield test_client, tmp_path
 
@@ -37,8 +38,9 @@ def test_config_is_masked_and_search_requires_cache(client):
     config = test_client.get("/config")
     assert config.status_code == 200
     assert "embedding_api_key" not in config.json()
-    assert "vlm_api_key" not in config.json()
+    assert "opencode_executable" not in config.json()
     assert config.json()["embedding_api_key_configured"] is False
+    assert config.json()["embedding_cache_ready"] is False
     response = test_client.post("/search", json={"query": "开心"})
     assert response.status_code == 503
     assert response.json()["error"] == "cache_not_ready"
@@ -74,7 +76,9 @@ def test_upload_lists_and_serves_image(client):
     image_path = (client[1] / "images" / "hello.png")
     sidecar = image_path.with_name("hello.png.json")
     assert sidecar.is_file()
-    assert test_client.get("/images").json()["items"][0]["metadata"]["status"] == "pending"
+    listed = test_client.get("/images").json()["items"][0]
+    assert listed["metadata"]["status"] == "pending"
+    assert listed["embedding_status"] == "pending"
 
 
 def test_batch_upload_keeps_success_and_reports_failure(client):
@@ -94,87 +98,15 @@ def test_batch_upload_keeps_success_and_reports_failure(client):
     assert duplicate.json()["results"][0]["error"] == "file_exists"
 
 
-def test_auto_name_is_optional_and_falls_back_per_file(client):
-    """自动命名成功时使用候选描述，失败时保留安全原名。"""
+def test_upload_queues_context_job_and_removed_vlm_routes_are_not_found(client):
+    """上传创建异步语境任务，原 VLM 路由不再暴露。"""
     test_client, _ = client
-
-    class FakeLabeling:
-        def describe(self, path):
-            if path.name.startswith("fallback"):
-                raise RuntimeError("vlm timeout")
-            return ["一只开心的猫"]
-
-    test_client.app.state.labeling = FakeLabeling()
-    response = test_client.post(
-        "/images/upload",
-        data={"auto_name": "true"},
-        files=[
-            ("files", ("named.png", png_bytes(), "image/png")),
-            ("files", ("fallback.png", png_bytes("blue"), "image/png")),
-        ],
-    )
-    results = response.json()["results"]
-    assert results[0]["auto_named"] is True
-    assert results[0]["saved_filename"].endswith(".png")
-    assert results[1]["auto_named"] is False
-    assert results[1]["auto_name_error"] == "auto_name_failed"
-
-
-def test_describe_returns_candidates_without_renaming(client):
-    """描述接口只返回候选，不修改原图。"""
-    test_client, _ = client
-
-    class FakeLabeling:
-        def describe(self, path):
-            return ["候选一", "候选二"]
-
-    test_client.app.state.labeling = FakeLabeling()
-    test_client.post("/images/upload", files=[("files", ("current.png", png_bytes(), "image/png"))])
-    response = test_client.post("/images/describe", json={"filename": "current.png"})
-    assert response.status_code == 200
-    assert response.json()["candidates"] == ["候选一", "候选二"]
-    assert test_client.get("/images").json()["items"][0]["filename"] == "current.png"
-    assert test_client.get("/images").json()["items"][0]["metadata"]["status"] == "partial"
-    assert "候选一" in test_client.get("/images").json()["items"][0]["metadata"]["summary"]
-
-
-def test_describe_failure_records_metadata_error(client):
-    """视觉描述失败时保留 sidecar 并记录可诊断错误。"""
-    test_client, tmp_path = client
-
-    class FakeLabeling:
-        def describe(self, path):
-            raise RuntimeError("timeout")
-
-    test_client.app.state.labeling = FakeLabeling()
-    test_client.post("/images/upload", files=[("files", ("failed.png", png_bytes(), "image/png"))])
-    response = test_client.post("/images/describe", json={"filename": "failed.png"})
-    assert response.status_code == 503
-    payload = json.loads((tmp_path / "images" / "failed.png.json").read_text(encoding="utf-8"))
-    assert payload["provenance"]["last_error"] == "vlm_failed"
-
-
-def test_batch_labeling_is_a_non_blocking_task(client):
-    """批量预生成返回任务标识，单张失败不影响任务终态。"""
-    test_client, _ = client
-
-    class FakeLabeling:
-        def describe(self, path):
-            if path.name == "bad.png":
-                raise RuntimeError("failed")
-            return ["ok"]
-
-    test_client.app.state.labeling = FakeLabeling()
-    test_client.post("/images/upload", files=[("files", ("good.png", png_bytes(), "image/png")), ("files", ("bad.png", png_bytes("blue"), "image/png"))])
-    response = test_client.post("/images/label-batch", json={"items": [{"filename": "good.png"}, {"filename": "bad.png"}]})
-    assert response.status_code == 202
-    task_id = response.json()["task_id"]
-    for _ in range(50):
-        status = test_client.get(f"/tasks/{task_id}").json()
-        if status["status"] in {"succeeded", "failed"}:
-            break
-    assert status["status"] == "succeeded"
-    assert [item["ok"] for item in status["result"]["results"]] == [True, False]
+    response = test_client.post("/images/upload", files=[("files", ("pending.png", png_bytes(), "image/png"))])
+    item = response.json()["results"][0]
+    assert item["metadata_job_id"]
+    assert test_client.get(f"/tasks/{item['metadata_job_id']}").status_code == 200
+    assert test_client.post("/images/describe", json={"filename": "pending.png"}).status_code == 404
+    assert test_client.post("/images/label-batch", json={"items": []}).status_code == 404
 
 
 def test_directory_and_rename_conflicts(client):
@@ -241,6 +173,19 @@ def test_unknown_task_has_stable_error(client):
     response = test_client.get("/tasks/unknown")
     assert response.status_code == 404
     assert response.json()["error"] == "task_not_found"
+
+
+def test_task_list_filters_and_does_not_expose_payload(client):
+    """持久任务列表支持类型筛选且不会返回内部 payload。"""
+    test_client, _ = client
+    submitted = test_client.post("/generate-cache")
+    assert submitted.status_code == 202
+    response = test_client.get("/tasks", params={"task_type": "cache_generation", "limit": 1})
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert len(items) == 1
+    assert items[0]["task_type"] == "cache_generation"
+    assert "payload" not in items[0]
 
 
 def test_search_maps_results_to_media_urls(client):

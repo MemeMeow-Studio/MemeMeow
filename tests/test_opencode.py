@@ -1,0 +1,341 @@
+"""OpenCode 候选解析与持久任务恢复测试。"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from backend.config import Settings
+from backend.opencode import OPENCODE_REASONING_VARIANT, OpenCodeError, OpenCodeRunner
+from backend.tasks import PersistentTaskService
+
+
+def make_settings(tmp_path: Path) -> Settings:
+    """构造不依赖真实 OpenCode 的隔离配置。"""
+    return Settings(
+        data_root=tmp_path / "data",
+        image_root=tmp_path / "images",
+        embedding_api_key=None,
+        embedding_base_url=None,
+        embedding_model="embedding",
+        llm_enhance_model=None,
+        protected_mode=False,
+        allowed_endpoints=("/",),
+        rate_limit_enabled=False,
+        rate_limit_requests=1,
+        rate_limit_window=1,
+        max_upload_size=1,
+        opencode_executable=None,
+        opencode_model=None,
+    )
+
+
+def candidate() -> dict[str, object]:
+    """提供满足研究输出契约的最小候选。"""
+    return {
+        "title": "测试标题",
+        "summary": "一张用于测试的图片",
+        "subjects": ["主体"],
+        "visible_text": [],
+        "references": [],
+        "meaning": None,
+        "keywords": ["测试"],
+        "search_queries": [],
+        "uncertainties": [],
+        "source_urls": [],
+    }
+
+
+def test_candidate_extraction_rejects_extra_text_and_accepts_single_fence(tmp_path: Path):
+    """只接受完整 JSON 或唯一 fenced JSON，不猜测花括号边界。"""
+    runner = OpenCodeRunner(make_settings(tmp_path))
+    raw = __import__("json").dumps(candidate(), ensure_ascii=False)
+    assert runner.extract_candidate(raw)["title"] == "测试标题"
+    assert runner.extract_candidate(f"```json\n{raw}\n```")["summary"] == "一张用于测试的图片"
+    with pytest.raises(OpenCodeError) as error:
+        runner.extract_candidate(f"说明\n```json\n{raw}\n```")
+    assert error.value.code == "agent_output_invalid_json"
+
+
+def test_candidate_validation_checks_required_fields_and_uri_format(tmp_path: Path):
+    """输出必须通过 schema 和 Pydantic 双重字段约束。"""
+    runner = OpenCodeRunner(make_settings(tmp_path))
+    assert runner.validate_candidate(candidate())["title"] == "测试标题"
+    invalid = candidate()
+    invalid["source_urls"] = ["not-a-uri"]
+    with pytest.raises(OpenCodeError) as error:
+        runner.validate_candidate(invalid)
+    assert error.value.code == "agent_output_schema_invalid"
+
+
+def test_missing_opencode_configuration_has_stable_error(tmp_path: Path):
+    """没有可执行文件或模型时 worker 返回稳定诊断。"""
+    with pytest.raises(OpenCodeError) as error:
+        OpenCodeRunner(make_settings(tmp_path)).prepare_runtime()
+    assert error.value.code == "opencode_not_configured"
+
+
+def test_prepare_runtime_writes_common_config_without_secrets(tmp_path: Path):
+    """runtime 配置固定在 workspace，provider 凭据只保留环境变量引用。"""
+    project = tmp_path / "project"
+    (project / "skills" / "research-meme-context").mkdir(parents=True)
+    modules = project / "node_modules"
+    (modules / "@ai-sdk" / "openai").mkdir(parents=True)
+    executable = tmp_path / "opencode"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    settings = Settings(
+        **{
+            **make_settings(tmp_path).__dict__,
+            "opencode_executable": str(executable),
+            "opencode_model": "mememeow/gpt-5.6-luna",
+            "opencode_base_url": "https://example.invalid/v1",
+            "opencode_api_key": "not-written-to-config",
+            "opencode_node_modules": modules,
+        }
+    )
+    runner = OpenCodeRunner(settings, project_root=project)
+    runner.prepare_runtime()
+
+    payload = __import__("json").loads((runner.workspace / "opencode.json").read_text(encoding="utf-8"))
+    provider = payload["provider"]["mememeow"]
+    assert provider["npm"] == "@ai-sdk/openai"
+    assert provider["options"] == {
+        "baseURL": "{env:MEMEMEOW_OPENCODE_BASE_URL}",
+        "apiKey": "{env:MEMEMEOW_OPENCODE_API_KEY}",
+    }
+    assert set(provider["models"]) == {"gpt-5.6-luna"}
+    assert provider["models"]["gpt-5.6-luna"]["variants"] == {
+        "max": {"reasoningEffort": "max"}
+    }
+    assert "not-written-to-config" not in (runner.workspace / "opencode.json").read_text(encoding="utf-8")
+
+
+def test_runtime_environment_isolates_project_config(tmp_path: Path):
+    """后台任务和检查脚本必须固定 DB、显式配置并禁止合并父目录配置。"""
+    settings = Settings(
+        **{
+            **make_settings(tmp_path).__dict__,
+            "opencode_model": "mememeow/gpt-5.6-luna",
+            "opencode_base_url": "https://example.invalid/v1",
+            "opencode_api_key": "test-key",
+        }
+    )
+    runner = OpenCodeRunner(settings)
+    environment = runner.build_environment()
+    assert environment["OPENCODE_DB"] == str(runner.db_path)
+    assert environment["OPENCODE_CONFIG"] == str(runner.workspace / "opencode.json")
+    assert environment["OPENCODE_CONFIG_DIR"] == str(runner.workspace / ".opencode")
+    assert environment["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
+
+
+def test_prepare_runtime_uses_project_opencode_modules_by_default(tmp_path: Path):
+    """未覆盖依赖路径时复用项目的 OpenCode 插件依赖而非前端依赖。"""
+    project = tmp_path / "project"
+    (project / "skills" / "research-meme-context").mkdir(parents=True)
+    modules = project / ".opencode" / "node_modules"
+    (modules / "@ai-sdk" / "openai").mkdir(parents=True)
+    executable = tmp_path / "opencode"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    settings = Settings(
+        **{
+            **make_settings(tmp_path).__dict__,
+            "opencode_executable": str(executable),
+            "opencode_model": "mememeow/gpt-5.6-luna",
+            "opencode_base_url": "https://example.invalid/v1",
+            "opencode_api_key": "test-key",
+        }
+    )
+    runner = OpenCodeRunner(settings, project_root=project)
+    runner.prepare_runtime()
+    assert (runner.workspace / "node_modules").resolve() == modules.resolve()
+
+
+def test_runtime_config_is_accepted_by_installed_opencode(tmp_path: Path):
+    """已安装 CLI 必须展开 workspace 配置中的环境变量引用。"""
+    executable = shutil.which("opencode")
+    if executable is None:
+        pytest.skip("当前环境未安装 OpenCode CLI")
+    project = tmp_path / "project"
+    (project / "skills" / "research-meme-context").mkdir(parents=True)
+    modules = project / "node_modules"
+    (modules / "@ai-sdk" / "openai").mkdir(parents=True)
+    settings = Settings(
+        **{
+            **make_settings(tmp_path).__dict__,
+            "opencode_executable": executable,
+            "opencode_model": "mememeow/gpt-5.6-luna",
+            "opencode_base_url": "https://example.invalid/v1",
+            "opencode_api_key": "test-key",
+            "opencode_node_modules": modules,
+        }
+    )
+    runner = OpenCodeRunner(settings, project_root=project)
+    runner.prepare_runtime()
+    environment = runner.build_environment()
+    result = subprocess.run(
+        [executable, "debug", "config"],
+        cwd=runner.workspace,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    resolved = json.loads(result.stdout)
+    assert resolved["provider"]["mememeow"]["options"] == {
+        "baseURL": "https://example.invalid/v1",
+        "apiKey": "test-key",
+    }
+
+
+def test_runner_fixes_luna_at_max_reasoning_variant(tmp_path: Path):
+    """每个研究任务传绝对图片路径并显式要求 max 推理强度。"""
+    settings = Settings(
+        **{
+            **make_settings(tmp_path).__dict__,
+            "opencode_executable": "opencode",
+            "opencode_model": "mememeow/gpt-5.6-luna",
+            "opencode_base_url": "https://example.invalid/v1",
+            "opencode_api_key": "test-key",
+        }
+    )
+    command = OpenCodeRunner(settings)._run_command(tmp_path / "image.png", "prompt")
+    file_index = command.index("--file")
+    assert command[file_index + 1] == str((tmp_path / "image.png").resolve())
+    variant_index = command.index("--variant")
+    assert command[variant_index + 1] == OPENCODE_REASONING_VARIANT == "max"
+
+
+def test_opencode_launcher_reuses_runtime_for_session_list(tmp_path: Path):
+    """会话检查入口必须复用同一 workspace 和 DB，并把 list 映射到公开 CLI。"""
+    project = Path(__file__).resolve().parent.parent
+    executable = tmp_path / "fake-opencode"
+    capture = tmp_path / "capture.txt"
+    executable.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$PWD\" \"$OPENCODE_DB\" \"$OPENCODE_CONFIG\" "
+        "\"$OPENCODE_CONFIG_DIR\" \"$OPENCODE_DISABLE_PROJECT_CONFIG\" \"$@\" > \"$CAPTURE\"\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    modules = tmp_path / "node_modules"
+    (modules / "@ai-sdk" / "openai").mkdir(parents=True)
+    runtime = tmp_path / "runtime"
+    environment = {
+        **os.environ,
+        "CAPTURE": str(capture),
+        "MEMEMEOW_OPENCODE_EXECUTABLE": str(executable),
+        "MEMEMEOW_OPENCODE_MODEL": "mememeow/gpt-5.6-luna",
+        "MEMEMEOW_OPENCODE_BASE_URL": "https://example.invalid/v1",
+        "MEMEMEOW_OPENCODE_API_KEY": "test-key",
+        "MEMEMEOW_OPENCODE_RUNTIME_ROOT": str(runtime),
+        "MEMEMEOW_OPENCODE_NODE_MODULES": str(modules),
+        "MEMEMEOW_PYTHON": sys.executable,
+    }
+    result = subprocess.run(
+        [str(project / "scripts" / "open-opencode.sh"), "--list", "--format", "json"],
+        cwd=project,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    lines = capture.read_text(encoding="utf-8").splitlines()
+    workspace = str((runtime / "workspace").resolve())
+    assert lines[:5] == [
+        workspace,
+        str((runtime / "opencode.db").resolve()),
+        str((runtime / "workspace" / "opencode.json").resolve()),
+        str((runtime / "workspace" / ".opencode").resolve()),
+        "1",
+    ]
+    assert lines[5:] == ["session", "list", "--format", "json"]
+
+
+def test_last_assistant_message_excludes_tool_content(tmp_path: Path):
+    """session 消息解析兼容公开 API 结构且只使用最后 assistant 的 text parts。"""
+    runner = OpenCodeRunner(make_settings(tmp_path))
+    text = runner._last_assistant_text({"messages": [
+        {"role": "assistant", "parts": [{"type": "text", "text": "旧内容"}]},
+        {"role": "tool", "parts": [{"type": "text", "text": "工具结果"}]},
+        {
+            "info": {"role": "assistant"},
+            "parts": [
+                {"type": "reasoning", "text": "内部推理"},
+                {"type": "text", "text": "{"},
+                {"type": "text", "text": "}"},
+                {"type": "step-finish"},
+            ],
+        },
+    ]})
+    assert text == "{}"
+
+
+def test_process_error_diagnostic_reads_opencode_jsonl_error(tmp_path: Path):
+    """非零退出时应从 OpenCode JSONL 中保留有限的上游错误诊断。"""
+    runner = OpenCodeRunner(make_settings(tmp_path))
+    stdout = json.dumps({
+        "type": "error",
+        "error": {"data": {"message": "Upstream request failed", "statusCode": 400}},
+    }).encode()
+    assert runner._process_error_diagnostic(stdout, b"") == "Upstream request failed (HTTP 400)"
+    assert runner._process_error_diagnostic(stdout, b"CLI failed\n") == "CLI failed"
+
+
+def test_persistent_task_keeps_stable_error_code_and_limited_diagnostic(tmp_path: Path):
+    """任务服务保留 Agent 失败码，同时允许有限的安全诊断。"""
+    service = PersistentTaskService(tmp_path / "tasks")
+
+    def fail(payload, progress):
+        raise RuntimeError("agent_process_failed: Upstream request failed (HTTP 400)")
+
+    service.register("meme_context_generation", fail)
+    service.start()
+    task = service.submit("meme_context_generation", {})
+    import time
+
+    for _ in range(50):
+        record = service.get(task.task_id)
+        if record and record.status == "failed":
+            break
+        time.sleep(0.01)
+    record = service.get(task.task_id)
+    assert record.error == {
+        "error": "agent_process_failed",
+        "message": "agent_process_failed: Upstream request failed (HTTP 400)",
+    }
+    service.shutdown()
+
+
+def test_persistent_tasks_recover_queued_and_interrupt_running(tmp_path: Path):
+    """服务重启会恢复 queued 并将旧 running 记录标为 task_interrupted。"""
+    root = tmp_path / "tasks"
+    first = PersistentTaskService(root)
+    queued = first.submit("known", {"value": 1})
+    running = first.submit("other", {"value": 2})
+    first.update(running.task_id, status="running")
+    first._executor.shutdown(wait=False, cancel_futures=True)
+
+    second = PersistentTaskService(root)
+    handled: list[int] = []
+    second.register("known", lambda payload, progress: handled.append(payload["value"]))
+    second.start()
+    import time
+
+    for _ in range(50):
+        if second.get(queued.task_id).status == "succeeded":
+            break
+        time.sleep(0.01)
+    assert second.get(queued.task_id).status == "succeeded"
+    assert handled == [1]
+    interrupted = second.get(running.task_id)
+    assert interrupted.status == "failed"
+    assert interrupted.error["error"] == "task_interrupted"
+    second.shutdown()

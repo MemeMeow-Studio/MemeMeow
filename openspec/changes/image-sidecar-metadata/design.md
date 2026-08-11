@@ -28,6 +28,7 @@
 
 ```json
 {
+  "title": null,
   "summary": "独立可读的检索摘要",
   "subjects": [],
   "visible_text": [],
@@ -40,13 +41,15 @@
 }
 ```
 
+`title` 是由 Agent 生成的简短、独立可读标题，未知时为 `null`。它属于语义内容，不是文件名；实际文件名只在用户显式启用自动命名时从已持久化的 `title` 派生，并经过路径安全、长度和冲突处理。后续研究或人工更新 `title` 不自动改变图片路径。
+
 集中式 `metadata.json` 或数据库是备选方案，但会使单图复制、导入和备份不透明；当前项目以本地图片目录为边界，sidecar 的故障范围和迁移成本更低。
 
 ### 2. 以状态和字段来源维护证据边界
 
 `context_status` 分为：`pending`（仅有基础文件信息）、`partial`（有可由画面支持的语义字段）、`ready`（研究语境已完成）和 `repair_required`（损坏、不兼容或与文件不匹配）。
 
-视觉模型只可填充 `summary`、`subjects`、`visible_text` 和 `keywords` 中可由像素或 OCR 支持的内容。外部角色、作品、模板、台词出处、歌曲、事件与当前会话含义必须经研究流程或人工确认后才写入 `references` 与 `meaning`；不能收敛的信息一律进入 `uncertainties`。`provenance` 至少记录生产者类别、模型/流程版本和更新时间，并在人工确认时保护相应字段不被自动覆盖。
+视觉模型只可填充 `title`、`summary`、`subjects`、`visible_text` 和 `keywords` 中可由像素或 OCR 支持的内容；仅完成视觉观察的 `title` 不得擅自采用未确认的角色、作品或模板名称。外部角色、作品、模板、台词出处、歌曲、事件与当前会话含义必须经研究流程或人工确认后才写入 `references` 与 `meaning`；研究 Agent 可依据已确认引用生成更准确的 `title`。不能收敛的信息一律进入 `uncertainties`。`provenance` 至少记录生产者类别、模型/流程版本和更新时间，并在人工确认时保护相应字段不被自动覆盖。
 
 这样保留了研究 schema 的简洁字符串数组，不需要建立逐项证据图谱，却能避免把模型猜测误写成检索事实。
 
@@ -55,6 +58,7 @@
 检索索引不读取整份 JSON，而是按固定顺序、固定标题、去重和长度上限拼接：
 
 ```text
+标题：{title}
 摘要：{summary}
 主体：{subjects}
 图片文字：{visible_text}
@@ -64,6 +68,8 @@
 ```
 
 空字段整段省略。`search_queries` 是后续研究 Agent 或搜索引擎的操作输入，`uncertainties` 是非事实候选，`source_urls` 是回查指针；三者永远不得进入 embedding。`pending` 与 `repair_required` 图片按文件名回退并被报告，`partial` 只使用已填充的画面事实字段，`ready` 使用全部白名单字段。
+
+自动命名先把 Agent 生成的 `title` 写入 sidecar，再从该值派生文件名。派生过程保留原扩展名，清理路径分隔符和不可用字符，并在目标冲突时保留原文件名而不覆盖已有文件。展示标题始终保留自然语言，不被文件名清理结果反向覆盖。
 
 索引记录保存 `semantic_document` 哈希、sidecar schema 版本、图片 sha256 和 embedding 模型。任一白名单字段、图片指纹或模型变化都会使相关索引记录过期；缓存格式至少升级到 v3，使旧的文件名索引不能被误用。
 

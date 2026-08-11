@@ -20,7 +20,7 @@ from backend.metadata import MetadataError, MetadataService
 from backend.paths import SUPPORTED_EXTENSIONS
 
 
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 
 
 class SearchService:
@@ -29,7 +29,7 @@ class SearchService:
     def __init__(self, settings: Settings, metadata: MetadataService | None = None):
         self.settings = settings
         self.metadata = metadata or MetadataService(settings.image_root)
-        self.cache_path = settings.data_root / "search-cache-v3.json"
+        self.cache_path = settings.data_root / "search-cache-v4.json"
         self._lock = Lock()
         self._items: list[dict[str, object]] | None = self._load_cache()
 
@@ -50,12 +50,15 @@ class SearchService:
             items = payload.get("items")
             if not isinstance(items, list) or not items:
                 return None
-            paths = {
-                path.resolve().relative_to(self.settings.image_root.resolve()).as_posix()
-                for path in self.settings.image_root.rglob("*")
-                if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
-            }
-            if {str(item.get("path")) for item in items if isinstance(item, dict)} != paths:
+            records: dict[str, dict[str, object]] = {}
+            for path in self.settings.image_root.rglob("*"):
+                if not path.is_file() or path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                    continue
+                relative = path.resolve().relative_to(self.settings.image_root.resolve()).as_posix()
+                record = self.metadata.embedding_record(path)
+                if record["indexable"]:
+                    records[relative] = record
+            if {str(item.get("path")) for item in items if isinstance(item, dict)} != set(records):
                 return None
             for item in items:
                 if not isinstance(item, dict) or not isinstance(item.get("embedding"), list):
@@ -65,8 +68,11 @@ class SearchService:
                     image.resolve().relative_to(self.settings.image_root.resolve())
                 except ValueError:
                     return None
-                current = self.metadata.embedding_record(image)
-                if item.get("image_sha256") != current["image_sha256"] or item.get("metadata_hash") != current["metadata_hash"]:
+                current = records.get(str(item.get("path")))
+                if not current or item.get("image_sha256") != current["image_sha256"] or item.get("metadata_hash") != current["metadata_hash"]:
+                    return None
+                text = str(current["text"])
+                if item.get("semantic_document_hash") != hashlib.sha256(text.encode("utf-8")).hexdigest():
                     return None
             return items
         except (MetadataError, OSError, ValueError, TypeError):
@@ -91,7 +97,7 @@ class SearchService:
             raise RuntimeError("embedding_invalid")
         return (vector / norm).tolist()
 
-    def generate_cache(self, progress: Callable[[float | None, str | None], None]) -> None:
+    def generate_cache(self, progress: Callable[[float | None, str | None], None]) -> dict[str, object]:
         """扫描图片并生成新缓存，成功后才替换仍可用的旧缓存。"""
         self.settings.data_root.mkdir(parents=True, exist_ok=True)
         paths = sorted(
@@ -101,10 +107,16 @@ class SearchService:
         if not paths:
             raise RuntimeError("image_library_empty")
         items: list[dict[str, object]] = []
+        skipped: dict[str, int] = {}
         total = len(paths)
         for index, path in enumerate(paths, start=1):
             relative = path.resolve().relative_to(self.settings.image_root.resolve()).as_posix()
             record = self.metadata.embedding_record(path)
+            if not record["indexable"]:
+                reason = str(record.get("skip_reason") or "metadata_unavailable")
+                skipped[reason] = skipped.get(reason, 0) + 1
+                progress(index / total, f"正在检查 {index}/{total}")
+                continue
             text = str(record["text"])
             items.append(
                 {
@@ -120,12 +132,22 @@ class SearchService:
                 }
             )
             progress(index / total, f"正在处理 {index}/{total}")
-        payload = {"version": CACHE_VERSION, "model": self.settings.embedding_model, "items": items}
+        if not items:
+            raise RuntimeError("no_indexable_images")
+        payload = {
+            "version": CACHE_VERSION,
+            "model": self.settings.embedding_model,
+            "indexed_count": len(items),
+            "skipped_count": sum(skipped.values()),
+            "skipped_by_reason": skipped,
+            "items": items,
+        }
         temporary = self.cache_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         os.replace(temporary, self.cache_path)
         with self._lock:
             self._items = items
+        return {"indexed_count": len(items), "skipped_count": sum(skipped.values()), "skipped_by_reason": skipped}
 
     def _enhance_query(self, query: str) -> str:
         """使用可选聊天模型改写查询；任何异常由调用方回退。"""

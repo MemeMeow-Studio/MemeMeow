@@ -19,10 +19,6 @@ def make_settings(tmp_path: Path) -> Settings:
         embedding_base_url="https://example.invalid/v1",
         embedding_model="model",
         llm_enhance_model=None,
-        vlm_api_key=None,
-        vlm_base_url=None,
-        vlm_model="vlm",
-        vlm_max_attempts=2,
         protected_mode=False,
         allowed_endpoints=("/",),
         rate_limit_enabled=False,
@@ -53,7 +49,11 @@ def test_cache_generation_replaces_only_after_success(tmp_path: Path, monkeypatc
     """缓存生成失败时旧缓存仍可继续使用，成功后一次性替换。"""
     settings = make_settings(tmp_path)
     settings.image_root.mkdir(parents=True)
-    (settings.image_root / "one.png").write_bytes(b"x")
+    image = settings.image_root / "one.png"
+    image.write_bytes(b"x")
+    metadata = MetadataService(settings.image_root)
+    metadata.create_pending(image)
+    metadata.update_context(image, {"summary": "可索引图片"}, producer="research", status="ready")
     service = SearchService(settings)
     service._items = [{"path": "old.png", "embedding": [1.0], "label": "old"}]
     calls = {"count": 0}
@@ -76,7 +76,7 @@ def test_cache_generation_replaces_only_after_success(tmp_path: Path, monkeypatc
 
 
 def test_cache_generation_uses_meme_context_whitelist(tmp_path: Path, monkeypatch):
-    """v3 缓存使用语境白名单，并保存图片与 sidecar 指纹。"""
+    """v4 缓存使用语境白名单，并保存图片与 sidecar 指纹。"""
     settings = make_settings(tmp_path)
     settings.image_root.mkdir(parents=True)
     image = settings.image_root / "cat.png"
@@ -86,6 +86,7 @@ def test_cache_generation_uses_meme_context_whitelist(tmp_path: Path, monkeypatc
     metadata.update_context(
         image,
         {
+            "title": "猫猫无奈摊手",
             "summary": "一只猫无奈地摊手",
             "subjects": ["猫"],
             "visible_text": ["为什么"],
@@ -103,9 +104,9 @@ def test_cache_generation_uses_meme_context_whitelist(tmp_path: Path, monkeypatc
     service = SearchService(settings, metadata)
     monkeypatch.setattr(service, "_embedding", lambda text: captured.append(text) or [1.0])
     service.generate_cache(lambda *_: None)
-    assert captured == ["摘要：一只猫无奈地摊手\n主体：猫\n图片文字：为什么\n已确认引用：确认的模板\n常见含义：表达无奈\n关键词：无奈"]
-    payload = json.loads((settings.data_root / "search-cache-v3.json").read_text(encoding="utf-8"))
-    assert payload["version"] == 3
+    assert captured == ["标题：猫猫无奈摊手\n摘要：一只猫无奈地摊手\n主体：猫\n图片文字：为什么\n已确认引用：确认的模板\n常见含义：表达无奈\n关键词：无奈"]
+    payload = json.loads((settings.data_root / "search-cache-v4.json").read_text(encoding="utf-8"))
+    assert payload["version"] == 4
     assert payload["items"][0]["metadata_hash"]
     assert "不得进入索引" not in payload["items"][0]["semantic_document"]
 
@@ -126,15 +127,35 @@ def test_cache_is_rejected_after_metadata_change(tmp_path: Path, monkeypatch):
     assert not SearchService(settings, metadata).has_cache()
 
 
-def test_legacy_v2_cache_is_rejected(tmp_path: Path):
-    """旧文件名索引不会被当作 v3 语境索引加载。"""
+def test_legacy_v3_cache_is_rejected(tmp_path: Path):
+    """旧文件名索引不会被当作 v4 语境索引加载。"""
     settings = make_settings(tmp_path)
     settings.image_root.mkdir(parents=True)
     image = settings.image_root / "cat.png"
     image.write_bytes(b"image")
     settings.data_root.mkdir(parents=True)
-    (settings.data_root / "search-cache-v3.json").write_text(
-        json.dumps({"version": 2, "model": settings.embedding_model, "items": [{"path": "cat.png", "embedding": [1.0]}]}),
+    (settings.data_root / "search-cache-v4.json").write_text(
+        json.dumps({"version": 3, "model": settings.embedding_model, "items": [{"path": "cat.png", "embedding": [1.0]}]}),
         encoding="utf-8",
     )
     assert not SearchService(settings).has_cache()
+
+
+def test_all_unindexable_images_keep_existing_cache(tmp_path: Path, monkeypatch):
+    """全部待研究时不调用 embedding，也不发布空缓存。"""
+    settings = make_settings(tmp_path)
+    settings.image_root.mkdir(parents=True)
+    (settings.image_root / "pending.png").write_bytes(b"image")
+    MetadataService(settings.image_root).create_pending(settings.image_root / "pending.png")
+    service = SearchService(settings)
+    service._items = [{"path": "old.png", "embedding": [1.0]}]
+    called = []
+    monkeypatch.setattr(service, "_embedding", lambda text: called.append(text) or [1.0])
+    try:
+        service.generate_cache(lambda *_: None)
+    except RuntimeError as exc:
+        assert str(exc) == "no_indexable_images"
+    else:
+        raise AssertionError("应拒绝发布空缓存")
+    assert called == []
+    assert service._items[0]["path"] == "old.png"

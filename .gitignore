@@ -19,7 +19,8 @@ htmlcov/
 .impeccable/
 opencode.json
 .agents/skills/impeccable/
-.agents/skills/research-meme-context/
+.agents/skills/research-meme-context
+.opencode/skills/research-meme-context
 .opencode/skills/impeccable/
 
 # Retired resource-pack binaries are preserved by the streamlit-v1 tag
@@ -53,3 +54,4 @@ frontend/node_modules/
 frontend/dist/
 frontend/test-results/
 frontend/playwright-report/
+add-subagent-luna-max-doc.md.archive

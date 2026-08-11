@@ -37,7 +37,7 @@ _✨ 通过自然语言检索表情包 ✨_
 > 本项目返回表情包结果由AI生成，与本人观点无关。
 
 - **自然语言处理**: 采用嵌入模型，实现 Q&A 式的检索，能够对给出问题自动使用表情包回应。
-- **高拓展性**: 可结合 VLM 高效为图片生成候选描述并人工确认文件名。
+- **异步语境**: OpenCode Agent 使用研究 skill 为每张图片生成结构化 JSON，任务状态可在“处理任务”页面查看。
 - **便捷使用**: 提供 Vue Web 界面、统一 API 和受控媒体访问，可部署在本地单机环境。
 - **可维护**：长任务、缓存和文件边界都有明确的 API 状态与错误契约。
 - 另外，**单纯使用检索功能**，若使用API无需任何花费💰
@@ -64,7 +64,7 @@ Mememeow 是一个基于自然语言的表情包检索工具。它能让你通�
 
 - Python 3.12（使用 uv 管理）
 - Node.js 22+
-- 可选：嵌入模型 API Key、VLM API Key
+- 可选：嵌入模型 API Key；使用异步语境需要预先安装 OpenCode、skill 和共享 `node_modules`
 
 ### 安装步骤
 
@@ -82,12 +82,19 @@ uv pip install -r requirements-dev.txt
 cp .env.example .env
 ```
 
-3. 启动 FastAPI
+3. 安装共享 Agent skill
+```bash
+./scripts/install-agent-skills.sh
+```
+
+该脚本只创建指向 `skills/research-meme-context` 的相对符号链接，供 Codex 和 OpenCode 发现同一份 skill；可重复执行，不会下载 Node.js 依赖或覆盖已有真实目录。部署前在共享目录一次性安装 `@ai-sdk/openai`（例如 `cd .opencode && npm install --save-exact @ai-sdk/openai@4.0.37`），任务执行期间不会运行包管理器。服务复用 `.opencode/node_modules` 中预装的 OpenCode 插件和 Responses provider，而不是前端 `node_modules`。配置 `.env` 中的 `MEMEMEOW_OPENCODE_BASE_URL`、`MEMEMEOW_OPENCODE_API_KEY` 和 `MEMEMEOW_OPENCODE_MODEL=mememeow/gpt-5.6-luna` 后，服务会在 `data/opencode/workspace/opencode.json` 写入无密钥的通用 OpenCode 配置。
+
+4. 启动 FastAPI
 ```bash
 uvicorn api:app --reload --port 8275
 ```
 
-4. 启动 Vue 开发服务器（另一个终端）
+5. 启动 Vue 开发服务器（另一个终端）
 ```bash
 cd frontend
 npm install
@@ -111,16 +118,26 @@ npm run dev -- --host 0.0.0.0
 
 1. 进入“上传”页面
 2. 选择目标目录和图片文件
-3. 可选：启用 VLM 自动命名
+3. 可选：启用“处理完成后按标题自动命名”；图片上传立即返回，Agent 完成并成功写入 JSON 后才会异步重命名图片与 sidecar
 
 > [!CAUTION]
 > 每次上传后需要重新生成缓存。
 
-#### 图片标注
+图片库中的“选择图片”可勾选指定的 `pending` 或 `repair_required` 图片并点击“重试选中”；“重试所有未就绪”会批量提交所有尚未完成语境处理的图片。每行同时显示 JSON 处理状态和 embedding 索引状态，顶栏显示全局 embedding 缓存状态。
 
-1. 进入“标注”页面
-2. 选择图片和“生成描述”
-3. 确认候选描述后提交重命名
+#### 处理任务
+
+1. 打开“处理任务”查看上传后的语境生成、缓存生成和 metadata repair
+2. 使用状态和类型筛选定位任务
+3. 失败的语境任务可在详情侧栏重试；完成语境后按需重新生成 v4 缓存
+
+#### 检查 OpenCode 会话
+
+```bash
+./scripts/open-opencode.sh
+```
+
+该入口复用图片语境任务的 runtime、数据库、skill 与无密钥配置。在 OpenCode 中输入 `/sessions` 查看历史会话并打开检查；也可运行 `./scripts/open-opencode.sh --list` 在终端列出会话，或将 OpenCode 参数直接传入，例如 `./scripts/open-opencode.sh --session <session-id>`。启动器会隔离项目根目录配置，避免混入其他 provider 或凭据。
 
 
 
@@ -150,7 +167,7 @@ npm run dev -- --host 0.0.0.0
 {"results":["/media/example.png"]}
 ```
 
-缓存生成和批量标注是长任务，接口立即返回 `202` 和 `task_id`，使用 `GET /tasks/{task_id}` 轮询。
+缓存生成、metadata repair 和语境生成都是长任务，接口立即返回 `202` 和 `task_id`，使用 `GET /tasks` 或 `GET /tasks/{task_id}` 查询。每张图片的 JSON 与图片同目录，文件名为完整图片文件名追加 `.json`。
 
 
 <a id="-related-applications"></a>

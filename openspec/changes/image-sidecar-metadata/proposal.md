@@ -5,11 +5,11 @@
 ## What Changes
 
 - 为每张受支持的图片维护一个同目录的 sidecar JSON，使用 `图片完整文件名.json` 命名（例如 `cat.png.json`），避免同名不同扩展名冲突。
-- 定义版本化的元数据结构：外层保存图片相对路径、文件指纹和生成信息；`meme_context` 使用研究输出 schema，保存 `summary`、`subjects`、`visible_text`、`references`、`meaning`、`keywords`、`search_queries`、`uncertainties` 与可选 `source_urls`。
+- 定义版本化的元数据结构：外层保存图片相对路径、文件指纹和生成信息；`meme_context` 使用研究输出 schema，保存 Agent 生成的可读 `title`，以及 `summary`、`subjects`、`visible_text`、`references`、`meaning`、`keywords`、`search_queries`、`uncertainties` 与可选 `source_urls`。
 - 上传图片时创建带 `pending` 语义状态的基础元数据；视觉标注或研究结果只更新其有权确认的字段，并保留来源、模型和时间。
-- 重命名图片时同步移动并更新 JSON；删除或清理图片时不留下孤立元数据文件。
+- 显式启用自动命名时从已持久化的 `title` 派生安全文件名；普通标题更新不隐式改动图片路径。重命名图片时同步移动并更新 JSON；删除或清理图片时不留下孤立元数据文件。
 - 让批量视觉标注和研究结果持久化每张图片的独立成功/失败状态，单张失败不影响其他图片或已确认内容。
-- 检索缓存继续作为可重建的派生索引；生成 embedding 时只使用 `summary`、`subjects`、`visible_text`、已确认 `references`、`meaning` 和 `keywords` 的固定组合，绝不使用 `search_queries`、`uncertainties` 或 `source_urls`。
+- 检索缓存继续作为可重建的派生索引；生成 embedding 时只使用 `title`、`summary`、`subjects`、`visible_text`、已确认 `references`、`meaning` 和 `keywords` 的固定组合，绝不使用 `search_queries`、`uncertainties` 或 `source_urls`。
 - 将未确认的角色、出处、模板和当前语用保存为不确定项，不得写入作为事实的摘要、引用或 embedding 输入。
 - 对缺失、损坏、版本不兼容或路径不匹配的 JSON 提供可识别状态，并允许重新生成，而不是阻塞整个图片库。
 
