@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -11,8 +12,9 @@ from pathlib import Path
 
 import pytest
 
+from backend import opencode as opencode_module
 from backend.config import Settings
-from backend.opencode import OPENCODE_REASONING_VARIANT, OpenCodeError, OpenCodeRunner
+from backend.opencode import DIAGNOSTIC_LOG_BYTES, OPENCODE_REASONING_VARIANT, OpenCodeError, OpenCodeRunner
 from backend.tasks import PersistentTaskService
 
 
@@ -212,6 +214,92 @@ def test_runner_fixes_luna_at_max_reasoning_variant(tmp_path: Path):
     assert command[variant_index + 1] == OPENCODE_REASONING_VARIANT == "max"
 
 
+def test_runner_accepts_large_cli_output_without_accumulating_pipe_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """CLI 事件流超过旧门禁时仍可解析，持久日志只保留诊断前缀。"""
+    project = tmp_path / "project"
+    (project / "skills" / "research-meme-context").mkdir(parents=True)
+    modules = project / "node_modules"
+    (modules / "@ai-sdk" / "openai").mkdir(parents=True)
+    executable = tmp_path / "fake-opencode.py"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "if sys.argv[1] == 'run':\n"
+        "    sys.stdout.write('{\\\"type\\\":\\\"noise\\\",\\\"payload\\\":\\\"' + ('x' * (3 * 1024 * 1024)) + '\\\"}\\n')\n"
+        "    sys.stdout.write('{\\\"type\\\":\\\"session.created\\\",\\\"session_id\\\":\\\"large-session\\\"}\\n')\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    settings = Settings(
+        **{
+            **make_settings(tmp_path).__dict__,
+            "opencode_executable": str(executable),
+            "opencode_model": "mememeow/gpt-5.6-luna",
+            "opencode_base_url": "https://example.invalid/v1",
+            "opencode_api_key": "test-key",
+            "opencode_node_modules": modules,
+        }
+    )
+    runner = OpenCodeRunner(settings, project_root=project)
+    monkeypatch.setattr(runner, "_session_messages", lambda session_id, environment: {"messages": [{"role": "assistant", "parts": [{"type": "text", "text": json.dumps(candidate(), ensure_ascii=False)}]}]})
+    monkeypatch.setattr(runner, "validate_candidate", lambda value: value)
+    image = tmp_path / "image.png"
+    image.write_bytes(b"image")
+
+    result, session_id = runner.run(image, lambda value, message: None)
+
+    assert session_id == "large-session"
+    assert result["title"] == "测试标题"
+    log_path = runner.log_root / f"{hashlib.sha256(str(image).encode()).hexdigest()[:16]}.jsonl"
+    assert log_path.stat().st_size == DIAGNOSTIC_LOG_BYTES
+
+
+def test_session_messages_stream_large_response_without_read_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """session API 大响应按块落盘读取，不再因固定字节门禁失败。"""
+    runner = OpenCodeRunner(make_settings(tmp_path))
+    body = json.dumps([{"role": "tool", "diagnostic": "x" * (3 * 1024 * 1024)}, {"role": "assistant", "parts": [{"type": "text", "text": "{}"}]}]).encode()
+    read_sizes: list[int] = []
+
+    class Response:
+        """提供可记录 read 尺寸的最小 HTTP 响应夹具。"""
+
+        def __init__(self, payload: bytes):
+            self.payload = payload
+            self.position = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self, size: int = -1) -> bytes:
+            read_sizes.append(size)
+            if size < 0:
+                size = len(self.payload) - self.position
+            chunk = self.payload[self.position : self.position + size]
+            self.position += len(chunk)
+            return chunk
+
+    class Server:
+        """避免测试启动真实 OpenCode server。"""
+
+        pid = 0
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(opencode_module.subprocess, "Popen", lambda *args, **kwargs: Server())
+    monkeypatch.setattr(opencode_module, "urlopen", lambda endpoint, timeout=1: Response(body))
+    monkeypatch.setattr(runner, "_terminate", lambda process: None)
+
+    result = runner._session_messages("large-session", runner.build_environment())
+
+    assert result["messages"][-1]["role"] == "assistant"
+    assert read_sizes
+    assert max(read_sizes) <= opencode_module.STREAM_COPY_CHUNK_BYTES
+
+
 def test_opencode_launcher_reuses_runtime_for_session_list(tmp_path: Path):
     """会话检查入口必须复用同一 workspace 和 DB，并把 list 映射到公开 CLI。"""
     project = Path(__file__).resolve().parent.parent
@@ -339,3 +427,32 @@ def test_persistent_tasks_recover_queued_and_interrupt_running(tmp_path: Path):
     assert interrupted.status == "failed"
     assert interrupted.error["error"] == "task_interrupted"
     second.shutdown()
+
+
+def test_slot_lock_is_cross_runner_and_does_not_reuse_busy_slot(tmp_path: Path):
+    """两个应用 runner 不能同时持有同一个 slot 文件锁。"""
+    settings = Settings(
+        **{
+            **make_settings(tmp_path).__dict__,
+            "opencode_concurrency": 2,
+        }
+    )
+    first = OpenCodeRunner(settings)
+    second = OpenCodeRunner(settings)
+    first.slots_root.mkdir(parents=True, exist_ok=True)
+    first_slot, first_handle = first._acquire_slot()
+    second_slot, second_handle = second._acquire_slot()
+    assert first_slot != second_slot
+    first._release_slot(first_slot, first_handle)
+    second._release_slot(second_slot, second_handle)
+
+
+def test_slot_acquire_after_shutdown_does_not_leak_semaphore(tmp_path: Path):
+    """关闭中的 runner 拒绝新任务且不会遗留已占用的进程内配额。"""
+    runner = OpenCodeRunner(make_settings(tmp_path))
+    runner.shutdown()
+    with pytest.raises(OpenCodeError) as error:
+        runner._acquire_slot()
+    assert error.value.code == "task_interrupted"
+    assert runner._slot_semaphore.acquire(timeout=0.1)
+    runner._slot_semaphore.release()

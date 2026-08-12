@@ -52,8 +52,11 @@ FastAPI 是唯一业务入口。模型密钥、Base URL 和路径只从服务端
 
 ## 配置与访问策略
 
-- `GET /config`：只返回模型名、Base URL 和 `*_api_key_configured` 布尔状态。
+- `GET /config`：只返回模型名、provider 是否配置和 `*_api_key_configured` 布尔状态；完整 URL、路径和密钥不返回。
+- `GET /backend/settings`：返回只读后端状态、安全可调整的 Agent 并发数量（1..8）和部署环境管理字段；密钥、完整路径与 provider URL 均不返回。
+- `PATCH /backend/settings`：请求 `{ "opencode_concurrency": 2 }`，需要 `X-Settings-Admin-Token`（或 Bearer）凭据。值只原子写入 `.env`，环境变量覆盖时返回 `409`；保存后重启服务生效。
 - `.env` 关键字段：`EMBEDDING_API_KEY`、`EMBEDDING_BASE_URL`、`EMBEDDING_MODEL`、`MEMEMEOW_OPENCODE_EXECUTABLE`、`MEMEMEOW_OPENCODE_BASE_URL`、`MEMEMEOW_OPENCODE_API_KEY`、`MEMEMEOW_OPENCODE_MODEL`、`MEMEMEOW_OPENCODE_RUNTIME_ROOT`、`MEMEMEOW_IMAGE_ROOT`。
+- `MEMEMEOW_OPENCODE_CONCURRENCY` 默认 `1`，安全范围 `1..8`；Agent lane 超出上限的任务保持 `queued`，等待队列达到 `MEMEMEOW_AGENT_BACKPRESSURE`（默认 `32`）后返回 `agent_backpressure`；cache/repair 使用独立资源。
 - OpenCode、skill 和 `.opencode/node_modules` 必须由部署环境预先安装；可用 `MEMEMEOW_OPENCODE_NODE_MODULES` 覆盖该共享依赖目录。启动时会在 `<runtime>/workspace/opencode.json` 写入引用 `MEMEMEOW_OPENCODE_BASE_URL` 与 `MEMEMEOW_OPENCODE_API_KEY` 的 `@ai-sdk/openai` Responses 配置，模型由 `MEMEMEOW_OPENCODE_MODEL` 经命令行传递，并固定使用 `max` 推理强度变体。所有图片 job 共用固定 runtime、DB 和依赖目录，但每张图片使用独立 session。可用 `./scripts/open-opencode.sh` 打开同一 runtime，并通过 `/sessions` 检查历史会话。
 - `MEMEMEOW_PROTECTED_MODE=true` 时仅放行 `MEMEMEOW_ALLOWED_ENDPOINTS`；限流由 `MEMEMEOW_RATE_LIMIT_*` 控制，超限返回 `429` 和 `Retry-After`。
 

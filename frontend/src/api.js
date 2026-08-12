@@ -18,6 +18,12 @@ export async function request(path, options = {}) {
 
 export const api = {
   config: () => request('/config'),
+  backendSettings: () => request('/backend/settings'),
+  updateBackendSettings: (payload, token) => request('/backend/settings', {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+    headers: token ? { 'X-Settings-Admin-Token': token } : {},
+  }),
   search: (payload) => request('/search', { method: 'POST', body: JSON.stringify(payload) }),
   images: (params = {}) => request(`/images?${new URLSearchParams(params)}`),
   directories: (parent = '') => request(`/images/directories?parent=${encodeURIComponent(parent)}`),

@@ -11,6 +11,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Any, Literal
 from urllib.parse import urlparse
 
@@ -186,6 +187,7 @@ class MetadataService:
     def __init__(self, image_root: Path):
         self.root = image_root.expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self._write_lock = RLock()
 
     def _relative(self, image: Path) -> str:
         """返回图片在受控根目录下的 POSIX 相对路径。"""
@@ -254,7 +256,7 @@ class MetadataService:
 
     def _atomic_write(self, sidecar: Path, payload: dict[str, object]) -> None:
         """通过同目录临时文件和原子替换提交完整 JSON。"""
-        temporary = sidecar.with_name(f".{sidecar.name}.tmp")
+        temporary = sidecar.with_name(f".{sidecar.name}.tmp.{os.getpid()}.{id(self)}")
         try:
             with temporary.open("w", encoding="utf-8") as handle:
                 handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
@@ -310,25 +312,27 @@ class MetadataService:
 
     def create_pending(self, image: Path) -> SidecarMetadata:
         """为图片创建初始 pending sidecar；已有合法记录不会被覆盖。"""
-        try:
-            return self.load(image)
-        except MetadataError as exc:
-            if exc.code not in {"metadata_missing", "metadata_invalid", "metadata_path_mismatch", "metadata_image_mismatch"}:
-                raise
-        payload = self._base(image)
-        sidecar = self.sidecar_path(image)
-        self._atomic_write(sidecar, payload)
-        return SidecarMetadata.model_validate(payload)
+        with self._write_lock:
+            try:
+                return self.load(image)
+            except MetadataError as exc:
+                if exc.code not in {"metadata_missing", "metadata_invalid", "metadata_path_mismatch", "metadata_image_mismatch"}:
+                    raise
+            payload = self._base(image)
+            sidecar = self.sidecar_path(image)
+            self._atomic_write(sidecar, payload)
+            return SidecarMetadata.model_validate(payload)
 
     def write(self, image: Path, payload: dict[str, object]) -> SidecarMetadata:
         """校验并原子写入 sidecar，同时刷新图片身份字段。"""
-        payload = dict(payload)
-        payload["schema_version"] = SCHEMA_VERSION
-        payload["image"] = self._identity(image)
-        metadata = SidecarMetadata.model_validate(payload)
-        serialized = metadata.model_dump(mode="json", exclude_none=False)
-        self._atomic_write(self.sidecar_path(image), serialized)
-        return metadata
+        with self._write_lock:
+            payload = dict(payload)
+            payload["schema_version"] = SCHEMA_VERSION
+            payload["image"] = self._identity(image)
+            metadata = SidecarMetadata.model_validate(payload)
+            serialized = metadata.model_dump(mode="json", exclude_none=False)
+            self._atomic_write(self.sidecar_path(image), serialized)
+            return metadata
 
     def update_context(
         self,
@@ -341,26 +345,27 @@ class MetadataService:
         error: str | None = None,
     ) -> SidecarMetadata:
         """合并语境字段并记录来源；自动流程不会覆盖人工字段。"""
-        try:
-            current = self.load(image)
-        except MetadataError:
-            current = self.create_pending(image)
-        payload = current.model_dump(mode="json", exclude_none=False)
-        context = dict(payload.get("meme_context") or {})
-        sources = dict((payload.get("provenance") or {}).get("field_sources") or {})
-        for field, value in context_updates.items():
-            if field not in MemeContext.model_fields:
-                continue
-            if sources.get(field) == "human" and producer != "human":
-                continue
-            context[field] = value
-            sources[field] = producer
-        payload["meme_context"] = context
-        payload["context_status"] = status if status in CONTEXT_STATUSES else "partial"
-        provenance = dict(payload.get("provenance") or {})
-        provenance.update({"producer": producer, "model": model, "updated_at": _now(), "field_sources": sources, "last_error": error})
-        payload["provenance"] = provenance
-        return self.write(image, payload)
+        with self._write_lock:
+            try:
+                current = self.load(image)
+            except MetadataError:
+                current = self.create_pending(image)
+            payload = current.model_dump(mode="json", exclude_none=False)
+            context = dict(payload.get("meme_context") or {})
+            sources = dict((payload.get("provenance") or {}).get("field_sources") or {})
+            for field, value in context_updates.items():
+                if field not in MemeContext.model_fields:
+                    continue
+                if sources.get(field) == "human" and producer != "human":
+                    continue
+                context[field] = value
+                sources[field] = producer
+            payload["meme_context"] = context
+            payload["context_status"] = status if status in CONTEXT_STATUSES else "partial"
+            provenance = dict(payload.get("provenance") or {})
+            provenance.update({"producer": producer, "model": model, "updated_at": _now(), "field_sources": sources, "last_error": error})
+            payload["provenance"] = provenance
+            return self.write(image, payload)
 
     def apply_visual_candidates(self, image: Path, candidates: list[str], model: str | None = None) -> SidecarMetadata:
         """兼容旧迁移工具的候选写入；应用运行路径不会调用此方法。"""
@@ -371,15 +376,16 @@ class MetadataService:
 
     def record_error(self, image: Path, *, producer: str, model: str | None, error: str) -> SidecarMetadata:
         """保留已有语境并记录本次生成失败，供任务重试和诊断使用。"""
-        try:
-            current = self.load(image)
-        except MetadataError:
-            current = self.create_pending(image)
-        payload = current.model_dump(mode="json", exclude_none=False)
-        provenance = dict(payload.get("provenance") or {})
-        provenance.update({"producer": producer, "model": model, "updated_at": _now(), "last_error": error})
-        payload["provenance"] = provenance
-        return self.write(image, payload)
+        with self._write_lock:
+            try:
+                current = self.load(image)
+            except MetadataError:
+                current = self.create_pending(image)
+            payload = current.model_dump(mode="json", exclude_none=False)
+            provenance = dict(payload.get("provenance") or {})
+            provenance.update({"producer": producer, "model": model, "updated_at": _now(), "last_error": error})
+            payload["provenance"] = provenance
+            return self.write(image, payload)
 
     def rename(self, source: Path, target: Path) -> SidecarMetadata:
         """同步重命名图片和 sidecar，失败时回滚图片路径。"""

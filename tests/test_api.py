@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import io
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -250,3 +252,93 @@ def test_cache_generation_returns_pollable_task(client):
         if status["status"] in {"succeeded", "failed"}:
             break
     assert status["status"] == "succeeded"
+
+
+def test_parallel_context_batch_writes_independent_sidecars_and_merges_cache(tmp_path, monkeypatch):
+    """并发度为 2 时两张图片使用独立 session，批次终态只提交一次缓存任务。"""
+    monkeypatch.setenv("MEMEMEOW_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("MEMEMEOW_IMAGE_ROOT", str(tmp_path / "images"))
+    monkeypatch.setenv("EMBEDDING_API_KEY", "")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "")
+    monkeypatch.setenv("MEMEMEOW_OPENCODE_MODEL", "")
+    monkeypatch.setenv("MEMEMEOW_OPENCODE_CONCURRENCY", "2")
+    with TestClient(app) as test_client:
+        first = tmp_path / "images" / "parallel-a.png"
+        second = tmp_path / "images" / "parallel-b.png"
+        first.write_bytes(png_bytes("red")); second.write_bytes(png_bytes("blue"))
+        test_client.app.state.metadata.create_pending(first)
+        test_client.app.state.metadata.create_pending(second)
+        started = threading.Barrier(2)
+        sessions: list[str] = []
+
+        def fake_run(image, progress):
+            """模拟两个独立 Agent session，并在 barrier 处确认真正并行。"""
+            sessions.append(image.name)
+            started.wait(timeout=2)
+            return {
+                "title": image.stem,
+                "summary": "并发测试",
+                "subjects": [image.name],
+                "visible_text": [],
+                "references": [],
+                "meaning": None,
+                "keywords": ["测试"],
+                "search_queries": [],
+                "uncertainties": [],
+                "source_urls": [],
+            }, f"session-{image.stem}"
+
+        monkeypatch.setattr(test_client.app.state.opencode, "run", fake_run)
+        submitted = test_client.post("/images/context/batch", json={"items": [{"filename": "parallel-a.png"}, {"filename": "parallel-b.png"}], "include_unready": True})
+        assert submitted.status_code == 200
+        task_ids = [item["task_id"] for item in submitted.json()["results"]]
+        assert len(task_ids) == 2
+        deadline = time.monotonic() + 2
+        while len(sessions) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert set(sessions) == {"parallel-a.png", "parallel-b.png"}
+        for task_id in task_ids:
+            for _ in range(100):
+                record = test_client.get(f"/tasks/{task_id}").json()
+                if record["status"] in {"succeeded", "failed"}:
+                    break
+                time.sleep(0.01)
+        assert record["status"] == "succeeded"
+        assert test_client.app.state.metadata.status(first)["status"] == "ready"
+        assert test_client.app.state.metadata.status(second)["status"] == "ready"
+        for _ in range(100):
+            cache_items = test_client.get("/tasks", params={"task_type": "cache_generation"}).json()["items"]
+            if cache_items:
+                break
+            time.sleep(0.01)
+        assert len(cache_items) == 1
+
+
+def test_context_target_deleted_during_agent_is_reported_as_target_changed(tmp_path, monkeypatch):
+    """Agent 运行期间图片被删除时，任务必须返回稳定的目标变化错误。"""
+    monkeypatch.setenv("MEMEMEOW_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("MEMEMEOW_IMAGE_ROOT", str(tmp_path / "images"))
+    monkeypatch.setenv("EMBEDDING_API_KEY", "")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "")
+    monkeypatch.setenv("MEMEMEOW_OPENCODE_MODEL", "")
+    with TestClient(app) as test_client:
+        image = tmp_path / "images" / "deleted.png"
+        image.write_bytes(png_bytes())
+        test_client.app.state.metadata.create_pending(image)
+
+        def fake_run(path, progress):
+            """模拟 Agent 完成前目标图片被删除。"""
+            path.unlink()
+            return {}, "deleted-session"
+
+        monkeypatch.setattr(test_client.app.state.opencode, "run", fake_run)
+        response = test_client.post("/images/context", json={"filename": image.name})
+        assert response.status_code == 202
+        task_id = response.json()["task_id"]
+        for _ in range(100):
+            status = test_client.get(f"/tasks/{task_id}").json()
+            if status["status"] in {"succeeded", "failed"}:
+                break
+            time.sleep(0.01)
+        assert status["status"] == "failed"
+        assert status["error"]["error"] == "target_changed"

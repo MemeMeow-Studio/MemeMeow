@@ -24,12 +24,13 @@ STABLE_TASK_ERRORS = {
     "opencode_not_configured",
     "agent_process_failed",
     "agent_timeout",
-    "agent_output_limit",
     "agent_event_invalid",
     "agent_export_failed",
+    "opencode_slot_unavailable",
     "agent_output_invalid_json",
     "agent_output_schema_invalid",
     "target_changed",
+    "task_interrupted",
 }
 TaskHandler = Callable[[dict[str, Any], Callable[[float | None, str | None], None]], Any]
 
@@ -55,6 +56,9 @@ class TaskRecord:
     attempts: int = 0
     error: dict[str, str] | None = None
     result: Any = None
+    settings_version: str | None = None
+    agent_concurrency: int | None = None
+    slot_id: int | None = None
 
     def as_dict(self, *, include_payload: bool = True) -> dict[str, Any]:
         """返回稳定 API 结构；列表调用方可排除内部 payload。"""
@@ -70,6 +74,9 @@ class TaskRecord:
             "attempts": self.attempts,
             "error": self.error,
             "result": self.result,
+            "settings_version": self.settings_version,
+            "agent_concurrency": self.agent_concurrency,
+            "slot_id": self.slot_id,
         }
         if include_payload:
             result["payload"] = self.payload
@@ -96,6 +103,9 @@ class TaskRecord:
             attempts=int(value.get("attempts", 0)),
             error=value.get("error") if isinstance(value.get("error"), dict) else None,
             result=value.get("result"),
+            settings_version=value.get("settings_version"),
+            agent_concurrency=value.get("agent_concurrency"),
+            slot_id=value.get("slot_id"),
         )
 
 
@@ -106,13 +116,21 @@ class PersistentTaskService:
     写进任务文件。所有更新在锁内持久化，保证并发读者只会看到完整记录。
     """
 
-    def __init__(self, task_root: Path, max_workers: int = 2):
+    def __init__(self, task_root: Path, max_workers: int = 2, *, agent_concurrency: int = 1, agent_backpressure: int = 32, settings_version: str | None = None):
+        """创建持久任务服务，并为 Agent 任务建立独立执行 lane。"""
         self.task_root = task_root.expanduser()
         self.task_root.mkdir(parents=True, exist_ok=True)
         self._records: dict[str, TaskRecord] = {}
         self._handlers: dict[str, TaskHandler] = {}
         self._lock = Lock()
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="mememeow-task")
+        self.agent_concurrency = max(1, min(int(agent_concurrency), 8))
+        self.agent_backpressure = max(1, min(int(agent_backpressure), 500))
+        self.settings_version = settings_version
+        self._agent_executor = ThreadPoolExecutor(max_workers=self.agent_concurrency, thread_name_prefix="mememeow-agent")
+        self._agent_task_types = {"meme_context_generation"}
+        self._batch_finalizer: Callable[[str], Any] | None = None
+        self._finalized_batches: set[str] = set()
         self._started = False
         self._stopped = False
         self._load_records()
@@ -123,6 +141,10 @@ class PersistentTaskService:
             raise ValueError("task_type_required")
         self._handlers[task_type] = handler
 
+    def set_batch_finalizer(self, callback: Callable[[str], Any] | None) -> None:
+        """注册批次终态回调，供 API 在所有语境任务结束后合并生成一次缓存。"""
+        self._batch_finalizer = callback
+
     def _path(self, task_id: str) -> Path:
         """返回任务 JSON 的受控存储位置。"""
         return self.task_root / f"{task_id}.json"
@@ -130,7 +152,7 @@ class PersistentTaskService:
     def _write(self, record: TaskRecord) -> None:
         """以 fsync 加原子替换保存单条任务，防止半写入记录。"""
         target = self._path(record.task_id)
-        temporary = target.with_name(f".{target.name}.tmp")
+        temporary = target.with_name(f".{target.name}.tmp.{os.getpid()}.{id(self)}")
         payload = json.dumps(record.as_dict(include_payload=True), ensure_ascii=False, separators=(",", ":"))
         try:
             with temporary.open("w", encoding="utf-8") as handle:
@@ -174,7 +196,21 @@ class PersistentTaskService:
     @staticmethod
     def _payload_key(payload: dict[str, Any]) -> str:
         """将 payload 规范化为活动任务去重键。"""
-        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        # 批次标识只用于协调，不应让同一图片在不同批次重复启动 Agent。
+        comparable = {key: value for key, value in payload.items() if key not in {"batch_id", "batch_ids"}}
+        return json.dumps(comparable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _batch_ids(record: TaskRecord) -> tuple[str, ...]:
+        """读取任务关联的批次标识，兼容单值和去重合并后的列表格式。"""
+        values: list[str] = []
+        single = record.payload.get("batch_id")
+        if isinstance(single, str) and single:
+            values.append(single)
+        multiple = record.payload.get("batch_ids")
+        if isinstance(multiple, list):
+            values.extend(value for value in multiple if isinstance(value, str) and value)
+        return tuple(dict.fromkeys(values))
 
     def start(self) -> None:
         """恢复排队任务，并把无法证明存活的旧运行任务标记为中断。"""
@@ -204,9 +240,34 @@ class PersistentTaskService:
             if self._stopped:
                 raise RuntimeError("task_service_stopped")
             for record in self._records.values():
-                if record.task_type == task_type and record.status not in TERMINAL and self._payload_key(record.payload) == key:
+                same_context_target = (
+                    task_type == "meme_context_generation"
+                    and record.task_type == task_type
+                    and isinstance(payload.get("image_relative_path"), str)
+                    and isinstance(payload.get("image_sha256"), str)
+                    and record.payload.get("image_relative_path") == payload.get("image_relative_path")
+                    and record.payload.get("image_sha256") == payload.get("image_sha256")
+                )
+                if record.task_type == task_type and record.status not in TERMINAL and (same_context_target or self._payload_key(record.payload) == key):
+                    if same_context_target and isinstance(payload.get("batch_id"), str) and payload["batch_id"]:
+                        # 同一图片被不同批次复用时保留全部关联，确保每个批次都能触发终态缓存合并。
+                        batch_ids = list(self._batch_ids(record))
+                        if payload["batch_id"] not in batch_ids:
+                            batch_ids.append(payload["batch_id"])
+                            record.payload["batch_ids"] = batch_ids
+                            self._write(record)
                     return TaskRecord.from_dict(record.as_dict(include_payload=True))
-            record = TaskRecord(task_id=uuid4().hex, task_type=task_type, payload=payload)
+            if task_type in self._agent_task_types and self._queued_agent_count_locked() >= self.agent_backpressure:
+                # 只限制等待队列，正在运行的 slot 不被新配置半途打断。
+                raise RuntimeError("agent_backpressure")
+            record = TaskRecord(
+                task_id=uuid4().hex,
+                task_type=task_type,
+                payload=payload,
+                message="Agent lane 背压排队" if task_type in self._agent_task_types and self._agent_load_locked() >= self.agent_concurrency else None,
+                settings_version=str(payload.get("settings_version") or self.settings_version) if task_type == "meme_context_generation" else self.settings_version,
+                agent_concurrency=self.agent_concurrency if task_type == "meme_context_generation" else None,
+            )
             self._records[record.task_id] = record
             self._write(record)
         if self._started:
@@ -219,7 +280,46 @@ class PersistentTaskService:
             record = self._records.get(task_id)
             if not record or record.status != "queued" or self._stopped:
                 return
-        self._executor.submit(self._run, task_id)
+        executor = self._agent_executor if record.task_type in self._agent_task_types else self._executor
+        executor.submit(self._run, task_id)
+
+    def _queued_agent_count_locked(self) -> int:
+        """统计当前尚未启动的 Agent 任务数量，调用方必须持有任务锁。"""
+        return sum(1 for item in self._records.values() if item.task_type in self._agent_task_types and item.status == "queued")
+
+    def _agent_load_locked(self) -> int:
+        """统计 Agent lane 中排队或运行的任务数量，调用方必须持有任务锁。"""
+        return sum(1 for item in self._records.values() if item.task_type in self._agent_task_types and item.status not in TERMINAL)
+
+    def _maybe_finalize_batch(self, record: TaskRecord) -> None:
+        """在批次所有语境任务进入终态后调用一次缓存合并回调。"""
+        batch_ids = self._batch_ids(record)
+        if record.task_type not in self._agent_task_types or not batch_ids:
+            return
+        callbacks: list[tuple[str, Callable[[str], Any]]] = []
+        with self._lock:
+            callback = self._batch_finalizer
+            if callback is None:
+                return
+            for batch_id in batch_ids:
+                if batch_id in self._finalized_batches:
+                    continue
+                active = any(
+                    item.task_type in self._agent_task_types
+                    and batch_id in self._batch_ids(item)
+                    and item.status not in TERMINAL
+                    for item in self._records.values()
+                )
+                if active:
+                    continue
+                self._finalized_batches.add(batch_id)
+                callbacks.append((batch_id, callback))
+        for batch_id, callback in callbacks:
+            try:
+                callback(batch_id)
+            except Exception:
+                # 缓存失败由其独立任务记录承载，不改变已完成的语境任务。
+                pass
 
     def _run(self, task_id: str) -> None:
         """执行已注册 handler，并将全部状态转换持久化。"""
@@ -250,6 +350,10 @@ class PersistentTaskService:
             self.update(task_id, status="failed", message="任务执行失败", error={"error": code, "message": diagnostic})
         else:
             self.update(task_id, status="succeeded", progress=1.0, message="任务完成", result=result)
+        finally:
+            latest = self.get(task_id)
+            if latest:
+                self._maybe_finalize_batch(latest)
 
     def update(self, task_id: str, **changes: Any) -> None:
         """更新任务状态或进度，终态记录不可被后续线程覆写。"""
@@ -303,6 +407,7 @@ class PersistentTaskService:
                     record.updated_at = record.completed_at
                     self._write(record)
         self._executor.shutdown(wait=False, cancel_futures=True)
+        self._agent_executor.shutdown(wait=False, cancel_futures=True)
 
 
 class TaskManager:

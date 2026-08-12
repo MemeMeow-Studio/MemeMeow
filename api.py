@@ -6,19 +6,22 @@
 from __future__ import annotations
 
 import mimetypes
+import os
 import re
+import secrets
 import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, StrictInt
+from pydantic import AliasChoices, BaseModel, Field, StrictInt
 
-from backend.config import Settings
+from backend.config import Settings, update_dotenv_concurrency
 from backend.errors import ErrorBody
 from backend.metadata import MetadataError, MetadataService
 from backend.paths import PathResolver, SUPPORTED_EXTENSIONS
@@ -72,6 +75,12 @@ class ContextBatchRequest(BaseModel):
     include_unready: bool = True
 
 
+class ConcurrencyUpdateRequest(BaseModel):
+    """后端设置页唯一允许持久化的安全参数。"""
+
+    opencode_concurrency: StrictInt = Field(ge=1, le=8, validation_alias=AliasChoices("opencode_concurrency", "agent_concurrency", "concurrency", "value"))
+
+
 def _error(status: int, code: str, message: str) -> HTTPException:
     """构造统一错误异常。"""
     return HTTPException(status_code=status, detail={"error": code, "message": message})
@@ -119,7 +128,7 @@ def _invalidate_search(request: Request) -> None:
         invalidate()
 
 
-def _context_payload(request: Request, image: Path, *, auto_name: bool = False) -> dict[str, object]:
+def _context_payload(request: Request, image: Path, *, auto_name: bool = False, batch_id: str | None = None) -> dict[str, object]:
     """构造可持久化的图片语境任务输入，不保存密钥或提示词。"""
     settings: Settings = request.app.state.settings
     runner: OpenCodeRunner = request.app.state.opencode
@@ -128,18 +137,32 @@ def _context_payload(request: Request, image: Path, *, auto_name: bool = False) 
         skill_hash = runner.skill_hash()
     except (OSError, OpenCodeError):
         skill_hash = None
-    return {
+    payload: dict[str, object] = {
         "image_relative_path": relative,
         "image_sha256": request.app.state.metadata.image_sha256(image),
         "auto_name": auto_name,
         "model": settings.opencode_model,
         "skill_hash": skill_hash,
+        "settings_version": settings.settings_version,
+        "agent_concurrency": settings.opencode_concurrency,
     }
+    if batch_id:
+        payload["batch_id"] = batch_id
+    return payload
 
 
-def _submit_context_task(request: Request, image: Path, *, auto_name: bool = False) -> TaskRecord:
+def _submit_context_task(request: Request, image: Path, *, auto_name: bool = False, batch_id: str | None = None) -> TaskRecord:
     """提交或复用同一图片内容的语境生成任务。"""
-    return request.app.state.tasks.submit("meme_context_generation", _context_payload(request, image, auto_name=auto_name))
+    return request.app.state.tasks.submit("meme_context_generation", _context_payload(request, image, auto_name=auto_name, batch_id=batch_id))
+
+
+def _context_enqueue_error(exc: Exception) -> str:
+    """把任务提交异常转换为不暴露内部路径的稳定错误码。"""
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code:
+        return code
+    text = str(exc).split(":", 1)[0]
+    return text if text == "agent_backpressure" else "context_enqueue_failed"
 
 
 @asynccontextmanager
@@ -152,7 +175,12 @@ async def lifespan(app: FastAPI):
     app.state.metadata = MetadataService(settings.image_root)
     app.state.search_engine = SearchService(settings, app.state.metadata)
     app.state.opencode = OpenCodeRunner(settings)
-    tasks = PersistentTaskService(settings.data_root / "tasks")
+    tasks = PersistentTaskService(
+        settings.data_root / "tasks",
+        agent_concurrency=settings.opencode_concurrency,
+        agent_backpressure=settings.agent_backpressure,
+        settings_version=settings.settings_version,
+    )
 
     def cache_handler(payload: dict[str, object], progress):
         """从持久任务 payload 重建缓存生成工作。"""
@@ -175,7 +203,12 @@ async def lifespan(app: FastAPI):
             image = app.state.resolver.resolve_file(str(Path(relative).parent), Path(relative).name)
         except HTTPException as exc:
             raise RuntimeError("target_changed") from exc
-        if app.state.metadata.image_sha256(image) != expected_sha:
+        try:
+            current_sha = app.state.metadata.image_sha256(image)
+        except MetadataError as exc:
+            # Agent 运行期间图片可能被删除；这属于提交目标变化而非普通任务故障。
+            raise RuntimeError("target_changed") from exc
+        if current_sha != expected_sha:
             raise RuntimeError("target_changed")
         try:
             candidate, session_id = app.state.opencode.run(image, progress)
@@ -185,19 +218,28 @@ async def lifespan(app: FastAPI):
             except MetadataError:
                 pass
             raise RuntimeError(f"{exc.code}: {exc}") from exc
-        if app.state.metadata.image_sha256(image) != expected_sha:
+        try:
+            current_sha = app.state.metadata.image_sha256(image)
+        except MetadataError as exc:
+            # Agent 运行期间图片可能被删除；这属于提交目标变化而非普通任务故障。
+            raise RuntimeError("target_changed") from exc
+        if current_sha != expected_sha:
             raise RuntimeError("target_changed")
         try:
             metadata = app.state.metadata.update_context(image, candidate, producer="research", model=app.state.settings.opencode_model, status="ready", error=None)
         except MetadataError as exc:
             raise RuntimeError("agent_output_schema_invalid") from exc
-        app.state.search_engine.invalidate_cache()
+        mark_invalidated = getattr(app.state.search_engine, "mark_cache_invalidated", None)
+        if mark_invalidated:
+            mark_invalidated(payload.get("batch_id"))
+        else:
+            app.state.search_engine.invalidate_cache()
         result: dict[str, object] = {
             "image_relative_path": relative,
             "session_id": session_id,
-            "sidecar_hash": app.state.metadata.embedding_record(image)["metadata_hash"],
             "auto_named": False,
         }
+        sidecar_hash = app.state.metadata.embedding_record(image)["metadata_hash"]
         if payload.get("auto_name") and metadata.meme_context.title:
             try:
                 target = image.parent / _filename_from_title(metadata.meme_context.title, image.suffix)
@@ -206,13 +248,27 @@ async def lifespan(app: FastAPI):
                     result["auto_named"] = True
                     result["saved_filename"] = target.name
                     result["image_relative_path"] = app.state.resolver.relative(target)
-            except (MetadataError, ValueError):
+            except (MetadataError, ValueError, OSError):
                 result["auto_name_error"] = "auto_name_failed"
+        # 自动命名可能改变 sidecar 的 relative_path，最终哈希必须从实际提交路径读取。
+        final_image = image
+        if isinstance(result.get("saved_filename"), str):
+            final_image = image.with_name(str(result["saved_filename"]))
+        try:
+            result["sidecar_hash"] = app.state.metadata.embedding_record(final_image)["metadata_hash"]
+        except MetadataError:
+            result["sidecar_hash"] = sidecar_hash
         return result
 
     tasks.register("cache_generation", cache_handler)
     tasks.register("metadata_repair", repair_handler)
     tasks.register("meme_context_generation", context_handler)
+
+    def finalize_context_batch(batch_id: str):
+        """批次所有语境任务收束后只提交一个去重的缓存生成任务。"""
+        tasks.submit("cache_generation", {})
+
+    tasks.set_batch_finalizer(finalize_context_batch)
     app.state.tasks = tasks
     tasks.start()
     try:
@@ -540,9 +596,9 @@ async def upload_images(
             task = _submit_context_task(request, target, auto_name=auto_name)
             result["metadata_job_id"] = task.task_id
             result["metadata_job_status"] = task.status
-        except (OSError, RuntimeError, MetadataError):
+        except (OSError, RuntimeError, MetadataError) as exc:
             # 图片和 pending sidecar 已有效提交，语境任务可由批量补齐恢复。
-            result["metadata_job_error"] = "metadata_enqueue_failed"
+            result["metadata_job_error"] = _context_enqueue_error(exc) if isinstance(exc, RuntimeError) else "metadata_enqueue_failed"
         result["metadata_status"] = request.app.state.metadata.status(target)["status"]
         _invalidate_search(request)
         results.append(result)
@@ -553,7 +609,12 @@ async def upload_images(
 async def generate_context(request: Request, payload: ContextRequest) -> dict[str, object]:
     """为单张图片显式创建或复用语境生成任务。"""
     image = request.app.state.resolver.resolve_file(payload.directory, payload.filename)
-    task = _submit_context_task(request, image)
+    try:
+        task = _submit_context_task(request, image)
+    except RuntimeError as exc:
+        if str(exc) == "agent_backpressure":
+            raise _error(429, "agent_backpressure", "Agent 等待队列已满，请稍后重试") from exc
+        raise
     return {"task_id": task.task_id, "task_type": task.task_type, "status": task.status}
 
 
@@ -561,6 +622,7 @@ async def generate_context(request: Request, payload: ContextRequest) -> dict[st
 async def generate_context_batch(request: Request, payload: ContextBatchRequest) -> dict[str, object]:
     """批量为缺失或未就绪图片提交独立语境任务，单项失败不影响其余项。"""
     resolver: PathResolver = request.app.state.resolver
+    batch_id = uuid4().hex
     if payload.items:
         paths = [(item.directory, item.filename) for item in payload.items]
     else:
@@ -579,11 +641,11 @@ async def generate_context_batch(request: Request, payload: ContextBatchRequest)
                 continue
             if state == "repair_required":
                 request.app.state.metadata.create_pending(image)
-            task = _submit_context_task(request, image)
+            task = _submit_context_task(request, image, batch_id=batch_id)
             results.append({"filename": resolver.relative(image), "task_id": task.task_id, "status": task.status})
         except (HTTPException, MetadataError, OSError, RuntimeError) as exc:
-            results.append({"filename": filename, "error": getattr(exc, "code", "context_enqueue_failed")})
-    return {"results": results}
+            results.append({"filename": filename, "error": _context_enqueue_error(exc) if isinstance(exc, RuntimeError) else getattr(exc, "code", "context_enqueue_failed")})
+    return {"batch_id": batch_id, "results": results}
 
 
 @app.post("/images/metadata/repair", status_code=202, tags=["images", "tasks"])

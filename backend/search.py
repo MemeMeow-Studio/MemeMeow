@@ -88,6 +88,10 @@ class SearchService:
         with self._lock:
             self._items = None
 
+    def mark_cache_invalidated(self, batch_id: object = None) -> None:
+        """记录图片级缓存失效；批次完成前不触发全库 embedding 重建。"""
+        self.invalidate_cache()
+
     def _embedding(self, text: str) -> list[float]:
         """调用模型生成归一化向量。"""
         response = self._client().embeddings.create(model=self.settings.embedding_model, input=text, encoding_format="float")
