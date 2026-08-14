@@ -1,4 +1,4 @@
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: OpenCode 运行时必须复用且隔离图片上下文
 系统 MUST 在固定 runtime 中执行已安装的 OpenCode，所有图片 job MUST 复用同一套受控配置和预安装的 Node.js 依赖，且任务执行期间 MUST NOT 调用包管理器或为每个 job 下载依赖。系统 MUST 在 `<runtime>/workspace/opencode.json` 维护不含密钥的 `@ai-sdk/openai` Responses provider 配置，其中只注册 `gpt-5.6-luna`；服务地址和密钥 MUST 分别从 `MEMEMEOW_OPENCODE_BASE_URL`、`MEMEMEOW_OPENCODE_API_KEY` 的环境变量引用，模型 MUST 由 `MEMEMEOW_OPENCODE_MODEL` 经命令行传递，并固定传入 `--variant max` 以使用 `max` 推理强度。每张图片 MUST 使用独立的 OpenCode session，后一张图片不得继承前一张图片的会话内容。系统 MUST 通过配置的并发上限和跨进程 slot 互斥限制同时运行的语境生成子进程；默认上限 MUST 为 `1`，未验证共享 runtime/DB 并发安全时不得超过已验证上限。

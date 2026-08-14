@@ -1,3 +1,5 @@
+> **历史关系**：本 change 已被 `introduce-postgres-scoped-persistence` superseded-by。其语境 schema、证据边界和字段来源规则由新 change 接管，sidecar 文件不再是运行时权威存储。归档时先归档新 change，再使用 `--skip-specs` 归档本 change，避免旧 delta 回写主规范。
+
 ## Why
 
 当前图片库只有图片文件和一个由文件名生成的全局检索缓存；VLM 生成的描述只在接口响应中短暂存在，也无法表达表情包的主体、原文、外部引用、会话含义和不确定性。这样既不能稳定复用研究成果，也会让 embedding 以低信息量文件名为输入。现在需要以按图片关联的 JSON 持久化一份有证据边界的 meme 语境记录，并以其生成检索索引。

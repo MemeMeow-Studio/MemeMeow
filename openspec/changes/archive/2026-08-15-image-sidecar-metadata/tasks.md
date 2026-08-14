@@ -1,3 +1,5 @@
+> **归档说明**：本 change 已被 `introduce-postgres-scoped-persistence` superseded-by。新 change 归档后，本 change 仅作为历史实现记录使用 `--skip-specs` 归档。
+
 ## 1. meme 语境元数据基础设施
 
 - [x] 1.1 新增图片 sidecar 元数据服务，定义技术外层、`meme_context` schema、`pending/partial/ready/repair_required` 状态和字段来源。
