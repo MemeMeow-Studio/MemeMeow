@@ -11,5 +11,5 @@ from alembic.script import ScriptDirectory
 def test_single_forward_migration_head():
     """仓库只暴露一个首版 revision，回滚由 migration 明确拒绝。"""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == ["0003_flat_meme_storage"]
+    assert script.get_heads() == ["0004_meme_collections"]
     assert (Path("alembic/versions/0001_postgres_scoped.py")).is_file()

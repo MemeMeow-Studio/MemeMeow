@@ -52,7 +52,7 @@ EMBEDDING_DIMENSIONS = 1024
 SCOPE_LOCAL = "local"
 UTC = timezone.utc
 # 当前代码要求的 Alembic head；数据库初始化脚本会显式传入同一 revision。
-CURRENT_SCHEMA_REVISION = "0003_flat_meme_storage"
+CURRENT_SCHEMA_REVISION = "0004_meme_collections"
 
 
 def utcnow() -> datetime:
@@ -130,6 +130,37 @@ class Meme(Base):
     )
 
 
+class MemeCollection(Base):
+    """当前 scope 内的逻辑 Meme 合集，不拥有图片文件。"""
+
+    __tablename__ = "meme_collections"
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    scope_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(["scope_id"], ["scopes.id"], ondelete="CASCADE"),
+        UniqueConstraint("scope_id", "id", name="uq_meme_collections_scope_id"),
+        UniqueConstraint("scope_id", "name", name="uq_meme_collections_scope_name"),
+    )
+
+
+class MemeCollectionItem(Base):
+    """合集与 Meme 的 scope-safe 多对多成员关系。"""
+
+    __tablename__ = "meme_collection_items"
+    scope_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    collection_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    meme_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(["scope_id", "collection_id"], ["meme_collections.scope_id", "meme_collections.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(["scope_id", "meme_id"], ["memes.scope_id", "memes.id"], ondelete="CASCADE"),
+        Index("ix_meme_collection_items_page", "scope_id", "collection_id", "added_at", "meme_id"),
+    )
 
 
 class StorageOperation(Base):
@@ -531,6 +562,147 @@ class MemeRepository:
         self.session.delete(record)
         self.session.flush()
         return record
+
+
+class CollectionRepository:
+    """绑定 Session 与 scope 的合集 CRUD、成员批量和分页 repository。"""
+
+    def __init__(self, session: Session, scope: ScopeContext):
+        self.session, self.scope = session, scope
+
+    @staticmethod
+    def normalize_name(name: str) -> str:
+        """去除合集名称首尾空白并限制有效长度。"""
+        normalized = name.strip() if isinstance(name, str) else ""
+        if not 1 <= len(normalized) <= 100:
+            raise DatabaseError("invalid_collection_name")
+        return normalized
+
+    @staticmethod
+    def _uuid(value: UUID | str, code: str = "collection_not_found") -> UUID:
+        """解析边界 UUID；非法值按资源不存在处理，避免泄露数据库异常。"""
+        try:
+            return UUID(str(value))
+        except (TypeError, ValueError) as exc:
+            raise DatabaseError(code) from exc
+
+    def get(self, collection_id: UUID | str, *, for_update: bool = False) -> MemeCollection | None:
+        """读取当前 scope 合集，跨 scope 或非法 UUID 均视为不存在。"""
+        try:
+            identifier = self._uuid(collection_id)
+        except DatabaseError:
+            return None
+        statement = select(MemeCollection).where(MemeCollection.scope_id == self.scope.scope_id, MemeCollection.id == identifier)
+        if for_update:
+            statement = statement.with_for_update()
+        return self.session.scalar(statement)
+
+    def count(self) -> int:
+        """统计当前 scope 合集数量。"""
+        return int(self.session.scalar(select(func.count()).select_from(MemeCollection).where(MemeCollection.scope_id == self.scope.scope_id)) or 0)
+
+    def list(self, *, page: int = 1, page_size: int = 50) -> list[MemeCollection]:
+        """按更新时间降序和 UUID 稳定分页列出合集。"""
+        size = max(1, min(page_size, 100))
+        return list(self.session.scalars(select(MemeCollection).where(MemeCollection.scope_id == self.scope.scope_id).order_by(MemeCollection.updated_at.desc(), MemeCollection.id.desc()).offset(max(0, page - 1) * size).limit(size)))
+
+    def create(self, name: str) -> MemeCollection:
+        """创建当前 scope 的规范化合集，重名映射为稳定冲突错误。"""
+        row = MemeCollection(scope_id=self.scope.scope_id, name=self.normalize_name(name))
+        try:
+            with self.session.begin_nested():
+                self.session.add(row)
+                self.session.flush()
+        except IntegrityError as exc:
+            raise DatabaseError("collection_exists") from exc
+        return row
+
+    def rename(self, collection_id: UUID | str, name: str) -> MemeCollection:
+        """重命名当前 scope 合集并保留成员关系。"""
+        row = self.get(collection_id, for_update=True)
+        if row is None:
+            raise DatabaseError("collection_not_found")
+        row.name = self.normalize_name(name)
+        row.updated_at = utcnow()
+        try:
+            with self.session.begin_nested():
+                self.session.flush()
+        except IntegrityError as exc:
+            raise DatabaseError("collection_exists") from exc
+        return row
+
+    def delete(self, collection_id: UUID | str) -> None:
+        """删除合集及成员关系，不触碰 Meme 或图片文件。"""
+        row = self.get(collection_id, for_update=True)
+        if row is None:
+            raise DatabaseError("collection_not_found")
+        self.session.delete(row)
+        self.session.flush()
+
+    def member_count(self, collection_id: UUID | str) -> int:
+        """统计合集成员数量。"""
+        identifier = self._uuid(collection_id)
+        return int(self.session.scalar(select(func.count()).select_from(MemeCollectionItem).where(MemeCollectionItem.scope_id == self.scope.scope_id, MemeCollectionItem.collection_id == identifier)) or 0)
+
+    def members(self, collection_id: UUID | str, *, page: int = 1, page_size: int = 50) -> list[tuple[MemeCollectionItem, Meme]]:
+        """按加入时间和 Meme UUID 稳定分页返回成员及当前 Meme。"""
+        identifier = self._uuid(collection_id)
+        size = max(1, min(page_size, 100))
+        statement = (
+            select(MemeCollectionItem, Meme)
+            .join(Meme, (Meme.scope_id == MemeCollectionItem.scope_id) & (Meme.id == MemeCollectionItem.meme_id))
+            .where(MemeCollectionItem.scope_id == self.scope.scope_id, MemeCollectionItem.collection_id == identifier)
+            .order_by(MemeCollectionItem.added_at.asc(), MemeCollectionItem.meme_id.asc())
+            .offset(max(0, page - 1) * size)
+            .limit(size)
+        )
+        return list(self.session.execute(statement).all())
+
+    def add_members(self, collection_id: UUID | str, meme_ids: Sequence[UUID | str]) -> tuple[int, int, int]:
+        """原子批量加入 Meme，重复请求幂等；任一 Meme 越界则整批失败。"""
+        collection = self.get(collection_id, for_update=True)
+        if collection is None:
+            raise DatabaseError("collection_not_found")
+        unique_ids: list[UUID] = []
+        for value in meme_ids:
+            identifier = self._uuid(value, "meme_not_found")
+            if identifier not in unique_ids:
+                unique_ids.append(identifier)
+        if not unique_ids:
+            raise DatabaseError("empty_members")
+        found = set(self.session.scalars(select(Meme.id).where(Meme.scope_id == self.scope.scope_id, Meme.id.in_(unique_ids))))
+        if found != set(unique_ids):
+            raise DatabaseError("meme_not_found")
+        existing = set(self.session.scalars(select(MemeCollectionItem.meme_id).where(MemeCollectionItem.scope_id == self.scope.scope_id, MemeCollectionItem.collection_id == collection.id, MemeCollectionItem.meme_id.in_(unique_ids))))
+        for meme_id in unique_ids:
+            if meme_id not in existing:
+                self.session.add(MemeCollectionItem(scope_id=self.scope.scope_id, collection_id=collection.id, meme_id=meme_id))
+        if len(existing) != len(unique_ids):
+            collection.updated_at = utcnow()
+        self.session.flush()
+        return len(set(unique_ids) - existing), len(existing), self.member_count(collection.id)
+
+    def remove_member(self, collection_id: UUID | str, meme_id: UUID | str) -> int:
+        """幂等移除单个成员并返回最终成员数。"""
+        collection = self.get(collection_id, for_update=True)
+        if collection is None:
+            raise DatabaseError("collection_not_found")
+        identifier = self._uuid(meme_id, "meme_not_found")
+        deleted = self.session.execute(delete(MemeCollectionItem).where(MemeCollectionItem.scope_id == self.scope.scope_id, MemeCollectionItem.collection_id == collection.id, MemeCollectionItem.meme_id == identifier))
+        if deleted.rowcount:
+            collection.updated_at = utcnow()
+        self.session.flush()
+        return self.member_count(collection.id)
+
+    def cover(self, collection_id: UUID | str) -> Meme | None:
+        """返回按加入顺序最早且仍存在的 Meme。"""
+        identifier = self._uuid(collection_id)
+        return self.session.scalar(
+            select(Meme)
+            .join(MemeCollectionItem, (Meme.scope_id == MemeCollectionItem.scope_id) & (Meme.id == MemeCollectionItem.meme_id))
+            .where(MemeCollectionItem.scope_id == self.scope.scope_id, MemeCollectionItem.collection_id == identifier)
+            .order_by(MemeCollectionItem.added_at.asc(), MemeCollectionItem.meme_id.asc())
+        )
 
 
 class SearchRepository:
@@ -1099,6 +1271,7 @@ class DataEnvironment:
         self.uow = UnitOfWork(factory, scope)
         self.scope = scope
         self.memes = MemeRepository(self.uow.session, scope)
+        self.collections = CollectionRepository(self.uow.session, scope)
         self.search = SearchRepository(self.uow.session, scope)
         self.tasks = TaskRepository(self.uow.session, scope)
 

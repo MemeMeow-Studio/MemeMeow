@@ -41,6 +41,20 @@ FastAPI 是唯一业务入口。模型密钥、Base URL 和路径只从服务端
 - `POST /images/metadata/repair`：异步执行数据库记录、图片文件和指纹完整性扫描；不读取 sidecar、不默认调用模型或外部搜索。
 - 图片库的“选择图片”“重试选中”和“重试所有未就绪”会调用上述语境批量接口；语境完成后仍需重新生成检索缓存，图片才会进入 embedding 索引。
 
+## 合集
+
+合集是当前 `local` scope 内的逻辑图片分组，使用稳定 `meme_id` 建立成员关系，不复制或移动图片文件。接口不接受 `scope_id` 或 `user_id`。
+
+- `GET /collections?page=1&page_size=50`：按更新时间和合集 ID 稳定分页列出合集，返回 `collection_id`、名称、成员数量、封面媒体 URL 和时间戳。
+- `POST /collections`：请求 `{ "name": "工作" }` 创建空合集；名称会去除首尾空白并限制为 1 至 100 个字符。
+- `GET /collections/{collection_id}?page=1&page_size=50`：返回合集元数据、成员总数和按加入时间稳定排序的成员。成员包含当前文件名、大小、状态和 `/media/{meme_id}`。
+- `PATCH /collections/{collection_id}`：请求 `{ "name": "新名称" }` 重命名，不改变成员关系。
+- `DELETE /collections/{collection_id}`：删除合集及成员关系，不删除 Meme 或图片文件。
+- `POST /collections/{collection_id}/items`：请求 `{ "meme_ids": ["..."] }` 原子批量加入图片；返回 `added_count`、`existing_count` 和最终 `member_count`。
+- `DELETE /collections/{collection_id}/items/{meme_id}`：幂等移除单个成员。
+
+同一 scope 内名称精确唯一，重名返回 `409 collection_exists`；未知合集或图片返回 `404`；非法名称和空成员数组返回 `422`。合集删除或图片删除都会由数据库级联清理关系，但不会影响其他图片。
+
 ## 长任务
 
 - `POST /generate-cache`：返回 `202`、`task_id`、`status=queued`；同类任务不会并发执行。

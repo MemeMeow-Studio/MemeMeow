@@ -150,6 +150,15 @@ button, input, select, textarea { border-radius: var(--radius-control); }
 .metadata-button { white-space: nowrap; }
 
 .upload-panel { display: grid; gap: 22px; border: 1px solid var(--line); border-radius: var(--radius-surface); padding: 30px; background: var(--surface); }
+.compact-dialog { width: min(520px, 100%); max-height: none; }
+.collection-form { display: grid; gap: 16px; padding: 20px 24px 24px; }
+.collection-inline-create { display: grid; gap: 10px; border-top: 1px solid var(--line); padding-top: 16px; }
+.collection-toolbar { align-items: stretch; }
+.collection-detail-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; min-width: 0; }
+.collection-row { width: 100%; border: 0; border-bottom: 1px solid var(--line); background: transparent; text-align: left; }
+.collection-row img { display: block; width: 64px; height: 64px; object-fit: contain; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); }
+.collection-open { display: flex; flex: 1; align-items: center; gap: 14px; border: 0; background: transparent; text-align: left; }
+.collection-actions { display: flex; gap: 8px; margin-left: auto; }
 .field { display: grid; gap: 8px; color: var(--muted); font-size: 15px; }
 .field select { width: 100%; }
 .drop-zone { min-height: 210px; display: grid; place-content: center; gap: 4px; border: 2px dashed var(--line-strong); border-radius: 6px; padding: 22px; text-align: center; cursor: pointer; background: #fbfcfc; }
@@ -224,6 +233,10 @@ button, input, select, textarea { border-radius: var(--radius-control); }
 .image-dialog-content { min-height: 0; display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(300px, .7fr); gap: 20px; padding: 20px 24px 24px; }
 .image-dialog-preview { min-height: 300px; display: grid; place-items: center; overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: var(--workspace); }
 .image-dialog-preview img { display: block; width: 100%; height: min(62vh, 600px); object-fit: contain; }
+.collection-form .empty-state { margin: 0; }
+.collection-form .empty-state h2 { font-size: 17px; }
+.collection-form .empty-state p { display: none; }
+.collection-row .collection-open:focus-visible, .collection-row .quiet:focus-visible { position: relative; z-index: 1; }
 .metadata-panel { min-height: 0; display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 6px; }
 .metadata-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 15px; border-bottom: 1px solid var(--line); }
 .metadata-panel-head h3 { margin: 0; color: var(--ink-soft); font-size: 17px; }
@@ -288,6 +301,9 @@ button, input, select, textarea { border-radius: var(--radius-control); }
   .task-toolbar label { flex: 1; min-width: 0; font-size: 16px; }
   .task-toolbar select { width: 100%; min-width: 0; font-size: 16px; }
   .task-drawer { top: 0; width: 100%; padding: 24px 18px; }
+.collection-actions { margin-left: 0; }
+.collection-open { min-width: 0; }
+  .collection-detail-actions { justify-content: flex-start; width: 100%; }
   .image-dialog-backdrop { padding: 10px; place-items: stretch; }
   .image-dialog { max-height: calc(100vh - 20px); }
   .image-dialog-head { padding: 16px; }

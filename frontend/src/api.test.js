@@ -33,4 +33,22 @@ describe('请求封装', () => {
       headers: { 'Content-Type': 'application/json' },
     })
   })
+
+  it('合集成员请求编码稳定 ID 并发送 JSON', async () => {
+    await api.addCollectionItems('collection/1', ['meme/1'])
+
+    expect(fetch).toHaveBeenCalledWith('/api/collections/collection%2F1/items', {
+      method: 'POST',
+      body: JSON.stringify({ meme_ids: ['meme/1'] }),
+      headers: { 'Content-Type': 'application/json' },
+    })
+  })
+
+  it('合集列表支持分页参数', async () => {
+    await api.collections({ page: 2, page_size: 10 })
+
+    expect(fetch).toHaveBeenCalledWith('/api/collections?page=2&page_size=10', {
+      headers: { 'Content-Type': 'application/json' },
+    })
+  })
 })

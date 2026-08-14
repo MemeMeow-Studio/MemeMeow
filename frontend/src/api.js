@@ -45,6 +45,13 @@ export const api = {
   task: (id) => request(`/tasks/${id}`),
   tasks: (params = {}) => request(`/tasks?${new URLSearchParams(Object.entries(params).filter(([, value]) => value !== undefined && value !== ''))}`),
   generateCache: () => request('/generate-cache', { method: 'POST' }),
+  collections: (params = {}) => request(`/collections?${new URLSearchParams(params)}`),
+  createCollection: (payload) => request('/collections', { method: 'POST', body: JSON.stringify(payload) }),
+  collection: (id, params = {}) => request(`/collections/${encodeURIComponent(id)}?${new URLSearchParams(params)}`),
+  renameCollection: (id, payload) => request(`/collections/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  deleteCollection: (id) => request(`/collections/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  addCollectionItems: (id, memeIds) => request(`/collections/${encodeURIComponent(id)}/items`, { method: 'POST', body: JSON.stringify({ meme_ids: memeIds }) }),
+  removeCollectionMember: (id, memeId) => request(`/collections/${encodeURIComponent(id)}/items/${encodeURIComponent(memeId)}`, { method: 'DELETE' }),
 }
 
 export async function pollTask(id, onUpdate, interval = 700) {

@@ -7,6 +7,7 @@ const page = ref('search')
 const pages = [
   { id: 'search', label: '检索' },
   { id: 'library', label: '图片库' },
+  { id: 'collections', label: '合集' },
   { id: 'upload', label: '上传' },
   { id: 'tasks', label: '处理任务' },
 ]
@@ -29,6 +30,15 @@ const retryNotice = ref('')
 const files = ref([])
 const autoName = ref(false)
 const uploadResults = ref([])
+const collections = ref([])
+const selectedCollection = ref(null)
+const collectionMembers = ref([])
+const collectionName = ref('')
+const collectionBusy = ref(false)
+const collectionNotice = ref('')
+const collectionDialogOpen = ref(false)
+const collectionTarget = ref('')
+const collectionSelectedIds = computed(() => [...selectedImages.value])
 
 const taskItems = ref([])
 const taskCursor = ref(null)
@@ -58,6 +68,7 @@ const clipboardImageMime = 'image/png'
 
 const hasActiveTasks = computed(() => taskItems.value.some((item) => item.status === 'queued' || item.status === 'running'))
 const selectedCount = computed(() => selectedImages.value.size)
+const selectedRetryableCount = computed(() => images.value.filter((item) => selectedImages.value.has(imageKey(item)) && isRetryable(item)).length)
 // 以稳定媒体地址作为检索结果身份，避免代理附加查询参数时重复展示同一张图。
 const uniqueResults = computed(() => {
   const seen = new Set()
@@ -151,6 +162,136 @@ function toggleSelectionMode() {
   selectionMode.value = !selectionMode.value
   if (!selectionMode.value) selectedImages.value = new Set()
   retryNotice.value = ''
+}
+
+/** 打开加入合集对话框，并读取当前 scope 的合集列表。 */
+function openCollectionDialog() {
+  if (!selectedImages.value.size || collectionBusy.value) return
+  collectionDialogOpen.value = true
+  collectionTarget.value = ''
+  collectionNotice.value = ''
+  loadCollections()
+}
+
+/** 加载合集列表，供导航页和加入对话框复用。 */
+async function loadCollections() {
+  collectionBusy.value = true
+  try {
+    collections.value = (await api.collections()).items
+  } catch (reason) {
+    showError(reason)
+  } finally {
+    collectionBusy.value = false
+  }
+}
+
+/** 创建空合集并刷新列表。 */
+async function createCollection() {
+  if (!collectionName.value.trim() || collectionBusy.value) return
+  collectionBusy.value = true
+  try {
+    await api.createCollection({ name: collectionName.value })
+    collectionName.value = ''
+    collectionNotice.value = '合集已创建'
+    await loadCollections()
+  } catch (reason) {
+    showError(reason)
+  } finally {
+    collectionBusy.value = false
+  }
+}
+
+/** 通过原生确认和提示完成合集重命名，不改变成员关系。 */
+async function renameCollectionItem(item) {
+  const name = window.prompt('合集名称', item.name)
+  if (!name || collectionBusy.value) return
+  try {
+    await api.renameCollection(item.collection_id, { name })
+    collectionNotice.value = '合集已重命名'
+    await loadCollections()
+  } catch (reason) {
+    showError(reason)
+  }
+}
+
+/** 删除合集前明确告知图片不会被删除。 */
+async function deleteCollectionItem(item) {
+  if (collectionBusy.value || !window.confirm('删除合集不会删除图片，确定继续吗？')) return
+  try {
+    await api.deleteCollection(item.collection_id)
+    if (selectedCollection.value?.collection_id === item.collection_id) selectedCollection.value = null
+    collectionNotice.value = '合集已删除'
+    await loadCollections()
+  } catch (reason) {
+    showError(reason)
+  }
+}
+
+/** 打开合集详情并载入分页成员。 */
+async function openCollection(item) {
+  collectionBusy.value = true
+  try {
+    selectedCollection.value = await api.collection(item.collection_id)
+    collectionMembers.value = selectedCollection.value.members || []
+    collectionNotice.value = ''
+  } catch (reason) {
+    showError(reason)
+  } finally {
+    collectionBusy.value = false
+  }
+}
+
+/** 幂等移除当前详情中的单个成员。 */
+async function removeCollectionMember(item) {
+  if (!selectedCollection.value || collectionBusy.value) return
+  collectionBusy.value = true
+  try {
+    await api.removeCollectionMember(selectedCollection.value.collection_id, item.meme_id)
+    selectedCollection.value = await api.collection(selectedCollection.value.collection_id)
+    collectionMembers.value = selectedCollection.value.members || []
+    collectionNotice.value = '图片已从合集移除'
+  } catch (reason) {
+    showError(reason)
+  } finally {
+    collectionBusy.value = false
+  }
+}
+
+/** 将图片库当前选择原子加入既有合集并清理选择状态。 */
+async function addSelectedToCollection() {
+  if (!collectionTarget.value || !collectionSelectedIds.value.length || collectionBusy.value) return
+  collectionBusy.value = true
+  try {
+    const result = await api.addCollectionItems(collectionTarget.value, collectionSelectedIds.value)
+    collectionNotice.value = `已加入 ${result.added_count} 张图片`
+    collectionDialogOpen.value = false
+    selectedImages.value = new Set()
+    selectionMode.value = false
+  } catch (reason) {
+    showError(reason)
+  } finally {
+    collectionBusy.value = false
+  }
+}
+
+/** 在加入流程内创建合集并立即写入当前选择，保持操作原子地收束到一个目标。 */
+async function createCollectionAndAdd() {
+  if (!collectionName.value.trim() || !collectionSelectedIds.value.length || collectionBusy.value) return
+  collectionBusy.value = true
+  try {
+    const created = await api.createCollection({ name: collectionName.value })
+    await api.addCollectionItems(created.collection_id, collectionSelectedIds.value)
+    collectionName.value = ''
+    collectionNotice.value = '合集已创建并加入图片'
+    collectionDialogOpen.value = false
+    selectedImages.value = new Set()
+    selectionMode.value = false
+    await loadCollections()
+  } catch (reason) {
+    showError(reason)
+  } finally {
+    collectionBusy.value = false
+  }
 }
 
 async function retryImages(items, label) {
@@ -534,6 +675,7 @@ async function generateCache() {
 function changePage(next) {
   page.value = next; clearError()
   if (next === 'library') loadLibrary()
+  if (next === 'collections') { selectedCollection.value = null; loadCollections() }
   if (next === 'tasks') { loadTasks().then(startTaskPolling) } else stopTaskPolling()
 }
 function openUploadTask(item) { if (item.metadata_job_id) { page.value = 'tasks'; loadTasks().then(() => openTask(item.metadata_job_id)).then(startTaskPolling) } }
@@ -573,7 +715,7 @@ onBeforeUnmount(() => {
         </section>
         <section v-else-if="page === 'library'" class="workspace">
           <div class="section-head"><div><h1>图片库</h1><p>浏览、筛选和整理本地图片。</p></div></div>
-          <div class="toolbar" aria-label="图片库工具"><input v-model="filter" aria-label="筛选文件名" placeholder="筛选文件名" @keyup.enter="loadLibrary" /><button type="button" @click="loadLibrary">刷新</button><span class="toolbar-spacer"></span><div class="toolbar-group library-operations"><button class="quiet" type="button" :class="{ active: selectionMode }" :aria-pressed="selectionMode" @click="toggleSelectionMode">{{ selectionMode ? '完成选择' : '选择图片' }}</button><button class="quiet" type="button" :disabled="retryBusy || !selectedCount" @click="retrySelected">重试选中<span v-if="selectedCount">（{{ selectedCount }}）</span></button><button class="primary toolbar-primary" type="button" :disabled="retryBusy || !images.some(isRetryable)" @click="retryAll">{{ retryBusy ? '提交中...' : '重试所有未就绪' }}</button><button class="primary toolbar-primary cache-action" type="button" :disabled="cacheGenerating || !config" :aria-busy="cacheGenerating" :title="cacheButtonTitle" @click="generateCache">{{ cacheButtonLabel }}</button><span v-if="cacheTask || cacheBusy" class="cache-status" :class="cacheTask?.status || 'running'" role="status" aria-live="polite" aria-atomic="true"><span class="cache-status-dot" aria-hidden="true"></span><span>{{ cacheTaskStatusLabel }}</span><b v-if="cacheTask?.progress != null">{{ Math.round(cacheTask.progress * 100) }}%</b></span></div></div>
+          <div class="toolbar" aria-label="图片库工具"><input v-model="filter" aria-label="筛选文件名" placeholder="筛选文件名" @keyup.enter="loadLibrary" /><button type="button" @click="loadLibrary">刷新</button><span class="toolbar-spacer"></span><div class="toolbar-group library-operations"><button class="quiet" type="button" :class="{ active: selectionMode }" :aria-pressed="selectionMode" @click="toggleSelectionMode">{{ selectionMode ? '完成选择' : '选择图片' }}</button><button class="quiet" type="button" :disabled="retryBusy || !selectedCount" @click="openCollectionDialog">加入合集<span v-if="selectedCount">（{{ selectedCount }}）</span></button><button class="quiet" type="button" :disabled="retryBusy || !selectedRetryableCount" @click="retrySelected">重试选中<span v-if="selectedRetryableCount">（{{ selectedRetryableCount }}）</span></button><button class="primary toolbar-primary" type="button" :disabled="retryBusy || !images.some(isRetryable)" @click="retryAll">{{ retryBusy ? '提交中...' : '重试所有未就绪' }}</button><button class="primary toolbar-primary cache-action" type="button" :disabled="cacheGenerating || !config" :aria-busy="cacheGenerating" :title="cacheButtonTitle" @click="generateCache">{{ cacheButtonLabel }}</button><span v-if="cacheTask || cacheBusy" class="cache-status" :class="cacheTask?.status || 'running'" role="status" aria-live="polite" aria-atomic="true"><span class="cache-status-dot" aria-hidden="true"></span><span>{{ cacheTaskStatusLabel }}</span><b v-if="cacheTask?.progress != null">{{ Math.round(cacheTask.progress * 100) }}%</b></span></div></div>
           <div v-if="retryNotice" class="inline-notice" role="status">{{ retryNotice }}</div>
           <div class="library-list" role="list"><article v-for="item in images" :key="imageKey(item)" class="library-row" role="listitem"><label v-if="selectionMode" class="image-check"><input type="checkbox" :checked="selectedImages.has(imageKey(item))" :disabled="retryBusy" :aria-label="`选择 ${item.filename}`" @change="toggleImageSelection(item)" /><span aria-hidden="true"></span></label><button class="library-preview-trigger" type="button" :aria-label="`查看 ${item.filename} 图片与元数据`" @click="openImagePreview(item, $event)"><img :src="item.media_url" :alt="`预览 ${item.filename}`" loading="lazy" /></button><div class="file-meta"><strong :title="item.filename">{{ item.filename }}</strong><small>{{ Math.ceil(item.size / 1024) }} KB · {{ item.extension }}</small></div><span class="metadata-state" :class="item.metadata?.status || 'unknown'">{{ metadataLabel(item.metadata?.status) }}</span><span class="embedding-state" :class="item.embedding_status || 'unknown'">{{ embeddingLabel(item.embedding_status) }}</span><button class="quiet metadata-button" type="button" @click="openImagePreview(item, $event)">查看元数据</button><button class="quiet" type="button" @click="rename(item)">重命名</button></article><div v-if="!images.length" class="empty-state compact"><h2>图片库还没有图片</h2><p>上传图片后，它们会出现在这里。</p></div></div>
         </section>
@@ -581,6 +723,15 @@ onBeforeUnmount(() => {
           <div class="section-head"><div><h1>上传图片</h1><p>支持 PNG、JPG、JPEG 和 GIF。</p></div></div>
           <div class="upload-panel"><label class="drop-zone"><input type="file" multiple accept=".png,.jpg,.jpeg,.gif" aria-label="选择图片文件" @change="onFiles" /><span class="drop-title">选择图片文件</span><span class="drop-sub">{{ files.length ? `已选择 ${files.length} 个文件` : '点击选择或拖入文件' }}</span></label><label class="switch"><input v-model="autoName" type="checkbox" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text">处理完成后按标题自动命名</span></label><button class="primary wide" type="button" :disabled="busy || !files.length" @click="upload">{{ busy ? '上传中...' : '上传所选图片' }}</button></div>
           <div v-if="uploadResults.length" class="upload-results" aria-live="polite"><div v-for="item in uploadResults" :key="item.filename" class="upload-result" :class="{ fail: !item.ok }"><span>{{ item.ok ? '完成' : '失败' }}</span><strong :title="item.filename">{{ item.filename }}</strong><button v-if="item.metadata_job_id" class="quiet" type="button" @click="openUploadTask(item)">查看任务</button><small v-else>{{ item.ok ? item.saved_filename : item.error }}</small></div></div>
+        </section>
+        <section v-else-if="page === 'collections'" class="workspace">
+          <div class="section-head"><div><h1>{{ selectedCollection ? selectedCollection.name : '合集' }}</h1><p>{{ selectedCollection ? '管理合集成员。删除合集不会删除图片。' : '用合集组织图片库中的资产。' }}</p></div><div v-if="selectedCollection" class="collection-detail-actions"><button class="quiet" type="button" :disabled="collectionBusy" @click="renameCollectionItem(selectedCollection)">重命名</button><button class="quiet" type="button" :disabled="collectionBusy" @click="deleteCollectionItem(selectedCollection)">删除</button><button class="quiet" type="button" @click="selectedCollection = null; loadCollections()">返回合集</button></div></div>
+          <template v-if="selectedCollection">
+            <div class="library-list" role="list"><article v-for="item in collectionMembers" :key="item.meme_id" class="library-row" role="listitem"><button class="library-preview-trigger" type="button"><img :src="item.media_url" :alt="`预览 ${item.filename}`" loading="lazy" /></button><div class="file-meta"><strong :title="item.filename">{{ item.filename }}</strong><small>{{ item.extension }}</small></div><button class="quiet" type="button" :disabled="collectionBusy" @click="removeCollectionMember(item)">移除</button></article><div v-if="!collectionMembers.length" class="empty-state compact"><h2>这个合集还没有图片</h2><p>在图片库选择图片后加入合集。</p></div></div><p v-if="collectionNotice" class="inline-notice" role="status">{{ collectionNotice }}</p>
+          </template>
+          <template v-else>
+            <div class="toolbar collection-toolbar"><input v-model="collectionName" aria-label="合集名称" placeholder="新合集名称" @keyup.enter="createCollection" /><button class="primary" type="button" :disabled="collectionBusy || !collectionName.trim()" @click="createCollection">创建合集</button></div><p v-if="collectionNotice" class="inline-notice" role="status">{{ collectionNotice }}</p><div class="library-list" role="list"><article v-for="item in collections" :key="item.collection_id" class="library-row collection-row"><button class="collection-open" type="button" @click="openCollection(item)"><img v-if="item.cover_media_url" :src="item.cover_media_url" :alt="item.name" /><span class="file-meta"><strong>{{ item.name }}</strong><small>{{ item.member_count }} 张图片</small></span></button><div class="collection-actions"><button class="quiet" type="button" :disabled="collectionBusy" @click="renameCollectionItem(item)">重命名</button><button class="quiet" type="button" :disabled="collectionBusy" @click="deleteCollectionItem(item)">删除</button></div></article><div v-if="!collections.length && !collectionBusy" class="empty-state compact"><h2>还没有合集</h2><p>创建合集后可从图片库添加成员。</p></div></div>
+          </template>
         </section>
         <section v-else class="workspace task-workspace" :class="{ detail: selectedTask }">
           <div class="section-head"><div><h1>处理任务</h1></div><button class="quiet" type="button" :disabled="taskLoading" @click="loadTasks">刷新</button></div>
@@ -600,5 +751,6 @@ onBeforeUnmount(() => {
         </div>
       </section>
     </div>
+    <div v-if="collectionDialogOpen" class="image-dialog-backdrop" role="presentation" @click.self="!collectionBusy && (collectionDialogOpen = false)"><section class="image-dialog compact-dialog" role="dialog" aria-modal="true" aria-label="加入合集"><header class="image-dialog-head"><h2>加入合集</h2><button class="quiet" type="button" :disabled="collectionBusy" @click="collectionDialogOpen = false">关闭</button></header><div class="collection-form"><p>已选择 {{ collectionSelectedIds.length }} 张图片</p><label class="field"><span>目标合集</span><select v-model="collectionTarget" :disabled="collectionBusy"><option value="">请选择合集</option><option v-for="item in collections" :key="item.collection_id" :value="item.collection_id">{{ item.name }}</option></select></label><button class="primary wide" type="button" :disabled="collectionBusy || !collectionTarget" @click="addSelectedToCollection">{{ collectionBusy ? '加入中...' : '确认加入' }}</button><div class="collection-inline-create"><label class="field"><span>或新建合集</span><input v-model="collectionName" aria-label="新建合集名称" placeholder="新合集名称" :disabled="collectionBusy" /></label><button class="quiet wide" type="button" :disabled="collectionBusy || !collectionName.trim()" @click="createCollectionAndAdd">创建并加入</button></div></div></section></div>
   </div>
 </template>
