@@ -6,9 +6,11 @@ test('首页可加载并切换核心工作区', async ({ page }) => {
   await expect(page).toHaveTitle('MemeMeow')
   await expect(page.getByRole('heading', { name: '找到合适的表达' })).toBeVisible()
   await page.getByRole('button', { name: '图片库' }).click()
-  await expect(page.getByRole('heading', { name: '图片库' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '图片库', exact: true })).toBeVisible()
   await page.getByRole('button', { name: '上传' }).click()
   await expect(page.getByRole('heading', { name: '上传图片' })).toBeVisible()
+  await page.getByRole('button', { name: '处理任务' }).click()
+  await expect(page.getByRole('heading', { name: '处理任务' })).toBeVisible()
 })
 
 test('搜索表单拒绝空查询并保留工作区', async ({ page }) => {
@@ -23,8 +25,9 @@ test('搜索表单拒绝空查询并保留工作区', async ({ page }) => {
 test('检索结果在延迟加载后仍只写入图片剪贴板', async ({ page, context }) => {
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')
   await page.route('**/api/config', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ embedding_model: 'test-model', embedding_cache_ready: false }) }))
-  await page.route('**/api/search', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ results: ['/media/clipboard-fixture.png'] }) }))
-  await page.route('**/media/clipboard-fixture.png', async (route) => {
+  const memeId = '66666666-6666-4666-8666-666666666666'
+  await page.route('**/api/search', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ results: [`/media/${memeId}`] }) }))
+  await page.route(`**/media/${memeId}`, async (route) => {
     await new Promise((resolve) => setTimeout(resolve, 5500))
     await route.fulfill({ status: 200, contentType: 'image/png', body: png })
   })

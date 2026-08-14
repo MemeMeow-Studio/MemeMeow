@@ -8,8 +8,10 @@ export async function request(path, options = {}) {
   })
   const data = await response.json().catch(() => ({}))
   if (!response.ok) {
-    const error = new Error(data.message || data.detail || '请求失败')
-    error.code = data.error || 'request_failed'
+    // FastAPI 对 HTTPException 会包一层 detail；统一解包后才能命中前端稳定错误码。
+    const detail = data.detail && typeof data.detail === 'object' ? data.detail : data
+    const error = new Error(detail.message || (typeof data.detail === 'string' ? data.detail : '请求失败'))
+    error.code = detail.error || 'request_failed'
     error.status = response.status
     throw error
   }
@@ -18,20 +20,22 @@ export async function request(path, options = {}) {
 
 export const api = {
   config: () => request('/config'),
-  backendSettings: () => request('/backend/settings'),
-  updateBackendSettings: (payload, token) => request('/backend/settings', {
-    method: 'PATCH',
-    body: JSON.stringify(payload),
-    headers: token ? { 'X-Settings-Admin-Token': token } : {},
-  }),
   search: (payload) => request('/search', { method: 'POST', body: JSON.stringify(payload) }),
   images: (params = {}) => request(`/images?${new URLSearchParams(params)}`),
-  directories: (parent = '') => request(`/images/directories?parent=${encodeURIComponent(parent)}`),
-  createDirectory: (payload) => request('/images/directories', { method: 'POST', body: JSON.stringify(payload) }),
+  imageMetadata: (value) => {
+    // 元数据查询只接受不可变 Meme 身份，避免客户端借助可变路径访问另一条记录。
+    const memeId = typeof value === 'string' ? value : value?.meme_id
+    if (!memeId) {
+      const error = new Error('必须提供 meme_id')
+      error.code = 'meme_id_required'
+      error.status = 400
+      return Promise.reject(error)
+    }
+    return request(`/images/metadata?meme_id=${encodeURIComponent(memeId)}`, { cache: 'no-store' })
+  },
   rename: (payload) => request('/images/rename', { method: 'POST', body: JSON.stringify(payload) }),
-  upload: (directory, files, autoName) => {
+  upload: (files, autoName) => {
     const body = new FormData()
-    body.append('directory', directory)
     body.append('auto_name', autoName)
     files.forEach((file) => body.append('files', file))
     return request('/images/upload', { method: 'POST', body })

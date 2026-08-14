@@ -1,8 +1,4 @@
-## Purpose
-
-为用户提供批量导入表情图片的行为契约，统一处理格式校验、文件名安全、重复文件和可选的 VLM 自动命名，并允许批量操作部分成功。
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: 系统必须校验上传图片
 系统 MUST 支持 PNG、JPG、JPEG 和 GIF 图片，并 MUST 校验文件内容确实是可读取的图片。系统 MUST 拒绝不支持的扩展名、伪造内容和超出配置大小限制的文件。所有合法图片 MUST 直接保存到当前可信数据范围的图片根，请求 MUST NOT 接受目标目录字段。

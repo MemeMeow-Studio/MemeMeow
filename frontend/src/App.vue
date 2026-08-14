@@ -9,7 +9,6 @@ const pages = [
   { id: 'library', label: '图片库' },
   { id: 'upload', label: '上传' },
   { id: 'tasks', label: '处理任务' },
-  { id: 'settings', label: '后端设置' },
 ]
 const busy = ref(false)
 const error = ref('')
@@ -20,11 +19,8 @@ const resultCount = ref(8)
 const llmEnhance = ref(false)
 const results = ref([])
 
-const directory = ref('')
-const directories = ref([])
 const images = ref([])
 const filter = ref('')
-const newDirectory = ref('')
 const selectionMode = ref(false)
 const selectedImages = ref(new Set())
 const retryBusy = ref(false)
@@ -43,15 +39,8 @@ const selectedTask = ref(null)
 const cacheTask = ref(null)
 const cacheBusy = ref(false)
 const embeddingTask = ref(null)
-const backendSettings = ref(null)
-const settingsLoading = ref(false)
-const settingsSaving = ref(false)
-const settingsNotice = ref('')
-const settingsConcurrency = ref(1)
-// 设置凭据只在当前页面内存中短暂保存，绝不写入 localStorage、任务记录或日志。
-const settingsAdminToken = ref('')
 
-// 预览状态同时承载图片放大和经接口读取的 sidecar JSON，避免批量选择状态互相污染。
+// 预览状态同时承载图片放大和数据库元数据，避免批量选择状态互相污染。
 const previewImage = ref(null)
 const previewJson = ref(null)
 const previewLoading = ref(false)
@@ -69,7 +58,7 @@ const clipboardImageMime = 'image/png'
 
 const hasActiveTasks = computed(() => taskItems.value.some((item) => item.status === 'queued' || item.status === 'running'))
 const selectedCount = computed(() => selectedImages.value.size)
-// 以规范化媒体路径作为图片身份，避免后端或代理附加查询参数时重复展示同一张图。
+// 以稳定媒体地址作为检索结果身份，避免代理附加查询参数时重复展示同一张图。
 const uniqueResults = computed(() => {
   const seen = new Set()
   return results.value.filter((url) => {
@@ -143,17 +132,16 @@ async function runSearch() {
 async function loadLibrary() {
   clearError(); busy.value = true
   try {
-    const data = await api.images({ directory: directory.value, search: filter.value })
-    images.value = data.items; directories.value = data.directories || []
+    const data = await api.images({ search: filter.value })
+    images.value = data.items
     const keys = new Set(images.value.map(imageKey))
     selectedImages.value = new Set([...selectedImages.value].filter((key) => keys.has(key)))
   } catch (reason) { showError(reason) } finally { busy.value = false }
 }
 
-function imageKey(item) { return `${item.directory || ''}/${item.filename}` }
+function imageKey(item) { return item.meme_id || '' }
 function isRetryable(item) { return item.metadata?.status !== 'ready' }
 function toggleImageSelection(item) {
-  if (!isRetryable(item)) return
   const next = new Set(selectedImages.value)
   const key = imageKey(item)
   if (next.has(key)) next.delete(key); else next.add(key)
@@ -181,16 +169,16 @@ async function retryImages(items, label) {
 }
 
 function retrySelected() {
-  const items = images.value.filter((item) => selectedImages.value.has(imageKey(item))).map((item) => ({ directory: item.directory || '', filename: item.filename }))
+  const items = images.value.filter((item) => selectedImages.value.has(imageKey(item)) && isRetryable(item)).map((item) => ({ meme_id: item.meme_id }))
   return retryImages(items, '重试选中')
 }
 
 function retryAll() {
-  return retryImages(images.value.filter(isRetryable).map((item) => ({ directory: item.directory || '', filename: item.filename })), '重试未就绪图片')
+  return retryImages(images.value.filter(isRetryable).map((item) => ({ meme_id: item.meme_id })), '重试未就绪图片')
 }
 
 function embeddingLabel(status) {
-  return { ready: '已索引', pending: '待生成', blocked: '缺少 JSON' }[status] || '未索引'
+  return { ready: '已索引', pending: '待生成', blocked: '需修复元数据' }[status] || '未索引'
 }
 
 /**
@@ -224,6 +212,15 @@ function formatTaskTime(value) {
 }
 
 /**
+ * 生成处理任务行的无障碍名称，把活动信号和任务自身状态放在同一语句中。
+ * @param {object} item 后端返回的任务摘要。
+ * @returns {string} 供列表按钮 aria-label 使用的完整描述。
+ */
+function taskRowAriaLabel(item) {
+  return [taskStatusLabel(item.status), taskTypeLabel(item.task_type), item.image?.filename || '无关联图片'].filter(Boolean).join('，')
+}
+
+/**
  * 将图片语境元数据状态转换为用户可读标签。
  * @param {string} status 图片元数据状态。
  * @returns {string} 对应的中文状态。
@@ -232,7 +229,7 @@ function metadataLabel(status) {
   return { ready: '语境就绪', pending: '待生成', repair_required: '需修复' }[status] || '状态未知'
 }
 
-/** 打开图片预览并按需读取该图片的完整 sidecar JSON。 */
+/** 打开图片预览并按需读取该图片的完整数据库元数据。 */
 async function openImagePreview(item, event) {
   previewTriggerElement = event?.currentTarget instanceof HTMLElement ? event.currentTarget : null
   previewImage.value = item
@@ -244,10 +241,10 @@ async function openImagePreview(item, event) {
   await nextTick()
   previewCloseButton.value?.focus()
   try {
-    const data = await api.imageMetadata({ directory: item.directory || '', filename: item.filename })
+    const data = await api.imageMetadata(item.meme_id)
     if (requestId === previewRequestId) previewJson.value = data
   } catch (reason) {
-    if (requestId === previewRequestId) previewError.value = reason?.message || '图片 JSON 读取失败'
+    if (requestId === previewRequestId) previewError.value = reason?.message || '图片元数据读取失败'
   } finally {
     if (requestId === previewRequestId) previewLoading.value = false
   }
@@ -268,7 +265,7 @@ function closeImagePreview() {
   })
 }
 
-/** 将文本写入剪贴板，供预览弹层复制 JSON 使用。 */
+/** 将文本写入剪贴板，供预览弹层复制元数据使用。 */
 async function writeTextToClipboard(value) {
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(value)
@@ -288,14 +285,14 @@ async function writeTextToClipboard(value) {
   }
 }
 
-/** 复制预览弹层中的完整 JSON。 */
+/** 复制预览弹层中的完整元数据 JSON。 */
 async function copyPreviewJson() {
   if (!previewJsonText.value) return
   try {
     await writeTextToClipboard(previewJsonText.value)
-    previewCopyNotice.value = 'JSON 已复制'
+    previewCopyNotice.value = '元数据已复制'
   } catch (reason) {
-    previewCopyNotice.value = reason?.message || 'JSON 复制失败，请检查浏览器权限'
+    previewCopyNotice.value = reason?.message || '元数据复制失败，请检查浏览器权限'
   }
 }
 
@@ -471,22 +468,17 @@ function onGlobalKeydown(event) {
   }
 }
 
-async function makeDirectory() {
-  if (!newDirectory.value.trim()) return
-  try { await api.createDirectory({ name: newDirectory.value.trim(), parent: directory.value }); newDirectory.value = ''; await loadLibrary() } catch (reason) { showError(reason) }
-}
-
 async function rename(item) {
   const name = window.prompt('新文件名', item.filename)
   if (!name) return
-  try { await api.rename({ directory: directory.value, filename: item.filename, new_name: name }); await loadLibrary() } catch (reason) { showError(reason) }
+  try { await api.rename({ meme_id: item.meme_id, new_name: name }); await loadLibrary() } catch (reason) { showError(reason) }
 }
 
 function onFiles(event) { files.value = [...event.target.files] }
 async function upload() {
   if (!files.value.length) return
   clearError(); busy.value = true
-  try { uploadResults.value = (await api.upload(directory.value, files.value, autoName.value)).results; files.value = [] } catch (reason) { showError(reason) } finally { busy.value = false }
+  try { uploadResults.value = (await api.upload(files.value, autoName.value)).results; files.value = [] } catch (reason) { showError(reason) } finally { busy.value = false }
 }
 
 async function loadTasks({ append = false } = {}) {
@@ -502,42 +494,15 @@ async function loadTasks({ append = false } = {}) {
   } catch (reason) { showError(reason) } finally { taskLoading.value = false }
 }
 
-/** 加载后端设置页数据；不缓存密钥或部署路径。 */
-async function loadBackendSettings() {
-  if (typeof api.backendSettings !== 'function') return
-  settingsLoading.value = true; settingsNotice.value = ''
-  try {
-    backendSettings.value = await api.backendSettings()
-    settingsConcurrency.value = backendSettings.value.editable?.opencode_concurrency?.value ?? 1
-  } catch (reason) { showError(reason) } finally { settingsLoading.value = false }
-}
-
-/** 保存并发待生效值，并明确告知操作者需要重启服务。 */
-async function saveBackendSettings() {
-  if (typeof api.updateBackendSettings !== 'function') return
-  settingsSaving.value = true; settingsNotice.value = ''
-  try {
-    backendSettings.value = await api.updateBackendSettings(
-      { opencode_concurrency: Number(settingsConcurrency.value) },
-      settingsAdminToken.value.trim() || undefined,
-    )
-    // 成功后立即丢弃凭据，避免在页面生命周期内无必要地保留敏感值。
-    settingsAdminToken.value = ''
-    settingsNotice.value = backendSettings.value.restart_required ? '配置已保存，重启服务后生效' : '配置已保存'
-  } catch (reason) { showError(reason) } finally { settingsSaving.value = false }
-}
-
 async function openTask(id) {
   try { selectedTask.value = await api.task(id) } catch (reason) { showError(reason) }
 }
 
 async function retryTask() {
   const image = selectedTask.value?.image
-  if (!image?.relative_path) return
-  const relative = image.relative_path.split('/')
-  const filename = relative.pop()
+  if (!image?.meme_id) return
   try {
-    const response = await api.context({ directory: relative.join('/'), filename })
+    const response = await api.context({ meme_id: image.meme_id })
     await loadTasks(); await openTask(response.task_id)
   } catch (reason) { showError(reason) }
 }
@@ -567,10 +532,8 @@ async function generateCache() {
 }
 
 function changePage(next) {
-  if (next !== 'settings') settingsAdminToken.value = ''
   page.value = next; clearError()
   if (next === 'library') loadLibrary()
-  if (next === 'settings') loadBackendSettings()
   if (next === 'tasks') { loadTasks().then(startTaskPolling) } else stopTaskPolling()
 }
 function openUploadTask(item) { if (item.metadata_job_id) { page.value = 'tasks'; loadTasks().then(() => openTask(item.metadata_job_id)).then(startTaskPolling) } }
@@ -581,7 +544,6 @@ onMounted(async () => {
   document.addEventListener('keydown', onGlobalKeydown)
 })
 onBeforeUnmount(() => {
-  settingsAdminToken.value = ''
   stopTaskPolling()
   window.clearTimeout(copyNoticeTimer)
   document.removeEventListener('visibilitychange', onVisibilityChange)
@@ -611,29 +573,19 @@ onBeforeUnmount(() => {
         </section>
         <section v-else-if="page === 'library'" class="workspace">
           <div class="section-head"><div><h1>图片库</h1><p>浏览、筛选和整理本地图片。</p></div></div>
-          <div class="toolbar" aria-label="图片库工具"><select v-model="directory" aria-label="选择目录" @change="loadLibrary"><option value="">根目录</option><option v-for="item in directories" :key="item" :value="directory ? `${directory}/${item}` : item">{{ item }}</option></select><input v-model="filter" aria-label="筛选文件名" placeholder="筛选文件名" @keyup.enter="loadLibrary" /><button type="button" @click="loadLibrary">刷新</button><input v-model="newDirectory" aria-label="新目录名" placeholder="新目录名" @keyup.enter="makeDirectory" /><button type="button" @click="makeDirectory">创建目录</button><span class="toolbar-spacer"></span><div class="toolbar-group library-operations"><button class="quiet" type="button" :class="{ active: selectionMode }" :aria-pressed="selectionMode" @click="toggleSelectionMode">{{ selectionMode ? '完成选择' : '选择图片' }}</button><button class="quiet" type="button" :disabled="retryBusy || !selectedCount" @click="retrySelected">重试选中<span v-if="selectedCount">（{{ selectedCount }}）</span></button><button class="primary toolbar-primary" type="button" :disabled="retryBusy || !images.some(isRetryable)" @click="retryAll">{{ retryBusy ? '提交中...' : '重试所有未就绪' }}</button><button class="primary toolbar-primary cache-action" type="button" :disabled="cacheGenerating || !config" :aria-busy="cacheGenerating" :title="cacheButtonTitle" @click="generateCache">{{ cacheButtonLabel }}</button><span v-if="cacheTask || cacheBusy" class="cache-status" :class="cacheTask?.status || 'running'" role="status" aria-live="polite" aria-atomic="true"><span class="cache-status-dot" aria-hidden="true"></span><span>{{ cacheTaskStatusLabel }}</span><b v-if="cacheTask?.progress != null">{{ Math.round(cacheTask.progress * 100) }}%</b></span></div></div>
+          <div class="toolbar" aria-label="图片库工具"><input v-model="filter" aria-label="筛选文件名" placeholder="筛选文件名" @keyup.enter="loadLibrary" /><button type="button" @click="loadLibrary">刷新</button><span class="toolbar-spacer"></span><div class="toolbar-group library-operations"><button class="quiet" type="button" :class="{ active: selectionMode }" :aria-pressed="selectionMode" @click="toggleSelectionMode">{{ selectionMode ? '完成选择' : '选择图片' }}</button><button class="quiet" type="button" :disabled="retryBusy || !selectedCount" @click="retrySelected">重试选中<span v-if="selectedCount">（{{ selectedCount }}）</span></button><button class="primary toolbar-primary" type="button" :disabled="retryBusy || !images.some(isRetryable)" @click="retryAll">{{ retryBusy ? '提交中...' : '重试所有未就绪' }}</button><button class="primary toolbar-primary cache-action" type="button" :disabled="cacheGenerating || !config" :aria-busy="cacheGenerating" :title="cacheButtonTitle" @click="generateCache">{{ cacheButtonLabel }}</button><span v-if="cacheTask || cacheBusy" class="cache-status" :class="cacheTask?.status || 'running'" role="status" aria-live="polite" aria-atomic="true"><span class="cache-status-dot" aria-hidden="true"></span><span>{{ cacheTaskStatusLabel }}</span><b v-if="cacheTask?.progress != null">{{ Math.round(cacheTask.progress * 100) }}%</b></span></div></div>
           <div v-if="retryNotice" class="inline-notice" role="status">{{ retryNotice }}</div>
-          <div class="library-list" role="list"><article v-for="item in images" :key="imageKey(item)" class="library-row" role="listitem"><label v-if="selectionMode" class="image-check" :class="{ disabled: !isRetryable(item) }"><input type="checkbox" :checked="selectedImages.has(imageKey(item))" :disabled="!isRetryable(item) || retryBusy" :aria-label="`选择 ${item.filename}`" @change="toggleImageSelection(item)" /><span aria-hidden="true"></span></label><button class="library-preview-trigger" type="button" :aria-label="`查看 ${item.filename} 图片与 JSON`" @click="openImagePreview(item, $event)"><img :src="item.media_url" :alt="`预览 ${item.filename}`" loading="lazy" /></button><div class="file-meta"><strong :title="item.filename">{{ item.filename }}</strong><small>{{ Math.ceil(item.size / 1024) }} KB · {{ item.extension }}</small></div><span class="metadata-state" :class="item.metadata?.status || 'unknown'">{{ metadataLabel(item.metadata?.status) }}</span><span class="embedding-state" :class="item.embedding_status || 'unknown'">{{ embeddingLabel(item.embedding_status) }}</span><button class="quiet metadata-button" type="button" @click="openImagePreview(item, $event)">查看 JSON</button><button class="quiet" type="button" @click="rename(item)">重命名</button></article><div v-if="!images.length" class="empty-state compact"><h2>这个目录还没有图片</h2><p>上传图片后，它们会出现在这里。</p></div></div>
+          <div class="library-list" role="list"><article v-for="item in images" :key="imageKey(item)" class="library-row" role="listitem"><label v-if="selectionMode" class="image-check"><input type="checkbox" :checked="selectedImages.has(imageKey(item))" :disabled="retryBusy" :aria-label="`选择 ${item.filename}`" @change="toggleImageSelection(item)" /><span aria-hidden="true"></span></label><button class="library-preview-trigger" type="button" :aria-label="`查看 ${item.filename} 图片与元数据`" @click="openImagePreview(item, $event)"><img :src="item.media_url" :alt="`预览 ${item.filename}`" loading="lazy" /></button><div class="file-meta"><strong :title="item.filename">{{ item.filename }}</strong><small>{{ Math.ceil(item.size / 1024) }} KB · {{ item.extension }}</small></div><span class="metadata-state" :class="item.metadata?.status || 'unknown'">{{ metadataLabel(item.metadata?.status) }}</span><span class="embedding-state" :class="item.embedding_status || 'unknown'">{{ embeddingLabel(item.embedding_status) }}</span><button class="quiet metadata-button" type="button" @click="openImagePreview(item, $event)">查看元数据</button><button class="quiet" type="button" @click="rename(item)">重命名</button></article><div v-if="!images.length" class="empty-state compact"><h2>图片库还没有图片</h2><p>上传图片后，它们会出现在这里。</p></div></div>
         </section>
         <section v-else-if="page === 'upload'" class="workspace narrow">
           <div class="section-head"><div><h1>上传图片</h1><p>支持 PNG、JPG、JPEG 和 GIF。</p></div></div>
-          <div class="upload-panel"><label class="field"><span>目标目录</span><select v-model="directory" aria-label="目标目录"><option value="">根目录</option><option v-for="item in directories" :key="item" :value="item">{{ item }}</option></select></label><label class="drop-zone"><input type="file" multiple accept=".png,.jpg,.jpeg,.gif" aria-label="选择图片文件" @change="onFiles" /><span class="drop-title">选择图片文件</span><span class="drop-sub">{{ files.length ? `已选择 ${files.length} 个文件` : '点击选择或拖入文件' }}</span></label><label class="switch"><input v-model="autoName" type="checkbox" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text">处理完成后按标题自动命名</span></label><button class="primary wide" type="button" :disabled="busy || !files.length" @click="upload">{{ busy ? '上传中...' : '上传所选图片' }}</button></div>
+          <div class="upload-panel"><label class="drop-zone"><input type="file" multiple accept=".png,.jpg,.jpeg,.gif" aria-label="选择图片文件" @change="onFiles" /><span class="drop-title">选择图片文件</span><span class="drop-sub">{{ files.length ? `已选择 ${files.length} 个文件` : '点击选择或拖入文件' }}</span></label><label class="switch"><input v-model="autoName" type="checkbox" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text">处理完成后按标题自动命名</span></label><button class="primary wide" type="button" :disabled="busy || !files.length" @click="upload">{{ busy ? '上传中...' : '上传所选图片' }}</button></div>
           <div v-if="uploadResults.length" class="upload-results" aria-live="polite"><div v-for="item in uploadResults" :key="item.filename" class="upload-result" :class="{ fail: !item.ok }"><span>{{ item.ok ? '完成' : '失败' }}</span><strong :title="item.filename">{{ item.filename }}</strong><button v-if="item.metadata_job_id" class="quiet" type="button" @click="openUploadTask(item)">查看任务</button><small v-else>{{ item.ok ? item.saved_filename : item.error }}</small></div></div>
-        </section>
-        <section v-else-if="page === 'settings'" class="workspace settings-workspace">
-          <div class="section-head"><div><h1>后端设置</h1><p>查看服务状态并调整安全范围内的 Agent 并发数量。</p></div><button class="quiet" :disabled="settingsLoading" @click="loadBackendSettings">刷新</button></div>
-          <div v-if="settingsLoading && !backendSettings" class="settings-loading">正在加载后端设置</div>
-          <template v-else-if="backendSettings">
-            <section class="settings-section"><div class="settings-section-head"><h2>后端状态</h2><span class="settings-readonly">只读</span></div><div class="settings-grid"><div><dt>语义模型</dt><dd>{{ backendSettings.readonly?.embedding_model || '未配置' }}</dd></div><div><dt>OpenCode 模型</dt><dd>{{ backendSettings.readonly?.opencode_model || '未配置' }}</dd></div><div><dt>运行时</dt><dd>{{ backendSettings.readonly?.runtime_ready ? '已就绪' : '待检查' }}</dd></div><div><dt>Embedding 缓存</dt><dd>{{ backendSettings.readonly?.embedding_cache_ready ? '已就绪' : '未生成' }}</dd></div><div><dt>设置管理</dt><dd>{{ backendSettings.readonly?.settings_admin_enabled ? '已启用' : '未启用' }}</dd></div><div><dt>配置版本</dt><dd>{{ backendSettings.settings_version || '—' }}</dd></div></div></section>
-            <section class="settings-section"><div class="settings-section-head"><h2>Agent 并发数量</h2><span class="settings-editable">可调整</span></div><div class="settings-edit-row"><label class="field"><span>设置管理凭据</span><input id="settings-admin-token" v-model="settingsAdminToken" type="password" autocomplete="off" :disabled="!backendSettings.readonly?.settings_admin_enabled" placeholder="输入服务端管理凭据" /></label><label class="field"><span>并发上限（{{ backendSettings.editable?.opencode_concurrency?.minimum || 1 }} - {{ backendSettings.editable?.opencode_concurrency?.maximum || 8 }}）</span><input v-model.number="settingsConcurrency" type="number" min="1" max="8" step="1" /></label><button class="primary" :disabled="settingsSaving || !backendSettings.readonly?.settings_admin_enabled || backendSettings.editable?.opencode_concurrency?.environment_overridden || !settingsAdminToken.trim()" @click="saveBackendSettings">{{ settingsSaving ? '保存中...' : '保存并发设置' }}</button></div><p v-if="!backendSettings.readonly?.settings_admin_enabled" class="settings-warning">设置管理未启用，当前页面为只读。</p><p v-if="backendSettings.readonly?.settings_admin_enabled && !settingsAdminToken.trim()" class="settings-hint">请输入设置管理凭据后保存。</p><p v-if="backendSettings.editable?.opencode_concurrency?.environment_overridden" class="settings-warning">当前值由环境变量覆盖，请在部署环境修改。</p><p v-if="backendSettings.restart_required || settingsNotice" class="settings-notice" role="status">{{ settingsNotice || '已保存的值将在服务重启后生效。' }}</p><p v-if="backendSettings.pending?.opencode_concurrency != null" class="settings-pending">待生效值：{{ backendSettings.pending.opencode_concurrency }} · 当前有效值：{{ backendSettings.effective.opencode_concurrency }}</p></section>
-            <section class="settings-section"><div class="settings-section-head"><h2>部署环境管理</h2><span class="settings-readonly">仅部署环境</span></div><div class="settings-grid deployment-grid"><div><dt>OpenCode 可执行文件</dt><dd>由服务端环境管理</dd></div><div><dt>Runtime / 数据目录</dt><dd>路径已隐藏</dd></div><div><dt>Provider 地址</dt><dd>{{ backendSettings.deployment?.provider_url?.configured ? '已配置（不展示地址）' : '未配置' }}</dd></div><div><dt>API Key</dt><dd>{{ backendSettings.deployment?.api_key?.configured ? '已配置（不展示密钥）' : '未配置' }}</dd></div></div></section>
-          </template>
-          <div v-else class="empty-state compact"><h2>后端设置暂不可用</h2></div>
         </section>
         <section v-else class="workspace task-workspace" :class="{ detail: selectedTask }">
           <div class="section-head"><div><h1>处理任务</h1></div><button class="quiet" type="button" :disabled="taskLoading" @click="loadTasks">刷新</button></div>
           <div class="task-toolbar"><label>状态<select v-model="taskStatus" aria-label="按状态筛选" @change="loadTasks"><option value="">全部</option><option value="queued">排队中</option><option value="running">处理中</option><option value="succeeded">已完成</option><option value="failed">失败</option></select></label><label>类型<select v-model="taskType" aria-label="按类型筛选" @change="loadTasks"><option value="">全部</option><option value="meme_context_generation">语境生成</option><option value="cache_generation">检索缓存</option><option value="metadata_repair">元数据修复</option></select></label></div>
-          <div class="task-table" :class="{ loading: taskLoading }" role="table" aria-label="处理任务列表"><div class="task-head" role="row"><span role="columnheader">状态</span><span role="columnheader">类型</span><span role="columnheader">关联图片</span><span role="columnheader">进度</span><span role="columnheader">最近更新</span></div><button v-for="item in taskItems" :key="item.task_id" class="task-row" :class="{ selected: selectedTask?.task_id === item.task_id }" type="button" role="row" :aria-label="`${taskStatusLabel(item.status)}，${taskTypeLabel(item.task_type)}，${item.image?.filename || '无关联图片'}`" @click="openTask(item.task_id)"><span class="task-status-cell" role="cell"><i :class="`status-dot ${item.status}`" aria-hidden="true"></i>{{ taskStatusLabel(item.status) }}</span><span class="task-type-cell" role="cell" data-label="类型">{{ taskTypeLabel(item.task_type) }}</span><span class="task-image" role="cell" data-label="图片">{{ item.image?.filename || '—' }}</span><span class="task-progress" role="cell" data-label="进度">{{ item.progress == null ? '—' : `${Math.round(item.progress * 100)}%` }}</span><time role="cell">{{ formatTaskTime(item.updated_at) }}</time></button><div v-if="taskLoading && !taskItems.length" class="task-skeleton" v-for="n in 5" :key="n"></div><div v-if="!taskLoading && !taskItems.length" class="empty-state compact"><h2>没有匹配的任务</h2><p>调整筛选条件后再试。</p></div></div>
+          <div class="task-table" :class="{ loading: taskLoading }" role="table" aria-label="处理任务列表"><div class="task-head" role="row"><span role="columnheader">状态</span><span role="columnheader">类型</span><span role="columnheader">关联图片</span><span role="columnheader">进度</span><span role="columnheader">最近更新</span></div><button v-for="item in taskItems" :key="item.task_id" class="task-row" :class="{ selected: selectedTask?.task_id === item.task_id }" type="button" role="row" :aria-label="taskRowAriaLabel(item)" @click="openTask(item.task_id)"><span class="task-status-cell" role="cell"><i :class="`status-dot ${item.status}`" aria-hidden="true"></i>{{ taskStatusLabel(item.status) }}</span><span class="task-type-cell" role="cell" data-label="类型"><span>{{ taskTypeLabel(item.task_type) }}</span></span><span class="task-image" role="cell" data-label="图片">{{ item.image?.filename || '—' }}</span><span class="task-progress" role="cell" data-label="进度">{{ item.progress == null ? '—' : `${Math.round(item.progress * 100)}%` }}</span><time role="cell">{{ formatTaskTime(item.updated_at) }}</time></button><div v-if="taskLoading && !taskItems.length" class="task-skeleton" v-for="n in 5" :key="n"></div><div v-if="!taskLoading && !taskItems.length" class="empty-state compact"><h2>没有匹配的任务</h2><p>调整筛选条件后再试。</p></div></div>
           <button v-if="taskCursor" class="quiet load-more" type="button" @click="loadTasks({ append: true })">加载更多</button>
           <aside v-if="selectedTask" class="task-drawer" role="dialog" aria-modal="true" aria-label="任务详情"><div class="drawer-head"><h2>任务详情</h2><button class="quiet" type="button" aria-label="关闭任务详情" @click="selectedTask = null">关闭</button></div><dl><div><dt>状态</dt><dd>{{ taskStatusLabel(selectedTask.status) }}</dd></div><div><dt>类型</dt><dd>{{ taskTypeLabel(selectedTask.task_type) }}</dd></div><div><dt>阶段</dt><dd>{{ selectedTask.message || '—' }}</dd></div><div><dt>创建时间</dt><dd>{{ formatTaskTime(selectedTask.created_at) }}</dd></div><div><dt>完成时间</dt><dd>{{ formatTaskTime(selectedTask.completed_at) }}</dd></div><div v-if="selectedTask.error"><dt>错误</dt><dd>{{ selectedTask.error.error }}</dd></div><div v-if="selectedTask.result?.auto_named !== undefined"><dt>自动命名</dt><dd>{{ selectedTask.result.auto_named ? selectedTask.result.saved_filename : selectedTask.result.auto_name_error || '未执行' }}</dd></div></dl><button v-if="selectedTask.task_type === 'meme_context_generation' && selectedTask.status === 'failed'" class="primary" type="button" @click="retryTask">重试</button></aside>
         </section>
@@ -641,10 +593,10 @@ onBeforeUnmount(() => {
     </div>
     <div v-if="previewImage" class="image-dialog-backdrop" role="presentation" @click.self="closeImagePreview">
       <section ref="previewDialog" class="image-dialog" role="dialog" aria-modal="true" aria-labelledby="image-dialog-title" tabindex="-1">
-        <header class="image-dialog-head"><div><h2 id="image-dialog-title">{{ previewImage.filename }}</h2><p>图片预览与 JSON</p></div><button ref="previewCloseButton" class="quiet" type="button" aria-label="关闭图片预览" @click="closeImagePreview">关闭</button></header>
+        <header class="image-dialog-head"><div><h2 id="image-dialog-title">{{ previewImage.filename }}</h2><p>图片预览与元数据</p></div><button ref="previewCloseButton" class="quiet" type="button" aria-label="关闭图片预览" @click="closeImagePreview">关闭</button></header>
         <div class="image-dialog-content">
           <div class="image-dialog-preview"><img :src="previewImage.media_url" :alt="`放大查看 ${previewImage.filename}`" /></div>
-          <section class="metadata-panel" aria-labelledby="metadata-panel-title"><div class="metadata-panel-head"><h3 id="metadata-panel-title">图片 JSON</h3><button class="quiet" type="button" :disabled="previewLoading || !previewJsonText" @click="copyPreviewJson">复制 JSON</button></div><p v-if="previewLoading" class="metadata-loading" role="status">正在读取 JSON...</p><p v-else-if="previewError" class="metadata-error" role="alert">{{ previewError }}</p><pre v-else class="metadata-json">{{ previewJsonText }}</pre><p v-if="previewCopyNotice" class="copy-notice" role="status" aria-live="polite">{{ previewCopyNotice }}</p></section>
+          <section class="metadata-panel" aria-labelledby="metadata-panel-title"><div class="metadata-panel-head"><h3 id="metadata-panel-title">图片元数据</h3><button class="quiet" type="button" :disabled="previewLoading || !previewJsonText" @click="copyPreviewJson">复制元数据</button></div><p v-if="previewLoading" class="metadata-loading" role="status">正在读取元数据...</p><p v-else-if="previewError" class="metadata-error" role="alert">{{ previewError }}</p><pre v-else class="metadata-json">{{ previewJsonText }}</pre><p v-if="previewCopyNotice" class="copy-notice" role="status" aria-live="polite">{{ previewCopyNotice }}</p></section>
         </div>
       </section>
     </div>

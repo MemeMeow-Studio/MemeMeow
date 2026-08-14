@@ -2,7 +2,7 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { search, images, imageMetadata, contextBatch, generateCache, pollTask, backendSettings, updateBackendSettings } = vi.hoisted(() => ({ search: vi.fn(), images: vi.fn(), imageMetadata: vi.fn(), contextBatch: vi.fn(), generateCache: vi.fn(), pollTask: vi.fn(), backendSettings: vi.fn(), updateBackendSettings: vi.fn() }))
+const { search, images, imageMetadata, contextBatch, generateCache, pollTask, tasks, task } = vi.hoisted(() => ({ search: vi.fn(), images: vi.fn(), imageMetadata: vi.fn(), contextBatch: vi.fn(), generateCache: vi.fn(), pollTask: vi.fn(), tasks: vi.fn(), task: vi.fn() }))
 vi.mock('./api', () => ({
   api: {
     config: vi.fn(async () => ({ embedding_model: 'test-model', embedding_cache_ready: false })),
@@ -10,9 +10,9 @@ vi.mock('./api', () => ({
     images,
     imageMetadata,
     contextBatch,
+    tasks,
+    task,
     generateCache,
-    backendSettings,
-    updateBackendSettings,
   },
   pollTask,
 }))
@@ -23,12 +23,12 @@ describe('App', () => {
   beforeEach(() => {
     vi.unstubAllGlobals()
     search.mockReset()
-    images.mockReset().mockResolvedValue({ items: [], directories: [] })
+    images.mockReset().mockResolvedValue({ items: [] })
     imageMetadata.mockReset().mockResolvedValue({})
     contextBatch.mockReset().mockResolvedValue({ results: [] })
+    tasks.mockReset().mockResolvedValue({ items: [], next_cursor: null })
+    task.mockReset().mockResolvedValue(null)
     generateCache.mockReset()
-    backendSettings.mockReset()
-    updateBackendSettings.mockReset()
     pollTask.mockReset()
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: vi.fn() } })
     Object.defineProperty(window, 'isSecureContext', { configurable: true, value: true })
@@ -37,18 +37,18 @@ describe('App', () => {
   })
 
   it('通过唯一 API 请求执行检索并显示结果', async () => {
-    search.mockResolvedValue({ results: ['/media/a.png'] })
+    search.mockResolvedValue({ results: ['/media/11111111-1111-4111-8111-111111111111'] })
     const wrapper = mount(App)
     await flushPromises()
     await wrapper.get('.search-form input').setValue('开心')
     await wrapper.get('.search-form').trigger('submit')
     await flushPromises()
     expect(search).toHaveBeenCalledWith({ query: '开心', n_results: 8, llm_enhance: false })
-    expect(wrapper.get('.result-item img').attributes('src')).toBe('/media/a.png')
+    expect(wrapper.get('.result-item img').attributes('src')).toBe('/media/11111111-1111-4111-8111-111111111111')
   })
 
   it('对相同媒体路径的查询结果稳定去重', async () => {
-    search.mockResolvedValue({ results: ['/media/a.png?cache=1', '/media/a.png?cache=2', '/media/b.png'] })
+    search.mockResolvedValue({ results: ['/media/11111111-1111-4111-8111-111111111111?cache=1', '/media/11111111-1111-4111-8111-111111111111?cache=2', '/media/22222222-2222-4222-8222-222222222222'] })
     const wrapper = mount(App)
     await flushPromises()
     await wrapper.get('.search-form input').setValue('开心')
@@ -59,7 +59,7 @@ describe('App', () => {
   })
 
   it('点击检索结果会复制图片二进制数据且不会复制地址', async () => {
-    search.mockResolvedValue({ results: ['/media/a.png'] })
+    search.mockResolvedValue({ results: ['/media/11111111-1111-4111-8111-111111111111'] })
     const write = vi.fn().mockResolvedValue(undefined)
     const writeText = navigator.clipboard.writeText
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { write, writeText } })
@@ -76,7 +76,7 @@ describe('App', () => {
     await flushPromises()
     await wrapper.get('.result-item').trigger('click')
     await flushPromises()
-    expect(fetch).toHaveBeenCalledWith('/media/a.png', { credentials: 'same-origin' })
+    expect(fetch).toHaveBeenCalledWith('/media/11111111-1111-4111-8111-111111111111', { credentials: 'same-origin' })
     expect(write).toHaveBeenCalledTimes(1)
     const [items] = write.mock.calls[0]
     expect(items).toHaveLength(1)
@@ -88,7 +88,7 @@ describe('App', () => {
   })
 
   it('浏览器不支持图片剪贴板时显示失败且不复制地址', async () => {
-    search.mockResolvedValue({ results: ['/media/a.png'] })
+    search.mockResolvedValue({ results: ['/media/11111111-1111-4111-8111-111111111111'] })
     const writeText = navigator.clipboard.writeText
     const wrapper = mount(App)
     await flushPromises()
@@ -103,7 +103,7 @@ describe('App', () => {
   })
 
   it('图片加载失败时不写入剪贴板或复制地址', async () => {
-    search.mockResolvedValue({ results: ['/media/a.png'] })
+    search.mockResolvedValue({ results: ['/media/11111111-1111-4111-8111-111111111111'] })
     const write = vi.fn(async ([item]) => item.data['image/png'])
     const writeText = navigator.clipboard.writeText
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { write, writeText } })
@@ -125,7 +125,7 @@ describe('App', () => {
   })
 
   it('图片 MIME 不可用或 Chrome 拒绝剪贴板时均显示失败原因', async () => {
-    search.mockResolvedValue({ results: ['/media/a.png'] })
+    search.mockResolvedValue({ results: ['/media/11111111-1111-4111-8111-111111111111'] })
     const write = vi.fn(async ([item]) => item.data['image/png'])
     const writeText = navigator.clipboard.writeText
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { write, writeText } })
@@ -199,10 +199,10 @@ describe('App', () => {
   it('可选择未就绪图片并提交定向重试任务，同时显示 embedding 状态', async () => {
     images.mockResolvedValue({
       items: [
-        { directory: '', filename: 'pending.png', size: 10, extension: '.png', media_url: '/media/pending.png', metadata: { status: 'pending' }, embedding_status: 'blocked' },
-        { directory: '', filename: 'ready.png', size: 10, extension: '.png', media_url: '/media/ready.png', metadata: { status: 'ready' }, embedding_status: 'ready' },
+        { meme_id: '33333333-3333-4333-8333-333333333333', filename: 'pending.png', size: 10, extension: '.png', media_url: '/media/33333333-3333-4333-8333-333333333333', metadata: { status: 'pending' }, embedding_status: 'blocked' },
+        { meme_id: '44444444-4444-4444-8444-444444444444', filename: 'ready.png', size: 10, extension: '.png', media_url: '/media/44444444-4444-4444-8444-444444444444', metadata: { status: 'ready' }, embedding_status: 'ready' },
       ],
-      directories: [],
+
     })
     const wrapper = mount(App)
     await flushPromises()
@@ -211,18 +211,17 @@ describe('App', () => {
     await wrapper.get('.toolbar .quiet').trigger('click')
     const checkboxes = wrapper.findAll('.image-check input')
     expect(checkboxes).toHaveLength(2)
-    expect(checkboxes[1].element.disabled).toBe(true)
+    expect(checkboxes[1].element.disabled).toBe(false)
     await checkboxes[0].setValue(true)
     await wrapper.get('.toolbar button:nth-last-child(2)').trigger('click')
     await flushPromises()
-    expect(contextBatch).toHaveBeenCalledWith({ items: [{ directory: '', filename: 'pending.png' }], include_unready: true })
+    expect(contextBatch).toHaveBeenCalledWith({ items: [{ meme_id: '33333333-3333-4333-8333-333333333333' }], include_unready: true })
     expect(wrapper.text()).toContain('已索引')
   })
 
   it('图片库点击图片会打开放大预览并显示完整 JSON', async () => {
     images.mockResolvedValue({
-      items: [{ directory: 'work', filename: 'pending.png', size: 10, extension: '.png', media_url: '/media/work/pending.png', metadata: { status: 'pending' }, embedding_status: 'pending' }],
-      directories: [],
+      items: [{ meme_id: '55555555-5555-4555-8555-555555555555', filename: 'pending.png', size: 10, extension: '.png', media_url: '/media/55555555-5555-4555-8555-555555555555', metadata: { status: 'pending' }, embedding_status: 'pending' }],
     })
     imageMetadata.mockResolvedValue({ schema_version: 1, image: { relative_path: 'work/pending.png' }, context_status: 'pending', meme_context: { summary: '等待处理' } })
     const wrapper = mount(App, { attachTo: document.body })
@@ -232,8 +231,8 @@ describe('App', () => {
     const previewTrigger = wrapper.get('.library-preview-trigger')
     await previewTrigger.trigger('click')
     await flushPromises()
-    expect(imageMetadata).toHaveBeenCalledWith({ directory: 'work', filename: 'pending.png' })
-    expect(wrapper.get('[role="dialog"] .image-dialog-preview img').attributes('src')).toBe('/media/work/pending.png')
+    expect(imageMetadata).toHaveBeenCalledWith('55555555-5555-4555-8555-555555555555')
+    expect(wrapper.get('[role="dialog"] .image-dialog-preview img').attributes('src')).toBe('/media/55555555-5555-4555-8555-555555555555')
     expect(wrapper.get('.metadata-json').text()).toContain('等待处理')
     expect(document.activeElement).toBe(wrapper.get('[aria-label="关闭图片预览"]').element)
     await wrapper.get('.metadata-panel .quiet').trigger('click')
@@ -244,51 +243,4 @@ describe('App', () => {
     wrapper.unmount()
   })
 
-  it('后端设置页区分只读状态并保存并发待生效值', async () => {
-    const settings = {
-      settings_version: 'v1',
-      restart_required: false,
-      effective: { opencode_concurrency: 1 },
-      pending: { opencode_concurrency: null },
-      readonly: { embedding_model: 'test-model', opencode_model: 'luna', runtime_ready: true, embedding_cache_ready: false, settings_admin_enabled: true },
-      editable: { opencode_concurrency: { value: 1, minimum: 1, maximum: 8, environment_overridden: false } },
-      deployment: { provider_url: { configured: true }, api_key: { configured: true } },
-    }
-    backendSettings.mockResolvedValue(settings)
-    updateBackendSettings.mockResolvedValue({ ...settings, restart_required: true, pending: { opencode_concurrency: 2 } })
-    const wrapper = mount(App)
-    await flushPromises()
-    await wrapper.findAll('.sidebar nav button').find((button) => button.text().includes('后端设置')).trigger('click')
-    await flushPromises()
-    expect(wrapper.text()).toContain('部署环境管理')
-    const tokenInput = wrapper.get('#settings-admin-token')
-    expect(tokenInput.attributes('type')).toBe('password')
-    expect(tokenInput.attributes('autocomplete')).toBe('off')
-    await tokenInput.setValue('admin-secret')
-    await wrapper.get('.settings-edit-row input[type="number"]').setValue(2)
-    await wrapper.get('.settings-edit-row button').trigger('click')
-    await flushPromises()
-    expect(updateBackendSettings).toHaveBeenCalledWith({ opencode_concurrency: 2 }, 'admin-secret')
-    expect(tokenInput.element.value).toBe('')
-    expect(window.localStorage.getItem('settings-admin-token')).toBeNull()
-    expect(wrapper.text()).toContain('重启服务后生效')
-  })
-
-  it('设置管理未启用时凭据输入和保存按钮保持只读', async () => {
-    backendSettings.mockResolvedValue({
-      settings_version: 'v1',
-      restart_required: false,
-      effective: { opencode_concurrency: 1 },
-      pending: { opencode_concurrency: null },
-      readonly: { embedding_model: 'test-model', opencode_model: 'luna', runtime_ready: false, embedding_cache_ready: false, settings_admin_enabled: false },
-      editable: { opencode_concurrency: { value: 1, minimum: 1, maximum: 8, environment_overridden: false } },
-      deployment: { provider_url: { configured: false }, api_key: { configured: false } },
-    })
-    const wrapper = mount(App)
-    await flushPromises()
-    await wrapper.findAll('.sidebar nav button').find((button) => button.text().includes('后端设置')).trigger('click')
-    await flushPromises()
-    expect(wrapper.get('#settings-admin-token').element.disabled).toBe(true)
-    expect(wrapper.get('.settings-edit-row button').element.disabled).toBe(true)
-  })
 })

@@ -15,10 +15,10 @@ FastAPI 是唯一业务入口。模型密钥、Base URL 和路径只从服务端
 `query` 必须非空，`n_results` 为 1 到 30 的整数，`llm_enhance` 默认 `false`。成功响应：
 
 ```json
-{"results":["/media/a.png"]}
+{"results":["/media/2f3a2a6d-93f6-4cd0-a4c8-1578c5b929b2"]}
 ```
 
-结果只包含受控媒体 URL，按相关性和稳定路径排序并去重。缓存只由图片 sidecar 中非空的 `title`、`summary`、`subjects`、`visible_text`、已确认 `references`、`meaning` 和 `keywords` 生成，版本为 v4；`search_queries`、`uncertainties` 和 `source_urls` 不参与 embedding。缺少或处于 `pending`/`repair_required` 的 sidecar 会跳过，不再使用文件名回退。缓存不存在或正在生成时返回 `503`：
+结果只包含受控媒体 URL，按相关性和稳定 `meme_id` 排序并去重。语义、向量和索引 generation 均由 PostgreSQL + pgvector 保存；缺少或处于 `pending`/`repair_required` 的记录会跳过，不再使用文件名回退。缓存不存在或正在生成时返回 `503`：
 
 ```json
 {"error":"cache_not_ready","message":"检索缓存尚未就绪"}
@@ -28,18 +28,17 @@ FastAPI 是唯一业务入口。模型密钥、Base URL 和路径只从服务端
 
 ## 图片库和媒体
 
-- `GET /images?directory=&search=&page=1&page_size=50`：列出图片元数据和一级子目录；每个图片项包含 `metadata.status`（`pending/partial/ready/repair_required`）、`embedding_status`（`pending/ready/blocked`）、可空 `title` 及可安全展示的摘要字段。
-- `GET /images/directories?parent=`：列出子目录。
-- `POST /images/directories`：请求 `{ "name": "work", "parent": "" }` 创建目录。
-- `POST /images/rename`：请求 `{ "directory": "", "filename": "old.png", "new_name": "new" }`，保留原扩展名且拒绝覆盖。
-- `POST /images/delete`：请求 `{ "directory": "", "filename": "old.png" }`，同步删除图片和同目录 `old.png.json` sidecar。
-- `POST /images/upload`：multipart 字段 `directory`、`auto_name`、多个 `files`，逐文件返回成功或失败。显式启用 `auto_name` 时，系统先保存 Agent 生成的自然语言 `title`，再从标题派生安全文件名；空标题、模型失败或目标冲突时保留原文件名。
-- 上传成功会创建同目录的 `图片完整文件名.json` sidecar；`meme_context.title` 初始为 `null`，图片尚未完成语境研究时状态为 `pending`。标题更新本身不会隐式重命名图片。
-- `GET /media/{file_path}`：受控读取 PNG/JPG/JPEG/GIF，不接受绝对路径、`..` 或符号链接越界。
+- `GET /images?search=&page=1&page_size=50`：分页列出当前 local scope 的扁平图片；每个图片项包含 `meme_id`、文件名、媒体 URL、`metadata.status` 和 `embedding_status`。
+- `GET /images/metadata?meme_id=`：读取当前 scope 指定 Meme 的完整数据库语境；不接受路径式资源标识。
+- `POST /images/rename`：请求 `{ "meme_id": "...", "new_name": "new" }`，保留原扩展名且拒绝覆盖。
+- `POST /images/delete`：请求 `{ "meme_id": "..." }`，隔离并删除图片及数据库 Meme。
+- `POST /images/upload`：multipart 字段 `auto_name`、多个 `files`，逐文件返回成功或失败，图片直接写入当前 scope 图片根。
+- 上传成功会在 PostgreSQL 创建稳定 `meme_id` 和 `pending` 元数据记录；`meme_context.title` 初始为 `null`。数据库是唯一结构化事实，运行时不读取或写入 sidecar。
+- `GET /media/{meme_id}`：按当前 scope 稳定 Meme ID 受控读取 PNG/JPG/JPEG/GIF。
 
-- `POST /images/context`：请求 `{ "directory": "", "filename": "a.png" }`，异步创建或复用单图语境 Agent 任务。
-- `POST /images/context/batch`：请求 `{ "items": [{"directory":"", "filename":"a.png"}], "include_unready": true }`；省略 items 时扫描既有未就绪图片，逐图返回任务结果。
-- `POST /images/metadata/repair`：异步补齐缺失或损坏的 sidecar，并为旧 sidecar 补写 `title: null`；不默认调用模型或外部搜索。
+- `POST /images/context`：请求 `{ "meme_id": "..." }`，异步创建或复用单图语境 Agent 任务。
+- `POST /images/context/batch`：请求 `{ "items": [{"meme_id":"..."}], "include_unready": true }`，逐图返回任务结果；省略 `items` 时不隐式扫描孤立文件。
+- `POST /images/metadata/repair`：异步执行数据库记录、图片文件和指纹完整性扫描；不读取 sidecar、不默认调用模型或外部搜索。
 - 图片库的“选择图片”“重试选中”和“重试所有未就绪”会调用上述语境批量接口；语境完成后仍需重新生成检索缓存，图片才会进入 embedding 索引。
 
 ## 长任务
@@ -48,16 +47,12 @@ FastAPI 是唯一业务入口。模型密钥、Base URL 和路径只从服务端
 - `GET /tasks?status=running&task_type=meme_context_generation&cursor=...&limit=50`：按状态、类型和 cursor 分页返回安全任务摘要。
 - `GET /tasks/{task_id}`：返回任务类型、`queued/running/succeeded/failed`、进度、消息、时间、错误和有限结果。
 
-任务记录持久化在 `MEMEMEOW_DATA_ROOT/tasks/`；服务重启会保留终态、重新排队 queued，并将遗留 running 标记为 `task_interrupted`。
+任务记录、去重、claim generation 和租约持久化在 PostgreSQL；服务重启后 queued 可继续执行，过期 running 按租约重新认领或失败。
 
 ## 配置与访问策略
 
 - `GET /config`：只返回模型名、provider 是否配置和 `*_api_key_configured` 布尔状态；完整 URL、路径和密钥不返回。
-- `GET /backend/settings`：返回只读后端状态、安全可调整的 Agent 并发数量（1..8）和部署环境管理字段；密钥、完整路径与 provider URL 均不返回。
-- `PATCH /backend/settings`：请求 `{ "opencode_concurrency": 2 }`，需要 `X-Settings-Admin-Token`（或 Bearer）凭据。值只原子写入 `.env`，环境变量覆盖时返回 `409`；保存后重启服务生效。
 - `.env` 关键字段：`EMBEDDING_API_KEY`、`EMBEDDING_BASE_URL`、`EMBEDDING_MODEL`、`MEMEMEOW_OPENCODE_EXECUTABLE`、`MEMEMEOW_OPENCODE_BASE_URL`、`MEMEMEOW_OPENCODE_API_KEY`、`MEMEMEOW_OPENCODE_MODEL`、`MEMEMEOW_OPENCODE_RUNTIME_ROOT`、`MEMEMEOW_IMAGE_ROOT`。
-- `MEMEMEOW_OPENCODE_CONCURRENCY` 默认 `1`，安全范围 `1..8`；Agent lane 超出上限的任务保持 `queued`，等待队列达到 `MEMEMEOW_AGENT_BACKPRESSURE`（默认 `32`）后返回 `agent_backpressure`；cache/repair 使用独立资源。
-- OpenCode、skill 和 `.opencode/node_modules` 必须由部署环境预先安装；可用 `MEMEMEOW_OPENCODE_NODE_MODULES` 覆盖该共享依赖目录。启动时会在 `<runtime>/workspace/opencode.json` 写入引用 `MEMEMEOW_OPENCODE_BASE_URL` 与 `MEMEMEOW_OPENCODE_API_KEY` 的 `@ai-sdk/openai` Responses 配置，模型由 `MEMEMEOW_OPENCODE_MODEL` 经命令行传递，并固定使用 `max` 推理强度变体。所有图片 job 共用固定 runtime、DB 和依赖目录，但每张图片使用独立 session。可用 `./scripts/open-opencode.sh` 打开同一 runtime，并通过 `/sessions` 检查历史会话。
 - `MEMEMEOW_PROTECTED_MODE=true` 时仅放行 `MEMEMEOW_ALLOWED_ENDPOINTS`；限流由 `MEMEMEOW_RATE_LIMIT_*` 控制，超限返回 `429` 和 `Retry-After`。
 
 系统不提供用户登录、注册、JWT、角色或多租户权限接口。资源包和社区同步功能已从生产入口移除。

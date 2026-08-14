@@ -3,28 +3,82 @@
 from __future__ import annotations
 
 import io
-import json
+import os
 import threading
 import time
 from pathlib import Path
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
+from sqlalchemy import text
 
 from api import app
+from backend.database import create_engine_for_url
+
+
+def _clear_test_scope() -> None:
+    """清理 API 测试使用的 local scope 业务行，保留安装标记和 scope 命名空间。"""
+    url = os.getenv("MEMEMEOW_TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("未设置 MEMEMEOW_TEST_DATABASE_URL，拒绝清理开发数据库")
+    engine = create_engine_for_url(url, pool_size=1, max_overflow=0)
+    statements = (
+        "DELETE FROM task_lane_slots",
+        "DELETE FROM task_batch_items",
+        "DELETE FROM task_batches",
+        "DELETE FROM tasks",
+        "DELETE FROM meme_visual_embeddings",
+        "DELETE FROM meme_embeddings",
+        "DELETE FROM search_heads",
+        "DELETE FROM search_generations",
+        "DELETE FROM storage_operations",
+        "DELETE FROM memes",
+    )
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+    engine.dispose()
 
 
 @pytest.fixture
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """使用隔离图片目录启动完整应用生命周期。"""
+    test_url = os.getenv("MEMEMEOW_TEST_DATABASE_URL")
+    if not test_url:
+        pytest.skip("未设置 MEMEMEOW_TEST_DATABASE_URL，跳过 API PostgreSQL 测试")
+    monkeypatch.setenv("MEMEMEOW_DATABASE_URL", test_url)
     monkeypatch.setenv("MEMEMEOW_DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("MEMEMEOW_IMAGE_ROOT", str(tmp_path / "images"))
     monkeypatch.setenv("EMBEDDING_API_KEY", "")
     monkeypatch.setenv("EMBEDDING_BASE_URL", "")
     monkeypatch.setenv("MEMEMEOW_OPENCODE_MODEL", "")
+    _clear_test_scope()
+    with TestClient(app) as test_client:
+        uploaded = test_client.post("/images/upload", files=[("files", ("deleted.png", png_bytes(), "image/png"))]).json()["results"][0]
+
+        def fake_run(path, progress, *, task_id=None):
+            """模拟 Agent 完成前目标图片被删除。"""
+            assert task_id
+            path.unlink()
+            return {}, "deleted-session"
+
+        monkeypatch.setattr(test_client.app.state.opencode, "run", fake_run)
+        response = test_client.post("/images/context", json={"meme_id": uploaded["meme_id"]})
+        assert response.status_code == 202
+        task_id = response.json()["task_id"]
+        for _ in range(100):
+            status = test_client.get(f"/tasks/{task_id}").json()
+            if status["status"] in {"succeeded", "failed"}:
+                break
+            time.sleep(0.01)
+        assert status["status"] == "failed"
+        assert status["error"]["error"] == "target_changed"
+    _clear_test_scope()
     with TestClient(app) as test_client:
         yield test_client, tmp_path
+    _clear_test_scope()
 
 
 def png_bytes(color: str = "red") -> bytes:
@@ -68,19 +122,48 @@ def test_upload_lists_and_serves_image(client):
     test_client, _ = client
     response = test_client.post("/images/upload", files=[("files", ("hello.png", png_bytes(), "image/png"))])
     assert response.status_code == 200
-    assert response.json()["results"][0]["ok"] is True
+    uploaded = response.json()["results"][0]
+    assert uploaded["ok"] is True
+    meme_id = uploaded["meme_id"]
+    UUID(meme_id)
     listing = test_client.get("/images").json()
     assert listing["total"] == 1
     media_url = listing["items"][0]["media_url"]
     media = test_client.get(media_url)
     assert media.status_code == 200
     assert media.headers["content-type"] == "image/png"
-    image_path = (client[1] / "images" / "hello.png")
-    sidecar = image_path.with_name("hello.png.json")
-    assert sidecar.is_file()
     listed = test_client.get("/images").json()["items"][0]
+    assert listed["meme_id"] == meme_id
+    assert listed["media_url"] == f"/media/{meme_id}"
     assert listed["metadata"]["status"] == "pending"
     assert listed["embedding_status"] == "pending"
+
+
+def test_image_metadata_returns_complete_database_record(client):
+    """图片库详情接口只返回受控 Meme 对应的完整数据库元数据。"""
+    test_client, tmp_path = client
+    response = test_client.post("/images/upload", files=[("files", ("detail.png", png_bytes(), "image/png"))])
+    assert response.status_code == 200
+    meme_id = response.json()["results"][0]["meme_id"]
+    image = tmp_path / "images" / "detail.png"
+    test_client.app.state.metadata.update_context(image, {"summary": "详情摘要", "keywords": ["测试"]}, producer="human", status="ready")
+
+    metadata = test_client.get("/images/metadata", params={"meme_id": meme_id})
+    assert metadata.status_code == 200
+    payload = metadata.json()
+    assert payload["image"]["relative_path"] == "detail.png"
+    assert payload["context_status"] == "ready"
+    assert payload["meme_context"]["summary"] == "详情摘要"
+    assert payload["meme_context"]["keywords"] == ["测试"]
+
+
+def test_image_metadata_requires_stable_id_and_reports_unknown_meme(client):
+    """详情接口拒绝旧路径参数，并对未知 Meme 返回稳定错误。"""
+    test_client, _ = client
+    assert test_client.get("/images/metadata", params={"filename": "missing.png"}).json()["error"] == "meme_id_required"
+    response = test_client.get("/images/metadata", params={"meme_id": str(uuid4())})
+    assert response.status_code == 404
+    assert response.json()["error"] == "meme_not_found"
 
 
 def test_batch_upload_keeps_success_and_reports_failure(client):
@@ -111,34 +194,37 @@ def test_upload_queues_context_job_and_removed_vlm_routes_are_not_found(client):
     assert test_client.post("/images/label-batch", json={"items": []}).status_code == 404
 
 
-def test_directory_and_rename_conflicts(client):
-    """目录和重命名接口拒绝重复目标。"""
+def test_removed_directory_contract_and_rename_conflicts(client):
+    """目录接口永久删除，重命名仍拒绝重复目标。"""
     test_client, tmp_path = client
-    assert test_client.post("/images/directories", json={"name": "work"}).status_code == 201
-    assert test_client.post("/images/directories", json={"name": "work"}).status_code == 409
-    test_client.post("/images/upload", files=[("files", ("one.png", png_bytes(), "image/png"))])
-    test_client.post("/images/upload", files=[("files", ("two.png", png_bytes("blue"), "image/png"))])
-    conflict = test_client.post("/images/rename", json={"filename": "one.png", "new_name": "two"})
+    assert test_client.get("/images/directories").status_code == 404
+    assert test_client.post("/images/directories", json={"name": "work"}).status_code == 404
+    one = test_client.post("/images/upload", files=[("files", ("one.png", png_bytes(), "image/png"))]).json()["results"][0]
+    two = test_client.post("/images/upload", files=[("files", ("two.png", png_bytes("blue"), "image/png"))]).json()["results"][0]
+    conflict = test_client.post("/images/rename", json={"meme_id": one["meme_id"], "new_name": "two"})
     assert conflict.status_code == 409
-    renamed = test_client.post("/images/rename", json={"filename": "one.png", "new_name": "first"})
+    renamed = test_client.post("/images/rename", json={"meme_id": one["meme_id"], "new_name": "first"})
     assert renamed.status_code == 200
+    assert renamed.json()["meme_id"] == one["meme_id"]
     assert renamed.json()["filename"] == "first.png"
-    assert not (tmp_path / "images" / "one.png.json").exists()
-    assert (tmp_path / "images" / "first.png.json").is_file()
+    assert test_client.get(f"/media/{one['meme_id']}").status_code == 200
+    assert test_client.get(f"/media/{two['meme_id']}").status_code == 200
 
 
-def test_delete_removes_image_and_sidecar(client):
-    """删除接口不会留下孤立 sidecar。"""
+def test_delete_removes_image_and_database_record(client):
+    """删除接口会移除数据库 Meme、文件和受控媒体访问。"""
     test_client, tmp_path = client
-    test_client.post("/images/upload", files=[("files", ("remove.png", png_bytes(), "image/png"))])
-    response = test_client.post("/images/delete", json={"filename": "remove.png"})
+    uploaded = test_client.post("/images/upload", files=[("files", ("remove.png", png_bytes(), "image/png"))]).json()["results"][0]
+    meme_id = uploaded["meme_id"]
+    response = test_client.post("/images/delete", json={"meme_id": meme_id})
     assert response.status_code == 200
     assert not (tmp_path / "images" / "remove.png").exists()
-    assert not (tmp_path / "images" / "remove.png.json").exists()
+    assert test_client.get(f"/media/{meme_id}").status_code == 404
+    assert test_client.get("/images").json()["total"] == 0
 
 
 def test_metadata_repair_is_pollable(client):
-    """元数据修复任务补齐图片 sidecar 并返回结构化结果。"""
+    """元数据修复任务报告数据库与文件完整性问题。"""
     test_client, tmp_path = client
     image = tmp_path / "images" / "legacy.png"
     image.write_bytes(png_bytes())
@@ -150,8 +236,8 @@ def test_metadata_repair_is_pollable(client):
         if status["status"] in {"succeeded", "failed"}:
             break
     assert status["status"] == "succeeded"
-    assert status["result"]["processed"] == 1
-    assert (image.with_name("legacy.png.json")).is_file()
+    assert status["result"]["processed"] == 0
+    assert "legacy.png" in status["result"]["orphan_files"]
     second = test_client.post("/images/metadata/repair")
     assert second.status_code == 202
 
@@ -164,9 +250,9 @@ def test_path_traversal_and_symlink_escape_are_blocked(client):
     (outside / "secret.png").write_bytes(png_bytes())
     (tmp_path / "images" / "escape").symlink_to(outside, target_is_directory=True)
     traversal = test_client.get("/images", params={"directory": "../outside"})
-    assert traversal.status_code == 403
+    assert traversal.status_code == 400
     escaped = test_client.get("/media/escape/secret.png")
-    assert escaped.status_code == 403
+    assert escaped.status_code == 404
 
 
 def test_unknown_task_has_stable_error(client):
@@ -192,28 +278,27 @@ def test_task_list_filters_and_does_not_expose_payload(client):
 
 def test_search_maps_results_to_media_urls(client):
     """正常检索只返回受控媒体 URL 且不重复。"""
-    test_client, tmp_path = client
-    image_root = tmp_path / "images"
-    (image_root / "a.png").write_bytes(png_bytes())
+    test_client, _ = client
+    uploaded = test_client.post("/images/upload", files=[("files", ("a.png", png_bytes(), "image/png"))]).json()["results"][0]
+    meme_id = uploaded["meme_id"]
 
     class FakeSearch:
         def has_cache(self):
             return True
 
         def search(self, *args, **kwargs):
-            return [str(image_root / "a.png"), str(image_root / "a.png"), str(image_root / "missing.png")]
+            return [meme_id, meme_id, str(uuid4())]
 
     test_client.app.state.search_engine = FakeSearch()
     response = test_client.post("/search", json={"query": "x", "n_results": 3})
     assert response.status_code == 200
-    assert response.json() == {"results": ["/media/a.png"]}
+    assert response.json() == {"results": [f"/media/{meme_id}"]}
 
 
 def test_llm_failure_falls_back_to_original_query(client):
     """LLM 增强异常时仍执行一次普通检索。"""
-    test_client, tmp_path = client
-    image_root = tmp_path / "images"
-    (image_root / "a.png").write_bytes(png_bytes())
+    test_client, _ = client
+    meme_id = test_client.post("/images/upload", files=[("files", ("a.png", png_bytes(), "image/png"))]).json()["results"][0]["meme_id"]
     calls = []
 
     class FakeSearch:
@@ -224,7 +309,7 @@ def test_llm_failure_falls_back_to_original_query(client):
             calls.append((query, kwargs.get("use_llm")))
             if kwargs.get("use_llm"):
                 raise RuntimeError("llm unavailable")
-            return [str(image_root / "a.png")]
+            return [meme_id]
 
     test_client.app.state.search_engine = FakeSearch()
     response = test_client.post("/search", json={"query": "原始查询", "llm_enhance": True})
@@ -254,25 +339,24 @@ def test_cache_generation_returns_pollable_task(client):
     assert status["status"] == "succeeded"
 
 
-def test_parallel_context_batch_writes_independent_sidecars_and_merges_cache(tmp_path, monkeypatch):
-    """并发度为 2 时两张图片使用独立 session，批次终态只提交一次缓存任务。"""
+def test_parallel_context_batch_writes_independent_database_records_and_merges_cache(tmp_path, monkeypatch):
+    """并发度为 2 时两张图片使用独立任务，批次终态只提交一次缓存任务。"""
     monkeypatch.setenv("MEMEMEOW_DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("MEMEMEOW_IMAGE_ROOT", str(tmp_path / "images"))
     monkeypatch.setenv("EMBEDDING_API_KEY", "")
     monkeypatch.setenv("EMBEDDING_BASE_URL", "")
     monkeypatch.setenv("MEMEMEOW_OPENCODE_MODEL", "")
     monkeypatch.setenv("MEMEMEOW_OPENCODE_CONCURRENCY", "2")
+    _clear_test_scope()
     with TestClient(app) as test_client:
-        first = tmp_path / "images" / "parallel-a.png"
-        second = tmp_path / "images" / "parallel-b.png"
-        first.write_bytes(png_bytes("red")); second.write_bytes(png_bytes("blue"))
-        test_client.app.state.metadata.create_pending(first)
-        test_client.app.state.metadata.create_pending(second)
+        first = test_client.post("/images/upload", files=[("files", ("parallel-a.png", png_bytes("red"), "image/png"))]).json()["results"][0]
+        second = test_client.post("/images/upload", files=[("files", ("parallel-b.png", png_bytes("blue"), "image/png"))]).json()["results"][0]
         started = threading.Barrier(2)
         sessions: list[str] = []
 
-        def fake_run(image, progress):
+        def fake_run(image, progress, *, task_id=None):
             """模拟两个独立 Agent session，并在 barrier 处确认真正并行。"""
+            assert task_id
             sessions.append(image.name)
             started.wait(timeout=2)
             return {
@@ -289,7 +373,7 @@ def test_parallel_context_batch_writes_independent_sidecars_and_merges_cache(tmp
             }, f"session-{image.stem}"
 
         monkeypatch.setattr(test_client.app.state.opencode, "run", fake_run)
-        submitted = test_client.post("/images/context/batch", json={"items": [{"filename": "parallel-a.png"}, {"filename": "parallel-b.png"}], "include_unready": True})
+        submitted = test_client.post("/images/context/batch", json={"items": [{"meme_id": first["meme_id"]}, {"meme_id": second["meme_id"]}], "include_unready": True})
         assert submitted.status_code == 200
         task_ids = [item["task_id"] for item in submitted.json()["results"]]
         assert len(task_ids) == 2
@@ -304,14 +388,15 @@ def test_parallel_context_batch_writes_independent_sidecars_and_merges_cache(tmp
                     break
                 time.sleep(0.01)
         assert record["status"] == "succeeded"
-        assert test_client.app.state.metadata.status(first)["status"] == "ready"
-        assert test_client.app.state.metadata.status(second)["status"] == "ready"
+        assert test_client.get(f"/images/metadata?meme_id={first['meme_id']}").json()["context_status"] == "ready"
+        assert test_client.get(f"/images/metadata?meme_id={second['meme_id']}").json()["context_status"] == "ready"
         for _ in range(100):
             cache_items = test_client.get("/tasks", params={"task_type": "cache_generation"}).json()["items"]
             if cache_items:
                 break
             time.sleep(0.01)
         assert len(cache_items) == 1
+    _clear_test_scope()
 
 
 def test_context_target_deleted_during_agent_is_reported_as_target_changed(tmp_path, monkeypatch):
@@ -321,18 +406,18 @@ def test_context_target_deleted_during_agent_is_reported_as_target_changed(tmp_p
     monkeypatch.setenv("EMBEDDING_API_KEY", "")
     monkeypatch.setenv("EMBEDDING_BASE_URL", "")
     monkeypatch.setenv("MEMEMEOW_OPENCODE_MODEL", "")
+    _clear_test_scope()
     with TestClient(app) as test_client:
-        image = tmp_path / "images" / "deleted.png"
-        image.write_bytes(png_bytes())
-        test_client.app.state.metadata.create_pending(image)
+        uploaded = test_client.post("/images/upload", files=[("files", ("deleted.png", png_bytes(), "image/png"))]).json()["results"][0]
 
-        def fake_run(path, progress):
+        def fake_run(path, progress, *, task_id=None):
             """模拟 Agent 完成前目标图片被删除。"""
+            assert task_id
             path.unlink()
             return {}, "deleted-session"
 
         monkeypatch.setattr(test_client.app.state.opencode, "run", fake_run)
-        response = test_client.post("/images/context", json={"filename": image.name})
+        response = test_client.post("/images/context", json={"meme_id": uploaded["meme_id"]})
         assert response.status_code == 202
         task_id = response.json()["task_id"]
         for _ in range(100):
@@ -342,3 +427,4 @@ def test_context_target_deleted_during_agent_is_reported_as_target_changed(tmp_p
             time.sleep(0.01)
         assert status["status"] == "failed"
         assert status["error"]["error"] == "target_changed"
+    _clear_test_scope()

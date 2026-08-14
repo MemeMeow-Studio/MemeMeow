@@ -6,29 +6,27 @@
 from __future__ import annotations
 
 import mimetypes
-import os
 import re
-import secrets
 import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import AliasChoices, BaseModel, Field, StrictInt
+from pydantic import BaseModel, Field, StrictInt
 
-from backend.config import Settings, update_dotenv_concurrency
+from backend.config import Settings
 from backend.errors import ErrorBody
-from backend.metadata import MetadataError, MetadataService
-from backend.paths import PathResolver, SUPPORTED_EXTENSIONS
+from backend.metadata import MetadataError
+from backend.database import DatabaseError, DatabaseResources, check_database, create_engine_for_settings
+from backend.pg_services import PostgresMetadataService, PostgresSearchService, PostgresTaskService
+from backend.paths import PathResolver, SUPPORTED_EXTENSIONS, validate_business_storage_key
 from backend.rate_limiter import RateLimiter
-from backend.search import SearchService
 from backend.opencode import OpenCodeError, OpenCodeRunner
-from backend.tasks import PersistentTaskService, TaskRecord
+from backend.tasks import TaskRecord
 
 
 class SearchRequest(BaseModel):
@@ -39,33 +37,23 @@ class SearchRequest(BaseModel):
     llm_enhance: bool = False
 
 
-class CreateDirectoryRequest(BaseModel):
-    """创建图片目录请求。"""
-
-    name: str = Field(min_length=1, max_length=100)
-    parent: str = ""
-
-
 class RenameRequest(BaseModel):
     """图片重命名请求。"""
 
-    directory: str = ""
-    filename: str = Field(min_length=1, max_length=255)
+    meme_id: str | None = None
     new_name: str = Field(min_length=1, max_length=255)
 
 
 class DeleteRequest(BaseModel):
-    """删除图片及其 sidecar 的请求。"""
+    """按稳定 meme_id 删除图片的请求。"""
 
-    directory: str = ""
-    filename: str = Field(min_length=1, max_length=255)
+    meme_id: str | None = None
 
 
 class ContextRequest(BaseModel):
-    """单张图片语境生成或重试请求。"""
+    """按稳定 meme_id 创建图片语境任务的请求。"""
 
-    directory: str = ""
-    filename: str = Field(min_length=1, max_length=255)
+    meme_id: str | None = None
 
 
 class ContextBatchRequest(BaseModel):
@@ -73,12 +61,6 @@ class ContextBatchRequest(BaseModel):
 
     items: list[ContextRequest] = Field(default_factory=list, max_length=500)
     include_unready: bool = True
-
-
-class ConcurrencyUpdateRequest(BaseModel):
-    """后端设置页唯一允许持久化的安全参数。"""
-
-    opencode_concurrency: StrictInt = Field(ge=1, le=8, validation_alias=AliasChoices("opencode_concurrency", "agent_concurrency", "concurrency", "value"))
 
 
 def _error(status: int, code: str, message: str) -> HTTPException:
@@ -96,50 +78,49 @@ def _safe_filename(name: str) -> str:
 
 
 def _filename_from_title(title: str, suffix: str) -> str:
-    """从自然语言标题派生安全文件名，并为同目录 sidecar 预留字节长度。"""
+    """从自然语言标题派生安全文件名并限制单个文件名长度。"""
     stem = unicodedata.normalize("NFKC", title).strip()
     stem = re.sub(r"[\x00-\x1f/\\:*?\"<>|]", "_", stem).strip(" .")
     if not stem:
         raise ValueError("empty_title")
     suffix = suffix.lower()
-    max_stem_bytes = 255 - len(f"{suffix}.json".encode("utf-8"))
+    max_stem_bytes = 255 - len(suffix.encode("utf-8"))
     stem = stem.encode("utf-8")[:max_stem_bytes].decode("utf-8", errors="ignore").rstrip(" .")
     if not stem:
         raise ValueError("empty_title")
     return f"{stem}{suffix}"
 
 
-def _media_for_path(resolver: PathResolver, value: Any) -> str | None:
-    """把搜索服务返回的路径或旧格式二元组映射为受控媒体 URL。"""
-    candidate = value[0] if isinstance(value, (tuple, list)) else value
+def _media_for_meme(request: Request, meme_id: str) -> str | None:
+    """将当前 scope 的稳定 meme_id 映射为受控媒体 URL。"""
     try:
-        path = Path(str(candidate)).expanduser().resolve()
-        if path.suffix.lower() not in SUPPORTED_EXTENSIONS or not path.is_file():
-            return None
-        return resolver.media_url(path)
-    except (OSError, ValueError):
+        _record, image = request.app.state.metadata.image_for_meme(meme_id)
+        return f"/media/{meme_id}"
+    except (MetadataError, ValueError):
         return None
 
 
 def _invalidate_search(request: Request) -> None:
-    """通知检索服务丢弃受图片元数据变化影响的进程内索引。"""
+    """通知检索服务；PostgreSQL generation 不在进程内缓存。"""
     invalidate = getattr(request.app.state.search_engine, "invalidate_cache", None)
     if invalidate:
         invalidate()
 
 
-def _context_payload(request: Request, image: Path, *, auto_name: bool = False, batch_id: str | None = None) -> dict[str, object]:
+def _context_payload(request: Request, image: Path, *, auto_name: bool = False, batch_id: str | None = None, expected_sha256: str | None = None) -> dict[str, object]:
     """构造可持久化的图片语境任务输入，不保存密钥或提示词。"""
     settings: Settings = request.app.state.settings
     runner: OpenCodeRunner = request.app.state.opencode
     relative = request.app.state.resolver.relative(image)
+    meme_id = str(request.app.state.metadata.meme_id_for_image(image))
     try:
         skill_hash = runner.skill_hash()
     except (OSError, OpenCodeError):
         skill_hash = None
     payload: dict[str, object] = {
+        "meme_id": meme_id,
         "image_relative_path": relative,
-        "image_sha256": request.app.state.metadata.image_sha256(image),
+        "image_sha256": expected_sha256 or request.app.state.metadata.image_sha256(image),
         "auto_name": auto_name,
         "model": settings.opencode_model,
         "skill_hash": skill_hash,
@@ -151,9 +132,9 @@ def _context_payload(request: Request, image: Path, *, auto_name: bool = False, 
     return payload
 
 
-def _submit_context_task(request: Request, image: Path, *, auto_name: bool = False, batch_id: str | None = None) -> TaskRecord:
+def _submit_context_task(request: Request, image: Path, *, auto_name: bool = False, batch_id: str | None = None, expected_sha256: str | None = None) -> TaskRecord:
     """提交或复用同一图片内容的语境生成任务。"""
-    return request.app.state.tasks.submit("meme_context_generation", _context_payload(request, image, auto_name=auto_name, batch_id=batch_id))
+    return request.app.state.tasks.submit("meme_context_generation", _context_payload(request, image, auto_name=auto_name, batch_id=batch_id, expected_sha256=expected_sha256))
 
 
 def _context_enqueue_error(exc: Exception) -> str:
@@ -170,38 +151,58 @@ async def lifespan(app: FastAPI):
     """初始化一次服务依赖，并在关闭时终止未完成任务。"""
     settings = Settings.from_env()
     settings.ensure_directories()
+    try:
+        engine = create_engine_for_settings(settings)
+        check_database(engine, expected_revision=settings.expected_database_revision)
+    except DatabaseError:
+        # 启动门禁拒绝任何可能回退到旧 JSON 的业务请求；测试和生产都必须显式准备 PostgreSQL。
+        raise
     app.state.settings = settings
     app.state.resolver = PathResolver(settings.image_root)
-    app.state.metadata = MetadataService(settings.image_root)
-    app.state.search_engine = SearchService(settings, app.state.metadata)
+    app.state.database = DatabaseResources(engine, image_root=settings.image_root, data_root=settings.data_root, settings=settings)
+    preflight = app.state.database.flat_preflight("local")
+    if any(preflight.get(key) for key in ("non_flat_keys", "nested_images", "orphan_files", "missing_files", "mismatched")):
+        raise DatabaseError("flat_meme_storage_preflight_failed")
+    app.state.metadata = PostgresMetadataService(app.state.database)
+    app.state.search_engine = PostgresSearchService(settings, app.state.database, app.state.metadata)
     app.state.opencode = OpenCodeRunner(settings)
-    tasks = PersistentTaskService(
-        settings.data_root / "tasks",
+    tasks = PostgresTaskService(
+        app.state.database,
         agent_concurrency=settings.opencode_concurrency,
         agent_backpressure=settings.agent_backpressure,
         settings_version=settings.settings_version,
+        lease_seconds=settings.worker_lease_seconds,
+        max_attempts=settings.worker_max_attempts,
     )
 
     def cache_handler(payload: dict[str, object], progress):
         """从持久任务 payload 重建缓存生成工作。"""
-        result = app.state.search_engine.generate_cache(progress)
+        claim = None
+        if isinstance(payload.get("_claim_task_id"), str) and isinstance(payload.get("_claim_generation"), int) and isinstance(payload.get("_claim_owner"), str):
+            claim = (str(payload["_claim_task_id"]), int(payload["_claim_generation"]), str(payload["_claim_owner"]))
+        if claim is None or not isinstance(app.state.search_engine, PostgresSearchService):
+            result = app.state.search_engine.generate_cache(progress)
+        else:
+            result = app.state.search_engine.generate_cache(progress, claim=claim)
         return result
 
     def repair_handler(payload: dict[str, object], progress):
-        """从持久任务 payload 重建 sidecar 修复工作。"""
+        """从持久任务 payload 重建数据库元数据完整性扫描工作。"""
         result = app.state.metadata.repair(progress)
         app.state.search_engine.invalidate_cache()
         return result
 
     def context_handler(payload: dict[str, object], progress):
-        """执行 Agent 候选校验、指纹复核与受保护 sidecar 写回。"""
+        """执行 Agent 候选校验、指纹复核与受保护数据库语境写回。"""
         relative = payload.get("image_relative_path")
+        meme_id = payload.get("meme_id")
         expected_sha = payload.get("image_sha256")
-        if not isinstance(relative, str) or not isinstance(expected_sha, str):
+        if not isinstance(meme_id, str) or not isinstance(expected_sha, str):
             raise RuntimeError("target_changed")
         try:
-            image = app.state.resolver.resolve_file(str(Path(relative).parent), Path(relative).name)
-        except HTTPException as exc:
+            _record, image = app.state.metadata.image_for_meme(meme_id)
+            relative = app.state.database.blob_store.relative(image)
+        except MetadataError as exc:
             raise RuntimeError("target_changed") from exc
         try:
             current_sha = app.state.metadata.image_sha256(image)
@@ -211,7 +212,7 @@ async def lifespan(app: FastAPI):
         if current_sha != expected_sha:
             raise RuntimeError("target_changed")
         try:
-            candidate, session_id = app.state.opencode.run(image, progress)
+            candidate, session_id = app.state.opencode.run(image, progress, task_id=str(payload.get("_claim_task_id") or ""))
         except OpenCodeError as exc:
             try:
                 app.state.metadata.record_error(image, producer="research", model=app.state.settings.opencode_model, error=exc.code)
@@ -225,9 +226,14 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("target_changed") from exc
         if current_sha != expected_sha:
             raise RuntimeError("target_changed")
+        claim = None
+        if isinstance(payload.get("_claim_task_id"), str) and isinstance(payload.get("_claim_generation"), int) and isinstance(payload.get("_claim_owner"), str):
+            claim = (str(payload["_claim_task_id"]), int(payload["_claim_generation"]), str(payload["_claim_owner"]))
         try:
-            metadata = app.state.metadata.update_context(image, candidate, producer="research", model=app.state.settings.opencode_model, status="ready", error=None)
+            metadata = app.state.metadata.update_context(image, candidate, producer="research", model=app.state.settings.opencode_model, status="ready", error=None, expected_sha256=expected_sha, claim=claim)
         except MetadataError as exc:
+            if exc.code == "claim_expired":
+                raise RuntimeError("target_changed") from exc
             raise RuntimeError("agent_output_schema_invalid") from exc
         mark_invalidated = getattr(app.state.search_engine, "mark_cache_invalidated", None)
         if mark_invalidated:
@@ -236,28 +242,29 @@ async def lifespan(app: FastAPI):
             app.state.search_engine.invalidate_cache()
         result: dict[str, object] = {
             "image_relative_path": relative,
+            "meme_id": meme_id,
             "session_id": session_id,
             "auto_named": False,
         }
-        sidecar_hash = app.state.metadata.embedding_record(image)["metadata_hash"]
+        metadata_hash = app.state.metadata.embedding_record(image)["metadata_hash"]
         if payload.get("auto_name") and metadata.meme_context.title:
             try:
                 target = image.parent / _filename_from_title(metadata.meme_context.title, image.suffix)
                 if target != image:
-                    app.state.metadata.rename(image, target)
+                    app.state.metadata.rename_by_id(meme_id, target)
                     result["auto_named"] = True
                     result["saved_filename"] = target.name
                     result["image_relative_path"] = app.state.resolver.relative(target)
             except (MetadataError, ValueError, OSError):
                 result["auto_name_error"] = "auto_name_failed"
-        # 自动命名可能改变 sidecar 的 relative_path，最终哈希必须从实际提交路径读取。
+        # 自动命名可能改变 storage_key，最终哈希必须从实际提交路径读取。
         final_image = image
         if isinstance(result.get("saved_filename"), str):
             final_image = image.with_name(str(result["saved_filename"]))
         try:
-            result["sidecar_hash"] = app.state.metadata.embedding_record(final_image)["metadata_hash"]
+            result["metadata_hash"] = app.state.metadata.embedding_record(final_image)["metadata_hash"]
         except MetadataError:
-            result["sidecar_hash"] = sidecar_hash
+            result["metadata_hash"] = metadata_hash
         return result
 
     tasks.register("cache_generation", cache_handler)
@@ -266,16 +273,22 @@ async def lifespan(app: FastAPI):
 
     def finalize_context_batch(batch_id: str):
         """批次所有语境任务收束后只提交一个去重的缓存生成任务。"""
-        tasks.submit("cache_generation", {})
+        try:
+            tasks.submit("cache_generation", {})
+        except Exception:
+            # 缓存任务的唯一约束/背压失败不能改变已完成的语境任务，后续可显式重试。
+            pass
 
     tasks.set_batch_finalizer(finalize_context_batch)
     app.state.tasks = tasks
+    app.state.metadata.recover_storage(limit=500)
     tasks.start()
     try:
         yield
     finally:
         app.state.opencode.shutdown()
         app.state.tasks.shutdown()
+        engine.dispose()
 
 
 app = FastAPI(
@@ -354,6 +367,8 @@ async def config_status(request: Request) -> dict[str, object]:
     # embedding 缓存属于运行时状态，供前端判断当前是否可以直接检索。
     engine = getattr(request.app.state, "search_engine", None)
     status["embedding_cache_ready"] = bool(engine and engine.has_cache())
+    status["database_ready"] = True
+    status["scope_id"] = "local"
     return status
 
 
@@ -385,7 +400,7 @@ async def search_images(request: Request, payload: SearchRequest) -> dict[str, l
     resolver: PathResolver = request.app.state.resolver
     mapped: list[str] = []
     for item in results or []:
-        media = _media_for_path(resolver, item)
+        media = _media_for_meme(request, str(item)) if isinstance(item, str) else None
         if media and media not in mapped:
             mapped.append(media)
         if len(mapped) >= payload.n_results:
@@ -405,16 +420,16 @@ async def generate_cache(request: Request) -> dict[str, object]:
 
 
 def _task_summary(request: Request, record: TaskRecord) -> dict[str, object]:
-    """将任务转换为列表安全摘要，不返回完整 payload 或运行日志。"""
+    """将任务转换为列表安全摘要，并附加稳定 Meme 媒体引用。"""
     data = record.as_dict(include_payload=False)
     payload = record.payload
-    related = payload.get("image_relative_path")
-    if isinstance(related, str):
+    meme_id = payload.get("meme_id")
+    if isinstance(meme_id, str):
         try:
-            image = request.app.state.resolver.resolve_file(str(Path(related).parent), Path(related).name)
-            data["image"] = {"relative_path": related, "media_url": request.app.state.resolver.media_url(image), "filename": image.name}
-        except HTTPException:
-            data["image"] = {"relative_path": related}
+            _meme_record, image = request.app.state.metadata.image_for_meme(meme_id)
+            data["image"] = {"meme_id": meme_id, "media_url": f"/media/{meme_id}", "filename": image.name}
+        except MetadataError:
+            data["image"] = {"meme_id": meme_id}
     return data
 
 
@@ -440,123 +455,128 @@ async def get_task(request: Request, task_id: str) -> dict[str, object]:
     return _task_summary(request, record)
 
 
+
 @app.get("/images", tags=["images"])
 async def list_images(
     request: Request,
-    directory: str = Query(default=""),
     search: str = Query(default=""),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=200),
 ) -> dict[str, object]:
-    """列出受控目录中的图片和子目录。"""
-    resolver: PathResolver = request.app.state.resolver
-    folder = resolver.resolve_directory(directory)
+    """按文件名筛选并分页列出当前 scope 的扁平图片。"""
+    unknown = set(request.query_params) - {"search", "page", "page_size"}
+    if unknown:
+        raise _error(400, "invalid_request", "图片列表不接受已废弃的目录参数")
+    with request.app.state.database.environment("local") as environment:
+        records = environment.memes.list(search=search, page=page, page_size=page_size)
+        total = environment.memes.count(search=search)
     items = []
-    directories = []
-    for path in sorted(folder.iterdir(), key=lambda p: p.name.casefold()):
-        if path.is_dir():
-            directories.append(path.name)
+    for record in records:
+        try:
+            image = request.app.state.metadata.blob_store.resolve(record.storage_key)
+            identity = request.app.state.metadata._identity(image)
+        except (DatabaseError, MetadataError):
             continue
-        if path.suffix.lower() not in SUPPORTED_EXTENSIONS or not path.is_file():
-            continue
-        if search and search.casefold() not in path.name.casefold():
-            continue
-        metadata_status = request.app.state.metadata.status(path)["status"]
-        embedding_record = request.app.state.metadata.embedding_record(path)
-        if metadata_status == "repair_required":
-            embedding_status = "blocked"
-        elif request.app.state.search_engine.has_cache():
-            embedding_status = "ready"
-        else:
-            embedding_status = "pending"
-        items.append(
-            {
-                "directory": directory,
-                "filename": path.name,
-                "extension": path.suffix.lower(),
-                "size": path.stat().st_size,
-                "media_url": resolver.media_url(path),
-                "metadata": request.app.state.metadata.status(path),
-                "embedding_status": embedding_status,
-            }
-        )
-    start = (page - 1) * page_size
-    return {"directory": directory, "directories": directories, "items": items[start : start + page_size], "total": len(items), "page": page, "page_size": page_size}
+        metadata_status = request.app.state.metadata.status(image)
+        items.append({"meme_id": str(record.id), "filename": record.storage_key, "extension": record.extension, "size": identity["size_bytes"], "media_url": f"/media/{record.id}", "metadata": metadata_status, "embedding_status": "ready" if request.app.state.search_engine.has_cache() and metadata_status.get("status") in {"partial", "ready"} else "blocked" if metadata_status.get("status") == "repair_required" else "pending"})
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
-@app.get("/images/directories", tags=["images"])
-async def list_directories(request: Request, parent: str = Query(default="")) -> dict[str, list[str]]:
-    """列出指定图片目录下的一级子目录。"""
-    folder = request.app.state.resolver.resolve_directory(parent)
-    return {"parent": parent, "directories": sorted((p.name for p in folder.iterdir() if p.is_dir()), key=str.casefold)}
+@app.get("/images/metadata", tags=["images"])
+async def image_metadata(
+    request: Request,
+    meme_id: str | None = Query(default=None),
+) -> dict[str, object]:
+    """按稳定 ``meme_id`` 返回当前 scope 的数据库语境记录。"""
+    if not meme_id:
+        raise _error(400, "meme_id_required", "必须提供 meme_id")
+    try:
+        _record, image = request.app.state.metadata.image_for_meme(meme_id)
+        metadata = request.app.state.metadata.load(image)
+    except MetadataError as exc:
+        status = 404 if exc.code == "metadata_missing" else 409
+        code = "meme_not_found" if exc.code == "metadata_missing" else exc.code
+        message = "图片不存在" if exc.code == "metadata_missing" else "图片元数据无法读取"
+        raise _error(status, code, message) from exc
+    payload = metadata.model_dump(mode="json", exclude_none=False)
+    payload["meme_id"] = meme_id
+    return payload
 
 
-@app.get("/media/{file_path:path}", tags=["images"])
-async def media(request: Request, file_path: str):
-    """通过受控标识返回图片内容。"""
-    path = request.app.state.resolver.resolve_file(str(Path(file_path).parent), Path(file_path).name)
+@app.get("/media/{meme_id}", tags=["images"])
+async def media(request: Request, meme_id: str):
+    """按当前 scope 的稳定 meme_id 读取经过指纹校验的图片。"""
+    try:
+        _record, path = request.app.state.metadata.image_for_meme(meme_id)
+    except MetadataError as exc:
+        raise _error(404, "meme_not_found", "图片不存在") from exc
     media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     return FileResponse(path, media_type=media_type)
 
 
-@app.post("/images/directories", status_code=201, tags=["images"])
-async def create_directory(request: Request, payload: CreateDirectoryRequest) -> dict[str, str]:
-    """创建单层图片目录，不覆盖现有目录。"""
-    if not re.fullmatch(r"[^/\\\x00-\x1f\x7f]+", payload.name) or payload.name in {".", ".."}:
-        raise _error(400, "invalid_directory", "目录名非法")
-    parent = request.app.state.resolver.resolve_directory(payload.parent)
-    target = parent / payload.name
-    if target.exists():
-        raise _error(409, "directory_exists", "目录已存在")
-    target.mkdir()
-    relative = request.app.state.resolver.relative(target)
-    return {"directory": relative}
-
-
 @app.post("/images/rename", tags=["images"])
 async def rename_image(request: Request, payload: RenameRequest) -> dict[str, str]:
-    """在原目录内安全重命名图片并拒绝覆盖。"""
+    """按稳定 meme_id 重命名图片并同步数据库 storage_key。"""
     resolver: PathResolver = request.app.state.resolver
-    source = resolver.resolve_file(payload.directory, payload.filename)
+    if not payload.meme_id:
+        raise _error(400, "meme_id_required", "必须提供 meme_id")
+    try:
+        _record, source = request.app.state.metadata.image_for_meme(payload.meme_id)
+    except MetadataError as exc:
+        raise _error(404, "meme_not_found", "图片不存在") from exc
     clean = _safe_filename(payload.new_name)
     if Path(clean).suffix.lower() != source.suffix.lower():
         clean = f"{Path(clean).stem}{source.suffix.lower()}"
+    if any(char in payload.new_name for char in "/\\") or any(ord(char) < 32 for char in payload.new_name):
+        raise _error(400, "invalid_filename", "文件名非法")
+    try:
+        validate_business_storage_key(clean)
+    except ValueError as exc:
+        raise _error(400, "invalid_filename", "文件名非法") from exc
     target = source.parent / clean
     if target.exists() and target != source:
         raise _error(409, "file_exists", "目标文件已存在")
     try:
-        request.app.state.metadata.rename(source, target)
+        metadata = request.app.state.metadata.rename_by_id(payload.meme_id, target)
     except MetadataError as exc:
         if exc.code == "target_exists":
             raise _error(409, "file_exists", "目标文件已存在")
         raise _error(500, "metadata_rename_failed", "图片元数据同步失败")
     _invalidate_search(request)
-    return {"directory": payload.directory, "filename": target.name, "media_url": resolver.media_url(target)}
+    return {"meme_id": payload.meme_id, "filename": Path(metadata.image.relative_path).name, "media_url": f"/media/{payload.meme_id}"}
 
 
 @app.post("/images/delete", tags=["images"])
 async def delete_image(request: Request, payload: DeleteRequest) -> dict[str, object]:
-    """删除图片并同步删除同目录 sidecar。"""
-    resolver: PathResolver = request.app.state.resolver
-    image = resolver.resolve_file(payload.directory, payload.filename)
+    """按稳定 meme_id 隔离文件后删除数据库记录。"""
+    if not payload.meme_id:
+        raise _error(400, "meme_id_required", "必须提供 meme_id")
     try:
-        request.app.state.metadata.remove(image)
+        record, image = request.app.state.metadata.image_for_meme(payload.meme_id)
+    except MetadataError as exc:
+        raise _error(404, "meme_not_found", "图片不存在") from exc
+    try:
+        request.app.state.metadata.remove_by_id(payload.meme_id)
     except MetadataError as exc:
         raise _error(500, exc.code, "图片及其元数据删除失败") from exc
     _invalidate_search(request)
-    return {"directory": payload.directory, "filename": payload.filename, "deleted": True}
+    return {"meme_id": payload.meme_id, "deleted": True}
 
 
 @app.post("/images/upload", tags=["images"])
 async def upload_images(
     request: Request,
-    directory: str = Form(default=""),
-    auto_name: bool = Form(default=False),
-    files: list[UploadFile] = File(...),
 ) -> dict[str, object]:
-    """逐文件校验并保存图片，批量中的失败不会回滚成功文件。"""
+    """解析扁平上传表单并逐文件校验保存，批量中的失败不会回滚成功文件。"""
+    form = await request.form()
+    unknown = set(form.keys()) - {"auto_name", "files"}
+    if unknown:
+        raise _error(400, "invalid_request", "上传不接受已废弃的目标目录字段")
+    auto_name = str(form.get("auto_name", "false")).lower() in {"1", "true", "yes", "on"}
+    files = [item for item in form.getlist("files") if hasattr(item, "filename") and hasattr(item, "read")]
+    if not files:
+        raise _error(400, "files_required", "必须上传图片文件")
     resolver: PathResolver = request.app.state.resolver
-    folder = resolver.resolve_directory(directory)
     settings: Settings = request.app.state.settings
     results = []
     for upload in files:
@@ -569,7 +589,12 @@ async def upload_images(
         if len(content) > settings.max_upload_size:
             results.append({"filename": original, "ok": False, "error": "file_too_large"})
             continue
-        target = folder / clean
+        try:
+            validate_business_storage_key(clean)
+        except ValueError:
+            results.append({"filename": original, "ok": False, "error": "invalid_filename"})
+            continue
+        target = resolver.root / clean
         if target.exists():
             results.append({"filename": original, "ok": False, "error": "file_exists"})
             continue
@@ -585,32 +610,53 @@ async def upload_images(
             results.append({"filename": original, "ok": False, "error": "invalid_image"})
             continue
         try:
-            target.write_bytes(content)
-            request.app.state.metadata.create_pending(target)
+            meme_id, saved_path = request.app.state.metadata.upload_bytes(content, target_key=clean)
         except (OSError, MetadataError):
-            target.unlink(missing_ok=True)
             results.append({"filename": original, "ok": False, "error": "metadata_write_failed"})
             continue
-        result = {"filename": original, "ok": True, "saved_filename": target.name, "media_url": resolver.media_url(target), "auto_named": False}
+        meme_id = str(meme_id)
+        target = saved_path
+        result = {"meme_id": meme_id, "filename": original, "ok": True, "saved_filename": target.name, "media_url": f"/media/{meme_id}", "auto_named": False}
         try:
             task = _submit_context_task(request, target, auto_name=auto_name)
             result["metadata_job_id"] = task.task_id
             result["metadata_job_status"] = task.status
         except (OSError, RuntimeError, MetadataError) as exc:
-            # 图片和 pending sidecar 已有效提交，语境任务可由批量补齐恢复。
+            # 图片和 pending Meme 记录已有效提交，语境任务可由批量补齐恢复。
             result["metadata_job_error"] = _context_enqueue_error(exc) if isinstance(exc, RuntimeError) else "metadata_enqueue_failed"
         result["metadata_status"] = request.app.state.metadata.status(target)["status"]
         _invalidate_search(request)
         results.append(result)
-    return {"directory": directory, "results": results}
+    return {"results": results}
 
 
 @app.post("/images/context", status_code=202, tags=["images", "tasks"])
 async def generate_context(request: Request, payload: ContextRequest) -> dict[str, object]:
     """为单张图片显式创建或复用语境生成任务。"""
-    image = request.app.state.resolver.resolve_file(payload.directory, payload.filename)
+    if payload.meme_id:
+        try:
+            record, image = request.app.state.metadata.image_for_meme(payload.meme_id)
+        except MetadataError as exc:
+            if exc.code == "metadata_image_mismatch":
+                raise _error(409, "target_changed", "图片内容已变化") from exc
+            # 只要数据库 Meme 仍存在，排队请求必须可创建；Worker 会在 claim 后以 target_changed 失败。
+            try:
+                with request.app.state.database.environment("local") as environment:
+                    record = environment.memes.get(payload.meme_id)
+            except Exception:
+                record = None
+            if record is None:
+                raise _error(404, "meme_not_found", "图片不存在") from exc
+            image = request.app.state.metadata.blob_store.root / record.storage_key
+    else:
+        raise _error(400, "meme_id_required", "必须提供 meme_id")
     try:
-        task = _submit_context_task(request, image)
+        task = _submit_context_task(request, image, expected_sha256=getattr(locals().get("record", None), "sha256", None))
+    except MetadataError as exc:
+        # 任务提交必须先记录目标指纹；文件在请求和排队之间消失时仍返回稳定 404。
+        if exc.code in {"image_unreadable", "metadata_image_mismatch", "metadata_missing"}:
+            raise _error(404, "meme_not_found", "图片不存在") from exc
+        raise _error(409, exc.code, "图片当前不可处理") from exc
     except RuntimeError as exc:
         if str(exc) == "agent_backpressure":
             raise _error(429, "agent_backpressure", "Agent 等待队列已满，请稍后重试") from exc
@@ -621,38 +667,43 @@ async def generate_context(request: Request, payload: ContextRequest) -> dict[st
 @app.post("/images/context/batch", tags=["images", "tasks"])
 async def generate_context_batch(request: Request, payload: ContextBatchRequest) -> dict[str, object]:
     """批量为缺失或未就绪图片提交独立语境任务，单项失败不影响其余项。"""
-    resolver: PathResolver = request.app.state.resolver
     batch_id = uuid4().hex
     if payload.items:
-        paths = [(item.directory, item.filename) for item in payload.items]
+        paths = [(item.meme_id, None) for item in payload.items]
     else:
-        paths = [
-            (("" if path.relative_to(request.app.state.metadata.root).parent == Path(".") else path.relative_to(request.app.state.metadata.root).parent.as_posix()), path.name)
-            for path in request.app.state.metadata.root.rglob("*")
-            if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
-        ]
+        paths = []
     results = []
-    for directory, filename in paths:
+    scheduled_task_ids: list[str] = []
+    for meme_id, _filename in paths:
         try:
-            image = resolver.resolve_file(directory, filename)
+            if not meme_id:
+                raise MetadataError("meme_id_required")
+            record, image = request.app.state.metadata.image_for_meme(meme_id)
             state = request.app.state.metadata.status(image)["status"]
-            if payload.include_unready and state not in {"pending", "partial", "repair_required"}:
-                results.append({"filename": resolver.relative(image), "skipped": "already_ready"})
+            # 显式 include_unready 请求代表强制重试；仅在调用方未开启时跳过已就绪记录。
+            if not payload.include_unready and state not in {"pending", "partial", "repair_required"}:
+                results.append({"meme_id": meme_id, "skipped": "already_ready"})
                 continue
             if state == "repair_required":
                 request.app.state.metadata.create_pending(image)
-            task = _submit_context_task(request, image, batch_id=batch_id)
-            results.append({"filename": resolver.relative(image), "task_id": task.task_id, "status": task.status})
+            task = _submit_context_task(request, image, batch_id=batch_id, expected_sha256=record.sha256)
+            scheduled_task_ids.append(task.task_id)
+            results.append({"meme_id": meme_id, "task_id": task.task_id, "status": task.status})
         except (HTTPException, MetadataError, OSError, RuntimeError) as exc:
-            results.append({"filename": filename, "error": _context_enqueue_error(exc) if isinstance(exc, RuntimeError) else getattr(exc, "code", "context_enqueue_failed")})
+            error_code = _context_enqueue_error(exc) if isinstance(exc, RuntimeError) else getattr(exc, "code", "context_enqueue_failed")
+            results.append({"meme_id": meme_id, "error": error_code})
+    # 先把整个批次的成员提交完成，再唤醒 Worker，避免首个快速任务在后续成员
+    # 入批前误判“全部完成”而提前收束 finalizer。
+    if scheduled_task_ids:
+        request.app.state.tasks.seal_batch(batch_id)
+    for task_id in scheduled_task_ids:
+        request.app.state.tasks.schedule(task_id)
     return {"batch_id": batch_id, "results": results}
 
 
 @app.post("/images/metadata/repair", status_code=202, tags=["images", "tasks"])
 async def repair_metadata(request: Request) -> dict[str, object]:
-    """提交幂等的 sidecar 初始化和修复任务。"""
-    metadata: MetadataService = request.app.state.metadata
-
+    """提交幂等的数据库元数据完整性扫描和修复任务。"""
     record = request.app.state.tasks.submit("metadata_repair", {})
     return {"task_id": record.task_id, "task_type": record.task_type, "status": record.status}
 

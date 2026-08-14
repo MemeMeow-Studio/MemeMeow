@@ -1,8 +1,4 @@
-## Purpose
-
-为浏览器前端提供受控的扁平图片库管理能力，使用户能够浏览、预览和重命名当前数据范围内的图片，同时阻断任意路径访问和覆盖风险。
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: 系统必须提供受控的扁平图片列表
 系统 MUST 只列出当前可信数据范围图片根中的 Meme，不得提供用户可见的目录层级。列表响应 MUST 返回稳定 `meme_id`、文件名、扩展名、大小、处理状态和受控媒体引用，不得返回服务器绝对路径或目录字段。列表 MUST 支持文件名筛选、分页和确定性排序。
@@ -47,6 +43,8 @@
 - **THEN** 系统返回 `404` 或一致性错误
 - **AND** 不读取其他文件
 
+## ADDED Requirements
+
 ### Requirement: 系统必须拒绝非扁平图片库存量
 系统 MUST 在 schema migration 写入扁平约束前拒绝任何非扁平 Meme 业务 key，并 MUST 在应用启动就绪检查中拒绝非扁平 Meme 记录、图片根下嵌套的受支持图片以及与数据库记录不一致的嵌套业务文件。检查 MUST 是只读的，不得自动移动、导入、重命名或删除文件。受控的内部 staging 和 quarantine key MUST NOT 被当作业务图片拒绝。
 
@@ -68,3 +66,15 @@
 - **WHEN** `.staging` 或 `.quarantine` 中存在符合存储操作协议的受控内部文件
 - **THEN** migration 和应用就绪检查不把这些内部 key 视为非扁平业务图片
 - **AND** 现有恢复流程仍可处理对应操作
+
+## REMOVED Requirements
+
+### Requirement: 系统必须安全地创建图片目录
+**Reason**: 合集成为唯一用户可见组织方式，目录会形成重复且相互冲突的分类模型。
+
+**Migration**: 不提供迁移或兼容接口；删除目录创建端点及全部前端入口。
+
+## RENAMED Requirements
+
+- FROM: `系统必须提供受控的图片目录和文件列表`
+- TO: `系统必须提供受控的扁平图片列表`
