@@ -2,6 +2,7 @@
 // MemeMeow 的主工作台：检索、图片库、异步处理与上传共享同一组任务状态。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { api, pollTask } from './api'
+import { formatAgentActivity } from './agentActivity'
 
 const page = ref('search')
 const pages = [
@@ -115,6 +116,7 @@ const embeddingStateLabel = computed(() => ({
   unknown: 'Embedding 状态未知',
 }[embeddingState.value]))
 const previewJsonText = computed(() => previewJson.value ? JSON.stringify(previewJson.value, null, 2) : '')
+const selectedTaskActivity = computed(() => formatAgentActivity(selectedTask.value))
 
 function clearError() { error.value = '' }
 function showError(reason) { error.value = reason?.message || '请求失败' }
@@ -318,8 +320,22 @@ function retryAll() {
   return retryImages(images.value.filter(isRetryable).map((item) => ({ meme_id: item.meme_id })), '重试未就绪图片')
 }
 
+/**
+ * 将文本语义索引状态转换为用户可读标签，视觉向量状态由独立标签处理。
+ * @param {string} status 后端返回的文本索引状态。
+ * @returns {string} 图片库中展示的文本索引状态文本。
+ */
 function embeddingLabel(status) {
-  return { ready: '已索引', pending: '待生成', blocked: '需修复元数据' }[status] || '未索引'
+  return { ready: '文本索引已就绪', pending: '文本索引待生成', blocked: '文本索引需修复' }[status] || '文本索引状态未知'
+}
+
+/**
+ * 将图片视觉向量状态转换为用户可读标签，和文本语义索引状态保持独立。
+ * @param {string} status 后端返回的视觉向量状态。
+ * @returns {string} 图片库中展示的视觉向量状态文本。
+ */
+function visualEmbeddingLabel(status) {
+  return { ready: '图片向量已就绪', pending: '图片向量待生成' }[status] || '图片向量状态未知'
 }
 
 /**
@@ -337,7 +353,7 @@ function taskStatusLabel(status) {
  * @returns {string} 用于列表和详情面板的任务名称。
  */
 function taskTypeLabel(type) {
-  return { meme_context_generation: '语境生成', cache_generation: '检索缓存', metadata_repair: '元数据修复' }[type] || type || '未知任务'
+  return { meme_context_generation: '语境生成', cache_generation: '检索缓存', metadata_repair: '元数据修复', visual_embedding_generation: '图片向量生成' }[type] || type || '未知任务'
 }
 
 /**
@@ -358,7 +374,16 @@ function formatTaskTime(value) {
  * @returns {string} 供列表按钮 aria-label 使用的完整描述。
  */
 function taskRowAriaLabel(item) {
-  return [taskStatusLabel(item.status), taskTypeLabel(item.task_type), item.image?.filename || '无关联图片'].filter(Boolean).join('，')
+  return [taskStatusLabel(item.status), taskTypeLabel(item.task_type), item.image?.filename || '无关联图片', taskActivity(item)?.ariaLabel].filter(Boolean).join('，')
+}
+
+/**
+ * 将任务 API 的可选 Agent 活跃度转换为可展示视图模型。
+ * @param {object} item 任务列表或详情中的安全任务摘要。
+ * @returns {{turns:string,lastActivity:string,ariaLabel:string}|null} 完整活动值，缺失时返回 null。
+ */
+function taskActivity(item) {
+  return formatAgentActivity(item)
 }
 
 /**
@@ -717,7 +742,7 @@ onBeforeUnmount(() => {
           <div class="section-head"><div><h1>图片库</h1><p>浏览、筛选和整理本地图片。</p></div></div>
           <div class="toolbar" aria-label="图片库工具"><input v-model="filter" aria-label="筛选文件名" placeholder="筛选文件名" @keyup.enter="loadLibrary" /><button type="button" @click="loadLibrary">刷新</button><span class="toolbar-spacer"></span><div class="toolbar-group library-operations"><button class="quiet" type="button" :class="{ active: selectionMode }" :aria-pressed="selectionMode" @click="toggleSelectionMode">{{ selectionMode ? '完成选择' : '选择图片' }}</button><button class="quiet" type="button" :disabled="retryBusy || !selectedCount" @click="openCollectionDialog">加入合集<span v-if="selectedCount">（{{ selectedCount }}）</span></button><button class="quiet" type="button" :disabled="retryBusy || !selectedRetryableCount" @click="retrySelected">重试选中<span v-if="selectedRetryableCount">（{{ selectedRetryableCount }}）</span></button><button class="primary toolbar-primary" type="button" :disabled="retryBusy || !images.some(isRetryable)" @click="retryAll">{{ retryBusy ? '提交中...' : '重试所有未就绪' }}</button><button class="primary toolbar-primary cache-action" type="button" :disabled="cacheGenerating || !config" :aria-busy="cacheGenerating" :title="cacheButtonTitle" @click="generateCache">{{ cacheButtonLabel }}</button><span v-if="cacheTask || cacheBusy" class="cache-status" :class="cacheTask?.status || 'running'" role="status" aria-live="polite" aria-atomic="true"><span class="cache-status-dot" aria-hidden="true"></span><span>{{ cacheTaskStatusLabel }}</span><b v-if="cacheTask?.progress != null">{{ Math.round(cacheTask.progress * 100) }}%</b></span></div></div>
           <div v-if="retryNotice" class="inline-notice" role="status">{{ retryNotice }}</div>
-          <div class="library-list" role="list"><article v-for="item in images" :key="imageKey(item)" class="library-row" role="listitem"><label v-if="selectionMode" class="image-check"><input type="checkbox" :checked="selectedImages.has(imageKey(item))" :disabled="retryBusy" :aria-label="`选择 ${item.filename}`" @change="toggleImageSelection(item)" /><span aria-hidden="true"></span></label><button class="library-preview-trigger" type="button" :aria-label="`查看 ${item.filename} 图片与元数据`" @click="openImagePreview(item, $event)"><img :src="item.media_url" :alt="`预览 ${item.filename}`" loading="lazy" /></button><div class="file-meta"><strong :title="item.filename">{{ item.filename }}</strong><small>{{ Math.ceil(item.size / 1024) }} KB · {{ item.extension }}</small></div><span class="metadata-state" :class="item.metadata?.status || 'unknown'">{{ metadataLabel(item.metadata?.status) }}</span><span class="embedding-state" :class="item.embedding_status || 'unknown'">{{ embeddingLabel(item.embedding_status) }}</span><button class="quiet metadata-button" type="button" @click="openImagePreview(item, $event)">查看元数据</button><button class="quiet" type="button" @click="rename(item)">重命名</button></article><div v-if="!images.length" class="empty-state compact"><h2>图片库还没有图片</h2><p>上传图片后，它们会出现在这里。</p></div></div>
+          <div class="library-list" role="list"><article v-for="item in images" :key="imageKey(item)" class="library-row" role="listitem"><label v-if="selectionMode" class="image-check"><input type="checkbox" :checked="selectedImages.has(imageKey(item))" :disabled="retryBusy" :aria-label="`选择 ${item.filename}`" @change="toggleImageSelection(item)" /><span aria-hidden="true"></span></label><button class="library-preview-trigger" type="button" :aria-label="`查看 ${item.filename} 图片与元数据`" @click="openImagePreview(item, $event)"><img :src="item.media_url" :alt="`预览 ${item.filename}`" loading="lazy" /></button><div class="file-meta"><strong :title="item.filename">{{ item.filename }}</strong><small>{{ Math.ceil(item.size / 1024) }} KB · {{ item.extension }}</small></div><span class="metadata-state" :class="item.metadata?.status || 'unknown'">{{ metadataLabel(item.metadata?.status) }}</span><span class="embedding-state" :class="item.embedding_status || 'unknown'">{{ embeddingLabel(item.embedding_status) }}</span><span class="visual-embedding-state" :class="item.visual_embedding_status || 'unknown'">{{ visualEmbeddingLabel(item.visual_embedding_status) }}</span><button class="quiet metadata-button" type="button" @click="openImagePreview(item, $event)">查看元数据</button><button class="quiet" type="button" @click="rename(item)">重命名</button></article><div v-if="!images.length" class="empty-state compact"><h2>图片库还没有图片</h2><p>上传图片后，它们会出现在这里。</p></div></div>
         </section>
         <section v-else-if="page === 'upload'" class="workspace narrow">
           <div class="section-head"><div><h1>上传图片</h1><p>支持 PNG、JPG、JPEG 和 GIF。</p></div></div>
@@ -736,9 +761,9 @@ onBeforeUnmount(() => {
         <section v-else class="workspace task-workspace" :class="{ detail: selectedTask }">
           <div class="section-head"><div><h1>处理任务</h1></div><button class="quiet" type="button" :disabled="taskLoading" @click="loadTasks">刷新</button></div>
           <div class="task-toolbar"><label>状态<select v-model="taskStatus" aria-label="按状态筛选" @change="loadTasks"><option value="">全部</option><option value="queued">排队中</option><option value="running">处理中</option><option value="succeeded">已完成</option><option value="failed">失败</option></select></label><label>类型<select v-model="taskType" aria-label="按类型筛选" @change="loadTasks"><option value="">全部</option><option value="meme_context_generation">语境生成</option><option value="cache_generation">检索缓存</option><option value="metadata_repair">元数据修复</option></select></label></div>
-          <div class="task-table" :class="{ loading: taskLoading }" role="table" aria-label="处理任务列表"><div class="task-head" role="row"><span role="columnheader">状态</span><span role="columnheader">类型</span><span role="columnheader">关联图片</span><span role="columnheader">进度</span><span role="columnheader">最近更新</span></div><button v-for="item in taskItems" :key="item.task_id" class="task-row" :class="{ selected: selectedTask?.task_id === item.task_id }" type="button" role="row" :aria-label="taskRowAriaLabel(item)" @click="openTask(item.task_id)"><span class="task-status-cell" role="cell"><i :class="`status-dot ${item.status}`" aria-hidden="true"></i>{{ taskStatusLabel(item.status) }}</span><span class="task-type-cell" role="cell" data-label="类型"><span>{{ taskTypeLabel(item.task_type) }}</span></span><span class="task-image" role="cell" data-label="图片">{{ item.image?.filename || '—' }}</span><span class="task-progress" role="cell" data-label="进度">{{ item.progress == null ? '—' : `${Math.round(item.progress * 100)}%` }}</span><time role="cell">{{ formatTaskTime(item.updated_at) }}</time></button><div v-if="taskLoading && !taskItems.length" class="task-skeleton" v-for="n in 5" :key="n"></div><div v-if="!taskLoading && !taskItems.length" class="empty-state compact"><h2>没有匹配的任务</h2><p>调整筛选条件后再试。</p></div></div>
+          <div class="task-table" :class="{ loading: taskLoading }" role="table" aria-label="处理任务列表"><div class="task-head" role="row"><span role="columnheader">状态</span><span role="columnheader">类型</span><span role="columnheader">关联图片</span><span role="columnheader">进度</span><span role="columnheader">最近更新</span></div><button v-for="item in taskItems" :key="item.task_id" class="task-row" :class="{ selected: selectedTask?.task_id === item.task_id }" type="button" role="row" :aria-label="taskRowAriaLabel(item)" @click="openTask(item.task_id)"><span class="task-status-cell" role="cell"><i :class="`status-dot ${item.status}`" aria-hidden="true"></i>{{ taskStatusLabel(item.status) }}</span><span class="task-type-cell" role="cell" data-label="类型"><span>{{ taskTypeLabel(item.task_type) }}</span><span v-if="taskActivity(item)" class="task-activity" :aria-label="taskActivity(item).ariaLabel"><b>{{ taskActivity(item).turns }}</b><time>{{ taskActivity(item).lastActivity }}</time></span></span><span class="task-image" role="cell" data-label="图片">{{ item.image?.filename || '—' }}</span><span class="task-progress" role="cell" data-label="进度">{{ item.progress == null ? '—' : `${Math.round(item.progress * 100)}%` }}</span><time role="cell">{{ formatTaskTime(item.updated_at) }}</time></button><div v-if="taskLoading && !taskItems.length" class="task-skeleton" v-for="n in 5" :key="n"></div><div v-if="!taskLoading && !taskItems.length" class="empty-state compact"><h2>没有匹配的任务</h2><p>调整筛选条件后再试。</p></div></div>
           <button v-if="taskCursor" class="quiet load-more" type="button" @click="loadTasks({ append: true })">加载更多</button>
-          <aside v-if="selectedTask" class="task-drawer" role="dialog" aria-modal="true" aria-label="任务详情"><div class="drawer-head"><h2>任务详情</h2><button class="quiet" type="button" aria-label="关闭任务详情" @click="selectedTask = null">关闭</button></div><dl><div><dt>状态</dt><dd>{{ taskStatusLabel(selectedTask.status) }}</dd></div><div><dt>类型</dt><dd>{{ taskTypeLabel(selectedTask.task_type) }}</dd></div><div><dt>阶段</dt><dd>{{ selectedTask.message || '—' }}</dd></div><div><dt>创建时间</dt><dd>{{ formatTaskTime(selectedTask.created_at) }}</dd></div><div><dt>完成时间</dt><dd>{{ formatTaskTime(selectedTask.completed_at) }}</dd></div><div v-if="selectedTask.error"><dt>错误</dt><dd>{{ selectedTask.error.error }}</dd></div><div v-if="selectedTask.result?.auto_named !== undefined"><dt>自动命名</dt><dd>{{ selectedTask.result.auto_named ? selectedTask.result.saved_filename : selectedTask.result.auto_name_error || '未执行' }}</dd></div></dl><button v-if="selectedTask.task_type === 'meme_context_generation' && selectedTask.status === 'failed'" class="primary" type="button" @click="retryTask">重试</button></aside>
+          <aside v-if="selectedTask" class="task-drawer" role="dialog" aria-modal="true" aria-label="任务详情"><div class="drawer-head"><h2>任务详情</h2><button class="quiet" type="button" aria-label="关闭任务详情" @click="selectedTask = null">关闭</button></div><dl><div><dt>状态</dt><dd>{{ taskStatusLabel(selectedTask.status) }}</dd></div><div><dt>类型</dt><dd>{{ taskTypeLabel(selectedTask.task_type) }}</dd></div><div><dt>阶段</dt><dd>{{ selectedTask.message || '—' }}</dd></div><div v-if="selectedTaskActivity" class="task-activity-detail"><dt>Agent 工作回合</dt><dd><strong>{{ selectedTaskActivity.turns }}</strong><time>最近活动 {{ selectedTaskActivity.lastActivity }}</time><small>工作回合仅表示 Agent 活动，不代表任务完成进度。</small></dd></div><div><dt>创建时间</dt><dd>{{ formatTaskTime(selectedTask.created_at) }}</dd></div><div><dt>完成时间</dt><dd>{{ formatTaskTime(selectedTask.completed_at) }}</dd></div><div v-if="selectedTask.error"><dt>错误</dt><dd>{{ selectedTask.error.error }}</dd></div><div v-if="selectedTask.result?.auto_named !== undefined"><dt>自动命名</dt><dd>{{ selectedTask.result.auto_named ? selectedTask.result.saved_filename : selectedTask.result.auto_name_error || '未执行' }}</dd></div></dl><button v-if="selectedTask.task_type === 'meme_context_generation' && selectedTask.status === 'failed'" class="primary" type="button" @click="retryTask">重试</button></aside>
         </section>
       </main>
     </div>

@@ -196,11 +196,30 @@ describe('App', () => {
     expect(wrapper.get('.embedding-global').text()).toBe('Embedding 生成失败')
   })
 
-  it('可选择未就绪图片并提交定向重试任务，同时显示 embedding 状态', async () => {
+  it('任务列表和详情展示完整的 Agent 工作回合摘要', async () => {
+    const activity = {
+      task_id: 'context-activity', task_type: 'meme_context_generation', status: 'running', progress: 0.1,
+      message: '正在提交 Agent executor 任务', image: { filename: 'sample.png', meme_id: 'sample' },
+      agent_completed_turns: 3, agent_turn_running: true, agent_last_activity_at: new Date().toISOString(),
+    }
+    tasks.mockResolvedValue({ items: [activity], next_cursor: null })
+    task.mockResolvedValue(activity)
+    const wrapper = mount(App)
+    await flushPromises()
+    await wrapper.findAll('.sidebar nav button').find((button) => button.text().includes('处理任务')).trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.task-activity').text()).toContain('第 4 轮进行中')
+    await wrapper.get('.task-row').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.task-activity-detail').text()).toContain('Agent 工作回合')
+    expect(wrapper.get('.task-activity-detail').text()).toContain('第 4 轮进行中')
+  })
+
+  it('可选择未就绪图片并提交定向重试任务，同时显示文本和图片 embedding 状态', async () => {
     images.mockResolvedValue({
       items: [
-        { meme_id: '33333333-3333-4333-8333-333333333333', filename: 'pending.png', size: 10, extension: '.png', media_url: '/media/33333333-3333-4333-8333-333333333333', metadata: { status: 'pending' }, embedding_status: 'blocked' },
-        { meme_id: '44444444-4444-4444-8444-444444444444', filename: 'ready.png', size: 10, extension: '.png', media_url: '/media/44444444-4444-4444-8444-444444444444', metadata: { status: 'ready' }, embedding_status: 'ready' },
+        { meme_id: '33333333-3333-4333-8333-333333333333', filename: 'pending.png', size: 10, extension: '.png', media_url: '/media/33333333-3333-4333-8333-333333333333', metadata: { status: 'repair_required' }, embedding_status: 'blocked', visual_embedding_status: 'pending' },
+        { meme_id: '44444444-4444-4444-8444-444444444444', filename: 'ready.png', size: 10, extension: '.png', media_url: '/media/44444444-4444-4444-8444-444444444444', metadata: { status: 'ready' }, embedding_status: 'ready', visual_embedding_status: 'ready' },
       ],
 
     })
@@ -216,12 +235,14 @@ describe('App', () => {
     await wrapper.get('.toolbar button:nth-last-child(2)').trigger('click')
     await flushPromises()
     expect(contextBatch).toHaveBeenCalledWith({ items: [{ meme_id: '33333333-3333-4333-8333-333333333333' }], include_unready: true })
-    expect(wrapper.text()).toContain('已索引')
+    expect(wrapper.text()).toContain('文本索引已就绪')
+    expect(wrapper.findAll('.visual-embedding-state')[0].text()).toBe('图片向量待生成')
+    expect(wrapper.findAll('.visual-embedding-state')[1].text()).toBe('图片向量已就绪')
   })
 
   it('图片库点击图片会打开放大预览并显示完整 JSON', async () => {
     images.mockResolvedValue({
-      items: [{ meme_id: '55555555-5555-4555-8555-555555555555', filename: 'pending.png', size: 10, extension: '.png', media_url: '/media/55555555-5555-4555-8555-555555555555', metadata: { status: 'pending' }, embedding_status: 'pending' }],
+      items: [{ meme_id: '55555555-5555-4555-8555-555555555555', filename: 'pending.png', size: 10, extension: '.png', media_url: '/media/55555555-5555-4555-8555-555555555555', metadata: { status: 'pending' }, embedding_status: 'pending', visual_embedding_status: 'pending' }],
     })
     imageMetadata.mockResolvedValue({ schema_version: 1, image: { relative_path: 'work/pending.png' }, context_status: 'pending', meme_context: { summary: '等待处理' } })
     const wrapper = mount(App, { attachTo: document.body })

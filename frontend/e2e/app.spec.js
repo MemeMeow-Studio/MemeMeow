@@ -21,6 +21,29 @@ test('搜索表单拒绝空查询并保留工作区', async ({ page }) => {
   await expect(submit).toBeEnabled()
 })
 
+/** 使用真实浏览器核对文本索引和图片视觉向量不会被混成同一个状态。 */
+test('图片库分别显示文本索引和图片向量状态', async ({ page }) => {
+  await page.route('**/api/config', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ embedding_model: 'test-model', embedding_cache_ready: true }) }))
+  await page.route('**/api/images?**', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      items: [
+        { meme_id: '33333333-3333-4333-8333-333333333333', filename: 'pending.png', size: 1024, extension: '.png', media_url: '/media/33333333-3333-4333-8333-333333333333', metadata: { status: 'pending' }, embedding_status: 'pending', visual_embedding_status: 'ready' },
+        { meme_id: '44444444-4444-4444-8444-444444444444', filename: 'ready.png', size: 2048, extension: '.png', media_url: '/media/44444444-4444-4444-8444-444444444444', metadata: { status: 'ready' }, embedding_status: 'ready', visual_embedding_status: 'pending' },
+      ],
+      total: 2,
+      page: 1,
+      page_size: 50,
+    }),
+  }))
+
+  await page.goto('/')
+  await page.getByRole('button', { name: '图片库' }).click()
+  await expect(page.locator('.embedding-state')).toHaveText(['文本索引待生成', '文本索引已就绪'])
+  await expect(page.locator('.visual-embedding-state')).toHaveText(['图片向量已就绪', '图片向量待生成'])
+})
+
 /** 使用真实 Chromium 验证延迟网络下仍保持图片写入手势，并读取系统剪贴板确认没有文本或 URL。 */
 test('检索结果在延迟加载后仍只写入图片剪贴板', async ({ page, context }) => {
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')

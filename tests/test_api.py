@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import zipfile
 import os
 import threading
 import time
@@ -15,6 +16,7 @@ from PIL import Image
 from sqlalchemy import text
 
 from api import app
+from backend.collection_packages import CollectionManifest, CollectionManifestCollection, CollectionManifestMember, serialize_manifest, sha256_bytes
 from backend.database import create_engine_for_url
 
 
@@ -88,6 +90,31 @@ def png_bytes(color: str = "red") -> bytes:
     return output.getvalue()
 
 
+def collection_zip_bytes() -> bytes:
+    """生成包含一张图片的最小合集包，验证导入任务衔接。"""
+    content = png_bytes("green")
+    source_id = uuid4().hex
+    member = CollectionManifestMember(
+        source_meme_id=source_id,
+        filename_at_export="imported.png",
+        path=f"images/{source_id}.png",
+        extension=".png",
+        size_bytes=len(content),
+        sha256=sha256_bytes(content),
+    )
+    manifest = CollectionManifest(
+        format="mememeow-collection",
+        format_version=1,
+        collection=CollectionManifestCollection(name=f"导入测试-{source_id[:8]}"),
+        members=[member],
+    )
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("manifest.json", serialize_manifest(manifest))
+        archive.writestr(member.path, content)
+    return output.getvalue()
+
+
 def test_config_is_masked_and_search_requires_cache(client):
     """配置响应不泄露密钥，缓存未就绪时搜索返回规范错误。"""
     test_client, _ = client
@@ -100,6 +127,32 @@ def test_config_is_masked_and_search_requires_cache(client):
     response = test_client.post("/search", json={"query": "开心"})
     assert response.status_code == 503
     assert response.json()["error"] == "cache_not_ready"
+
+
+def test_startup_allows_root_orphan_files_without_listing_them(tmp_path, monkeypatch):
+    """启动预检允许根目录孤立图片，并继续只从数据库列出可信 Meme。"""
+    test_url = os.getenv("MEMEMEOW_TEST_DATABASE_URL")
+    if not test_url:
+        pytest.skip("未设置 MEMEMEOW_TEST_DATABASE_URL，跳过 API PostgreSQL 测试")
+    image_root = tmp_path / "images"
+    image_root.mkdir(parents=True)
+    orphan = image_root / "legacy.png"
+    orphan.write_bytes(png_bytes())
+    monkeypatch.setenv("MEMEMEOW_DATABASE_URL", test_url)
+    monkeypatch.setenv("MEMEMEOW_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("MEMEMEOW_IMAGE_ROOT", str(image_root))
+    monkeypatch.setenv("EMBEDDING_API_KEY", "")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "")
+    monkeypatch.setenv("MEMEMEOW_OPENCODE_MODEL", "")
+    _clear_test_scope()
+    with TestClient(app) as test_client:
+        health = test_client.get("/health")
+        assert health.status_code == 200
+        assert health.json()["storage_preflight"] == {"status": "warning", "orphan_files": 1, "blocking_errors": {}}
+        assert test_client.get("/config").json()["storage_preflight"] == health.json()["storage_preflight"]
+        assert test_client.get("/images").json()["total"] == 0
+        assert orphan.is_file()
+    _clear_test_scope()
 
 
 @pytest.mark.parametrize("payload", [{"query": ""}, {"query": "x", "n_results": 0}, {"query": "x", "n_results": 31}, {"query": "x", "n_results": "5"}])
@@ -137,6 +190,22 @@ def test_upload_lists_and_serves_image(client):
     assert listed["media_url"] == f"/media/{meme_id}"
     assert listed["metadata"]["status"] == "pending"
     assert listed["embedding_status"] == "pending"
+
+
+def test_multi_upload_seals_visual_batch(client):
+    """多图上传必须把视觉任务登记到批次后再封口，不能返回 batch_not_found。"""
+    test_client, _ = client
+    response = test_client.post(
+        "/images/upload",
+        files=[
+            ("files", ("batch-a.png", png_bytes("red"), "image/png")),
+            ("files", ("batch-b.png", png_bytes("blue"), "image/png")),
+        ],
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["batch_id"]
+    assert all(item["ok"] and item["visual_task_id"] for item in payload["results"])
 
 
 def test_image_metadata_returns_complete_database_record(client):
@@ -192,6 +261,19 @@ def test_upload_queues_context_job_and_removed_vlm_routes_are_not_found(client):
     assert test_client.get(f"/tasks/{item['metadata_job_id']}").status_code == 200
     assert test_client.post("/images/describe", json={"filename": "pending.png"}).status_code == 404
     assert test_client.post("/images/label-batch", json={"items": []}).status_code == 404
+
+
+def test_collection_import_starts_with_visual_task(client):
+    """合集导入后的新 Meme 必须先进入视觉任务，而不是直接进入 Agent。"""
+    test_client, _ = client
+    response = test_client.post("/collections/import", files={"file": ("import.zip", collection_zip_bytes(), "application/zip")})
+    assert response.status_code == 200
+    item = response.json()["results"][0]
+    assert item["ok"] is True
+    assert item["visual_task_id"] == item["metadata_job_id"]
+    task = test_client.get(f"/tasks/{item['visual_task_id']}")
+    assert task.status_code == 200
+    assert task.json()["task_type"] == "visual_embedding_generation"
 
 
 def test_removed_directory_contract_and_rename_conflicts(client):
@@ -360,7 +442,7 @@ def test_parallel_context_batch_writes_independent_database_records_and_merges_c
             sessions.append(image.name)
             started.wait(timeout=2)
             return {
-                "title": image.stem,
+                "title": image.stem.replace("-", " "),
                 "summary": "并发测试",
                 "subjects": [image.name],
                 "visible_text": [],
