@@ -19,10 +19,14 @@ from dotenv import dotenv_values
 from pydantic import AliasChoices, Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from backend.visual_models import ACTIVE_VISUAL_MODEL_ID, active_visual_model_spec, source_repository_valid, visual_model_spec
+from executor.token import ExecutorTokenError, read_token_file
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONCURRENCY_ENV = "MEMEMEOW_OPENCODE_CONCURRENCY"
 SETTINGS_TOKEN_ENV = "MEMEMEOW_SETTINGS_ADMIN_TOKEN"
+_ACTIVE_VISUAL_SPEC = active_visual_model_spec()
 
 
 class Settings(BaseSettings):
@@ -43,6 +47,31 @@ class Settings(BaseSettings):
     embedding_api_key: str | None = Field(default=None, validation_alias=AliasChoices("EMBEDDING_API_KEY", "embedding_api_key"), repr=False)
     embedding_base_url: str | None = Field(default=None, validation_alias=AliasChoices("EMBEDDING_BASE_URL", "embedding_base_url"))
     embedding_model: str = Field(default="BAAI/bge-m3", validation_alias=AliasChoices("EMBEDDING_MODEL", "embedding_model"))
+    # 当前视觉空间固定为 DINOv2 ViT-B/14；源码和权重均不随主后端镜像分发。
+    visual_model: str = Field(default=ACTIVE_VISUAL_MODEL_ID, validation_alias=AliasChoices("MEMEMEOW_VISUAL_MODEL", "VISUAL_MODEL", "visual_model"))
+    visual_model_dimensions: int = Field(default=_ACTIVE_VISUAL_SPEC.dimensions, ge=1, le=8192, validation_alias=AliasChoices("MEMEMEOW_VISUAL_DIMENSIONS", "MEMEMEOW_VISUAL_EMBEDDING_DIMENSIONS", "VISUAL_MODEL_DIMENSIONS", "visual_model_dimensions"))
+    visual_preprocess_version: str = Field(default=_ACTIVE_VISUAL_SPEC.preprocess_version, min_length=1, max_length=128, validation_alias=AliasChoices("MEMEMEOW_VISUAL_PREPROCESS_VERSION", "VISUAL_PREPROCESS_VERSION", "visual_preprocess_version"))
+    visual_weights_path: Path | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_VISUAL_WEIGHTS_PATH", "VISUAL_WEIGHTS_PATH", "visual_weights_path"))
+    visual_weights_sha256: str | None = Field(default=None, min_length=64, max_length=64, validation_alias=AliasChoices("MEMEMEOW_VISUAL_WEIGHTS_SHA256", "VISUAL_WEIGHTS_SHA256", "visual_weights_sha256"))
+    visual_internal_url: str = Field(default="http://127.0.0.1:8276/internal/visual-embedding", validation_alias=AliasChoices("MEMEMEOW_VISUAL_INTERNAL_URL", "VISUAL_INTERNAL_URL", "visual_internal_url"))
+    visual_health_url: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_VISUAL_HEALTH_URL", "VISUAL_HEALTH_URL", "visual_health_url"))
+    visual_search_internal_url: str = Field(default="http://127.0.0.1:8275/internal/visual-search/match", validation_alias=AliasChoices("MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL", "VISUAL_SEARCH_INTERNAL_URL", "visual_search_internal_url"))
+    # Agent 容器内的回调地址与后端自身地址分离，Compose 模式使用服务 DNS。
+    agent_reverse_image_internal_url: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_AGENT_REVERSE_IMAGE_INTERNAL_URL", "agent_reverse_image_internal_url"))
+    agent_visual_search_internal_url: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_AGENT_VISUAL_SEARCH_INTERNAL_URL", "agent_visual_search_internal_url"))
+    # API 只通过 Compose 内网 executor URL 调用 Agent；不会启动 Docker CLI。
+    agent_executor_url: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_AGENT_EXECUTOR_URL", "agent_executor_url"))
+    agent_executor_token: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_AGENT_EXECUTOR_TOKEN", "agent_executor_token"), repr=False)
+    agent_executor_token_file: Path | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_AGENT_EXECUTOR_TOKEN_FILE", "agent_executor_token_file"), repr=False)
+    agent_executor_request_timeout_seconds: int = Field(default=1810, ge=1, le=7200, validation_alias=AliasChoices("MEMEMEOW_AGENT_EXECUTOR_REQUEST_TIMEOUT_SECONDS", "agent_executor_request_timeout_seconds"))
+    agent_executor_max_timeout_seconds: int = Field(default=1800, ge=1, le=7200, validation_alias=AliasChoices("MEMEMEOW_AGENT_EXECUTOR_MAX_TIMEOUT_SECONDS", "agent_executor_max_timeout_seconds"))
+    visual_internal_token: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_VISUAL_INTERNAL_TOKEN", "VISUAL_INTERNAL_TOKEN", "visual_internal_token"), repr=False)
+    visual_model_repo: Path | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_VISUAL_MODEL_REPO", "VISUAL_MODEL_REPO", "visual_model_repo"))
+    visual_cpu_threads: int = Field(default=4, ge=1, le=128, validation_alias=AliasChoices("MEMEMEOW_VISUAL_CPU_THREADS", "VISUAL_CPU_THREADS", "visual_cpu_threads"))
+    visual_cpu_interop_threads: int = Field(default=1, ge=1, le=32, validation_alias=AliasChoices("MEMEMEOW_VISUAL_CPU_INTEROP_THREADS", "VISUAL_CPU_INTEROP_THREADS", "visual_cpu_interop_threads"))
+    visual_concurrency: int = Field(default=1, ge=1, le=8, validation_alias=AliasChoices("MEMEMEOW_VISUAL_CONCURRENCY", "VISUAL_CONCURRENCY", "visual_concurrency"))
+    visual_max_pixels: int = Field(default=25_000_000, ge=1, le=100_000_000, validation_alias=AliasChoices("MEMEMEOW_VISUAL_MAX_PIXELS", "VISUAL_MAX_PIXELS", "visual_max_pixels"))
+    visual_request_timeout_seconds: int = Field(default=120, ge=1, le=3600, validation_alias=AliasChoices("MEMEMEOW_VISUAL_REQUEST_TIMEOUT_SECONDS", "VISUAL_REQUEST_TIMEOUT_SECONDS", "visual_request_timeout_seconds"))
     llm_enhance_model: str | None = Field(default=None, validation_alias=AliasChoices("LLM_ENHANCE_MODEL", "llm_enhance_model"))
     protected_mode: bool = Field(default=False, validation_alias=AliasChoices("MEMEMEOW_PROTECTED_MODE", "protected_mode"))
     allowed_endpoints: tuple[str, ...] = Field(default=("/", "/health", "/search", "/config", "/tasks"), validation_alias=AliasChoices("MEMEMEOW_ALLOWED_ENDPOINTS", "allowed_endpoints"))
@@ -51,16 +80,35 @@ class Settings(BaseSettings):
     rate_limit_window: int = Field(default=60, ge=1, validation_alias=AliasChoices("MEMEMEOW_RATE_LIMIT_WINDOW", "rate_limit_window"))
     max_upload_size: int = Field(default=20 * 1024 * 1024, ge=1, validation_alias=AliasChoices("MEMEMEOW_MAX_UPLOAD_SIZE", "max_upload_size"))
     opencode_executable: str | None = Field(default="opencode", validation_alias=AliasChoices("MEMEMEOW_OPENCODE_EXECUTABLE", "opencode_executable"))
+    # 生产部署由 Compose 注入容器名称；留空仅用于不依赖 Docker 的离线单元夹具。
+    agent_container_name: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_AGENT_CONTAINER_NAME", "agent_container_name"))
+    agent_container_runtime: str = Field(default="docker", validation_alias=AliasChoices("MEMEMEOW_AGENT_CONTAINER_RUNTIME", "agent_container_runtime"))
+    agent_runtime_mode: str = Field(default="auto", validation_alias=AliasChoices("MEMEMEOW_AGENT_RUNTIME_MODE", "agent_runtime_mode"))
     opencode_model: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_MODEL", "opencode_model"))
     opencode_base_url: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_BASE_URL", "opencode_base_url"))
     opencode_api_key: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_API_KEY", "opencode_api_key"), repr=False)
+    serpapi_api_key: str | None = Field(default=None, validation_alias=AliasChoices("SERPAPI_API_KEY", "serpapi_api_key"), repr=False)
+    reverse_image_cache_root: Path | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_REVERSE_IMAGE_CACHE_ROOT", "reverse_image_cache_root"))
+    reverse_image_internal_url: str = Field(default="http://127.0.0.1:8275/internal/reverse-image/search", validation_alias=AliasChoices("MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL", "reverse_image_internal_url"))
     opencode_runtime_root: Path | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_RUNTIME_ROOT", "opencode_runtime_root"))
     opencode_timeout_seconds: int = Field(default=300, ge=1, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_TIMEOUT_SECONDS", "opencode_timeout_seconds"))
     # 保留旧配置字段供部署和外部调用方读取；OpenCode 输出现在通过临时文件流式承接，不再按该值截断。
     opencode_max_output_bytes: int = Field(default=2 * 1024 * 1024, ge=1024, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_MAX_OUTPUT_BYTES", "opencode_max_output_bytes"))
     opencode_node_modules: Path | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_NODE_MODULES", "opencode_node_modules"))
+    agent_result_max_bytes: int = Field(default=1024 * 1024, ge=1024, le=16 * 1024 * 1024, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESULT_MAX_BYTES", "agent_result_max_bytes"))
+    agent_result_retention_days: int = Field(default=14, ge=1, le=365, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESULT_RETENTION_DAYS", "agent_result_retention_days"))
+    agent_result_max_tasks: int = Field(default=500, ge=1, le=10000, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESULT_MAX_TASKS", "agent_result_max_tasks"))
     opencode_concurrency: int = Field(default=1, ge=1, le=8, validation_alias=AliasChoices(CONCURRENCY_ENV, "opencode_concurrency"))
     agent_backpressure: int = Field(default=32, ge=1, le=500, validation_alias=AliasChoices("MEMEMEOW_AGENT_BACKPRESSURE", "agent_backpressure"))
+    database_url: str = Field(default="postgresql+psycopg://mememeow:mememeow@127.0.0.1:5434/mememeow", validation_alias=AliasChoices("MEMEMEOW_DATABASE_URL", "database_url"), repr=False)
+    database_pool_size: int = Field(default=5, ge=1, le=100, validation_alias=AliasChoices("MEMEMEOW_DATABASE_POOL_SIZE", "database_pool_size"))
+    database_max_overflow: int = Field(default=10, ge=0, le=100, validation_alias=AliasChoices("MEMEMEOW_DATABASE_MAX_OVERFLOW", "database_max_overflow"))
+    database_pool_timeout: int = Field(default=10, ge=1, le=300, validation_alias=AliasChoices("MEMEMEOW_DATABASE_POOL_TIMEOUT", "database_pool_timeout"))
+    database_pool_recycle: int = Field(default=1800, ge=60, le=86400, validation_alias=AliasChoices("MEMEMEOW_DATABASE_POOL_RECYCLE", "database_pool_recycle"))
+    embedding_dimensions: int = Field(default=1024, validation_alias=AliasChoices("MEMEMEOW_EMBEDDING_DIMENSIONS", "embedding_dimensions"))
+    worker_lease_seconds: int = Field(default=120, ge=10, le=3600, validation_alias=AliasChoices("MEMEMEOW_WORKER_LEASE_SECONDS", "worker_lease_seconds"))
+    worker_heartbeat_seconds: int = Field(default=30, ge=1, le=120, validation_alias=AliasChoices("MEMEMEOW_WORKER_HEARTBEAT_SECONDS", "worker_heartbeat_seconds"))
+    worker_max_attempts: int = Field(default=3, ge=1, le=20, validation_alias=AliasChoices("MEMEMEOW_WORKER_MAX_ATTEMPTS", "worker_max_attempts"))
     settings_admin_token: str | None = Field(default=None, validation_alias=AliasChoices(SETTINGS_TOKEN_ENV, "settings_admin_token"), repr=False)
 
     _dotenv_path: Path | None = PrivateAttr(default=None)
@@ -79,14 +127,30 @@ class Settings(BaseSettings):
         "image_root",
         "embedding_api_key",
         "embedding_base_url",
+        "visual_weights_path",
+        "visual_weights_sha256",
+        "visual_internal_token",
+        "visual_health_url",
+        "visual_model_repo",
+        "agent_reverse_image_internal_url",
+        "agent_visual_search_internal_url",
+        "agent_executor_url",
+        "agent_executor_token",
+        "agent_executor_token_file",
         "llm_enhance_model",
         "opencode_executable",
+        "agent_container_name",
+        "agent_container_runtime",
+        "agent_runtime_mode",
         "opencode_model",
         "opencode_base_url",
         "opencode_api_key",
+        "serpapi_api_key",
         "opencode_runtime_root",
+        "reverse_image_cache_root",
         "opencode_node_modules",
         "settings_admin_token",
+        "database_url",
         mode="before",
     )
     @classmethod
@@ -101,14 +165,56 @@ class Settings(BaseSettings):
             self.image_root = self.data_root / "images"
         if self.opencode_runtime_root is None:
             self.opencode_runtime_root = self.data_root / "opencode"
+        if self.reverse_image_cache_root is None:
+            self.reverse_image_cache_root = self.data_root / "reverse_image_cache" / "serpapi_google_lens"
+        if self.embedding_dimensions != 1024:
+            raise ValueError("embedding_dimensions_must_be_1024")
+        spec = visual_model_spec(self.visual_model)
+        if spec is not None:
+            if not spec.runtime_supported:
+                raise ValueError("visual_model_migration_required")
+            if self.visual_model_dimensions != spec.dimensions:
+                raise ValueError(f"visual_dimensions_must_be_{spec.dimensions}")
+            if self.visual_preprocess_version != spec.preprocess_version:
+                raise ValueError("visual_preprocess_version_mismatch")
+        if self.visual_weights_sha256 is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", self.visual_weights_sha256):
+            raise ValueError("visual_weights_sha256_invalid")
+        if not self.database_url.startswith("postgresql"):
+            raise ValueError("postgresql_required")
+        if self.agent_container_runtime not in {"docker"}:
+            raise ValueError("agent_container_runtime_unsupported")
+        if self.agent_runtime_mode not in {"auto", "executor", "docker", "host"}:
+            raise ValueError("agent_runtime_mode_invalid")
         return self
+
+    @property
+    def expected_database_revision(self) -> str:
+        """返回当前应用构建期要求的 Alembic head，供启动门禁比较。"""
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+
+        config = Config(str(PROJECT_ROOT / "alembic.ini"))
+        heads = ScriptDirectory.from_config(config).get_heads()
+        if len(heads) != 1:
+            raise ValueError("schema_heads_invalid")
+        return heads[0]
 
     @classmethod
     def from_env(cls, env_file: str | Path | None = ".env") -> "Settings":
-        """读取 `.env` 和进程环境；进程环境由 Pydantic Settings 自动优先。"""
+        """读取 `.env` 和进程环境，并在 Compose 模式加载共享 token 文件。
+
+        进程环境由 Pydantic Settings 自动优先；当配置了 token 文件时，文件是
+        Compose executor 的唯一认证来源，避免 `.env` 中的旧 token 与 named
+        volume 中的持久凭据不一致。
+        """
         path = Path(env_file).expanduser() if env_file else None
         # `_env_file` 是 Pydantic Settings 的启动期覆盖参数，不会修改全局 os.environ。
         settings = cls(_env_file=path if path and path.is_file() else None)
+        if settings.agent_executor_token_file is not None:
+            try:
+                settings.agent_executor_token = read_token_file(settings.agent_executor_token_file)
+            except ExecutorTokenError as exc:
+                raise ValueError(str(exc)) from exc
         settings._dotenv_path = path.resolve() if path else None
         return settings
 
@@ -139,7 +245,14 @@ class Settings(BaseSettings):
         """计算只包含非敏感有效配置的稳定版本摘要。"""
         payload = {
             "embedding_model": self.embedding_model,
+            "visual_model": self.visual_model,
+            "visual_model_dimensions": self.visual_model_dimensions,
+            "visual_preprocess_version": self.visual_preprocess_version,
             "opencode_model": self.opencode_model,
+            "agent_container_name": self.agent_container_name,
+            "agent_runtime_mode": self.agent_runtime_mode,
+            "agent_executor_configured": bool(self.agent_executor_url),
+            "agent_executor_token_configured": bool(self.agent_executor_token),
             "opencode_concurrency": self.opencode_concurrency,
             "agent_backpressure": self.agent_backpressure,
             "protected_mode": self.protected_mode,
@@ -167,10 +280,21 @@ class Settings(BaseSettings):
             "opencode_base_url": "已配置" if self.opencode_base_url else None,
             "opencode_api_key_configured": self._configured(self.opencode_api_key),
             "opencode_configured": bool(self.opencode_executable and self.opencode_model and self.opencode_base_url and self.opencode_api_key),
+            "agent_executor_configured": bool(self.agent_executor_url),
+            "agent_executor_token_configured": bool(self.agent_executor_token),
+            "agent_runtime_mode": self.agent_runtime_mode,
             "data_root_configured": True,
             "opencode_concurrency": self.opencode_concurrency,
             "agent_backpressure": self.agent_backpressure,
             "settings_version": self.settings_version,
+            "embedding_dimensions": self.embedding_dimensions,
+            "visual_model": self.visual_model,
+            "visual_model_dimensions": self.visual_model_dimensions,
+            "visual_preprocess_version": self.visual_preprocess_version,
+            "visual_available": self.visual_available,
+            "database_configured": bool(self.database_url),
+            "worker_lease_seconds": self.worker_lease_seconds,
+            "worker_heartbeat_seconds": self.worker_heartbeat_seconds,
         }
 
     def backend_status(self, *, cache_ready: bool = False, runtime_ready: bool = False) -> dict[str, object]:
@@ -180,9 +304,18 @@ class Settings(BaseSettings):
         restart_required = pending is not None and pending != self.opencode_concurrency and not environment_override
         readonly = {
             "embedding_model": self.embedding_model,
+            "visual_model": self.visual_model,
+            "visual_model_dimensions": self.visual_model_dimensions,
+            "visual_preprocess_version": self.visual_preprocess_version,
+            "visual_available": self.visual_available,
             "opencode_model": self.opencode_model,
+            "agent_container_name": self.agent_container_name,
+            "agent_runtime_mode": self.agent_runtime_mode,
+            "agent_executor_configured": bool(self.agent_executor_url),
+            "agent_executor_token_configured": bool(self.agent_executor_token),
             "opencode_configured": bool(self.opencode_executable and self.opencode_model and self.opencode_base_url and self.opencode_api_key),
             "embedding_cache_ready": cache_ready,
+            "reverse_image_available": bool(self.serpapi_api_key),
             "runtime_ready": runtime_ready,
             "settings_admin_enabled": bool(self.settings_admin_token),
         }
@@ -220,6 +353,33 @@ class Settings(BaseSettings):
             "deployment": deployment,
             "deployment_only": deployment,
         }
+
+    @property
+    def visual_available(self) -> bool:
+        """返回官方源码和权重是否可读且（如配置）通过 SHA 校验，不暴露本地路径。"""
+        path = self.visual_weights_path
+        source = self.visual_model_repo
+        if path is None or source is None:
+            return False
+        try:
+            spec = visual_model_spec(self.visual_model)
+            if spec is None or not spec.runtime_supported:
+                return False
+            source_root = source.expanduser()
+            if not source_repository_valid(source_root, self.visual_model):
+                return False
+            resolved = path.expanduser()
+            if not resolved.is_file() or not os.access(resolved, os.R_OK):
+                return False
+            if self.visual_weights_sha256:
+                digest = hashlib.sha256()
+                with resolved.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                return digest.hexdigest().lower() == self.visual_weights_sha256.lower()
+            return True
+        except OSError:
+            return False
 
 
 def update_dotenv_concurrency(path: str | Path, value: int) -> Path:
