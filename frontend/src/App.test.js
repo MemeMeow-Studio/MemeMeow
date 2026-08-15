@@ -47,6 +47,22 @@ describe('App', () => {
     expect(wrapper.get('.result-item img').attributes('src')).toBe('/media/11111111-1111-4111-8111-111111111111')
   })
 
+  it('检索失败后显示可关闭错误并恢复提交按钮', async () => {
+    search.mockRejectedValue(new Error('检索服务暂不可用'))
+    const wrapper = mount(App)
+    await flushPromises()
+    await wrapper.get('.search-form input').setValue('开心')
+    await wrapper.get('.search-form').trigger('submit')
+    await flushPromises()
+
+    expect(wrapper.get('[role="alert"]').text()).toContain('检索服务暂不可用')
+    expect(wrapper.get('.search-form .primary').attributes('disabled')).toBeUndefined()
+    expect(wrapper.get('.search-form .primary').text()).toBe('开始检索')
+
+    await wrapper.get('[aria-label="关闭错误"]').trigger('click')
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+  })
+
   it('对相同媒体路径的查询结果稳定去重', async () => {
     search.mockResolvedValue({ results: ['/media/11111111-1111-4111-8111-111111111111?cache=1', '/media/11111111-1111-4111-8111-111111111111?cache=2', '/media/22222222-2222-4222-8222-222222222222'] })
     const wrapper = mount(App)
@@ -188,10 +204,18 @@ describe('App', () => {
     await flushPromises()
     expect(button.element.disabled).toBe(true)
     expect(button.text()).toBe('排队中...')
+
+    await wrapper.findAll('.sidebar nav button').find((item) => item.text().includes('检索')).trigger('click')
+    await wrapper.findAll('.sidebar nav button').find((item) => item.text().includes('图片库')).trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.cache-action').element.disabled).toBe(true)
+    expect(wrapper.get('.cache-action').text()).toBe('排队中...')
+    expect(generateCache).toHaveBeenCalledTimes(1)
+
     finishPoll({ task_id: 'cache-1', status: 'failed', progress: 0.4, message: '任务执行失败', error: { message: 'image_library_empty' } })
     await flushPromises()
-    expect(button.element.disabled).toBe(false)
-    expect(button.text()).toBe('重新生成检索缓存')
+    expect(wrapper.get('.cache-action').element.disabled).toBe(false)
+    expect(wrapper.get('.cache-action').text()).toBe('重新生成检索缓存')
     expect(wrapper.get('.cache-status').text()).toContain('任务执行失败')
     expect(wrapper.get('.embedding-global').text()).toBe('Embedding 生成失败')
   })
