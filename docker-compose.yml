@@ -1,13 +1,196 @@
 services:
-  mememeow:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mememeow}
+      POSTGRES_USER: ${POSTGRES_USER:-mememeow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mememeow}
+    ports:
+      - "127.0.0.1:5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - mememeow-postgres-data:/var/lib/postgresql/data
+
+  db-init:
     build:
       context: .
-    command: uvicorn api:app --host 0.0.0.0 --port 8275
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MEMEMEOW_DATABASE_URL: ${MEMEMEOW_DATABASE_URL_CONTAINER:-postgresql+psycopg://mememeow:mememeow@postgres:5432/mememeow}
+    working_dir: /app
+    command: ["alembic", "upgrade", "head"]
+
+  db-viewer:
+    profiles: ["db-viewer"]
+    image: adminer:4
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
     ports:
-      - "8275:8275"
+      - "127.0.0.1:${MEMEMEOW_DB_VIEWER_PORT:-8080}:8080"
+
+  mememeow-visual:
+    build:
+      context: .
+      dockerfile: docker/visual/Dockerfile
+    container_name: ${MEMEMEOW_VISUAL_CONTAINER_NAME:-mememeow-visual}
+    restart: unless-stopped
+    # 视觉端口只加入 Compose 网络，不发布到宿主机。
+    expose:
+      - "8276"
+    networks:
+      - visual-backend
+    environment:
+      MEMEMEOW_VISUAL_MODEL: ${MEMEMEOW_VISUAL_MODEL:-dinov2_vitb14}
+      MEMEMEOW_VISUAL_DIMENSIONS: ${MEMEMEOW_VISUAL_DIMENSIONS:-768}
+      MEMEMEOW_VISUAL_PREPROCESS_VERSION: ${MEMEMEOW_VISUAL_PREPROCESS_VERSION:-dinov2_vitb14-rgb224-first-frame-v1}
+      MEMEMEOW_VISUAL_MODEL_REPO: /opt/dinov2
+      MEMEMEOW_VISUAL_WEIGHTS_PATH: /models/dinov2_vitb14_pretrain.pth
+      MEMEMEOW_VISUAL_WEIGHTS_SHA256: ${MEMEMEOW_VISUAL_WEIGHTS_SHA256:-}
+      MEMEMEOW_VISUAL_INTERNAL_TOKEN: ${MEMEMEOW_VISUAL_INTERNAL_TOKEN:-}
+      MEMEMEOW_VISUAL_CPU_THREADS: ${MEMEMEOW_VISUAL_CPU_THREADS:-4}
+      MEMEMEOW_VISUAL_CPU_INTEROP_THREADS: ${MEMEMEOW_VISUAL_CPU_INTEROP_THREADS:-1}
+      MEMEMEOW_VISUAL_MAX_PIXELS: ${MEMEMEOW_VISUAL_MAX_PIXELS:-25000000}
+    volumes:
+      - type: bind
+        source: ${MEMEMEOW_VISUAL_WEIGHTS_DIR:-./data/models}
+        target: /models
+        read_only: true
+        bind:
+          create_host_path: true
+      - type: bind
+        source: ./data/images
+        target: /images
+        read_only: true
+    cpus: ${MEMEMEOW_VISUAL_CPU_QUOTA:-4.0}
+    mem_limit: ${MEMEMEOW_VISUAL_MEMORY_LIMIT:-8g}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import json,urllib.request; payload=json.load(urllib.request.urlopen(\"http://127.0.0.1:8276/health\", timeout=3)); raise SystemExit(0 if payload.get(\"status\") in (\"ok\", \"degraded\") else 1)' "]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  mememeow-agent-runtime:
+    build:
+      context: .
+      dockerfile: docker/agent/Dockerfile
+    container_name: ${MEMEMEOW_AGENT_CONTAINER_NAME:-mememeow-agent-runtime}
+    init: true
+    restart: unless-stopped
+    working_dir: /runtime/workspace
+    expose:
+      - "8277"
+    environment:
+      # token 首次由非 root executor 写入持久 named volume；API 只读同一文件。
+      MEMEMEOW_AGENT_EXECUTOR_TOKEN_FILE: /run/agent-executor-secret/token
+      MEMEMEOW_AGENT_EXECUTOR_HOST: 0.0.0.0
+      MEMEMEOW_AGENT_EXECUTOR_PORT: ${MEMEMEOW_AGENT_EXECUTOR_PORT:-8277}
+      MEMEMEOW_AGENT_EXECUTOR_MAX_TIMEOUT_SECONDS: ${MEMEMEOW_AGENT_EXECUTOR_MAX_TIMEOUT_SECONDS:-1800}
+      MEMEMEOW_OPENCODE_EXECUTABLE: opencode
+      MEMEMEOW_OPENCODE_MODEL: ${MEMEMEOW_OPENCODE_MODEL:-}
+      MEMEMEOW_OPENCODE_BASE_URL: ${MEMEMEOW_OPENCODE_BASE_URL:-}
+      MEMEMEOW_OPENCODE_API_KEY: ${MEMEMEOW_OPENCODE_API_KEY:-}
+      MEMEMEOW_OPENCODE_CONCURRENCY: ${MEMEMEOW_OPENCODE_CONCURRENCY:-1}
+      MEMEMEOW_AGENT_BACKPRESSURE: ${MEMEMEOW_AGENT_BACKPRESSURE:-32}
+      MEMEMEOW_AGENT_RESULT_MAX_BYTES: ${MEMEMEOW_AGENT_RESULT_MAX_BYTES:-1048576}
+      MEMEMEOW_AGENT_REVERSE_IMAGE_INTERNAL_URL: http://mememeow:8275/internal/reverse-image/search
+      MEMEMEOW_AGENT_VISUAL_SEARCH_INTERNAL_URL: http://mememeow:8275/internal/visual-search/match
+    volumes:
+      # named volume 的 owner 从镜像初始化，不会被全新 checkout 的 bind mount 覆盖为 root。
+      - mememeow-agent-runtime-data:/runtime
+      - mememeow-agent-executor-secret:/run/agent-executor-secret
+      - type: bind
+        source: ./data/images
+        target: /images
+        read_only: true
+      - type: bind
+        source: ./skills/research-meme-context
+        target: /skills/research-meme-context
+        read_only: true
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD-SHELL", "test \"$$(id -u)\" != 0 && python3 -m executor.probe"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  mememeow:
+    profiles: ["app"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+      mememeow-agent-runtime:
+        condition: service_healthy
+      mememeow-visual:
+        condition: service_healthy
+    build:
+      context: .
+    restart: unless-stopped
+    command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8275"]
+    ports:
+      - "127.0.0.1:8275:8275"
+    # 视觉权重缺失时 API 可以降级提供界面，因此探活只阻断 HTTP 未启动状态。
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import json,urllib.request; payload=json.load(urllib.request.urlopen(\"http://127.0.0.1:8275/health\", timeout=3)); raise SystemExit(0 if payload.get(\"status\") in (\"ok\", \"degraded\") else 1)' "]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
     env_file:
       - path: .env
         required: false
+    environment:
+      MEMEMEOW_DATABASE_URL: ${MEMEMEOW_DATABASE_URL_CONTAINER:-postgresql+psycopg://mememeow:mememeow@postgres:5432/mememeow}
+      MEMEMEOW_IMAGE_ROOT: /app/data/images
+      MEMEMEOW_OPENCODE_RUNTIME_ROOT: /app/data/opencode
+      MEMEMEOW_AGENT_CONTAINER_NAME: ${MEMEMEOW_AGENT_CONTAINER_NAME:-mememeow-agent-runtime}
+      MEMEMEOW_AGENT_RUNTIME_MODE: executor
+      MEMEMEOW_AGENT_EXECUTOR_URL: http://mememeow-agent-runtime:8277
+      MEMEMEOW_AGENT_EXECUTOR_TOKEN_FILE: /run/agent-executor-secret/token
+      MEMEMEOW_AGENT_EXECUTOR_REQUEST_TIMEOUT_SECONDS: ${MEMEMEOW_AGENT_EXECUTOR_REQUEST_TIMEOUT_SECONDS:-1810}
+      MEMEMEOW_AGENT_EXECUTOR_MAX_TIMEOUT_SECONDS: ${MEMEMEOW_AGENT_EXECUTOR_MAX_TIMEOUT_SECONDS:-1800}
+      MEMEMEOW_AGENT_REVERSE_IMAGE_INTERNAL_URL: http://mememeow:8275/internal/reverse-image/search
+      MEMEMEOW_AGENT_VISUAL_SEARCH_INTERNAL_URL: http://mememeow:8275/internal/visual-search/match
+      MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL: http://mememeow:8275/internal/reverse-image/search
+      MEMEMEOW_VISUAL_INTERNAL_URL: http://mememeow-visual:8276/internal/visual-embedding
+      MEMEMEOW_VISUAL_HEALTH_URL: http://mememeow-visual:8276/health
+      MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL: http://mememeow:8275/internal/visual-search/match
+      MEMEMEOW_VISUAL_INTERNAL_TOKEN: ${MEMEMEOW_VISUAL_INTERNAL_TOKEN:-}
+      MEMEMEOW_OPENCODE_MODEL: ${MEMEMEOW_OPENCODE_MODEL:-}
+      MEMEMEOW_OPENCODE_BASE_URL: ${MEMEMEOW_OPENCODE_BASE_URL:-}
+      MEMEMEOW_OPENCODE_API_KEY: ${MEMEMEOW_OPENCODE_API_KEY:-}
     volumes:
-      - ./data:/app/data
-    working_dir: /app
+      - mememeow-agent-runtime-data:/app/data/opencode
+      - type: volume
+        source: mememeow-agent-executor-secret
+        target: /run/agent-executor-secret
+        read_only: true
+      - type: bind
+        source: ./data/images
+        target: /app/data/images
+    networks:
+      - default
+      - visual-backend
+
+networks:
+  visual-backend:
+    internal: true
+
+volumes:
+  mememeow-postgres-data:
+  mememeow-agent-runtime-data:
+  # token 不落盘到 checkout 或宿主环境，只存在 Docker named volume。
+  mememeow-agent-executor-secret:

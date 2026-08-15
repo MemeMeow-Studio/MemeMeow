@@ -55,3 +55,6 @@ frontend/dist/
 frontend/test-results/
 frontend/playwright-report/
 add-subagent-luna-max-doc.md.archive
+add-subagent-luna-max-doc.md
+tmp/
+add-subagent-luna-doc.md
