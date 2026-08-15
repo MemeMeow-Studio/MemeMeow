@@ -355,6 +355,7 @@ def test_opencode_launcher_reuses_runtime_for_session_list(tmp_path: Path):
         "MEMEMEOW_OPENCODE_API_KEY": "test-key",
         "MEMEMEOW_OPENCODE_RUNTIME_ROOT": str(runtime),
         "MEMEMEOW_OPENCODE_NODE_MODULES": str(modules),
+        "MEMEMEOW_AGENT_RUNTIME_MODE": "host",
         "MEMEMEOW_PYTHON": sys.executable,
     }
     result = subprocess.run(
@@ -422,6 +423,180 @@ def test_opencode_launcher_keeps_cli_executable_in_docker_mode(tmp_path: Path):
     lines = capture.read_text(encoding="utf-8").splitlines()
     assert "opencode" in lines
     assert lines[lines.index("opencode") + 1 : lines.index("opencode") + 4] == ["session", "list", "--format"]
+
+
+def test_opencode_launcher_allocates_terminal_for_docker_tui(tmp_path: Path):
+    """旧 Docker 兼容模式必须为交互式 OpenCode 分配 stdin 和 TTY。"""
+    project = Path(__file__).resolve().parent.parent
+    capture = tmp_path / "capture-docker-tui.txt"
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == info ]]; then exit 0; fi\n"
+        "if [[ \"$1\" == inspect ]]; then printf true; exit 0; fi\n"
+        "if [[ \"$1\" == exec ]]; then\n"
+        f"  printf '%s\\n' \"$@\" > {str(capture)!r}\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    runtime = tmp_path / "runtime"
+    environment = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ.get('PATH', '')}",
+        "MEMEMEOW_AGENT_RUNTIME_MODE": "docker",
+        "MEMEMEOW_AGENT_CONTAINER_NAME": "mememeow-agent-runtime",
+        "MEMEMEOW_OPENCODE_MODEL": "mememeow/gpt-5.6-luna",
+        "MEMEMEOW_OPENCODE_BASE_URL": "https://example.invalid/v1",
+        "MEMEMEOW_OPENCODE_API_KEY": "test-key",
+        "MEMEMEOW_OPENCODE_RUNTIME_ROOT": str(runtime),
+        "MEMEMEOW_PYTHON": sys.executable,
+    }
+    result = subprocess.run(
+        [str(project / "scripts" / "open-opencode.sh"), "--session", "ses_test"],
+        cwd=project,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    lines = capture.read_text(encoding="utf-8").splitlines()
+    assert lines[:2] == ["exec", "-it"]
+    opencode_index = lines.index("opencode")
+    assert lines[opencode_index + 1 : opencode_index + 3] == ["/runtime/workspace", "--model"]
+    assert lines[-2:] == ["--session", "ses_test"]
+
+
+def test_opencode_launcher_uses_running_compose_runtime_for_session_list(tmp_path: Path):
+    """Compose 服务运行时必须查询 named volume，而不是宿主旧数据库。"""
+    project = Path(__file__).resolve().parent.parent
+    capture = tmp_path / "capture-compose-list.txt"
+    compose_file = tmp_path / "compose file.yml"
+    compose_file.write_text("services: {}\n", encoding="utf-8")
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == info ]]; then exit 0; fi\n"
+        "if [[ \" $* \" == *\" ps --status running --services mememeow-agent-runtime \"* ]]; then\n"
+        "  printf 'mememeow-agent-runtime\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        f"printf '%s\\n' \"$@\" > {str(capture)!r}\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    host_runtime = tmp_path / "host-runtime"
+    environment = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ.get('PATH', '')}",
+        "MEMEMEOW_AGENT_RUNTIME_MODE": "executor",
+        "MEMEMEOW_COMPOSE_FILE": str(compose_file),
+        "MEMEMEOW_OPENCODE_RUNTIME_ROOT": str(host_runtime),
+        "MEMEMEOW_PYTHON": sys.executable,
+    }
+    environment.pop("MEMEMEOW_AGENT_EXECUTOR_TOKEN_FILE", None)
+    result = subprocess.run(
+        [str(project / "scripts" / "open-opencode.sh"), "--list", "--format", "json"],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    lines = capture.read_text(encoding="utf-8").splitlines()
+    assert lines[:3] == ["compose", "-f", str(compose_file)]
+    assert "exec" in lines
+    assert "-T" in lines
+    assert "OPENCODE_DB=/runtime/opencode.db" in lines
+    assert lines[-4:] == ["session", "list", "--format", "json"]
+    assert str(host_runtime) not in "\n".join(lines)
+
+
+def test_opencode_launcher_uses_container_model_for_compose_tui(tmp_path: Path):
+    """Compose TUI 必须读取容器模型配置，并把未知参数原样交给 OpenCode。"""
+    project = Path(__file__).resolve().parent.parent
+    capture = tmp_path / "capture-compose-tui.txt"
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text("services: {}\n", encoding="utf-8")
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == info ]]; then exit 0; fi\n"
+        "if [[ \" $* \" == *\" ps --status running --services mememeow-agent-runtime \"* ]]; then\n"
+        "  printf 'mememeow-agent-runtime\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        f"printf '%s\\n' \"$@\" > {str(capture)!r}\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    environment = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ.get('PATH', '')}",
+        "MEMEMEOW_AGENT_RUNTIME_MODE": "auto",
+        "MEMEMEOW_COMPOSE_FILE": str(compose_file),
+        "MEMEMEOW_PYTHON": sys.executable,
+    }
+    environment.pop("MEMEMEOW_AGENT_EXECUTOR_TOKEN_FILE", None)
+    result = subprocess.run(
+        [str(project / "scripts" / "open-opencode.sh"), "--session", "ses_test"],
+        cwd=project,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    lines = capture.read_text(encoding="utf-8").splitlines()
+    assert "-T" not in lines
+    shell_index = lines.index("sh")
+    assert lines[shell_index : shell_index + 4] == [
+        "sh",
+        "-lc",
+        'exec opencode /runtime/workspace --model "$MEMEMEOW_OPENCODE_MODEL" "$@"',
+        "open-opencode",
+    ]
+    assert lines[-2:] == ["--session", "ses_test"]
+
+
+@pytest.mark.parametrize("runtime_mode", ["auto", "executor"])
+def test_opencode_launcher_rejects_stale_host_runtime_when_compose_is_down(
+    tmp_path: Path,
+    runtime_mode: str,
+):
+    """Compose 模式不可在服务停机时静默回退到宿主历史 runtime。"""
+    project = Path(__file__).resolve().parent.parent
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text("services: {}\n", encoding="utf-8")
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    fake_docker.chmod(0o755)
+    environment = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ.get('PATH', '')}",
+        "MEMEMEOW_AGENT_RUNTIME_MODE": runtime_mode,
+        "MEMEMEOW_COMPOSE_FILE": str(compose_file),
+        "MEMEMEOW_PYTHON": sys.executable,
+    }
+    environment.pop("MEMEMEOW_AGENT_EXECUTOR_TOKEN_FILE", None)
+    result = subprocess.run(
+        [str(project / "scripts" / "open-opencode.sh"), "--list"],
+        cwd=project,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "Compose Agent 服务 mememeow-agent-runtime 未运行" in result.stderr
 
 
 def test_last_assistant_message_excludes_tool_content(tmp_path: Path):

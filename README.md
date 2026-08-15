@@ -200,7 +200,9 @@ sha256sum data/models/dinov2_vitb14_pretrain.pth
 ```
 
 该入口复用图片语境任务的 runtime、数据库、skill 与无密钥配置。在 Compose executor 模式下，
-历史 session 应通过 Agent 容器内的受控运维入口检查；生产 API 不提供任意 OpenCode 命令转发。
+入口会直接进入正在运行的 Agent 服务，并读取 named volume 中的历史 session；服务未运行时不会
+静默回退到宿主旧数据库。仅在明确设置 `MEMEMEOW_AGENT_RUNTIME_MODE=host` 时使用宿主 runtime；
+生产 API 仍不提供任意 OpenCode 命令转发。
 
 ### 回滚与诊断
 
