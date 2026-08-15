@@ -134,9 +134,29 @@
 - **WHEN** 客户端提交查询但检索缓存不存在或正在生成
 - **THEN** 系统返回 `503`，错误标识为 `cache_not_ready`，且不返回部分检索结果
 
+#### Scenario: 索引刷新期间查询
+- **WHEN** 当前 scope 已有可用索引且新一代索引正在生成
+- **THEN** 系统继续使用已激活索引，直到新索引完整生成并原子切换
+
 #### Scenario: 空查询
 - **WHEN** 客户端提交空白或缺失的查询文本
 - **THEN** 系统返回 `400`，错误标识为 `invalid_query`
+
+#### Scenario: 数据库语境驱动索引生成
+- **WHEN** Meme 具有 `partial` 或 `ready` 的可用语境且系统生成索引
+- **THEN** 系统仅使用已填充的白名单事实字段构造语义文本，并保存文档、元数据和图片内容指纹
+
+#### Scenario: 不可用语境不得回退文件名
+- **WHEN** Meme 为 `pending`、`repair_required` 或白名单语义文本为空
+- **THEN** 系统跳过该 Meme 并报告其索引状态，不使用文件名或不确定内容生成 embedding
+
+#### Scenario: 全部 Meme 都不可索引
+- **WHEN** 当前 scope 没有任何具有有效语义文本的 Meme
+- **THEN** 索引生成任务明确失败或保持索引未就绪，且不以空 generation 替换已有激活索引
+
+#### Scenario: embedding 维度不匹配
+- **WHEN** embedding 服务返回的向量维度不是系统配置的固定维度
+- **THEN** 系统拒绝写入并使本次 generation 失败，已有激活索引继续可用
 
 #### Scenario: JSON 语义文本作为唯一图片输入
 - **WHEN** 图片 sidecar 含有一个或多个非空白名单字段且语义状态为 `partial` 或 `ready`
@@ -160,6 +180,10 @@
 #### Scenario: 结果图片不可访问
 - **WHEN** 候选图片在本地不存在且其远程来源下载失败
 - **THEN** 系统跳过该候选图片，继续处理其他候选图片，不返回失效引用
+
+#### Scenario: 相同分数的候选
+- **WHEN** 多个候选具有相同相关性分数
+- **THEN** 系统按 `meme_id` 稳定排序，不依赖可变文件路径决定顺序
 
 ### Requirement: LLM 增强必须可选且可回退
 系统 MUST 默认使用普通语义检索；客户端显式启用 LLM 增强时，系统 MAY 先改写查询。LLM 调用失败、超时或未配置时，系统 MUST 使用原始查询执行普通检索，不得因此使整个搜索请求失败。

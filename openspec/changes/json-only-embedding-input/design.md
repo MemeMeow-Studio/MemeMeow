@@ -31,7 +31,7 @@ OpenCode CLI 已提供 `run --format json --file <image>`；其 `export <session
 
 ### 1. 使用固定且非临时的 OpenCode runtime
 
-配置增加 OpenCode 可执行文件、模型、超时、最大输出大小和 runtime 根目录。默认 runtime 位于应用 `data_root` 下，而不是 `/tmp` 或可被普通缓存清理的目录：
+配置增加 OpenCode 可执行文件、模型、超时和 runtime 根目录。默认 runtime 位于应用 `data_root` 下，而不是 `/tmp` 或可被普通缓存清理的目录：
 
 ```text
 <data_root>/opencode/
@@ -86,9 +86,9 @@ opencode run --dir <workspace> --format json --file <image> --model <model> <pro
 
 ### 5. 把 JSONL 事件流与业务 JSON 分层解析
 
-runner 逐行解析 `opencode run --format json` 的 stdout，把 session ID 和阶段信息写入 job，并把原始事件保存到有总字节上限的诊断日志。stderr 单独截断保存，不与业务候选混合。超时、非零退出、输出超过上限或事件行不是合法 JSON 时，终止整个子进程组并返回稳定错误。
+runner 将 `opencode run --format json` 的 stdout/stderr 流式写入本次运行的临时文件，逐行解析 stdout 以取得 session ID 和阶段信息，不设置 CLI 输出总字节门禁。runtime 只保留有限诊断前缀，避免完整 transcript 长期占用磁盘；超时、非零退出或事件行不是合法 JSON 时，终止整个子进程组并返回稳定错误。
 
-OpenCode 正常退出后，runner 临时启动只监听 `127.0.0.1` 的 headless server，通过公开 `GET /session/{id}/message` 取得完成 session；读取上限仍受任务的最大输出字节数约束。它选择最后一条完整 assistant 消息，只合并其中的 text parts。它不从工具结果、搜索摘要、thinking 或中间 assistant 消息提取候选，也不直接查询 OpenCode DB。
+OpenCode 正常退出后，runner 临时启动只监听 `127.0.0.1` 的 headless server，通过公开 `GET /session/{id}/message` 将完成 session 流式落入临时文件后解析，不设置响应总字节门禁。它选择最后一条完整 assistant 消息，只合并其中的 text parts。它不从工具结果、搜索摘要、thinking 或中间 assistant 消息提取候选，也不直接查询 OpenCode DB。
 
 最终文本先尝试作为完整 JSON 解析；失败时只允许存在唯一一个标记为 JSON 的 fenced block。多个代码块、额外说明或用“第一个左花括号到最后一个右花括号”猜测边界都被拒绝。这样可防止网页内容、工具输出或模型解释被错误当成 sidecar 数据。
 
@@ -144,7 +144,7 @@ OpenCode 正常退出后，runner 临时启动只监听 `127.0.0.1` 的 headless
 - [Risk] 多应用进程重复消费同一 job。→ 进程内单 worker 加 runtime 文件锁，job 状态更新使用原子替换并在启动前复核。
 - [Risk] 统一持久任务服务迁移会影响既有缓存和 repair 任务。→ 保持原有 `task_id`、状态和查询响应字段，使用 handler 夹具覆盖三种任务类型的提交、恢复和失败。
 - [Risk] OpenCode 事件格式或内部 DB 随版本变化。→ 只依赖公开 JSON event 和 loopback session API，不查询 DB 表；固定受支持版本并用录制事件夹具测试解析器。
-- [Risk] runtime 日志、session 和 job 文件持续增长。→ 限制单 job stdout/stderr 大小，终态只保留有限业务摘要；清理策略按终态保留期单独配置，不删除 sidecar。
+- [Risk] runtime 日志、session 和 job 文件持续增长。→ 完整 stdout/stderr 与 session 响应只在单次运行的临时文件中流式处理，持久日志只保留有限诊断前缀；清理策略按终态保留期单独配置，不删除 sidecar。
 - [Risk] 第三方反向图片检索可能带来隐私和费用。→ 仅在服务端明确配置并允许时把图片交给第三方，单并发执行并保留 job 诊断。
 - [Risk] 元数据尚未研究的图片会暂时从搜索结果消失。→ 上传自动排队并提供既有图片批量补齐，缓存任务报告所有跳过原因。
 - [Risk] 移除 VLM 后，描述和自动命名不再同步返回。→ 上传始终返回 Agent task ID；只在显式 `auto_name=true` 的终态任务中异步改名，前端通过任务状态展示结果。

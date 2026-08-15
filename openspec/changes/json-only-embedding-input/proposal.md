@@ -1,3 +1,5 @@
+> **历史关系**：本 change 已被 `introduce-postgres-scoped-persistence` superseded-by。JSON 任务、sidecar 运行时读写和旧缓存格式不再是当前实现契约；其任务与 embedding 语义约束由新 change 接管。归档时先归档新 change，再使用 `--skip-specs` 归档本 change，避免旧 delta 回写主规范。
+
 ## Why
 
 JSON-only embedding 可以消除低信息量文件名带来的检索噪声，但如果没有自动生产 sidecar 语义的流程，新上传和既有 `pending` 图片会长期被索引跳过。现有 VLM 描述链与 OpenCode Agent 将产生重复且能力不对等的语义来源；现有内存 `TaskManager` 也无法记录跨重启的长 Agent 任务。需要把“异步生成可信 JSON”“统一持久任务”和“只从 JSON 生成 embedding”合成一条管线。

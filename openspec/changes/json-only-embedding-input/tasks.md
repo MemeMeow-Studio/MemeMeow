@@ -1,7 +1,9 @@
+> **归档说明**：本 change 已被 `introduce-postgres-scoped-persistence` superseded-by。新 change 归档后，本 change 仅作为历史实现记录使用 `--skip-specs` 归档。
+
 ## 1. OpenCode 运行时与共享 skill
 
 - [x] 1.1 将 `research-meme-context` 移到受版本控制的 `skills/`，新增幂等安装脚本，为 `.agents/skills` 和 `.opencode/skills` 创建可移植相对链接，并更新安装文档与忽略规则。
-- [x] 1.2 新增 OpenCode 可执行文件、服务地址、密钥、模型、固定 runtime、超时、最大输出大小和共享依赖路径配置；在 workspace 生成无密钥通用 `opencode.json`，只注册 `gpt-5.6-luna`，配置查询保持脱敏，缺失项返回稳定错误。
+- [x] 1.2 新增 OpenCode 可执行文件、服务地址、密钥、模型、固定 runtime、超时和共享依赖路径配置；在 workspace 生成无密钥通用 `opencode.json`，只注册 `gpt-5.6-luna`，配置查询保持脱敏，缺失项返回稳定错误。
 - [x] 1.3 实现固定 workspace 初始化，链接同一份 skill 与预安装 `node_modules`，设置固定 `OPENCODE_DB`，验证任务路径中不会调用包管理器或创建逐任务依赖目录。
 - [x] 1.4 实现语境生成进程的单 worker 与跨进程 `worker.lock`，按创建时间和 task ID 稳定消费队列，并为 runtime 初始化、互斥和缺失依赖补充测试。
 - [x] 1.5 新增会话检查启动脚本，复用固定 OpenCode runtime 与 DB，隔离父目录配置，支持 TUI `/sessions` 和非交互列表，并补充验证与使用文档。
@@ -17,12 +19,12 @@
 
 ## 3. OpenCode runner 与结果解析
 
-- [x] 3.1 以无 shell 的参数数组启动 `opencode run --format json --file`，每张图片创建独立 session，流式限制 stdout/stderr，并在超时、取消或输出超限时终止整个进程组。
+- [x] 3.1 以无 shell 的参数数组启动 `opencode run --format json --file`，每张图片创建独立 session，流式写入临时文件而不设置 stdout/stderr 总字节门禁，并在超时或取消时终止整个进程组。
 - [x] 3.2 解析 JSONL 事件并记录 session ID/阶段，正常退出后通过公开 loopback session messages API 读取完成 session，只选择最后一条完整 assistant 消息的 text parts。
 - [x] 3.3 实现严格候选提取：优先解析完整原始 JSON，只兼容唯一 JSON fenced block，拒绝多个对象、额外说明、工具结果和花括号猜测。
 - [x] 3.4 引入并配置 JSON Schema 校验与 URI format 检查，再使用 `MemeContext` 完成字段清理、数量和长度校验，输出稳定的解析/schema 错误。
 - [x] 3.5 在写回前复核目标路径、文件存在性和图片 SHA-256；通过研究来源与人工字段保护原子提交 sidecar，保存结果哈希并使检索缓存失效。
-- [x] 3.6 使用录制的 OpenCode event/session-message 夹具覆盖分块文本、工具输出、无 session、非零退出、超时、超限、无效 JSON、多个 fenced block、schema 失败、目标变化和成功写回。
+- [x] 3.6 使用录制的 OpenCode event/session-message 夹具覆盖分块文本、大输出、工具输出、无 session、非零退出、超时、无效 JSON、多个 fenced block、schema 失败、目标变化和成功写回。
 
 ## 4. 上传流程与 VLM 移除
 
