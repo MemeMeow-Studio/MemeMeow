@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import errno
 import uuid
@@ -49,10 +50,11 @@ from backend.paths import SUPPORTED_EXTENSIONS, validate_business_storage_key
 
 
 EMBEDDING_DIMENSIONS = 1024
+VISUAL_EMBEDDING_DIMENSIONS = 768
 SCOPE_LOCAL = "local"
 UTC = timezone.utc
 # 当前代码要求的 Alembic head；数据库初始化脚本会显式传入同一 revision。
-CURRENT_SCHEMA_REVISION = "0004_meme_collections"
+CURRENT_SCHEMA_REVISION = "0009_dinov2_vitb14_visual_search"
 
 
 def utcnow() -> datetime:
@@ -253,6 +255,34 @@ class MemeEmbedding(Base):
     )
 
 
+class MemeVisualEmbedding(Base):
+    """当前 scope 中一张图片的版本化视觉向量产物。
+
+    视觉向量与文本 generation 完全分表；复合主键把模型和预处理身份纳入
+    产物地址，模型切换时不会把两个向量空间混在同一次查询里。当前表由
+    当前发布迁移固定为 DINOv2 ViT-B/14 的 768 维；历史模型必须通过独立迁移启用。
+    """
+
+    __tablename__ = "meme_visual_embeddings"
+    scope_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    meme_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    model: Mapped[str] = mapped_column(String(255), primary_key=True)
+    preprocess_version: Mapped[str] = mapped_column(String(128), primary_key=True)
+    dimensions: Mapped[int] = mapped_column(Integer, nullable=False, default=VISUAL_EMBEDDING_DIMENSIONS)
+    image_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector(VISUAL_EMBEDDING_DIMENSIONS), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(["scope_id"], ["scopes.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(["scope_id", "meme_id"], ["memes.scope_id", "memes.id"], ondelete="CASCADE"),
+        CheckConstraint(f"dimensions = {VISUAL_EMBEDDING_DIMENSIONS}", name="ck_visual_embedding_dimensions"),
+        CheckConstraint("length(image_sha256) = 64", name="ck_visual_embedding_sha256"),
+        UniqueConstraint("scope_id", "meme_id", "model", "preprocess_version", name="uq_visual_embedding_identity"),
+    )
+
+
 class Task(Base):
     """字符串任务 ID、状态、去重键和 Worker 租约。"""
 
@@ -288,6 +318,41 @@ class Task(Base):
     )
 
 
+class ReverseImageUsageEvent(Base):
+    """反向图片检索的逐请求审计流水。
+
+    事件以 ``scope_id`` 绑定任务和图片，``request_id`` 负责幂等恢复；
+    ``provider_called`` 只在真正开始供应商逻辑检索时置为真，供任务终态聚合。
+    """
+
+    __tablename__ = "reverse_image_usage_events"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    scope_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    task_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    meme_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    cache_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    cache_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    provider_called: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False, default="started")
+    retryable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    provider_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        ForeignKeyConstraint(["scope_id", "task_id"], ["tasks.scope_id", "tasks.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(["scope_id", "meme_id"], ["memes.scope_id", "memes.id"], ondelete="CASCADE"),
+        CheckConstraint("cache_status IN ('hit','miss','refresh')", name="ck_reverse_usage_cache_status"),
+        CheckConstraint("outcome IN ('started','success','empty','failed','forbidden')", name="ck_reverse_usage_outcome"),
+        CheckConstraint("provider_called = false OR provider_started_at IS NOT NULL", name="ck_reverse_usage_provider_started"),
+        Index("ix_reverse_usage_scope_created", "scope_id", "created_at"),
+        Index("ix_reverse_usage_scope_task", "scope_id", "task_id", "created_at"),
+    )
 
 
 class TaskBatch(Base):
@@ -343,6 +408,7 @@ class TaskLaneSlot(Base):
 Index("ix_tasks_active_dedupe", Task.scope_id, Task.task_type, Task.dedupe_key, unique=True, postgresql_where=text("status IN ('queued','running') AND dedupe_key IS NOT NULL"))
 Index("ix_tasks_claimable", Task.scope_id, Task.status, Task.available_at, Task.lease_expires_at)
 Index("ix_embeddings_generation_status", MemeEmbedding.scope_id, MemeEmbedding.generation_id, MemeEmbedding.item_status)
+Index("ix_visual_embeddings_match", MemeVisualEmbedding.scope_id, MemeVisualEmbedding.model, MemeVisualEmbedding.preprocess_version, MemeVisualEmbedding.meme_id)
 Index("uq_search_generation_building", SearchGeneration.scope_id, SearchGeneration.model, unique=True, postgresql_where=text("status = 'building'"))
 Index("ix_storage_operations_recovery", StorageOperation.scope_id, StorageOperation.status, StorageOperation.updated_at)
 Index("uq_storage_operation_active", StorageOperation.scope_id, StorageOperation.meme_id, unique=True, postgresql_where=text("status IN ('prepared','file_applied') AND meme_id IS NOT NULL"))
@@ -578,24 +644,21 @@ class CollectionRepository:
             raise DatabaseError("invalid_collection_name")
         return normalized
 
-    @staticmethod
-    def _uuid(value: UUID | str, code: str = "collection_not_found") -> UUID:
-        """解析边界 UUID；非法值按资源不存在处理，避免泄露数据库异常。"""
-        try:
-            return UUID(str(value))
-        except (TypeError, ValueError) as exc:
-            raise DatabaseError(code) from exc
-
     def get(self, collection_id: UUID | str, *, for_update: bool = False) -> MemeCollection | None:
         """读取当前 scope 合集，跨 scope 或非法 UUID 均视为不存在。"""
         try:
-            identifier = self._uuid(collection_id)
-        except DatabaseError:
+            identifier = UUID(str(collection_id))
+        except (ValueError, TypeError):
             return None
         statement = select(MemeCollection).where(MemeCollection.scope_id == self.scope.scope_id, MemeCollection.id == identifier)
         if for_update:
             statement = statement.with_for_update()
         return self.session.scalar(statement)
+
+    def by_name(self, name: str) -> MemeCollection | None:
+        """按规范名称查询当前 scope 合集，供导入预检避免业务副作用。"""
+        normalized = self.normalize_name(name)
+        return self.session.scalar(select(MemeCollection).where(MemeCollection.scope_id == self.scope.scope_id, MemeCollection.name == normalized))
 
     def count(self) -> int:
         """统计当前 scope 合集数量。"""
@@ -603,17 +666,16 @@ class CollectionRepository:
 
     def list(self, *, page: int = 1, page_size: int = 50) -> list[MemeCollection]:
         """按更新时间降序和 UUID 稳定分页列出合集。"""
-        size = max(1, min(page_size, 100))
-        return list(self.session.scalars(select(MemeCollection).where(MemeCollection.scope_id == self.scope.scope_id).order_by(MemeCollection.updated_at.desc(), MemeCollection.id.desc()).offset(max(0, page - 1) * size).limit(size)))
+        return list(self.session.scalars(select(MemeCollection).where(MemeCollection.scope_id == self.scope.scope_id).order_by(MemeCollection.updated_at.desc(), MemeCollection.id.desc()).offset(max(0, page - 1) * page_size).limit(max(1, min(page_size, 100)))))
 
     def create(self, name: str) -> MemeCollection:
         """创建当前 scope 的规范化合集，重名映射为稳定冲突错误。"""
         row = MemeCollection(scope_id=self.scope.scope_id, name=self.normalize_name(name))
+        self.session.add(row)
         try:
-            with self.session.begin_nested():
-                self.session.add(row)
-                self.session.flush()
+            self.session.flush()
         except IntegrityError as exc:
+            self.session.rollback()
             raise DatabaseError("collection_exists") from exc
         return row
 
@@ -625,9 +687,9 @@ class CollectionRepository:
         row.name = self.normalize_name(name)
         row.updated_at = utcnow()
         try:
-            with self.session.begin_nested():
-                self.session.flush()
+            self.session.flush()
         except IntegrityError as exc:
+            self.session.rollback()
             raise DatabaseError("collection_exists") from exc
         return row
 
@@ -641,22 +703,35 @@ class CollectionRepository:
 
     def member_count(self, collection_id: UUID | str) -> int:
         """统计合集成员数量。"""
-        identifier = self._uuid(collection_id)
-        return int(self.session.scalar(select(func.count()).select_from(MemeCollectionItem).where(MemeCollectionItem.scope_id == self.scope.scope_id, MemeCollectionItem.collection_id == identifier)) or 0)
+        return int(self.session.scalar(select(func.count()).select_from(MemeCollectionItem).where(MemeCollectionItem.scope_id == self.scope.scope_id, MemeCollectionItem.collection_id == UUID(str(collection_id)))) or 0)
 
     def members(self, collection_id: UUID | str, *, page: int = 1, page_size: int = 50) -> list[tuple[MemeCollectionItem, Meme]]:
         """按加入时间和 Meme UUID 稳定分页返回成员及当前 Meme。"""
-        identifier = self._uuid(collection_id)
-        size = max(1, min(page_size, 100))
-        statement = (
-            select(MemeCollectionItem, Meme)
-            .join(Meme, (Meme.scope_id == MemeCollectionItem.scope_id) & (Meme.id == MemeCollectionItem.meme_id))
-            .where(MemeCollectionItem.scope_id == self.scope.scope_id, MemeCollectionItem.collection_id == identifier)
-            .order_by(MemeCollectionItem.added_at.asc(), MemeCollectionItem.meme_id.asc())
-            .offset(max(0, page - 1) * size)
-            .limit(size)
-        )
+        statement = select(MemeCollectionItem, Meme).join(Meme, (Meme.scope_id == MemeCollectionItem.scope_id) & (Meme.id == MemeCollectionItem.meme_id)).where(MemeCollectionItem.scope_id == self.scope.scope_id, MemeCollectionItem.collection_id == UUID(str(collection_id))).order_by(MemeCollectionItem.added_at.asc(), MemeCollectionItem.meme_id.asc()).offset(max(0, page - 1) * page_size).limit(max(1, min(page_size, 100)))
         return list(self.session.execute(statement).all())
+
+    def members_for_export(self, collection_id: UUID | str) -> list[Meme]:
+        """按加入顺序读取合集全部可导出 Meme，并排除活动存储操作。
+
+        导出需要一次稳定的非分页成员快照；``prepared``/``file_applied`` 期间的 Meme
+        可能正处于跨数据库与文件系统的中间态，必须等待恢复后再进入归档。
+        """
+        active_operation = select(StorageOperation.id).where(
+            StorageOperation.scope_id == self.scope.scope_id,
+            StorageOperation.meme_id == Meme.id,
+            StorageOperation.status.in_(("prepared", "file_applied")),
+        ).exists()
+        statement = (
+            select(Meme)
+            .join(MemeCollectionItem, (Meme.scope_id == MemeCollectionItem.scope_id) & (Meme.id == MemeCollectionItem.meme_id))
+            .where(
+                MemeCollectionItem.scope_id == self.scope.scope_id,
+                MemeCollectionItem.collection_id == UUID(str(collection_id)),
+                ~active_operation,
+            )
+            .order_by(MemeCollectionItem.added_at.asc(), MemeCollectionItem.meme_id.asc())
+        )
+        return list(self.session.scalars(statement))
 
     def add_members(self, collection_id: UUID | str, meme_ids: Sequence[UUID | str]) -> tuple[int, int, int]:
         """原子批量加入 Meme，重复请求幂等；任一 Meme 越界则整批失败。"""
@@ -665,7 +740,10 @@ class CollectionRepository:
             raise DatabaseError("collection_not_found")
         unique_ids: list[UUID] = []
         for value in meme_ids:
-            identifier = self._uuid(value, "meme_not_found")
+            try:
+                identifier = UUID(str(value))
+            except (ValueError, TypeError) as exc:
+                raise DatabaseError("meme_not_found") from exc
             if identifier not in unique_ids:
                 unique_ids.append(identifier)
         if not unique_ids:
@@ -677,33 +755,27 @@ class CollectionRepository:
         for meme_id in unique_ids:
             if meme_id not in existing:
                 self.session.add(MemeCollectionItem(scope_id=self.scope.scope_id, collection_id=collection.id, meme_id=meme_id))
-        if len(existing) != len(unique_ids):
-            collection.updated_at = utcnow()
         self.session.flush()
-        return len(set(unique_ids) - existing), len(existing), self.member_count(collection.id)
+        total = self.member_count(collection.id)
+        return len(set(unique_ids) - existing), len(existing), total
 
     def remove_member(self, collection_id: UUID | str, meme_id: UUID | str) -> int:
         """幂等移除单个成员并返回最终成员数。"""
-        collection = self.get(collection_id, for_update=True)
+        collection = self.get(collection_id)
         if collection is None:
             raise DatabaseError("collection_not_found")
-        identifier = self._uuid(meme_id, "meme_not_found")
-        deleted = self.session.execute(delete(MemeCollectionItem).where(MemeCollectionItem.scope_id == self.scope.scope_id, MemeCollectionItem.collection_id == collection.id, MemeCollectionItem.meme_id == identifier))
-        if deleted.rowcount:
-            collection.updated_at = utcnow()
+        try:
+            identifier = UUID(str(meme_id))
+        except (ValueError, TypeError) as exc:
+            raise DatabaseError("meme_not_found") from exc
+        self.session.execute(delete(MemeCollectionItem).where(MemeCollectionItem.scope_id == self.scope.scope_id, MemeCollectionItem.collection_id == collection.id, MemeCollectionItem.meme_id == identifier))
         self.session.flush()
         return self.member_count(collection.id)
 
     def cover(self, collection_id: UUID | str) -> Meme | None:
         """返回按加入顺序最早且仍存在的 Meme。"""
-        identifier = self._uuid(collection_id)
-        return self.session.scalar(
-            select(Meme)
-            .join(MemeCollectionItem, (Meme.scope_id == MemeCollectionItem.scope_id) & (Meme.id == MemeCollectionItem.meme_id))
-            .where(MemeCollectionItem.scope_id == self.scope.scope_id, MemeCollectionItem.collection_id == identifier)
-            .order_by(MemeCollectionItem.added_at.asc(), MemeCollectionItem.meme_id.asc())
-        )
-
+        row = self.session.scalar(select(Meme).join(MemeCollectionItem, (Meme.scope_id == MemeCollectionItem.scope_id) & (Meme.id == MemeCollectionItem.meme_id)).where(MemeCollectionItem.scope_id == self.scope.scope_id, MemeCollectionItem.collection_id == UUID(str(collection_id))).order_by(MemeCollectionItem.added_at.asc(), MemeCollectionItem.meme_id.asc()))
+        return row
 
 class SearchRepository:
     """按 scope 管理 generation、head 和 pgvector 查询。"""
@@ -902,6 +974,176 @@ class SearchRepository:
         return [(identifier, float(score)) for identifier, score in self.session.execute(statement).all()]
 
 
+def validate_visual_vector(vector: Sequence[float], *, dimensions: int = VISUAL_EMBEDDING_DIMENSIONS) -> list[float]:
+    """校验视觉向量维度、有限性和范数，并返回 L2 归一化的普通列表。"""
+    try:
+        values = [float(value) for value in vector]
+    except (TypeError, ValueError) as exc:
+        raise DatabaseError("visual_embedding_invalid") from exc
+    if len(values) != int(dimensions):
+        raise DatabaseError("visual_embedding_dimensions_mismatch")
+    if not all(math.isfinite(value) for value in values):
+        raise DatabaseError("visual_embedding_non_finite")
+    norm = math.sqrt(sum(value * value for value in values))
+    if not math.isfinite(norm) or norm <= 0:
+        raise DatabaseError("visual_embedding_zero_norm")
+    return [value / norm for value in values]
+
+
+class VisualEmbeddingRepository:
+    """绑定 scope 的视觉向量写入和精确 cosine 查询 repository。"""
+
+    def __init__(self, session: Session, scope: ScopeContext):
+        self.session, self.scope = session, scope
+
+    @staticmethod
+    def _identity(model: str, preprocess_version: str, dimensions: int) -> tuple[str, str, int]:
+        """规范化向量空间身份，避免空模型或错误维度进入查询。"""
+        if not isinstance(model, str) or not model.strip() or not isinstance(preprocess_version, str) or not preprocess_version.strip():
+            raise DatabaseError("visual_model_not_configured")
+        if int(dimensions) <= 0:
+            raise DatabaseError("visual_embedding_dimensions_mismatch")
+        return model.strip(), preprocess_version.strip(), int(dimensions)
+
+    def get(
+        self,
+        meme_id: UUID | str,
+        *,
+        model: str,
+        preprocess_version: str,
+        dimensions: int = VISUAL_EMBEDDING_DIMENSIONS,
+        image_sha256: str | None = None,
+        for_update: bool = False,
+    ) -> MemeVisualEmbedding | None:
+        """读取当前 scope、模型空间和可选图片 SHA 对应的视觉向量。"""
+        try:
+            identifier = UUID(str(meme_id))
+        except (ValueError, TypeError):
+            return None
+        model, preprocess_version, dimensions = self._identity(model, preprocess_version, dimensions)
+        filters = [
+            MemeVisualEmbedding.scope_id == self.scope.scope_id,
+            MemeVisualEmbedding.meme_id == identifier,
+            MemeVisualEmbedding.model == model,
+            MemeVisualEmbedding.preprocess_version == preprocess_version,
+            MemeVisualEmbedding.dimensions == dimensions,
+        ]
+        if image_sha256 is not None:
+            filters.append(MemeVisualEmbedding.image_sha256 == image_sha256)
+        statement = select(MemeVisualEmbedding).where(*filters)
+        if for_update:
+            statement = statement.with_for_update()
+        return self.session.scalar(statement)
+
+    def upsert(
+        self,
+        meme_id: UUID | str,
+        *,
+        model: str,
+        preprocess_version: str,
+        image_sha256: str,
+        embedding: Sequence[float],
+        dimensions: int = VISUAL_EMBEDDING_DIMENSIONS,
+    ) -> MemeVisualEmbedding:
+        """校验并幂等写入当前图片版本的视觉向量。"""
+        model, preprocess_version, dimensions = self._identity(model, preprocess_version, dimensions)
+        normalized = validate_visual_vector(embedding, dimensions=dimensions)
+        try:
+            identifier = UUID(str(meme_id))
+        except (ValueError, TypeError) as exc:
+            raise DatabaseError("meme_not_found") from exc
+        if not isinstance(image_sha256, str) or len(image_sha256) != 64 or any(character not in "0123456789abcdefABCDEF" for character in image_sha256):
+            raise DatabaseError("visual_embedding_sha256_invalid")
+        meme = self.session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == identifier).with_for_update())
+        if meme is None:
+            raise DatabaseError("meme_not_found")
+        if meme.sha256 != image_sha256:
+            raise DatabaseError("visual_embedding_sha256_mismatch")
+        row = self.get(identifier, model=model, preprocess_version=preprocess_version, dimensions=dimensions, for_update=True)
+        if row is None:
+            row = MemeVisualEmbedding(scope_id=self.scope.scope_id, meme_id=identifier, model=model, preprocess_version=preprocess_version, dimensions=dimensions, image_sha256=image_sha256, embedding=normalized)
+            self.session.add(row)
+        else:
+            row.image_sha256 = image_sha256
+            row.embedding = normalized
+            row.dimensions = dimensions
+            row.updated_at = utcnow()
+        self.session.flush()
+        return row
+
+    @staticmethod
+    def agent_ready(meme: Meme) -> bool:
+        """验证候选图片具有当前 SHA 对应的 research Agent provenance。"""
+        if meme.context_status != "ready":
+            return False
+        summary = (meme.provenance or {}).get("agent_context")
+        if not isinstance(summary, dict):
+            return False
+        return bool(
+            summary.get("task_id")
+            and summary.get("model")
+            and summary.get("skill_hash")
+            and summary.get("completed_at")
+            and summary.get("image_sha256") == meme.sha256
+        )
+
+    def match(
+        self,
+        vector: Sequence[float],
+        *,
+        model: str,
+        preprocess_version: str,
+        dimensions: int = VISUAL_EMBEDDING_DIMENSIONS,
+        limit: int = 20,
+        exclude_meme_id: UUID | str | None = None,
+    ) -> list[tuple[MemeVisualEmbedding, Meme, float]]:
+        """在当前 scope 内精确查询合格候选并按分数和 Meme UUID 稳定排序。"""
+        model, preprocess_version, dimensions = self._identity(model, preprocess_version, dimensions)
+        normalized = validate_visual_vector(vector, dimensions=dimensions)
+        limit = max(1, min(int(limit), 50))
+        excluded: UUID | None = None
+        if exclude_meme_id is not None:
+            try:
+                excluded = UUID(str(exclude_meme_id))
+            except (ValueError, TypeError):
+                excluded = None
+        active_operation = select(StorageOperation.id).where(
+            StorageOperation.scope_id == self.scope.scope_id,
+            StorageOperation.meme_id == Meme.id,
+            StorageOperation.status.in_(("prepared", "file_applied")),
+        ).exists()
+        distance = MemeVisualEmbedding.embedding.cosine_distance(normalized)
+        statement = (
+            select(MemeVisualEmbedding, Meme, (1 - distance).label("score"))
+            .join(Meme, (Meme.scope_id == MemeVisualEmbedding.scope_id) & (Meme.id == MemeVisualEmbedding.meme_id))
+            .where(
+                MemeVisualEmbedding.scope_id == self.scope.scope_id,
+                MemeVisualEmbedding.model == model,
+                MemeVisualEmbedding.preprocess_version == preprocess_version,
+                MemeVisualEmbedding.dimensions == dimensions,
+                MemeVisualEmbedding.image_sha256 == Meme.sha256,
+                ~active_operation,
+            )
+            .order_by(distance.asc(), MemeVisualEmbedding.meme_id.asc())
+            .limit(max(limit * 8, 50))
+        )
+        if excluded is not None:
+            statement = statement.where(MemeVisualEmbedding.meme_id != excluded)
+        rows: list[tuple[MemeVisualEmbedding, Meme, float]] = []
+        for embedding, meme, score in self.session.execute(statement).all():
+            if not self.agent_ready(meme):
+                continue
+            rows.append((embedding, meme, float(score)))
+            if len(rows) >= limit:
+                break
+        rows.sort(key=lambda item: (-item[2], str(item[1].id)))
+        return rows
+
+    def query(self, vector: Sequence[float], **kwargs: Any) -> list[tuple[UUID, float]]:
+        """返回与文本 SearchRepository 对齐的 ``(meme_id, score)`` 结果。"""
+        return [(meme.id, score) for _embedding, meme, score in self.match(vector, **kwargs)]
+
+
 class TaskRepository:
     """数据库任务队列 repository，所有方法自动带 scope 条件。"""
 
@@ -1069,10 +1311,32 @@ class TaskRepository:
         """幂等写入 scope-safe 批次成员关系。"""
         batch = self.ensure_batch(batch_id)
         if batch.sealed:
-            raise DatabaseError("batch_sealed")
+            # 视觉任务重试或其事务内创建的 Agent 子任务可能晚于批次封口；只允许
+            # 这两种阶段关系加入，其他外部任务继续拒绝，避免 finalizer 观察到错误成员。
+            child = self.get(task_id)
+            if child is None or child.task_type not in {"visual_embedding_generation", "meme_context_generation"}:
+                raise DatabaseError("batch_sealed")
+            # 视觉重试可能在旧 finalizer 完成后补入 Agent；重新打开收束状态，
+            # 让该子任务终态后再次提交文本索引，而不是沿用旧批次快照。
+            if batch.finalizer_state == "complete":
+                batch.finalizer_state = "pending"
+                batch.finalized_at = None
         if self.session.scalar(select(TaskBatchItem).where(TaskBatchItem.scope_id == self.scope.scope_id, TaskBatchItem.batch_id == batch_id, TaskBatchItem.task_id == task_id)) is None:
             self.session.add(TaskBatchItem(scope_id=self.scope.scope_id, batch_id=batch_id, task_id=task_id))
             self.session.flush()
+
+    def context_task_for_target(self, meme_id: UUID | str, image_sha256: str) -> Task | None:
+        """读取当前 scope、图片版本对应的最近 Agent 任务，供视觉完成幂等衔接使用。"""
+        dedupe_key = f"context:{meme_id}:{image_sha256}"
+        return self.session.scalar(
+            select(Task)
+            .where(
+                Task.scope_id == self.scope.scope_id,
+                Task.task_type == "meme_context_generation",
+                Task.dedupe_key == dedupe_key,
+            )
+            .order_by(Task.created_at.desc(), Task.id.desc())
+        )
 
     def batch_ids_for_task(self, task_id: str) -> list[str]:
         """读取当前 scope 中与任务关联的所有批次，兼容任务去重后的复用路径。"""
@@ -1263,6 +1527,136 @@ class TaskRepository:
         return records[:limit], next_cursor
 
 
+class ReverseImageUsageRepository:
+    """按 scope 读写反向图片用量事件并生成任务级审计摘要。"""
+
+    def __init__(self, session: Session, scope: ScopeContext):
+        self.session, self.scope = session, scope
+
+    def get(self, request_id: str, *, for_update: bool = False) -> ReverseImageUsageEvent | None:
+        """幂等读取当前 scope 的请求记录；全局 request_id 仍不会跨 scope 产生统计。"""
+        statement = select(ReverseImageUsageEvent).where(
+            ReverseImageUsageEvent.scope_id == self.scope.scope_id,
+            ReverseImageUsageEvent.request_id == request_id,
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return self.session.scalar(statement)
+
+    @staticmethod
+    def _same_request(event: ReverseImageUsageEvent, *, task_id: str, cache_key: str) -> ReverseImageUsageEvent:
+        """校验幂等请求仍指向同一任务和缓存身份，防止复用标识覆盖另一项检索。"""
+        if event.task_id != task_id or event.cache_key != cache_key:
+            raise DatabaseError("usage_request_conflict")
+        return event
+
+    def create(
+        self,
+        *,
+        request_id: str,
+        task_id: str,
+        meme_id: UUID | str | None,
+        cache_key: str,
+        cache_status: str,
+        provider: str | None = None,
+    ) -> ReverseImageUsageEvent:
+        """创建一次逻辑检索事件；重复 request_id 返回现有事件以保持幂等。"""
+        parsed_meme_id: UUID | None = None
+        if meme_id:
+            try:
+                parsed_meme_id = UUID(str(meme_id))
+            except (ValueError, TypeError) as exc:
+                raise DatabaseError("meme_not_found") from exc
+        existing = self.get(request_id, for_update=True)
+        if existing is not None:
+            return self._same_request(existing, task_id=task_id, cache_key=cache_key)
+        event = ReverseImageUsageEvent(
+            request_id=request_id,
+            scope_id=self.scope.scope_id,
+            task_id=task_id,
+            meme_id=parsed_meme_id,
+            cache_key=cache_key,
+            cache_status=cache_status,
+            provider=provider,
+        )
+        try:
+            # 保存点只回滚这次幂等插入，不能撤销调用方 UOW 中已经完成的任务写入。
+            with self.session.begin_nested():
+                self.session.add(event)
+                self.session.flush()
+        except IntegrityError:
+            existing = self.get(request_id, for_update=True)
+            if existing is None:
+                raise DatabaseError("usage_event_conflict")
+            return self._same_request(existing, task_id=task_id, cache_key=cache_key)
+        return event
+
+    def mark_provider_started(self, request_id: str) -> ReverseImageUsageEvent:
+        """原子标记供应商逻辑调用已开始，计数只会从 false 变为 true 一次。"""
+        event = self.get(request_id, for_update=True)
+        if event is None:
+            raise DatabaseError("usage_event_not_found")
+        if event.completed_at is not None:
+            return event
+        if not event.provider_called:
+            event.provider_called = True
+            event.provider_started_at = utcnow()
+            event.outcome = "started"
+            self.session.flush()
+        return event
+
+    def finish(
+        self,
+        request_id: str,
+        *,
+        cache_status: str | None = None,
+        outcome: str,
+        retryable: bool = False,
+        result: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> ReverseImageUsageEvent:
+        """写入供应商或缓存终态；失败事件保留以供恢复和审计。"""
+        event = self.get(request_id, for_update=True)
+        if event is None:
+            raise DatabaseError("usage_event_not_found")
+        # 已完成事件是幂等终态；重试不能用另一份响应覆盖原始审计事实。
+        if event.completed_at is not None:
+            return event
+        if cache_status is not None:
+            event.cache_status = cache_status
+        event.outcome = outcome
+        event.retryable = retryable
+        event.result = result
+        event.error = error
+        event.completed_at = utcnow()
+        self.session.flush()
+        return event
+
+    def aggregate_task(self, task_id: str) -> dict[str, Any]:
+        """按当前 scope 聚合任务事件，返回不含图片身份和供应商秘密的摘要。"""
+        rows = list(
+            self.session.scalars(
+                select(ReverseImageUsageEvent)
+                .where(
+                    ReverseImageUsageEvent.scope_id == self.scope.scope_id,
+                    ReverseImageUsageEvent.task_id == task_id,
+                )
+                .order_by(ReverseImageUsageEvent.created_at.asc(), ReverseImageUsageEvent.id.asc())
+            )
+        )
+        completed = sorted(
+            (row for row in rows if row.completed_at is not None),
+            key=lambda row: (row.completed_at, row.created_at, row.id),
+        )
+        return {
+            "attempted": bool(rows),
+            "used": any(row.outcome in {"success", "empty"} and bool((row.result or {}).get("used", True)) for row in rows),
+            "cache_hits": sum(1 for row in rows if row.cache_status == "hit"),
+            "provider_calls": sum(1 for row in rows if row.provider_called),
+            "outcome": completed[-1].outcome if completed else ("started" if rows else "not_requested"),
+            "request_count": len(rows),
+        }
+
 
 class DataEnvironment:
     """请求或任务级 scope-bound Session、repository 和 BlobStore 组合。"""
@@ -1273,7 +1667,11 @@ class DataEnvironment:
         self.memes = MemeRepository(self.uow.session, scope)
         self.collections = CollectionRepository(self.uow.session, scope)
         self.search = SearchRepository(self.uow.session, scope)
+        self.visual = VisualEmbeddingRepository(self.uow.session, scope)
+        # 兼容领域层较直白的命名，调用方不得绕过 scope-bound repository。
+        self.visual_embeddings = self.visual
         self.tasks = TaskRepository(self.uow.session, scope)
+        self.reverse_image_usage = ReverseImageUsageRepository(self.uow.session, scope)
 
     def __enter__(self) -> "DataEnvironment":
         self.uow.__enter__()
