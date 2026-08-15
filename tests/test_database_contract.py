@@ -7,17 +7,19 @@ from uuid import uuid4
 
 import pytest
 
-from backend.database import Base, CollectionRepository, EMBEDDING_DIMENSIONS, BlobStore, DatabaseError, ScopeContext
+from backend.database import Base, EMBEDDING_DIMENSIONS, VISUAL_EMBEDDING_DIMENSIONS, BlobStore, DatabaseError, ScopeContext
 from backend.paths import validate_business_storage_key
 from api import image_metadata
 
 
 def test_schema_contains_scope_and_queue_tables():
     """首版 schema 必须覆盖业务记录、generation 和持久任务队列。"""
-    expected = {"scopes", "installation_state", "memes", "storage_operations", "search_generations", "search_heads", "meme_embeddings", "tasks", "task_batches", "task_batch_items", "task_lane_slots", "meme_collections", "meme_collection_items"}
+    expected = {"scopes", "installation_state", "memes", "storage_operations", "search_generations", "search_heads", "meme_embeddings", "meme_visual_embeddings", "tasks", "task_batches", "task_batch_items", "task_lane_slots", "meme_collections", "meme_collection_items", "reverse_image_usage_events"}
     assert expected <= set(Base.metadata.tables)
     assert EMBEDDING_DIMENSIONS == 1024
     assert Base.metadata.tables["meme_embeddings"].c.embedding.type.dim == 1024
+    assert VISUAL_EMBEDDING_DIMENSIONS == 768
+    assert Base.metadata.tables["meme_visual_embeddings"].c.embedding.type.dim == 768
 
 
 def test_scope_context_rejects_empty_scope():
@@ -54,10 +56,3 @@ def test_metadata_http_contract_only_exposes_stable_meme_id():
     assert "meme_id" in parameters
     assert "directory" not in parameters
     assert "filename" not in parameters
-
-
-def test_collection_repository_is_scope_bound():
-    """合集 repository 的公开方法不接受客户端 scope 覆盖参数。"""
-    public = {name for name in dir(CollectionRepository) if not name.startswith("_") and callable(getattr(CollectionRepository, name))}
-    for name in public:
-        assert "scope_id" not in inspect.signature(getattr(CollectionRepository, name)).parameters

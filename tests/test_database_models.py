@@ -9,7 +9,7 @@ from alembic.script import ScriptDirectory
 
 
 def test_single_forward_migration_head():
-    """仓库只暴露一个首版 revision，回滚由 migration 明确拒绝。"""
+    """仓库只暴露一个前向 revision head，回滚由 migration 明确拒绝。"""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == ["0004_meme_collections"]
+    assert script.get_heads() == ["0009_dinov2_vitb14_visual_search"]
     assert (Path("alembic/versions/0001_postgres_scoped.py")).is_file()
