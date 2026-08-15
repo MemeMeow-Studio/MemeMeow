@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
@@ -86,14 +87,17 @@ class MemeContext(BaseModel):
     @field_validator("title", mode="before")
     @classmethod
     def clean_title(cls, value: str | None) -> str | None:
-        """把标题规范为可空单行文本，保留自然语言内容。"""
+        """把标题规范为只含 Unicode 字母、数字和空格的可空单行文本。"""
         if value is None:
             return None
         if not isinstance(value, str):
             raise ValueError("context_text_must_be_string")
-        value = value.strip()
+        value = unicodedata.normalize("NFC", value).strip()
         if any(ord(character) < 32 for character in value):
             raise ValueError("title_must_be_single_line")
+        value = " ".join(value.split())
+        if any(not unicodedata.category(character).startswith("L") and not character.isdecimal() and character != " " for character in value):
+            raise ValueError("title_contains_disallowed_characters")
         return value or None
 
     @field_validator("meaning", mode="before")

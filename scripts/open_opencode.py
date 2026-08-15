@@ -33,8 +33,12 @@ def main(argv: list[str] | None = None) -> int:
     except OpenCodeError as exc:
         parser.exit(1, f"OpenCode runtime 初始化失败 [{exc.code}]: {exc}\n")
 
-    executable = str(settings.opencode_executable)
-    environment = runner.build_environment()
+    if runner.executor_mode:
+        parser.exit(1, "Compose executor 模式不提供任意 OpenCode CLI 转发，请通过受控任务接口运行研究。\n")
+
+    # Docker 模式只使用镜像内的固定命令，避免把宿主绝对路径传入容器。
+    executable = "opencode" if runner.docker_mode else str(settings.opencode_executable or "opencode")
+    environment = runner._allowed_container_environment(0) if runner.docker_mode else runner.build_environment()
     if known.list:
         command = [executable, "session", "list", *passthrough]
     else:
@@ -47,7 +51,19 @@ def main(argv: list[str] | None = None) -> int:
         ]
     try:
         os.chdir(runner.workspace)
-        os.execvpe(executable, command, environment)
+        if runner.docker_mode:
+            # 诊断入口沿用共享容器和同一 runtime DB，不会启动第二个容器。
+            container_command = list(command)
+            if not known.list:
+                # 宿主 workspace 路径不能传给容器；runtime 在容器内固定挂载到 /runtime。
+                container_command[1] = "/runtime/workspace"
+            docker_command = runner._docker_command_for_execution(
+                runner._container_exec(*container_command, environment=runner._allowed_container_environment(0), workdir="/runtime/workspace")
+            )
+            launcher_environment = {"PATH": os.environ.get("PATH", ""), **environment}
+            os.execvpe(docker_command[0], docker_command, launcher_environment)
+        else:
+            os.execvpe(executable, command, environment)
     except OSError as exc:
         parser.exit(1, f"无法启动 OpenCode: {exc}\n")
     return 0

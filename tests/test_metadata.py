@@ -34,13 +34,22 @@ def test_sidecar_preserves_schema_and_unknown_fields(tmp_path: Path):
     assert loaded.meme_context.summary == "一只猫正在做出反应"
 
 
-def test_title_is_nullable_trimmed_and_single_line():
-    """标题保留自然语言，但空白、超长或多行值不能进入 sidecar。"""
-    assert MemeContext(title="  杰瑞震惊回头  ").title == "杰瑞震惊回头"
+def test_title_only_accepts_letters_numbers_and_spaces():
+    """标题只接受文字、数字和空格，并将连续空白折叠为单个空格。"""
+    assert MemeContext(title="  杰瑞  震惊  2  ").title == "杰瑞 震惊 2"
+    assert MemeContext(title="Cafe\u0301\u00a0测试").title == "Café 测试"
     assert MemeContext(title="   ").title is None
+    for title in ("认真!", "认真！", "猫：认真", "滑稽“认真”", "测试_标题", "开心🙂", "第①次", "版本Ⅷ", "零\u200d宽"):
+        with pytest.raises(ValidationError, match="title_contains_disallowed_characters"):
+            MemeContext(title=title)
+
+
+def test_title_rejects_overlong_and_multiline_values():
+    """标题按规范化结果限制长度，并优先报告控制字符错误。"""
+    assert MemeContext(title=("x  " * 40) + "x").title == ("x " * 40) + "x"
     with pytest.raises(ValidationError):
         MemeContext(title="x" * 121)
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match="title_must_be_single_line"):
         MemeContext(title="第一行\n第二行")
 
 

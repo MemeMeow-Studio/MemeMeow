@@ -76,6 +76,16 @@ def test_candidate_validation_checks_required_fields_and_uri_format(tmp_path: Pa
     assert error.value.code == "agent_output_schema_invalid"
 
 
+def test_candidate_validation_rejects_title_punctuation(tmp_path: Path):
+    """Agent 即使输出结构合法，也不能把标点或符号写入标题。"""
+    runner = OpenCodeRunner(make_settings(tmp_path))
+    invalid = candidate()
+    invalid["title"] = "滑稽表情“认真！”"
+    with pytest.raises(OpenCodeError) as error:
+        runner.validate_candidate(invalid)
+    assert error.value.code == "agent_output_schema_invalid"
+
+
 def test_missing_opencode_configuration_has_stable_error(tmp_path: Path):
     """没有可执行文件或模型时 worker 返回稳定诊断。"""
     with pytest.raises(OpenCodeError) as error:
@@ -105,6 +115,7 @@ def test_prepare_runtime_writes_common_config_without_secrets(tmp_path: Path):
     runner.prepare_runtime()
 
     payload = __import__("json").loads((runner.workspace / "opencode.json").read_text(encoding="utf-8"))
+    assert payload["experimental"] == {"continue_loop_on_deny": True}
     provider = payload["provider"]["mememeow"]
     assert provider["npm"] == "@ai-sdk/openai"
     assert provider["options"] == {
@@ -134,6 +145,26 @@ def test_runtime_environment_isolates_project_config(tmp_path: Path):
     assert environment["OPENCODE_CONFIG"] == str(runner.workspace / "opencode.json")
     assert environment["OPENCODE_CONFIG_DIR"] == str(runner.workspace / ".opencode")
     assert environment["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
+    assert "SERPAPI_API_KEY" not in environment
+    assert environment["MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL"].endswith("/internal/reverse-image/search")
+
+
+def test_host_runtime_environment_contains_claim_task_id(tmp_path: Path):
+    """Host 模式也必须把当前 claim task id 传给薄客户端，避免请求落到错误任务。"""
+    settings = Settings(
+        **{
+            **make_settings(tmp_path).__dict__,
+            "opencode_model": "mememeow/gpt-5.6-luna",
+            "opencode_base_url": "https://example.invalid/v1",
+            "opencode_api_key": "test-key",
+            "agent_runtime_mode": "host",
+        }
+    )
+    runner = OpenCodeRunner(settings)
+    environment = runner.build_environment(2, "claim-task-123")
+    assert environment["MEMEMEOW_OPENCODE_SLOT"] == "2"
+    assert environment["MEMEMEOW_AGENT_TASK_ID"] == "claim-task-123"
+    assert "SERPAPI_API_KEY" not in environment
 
 
 def test_prepare_runtime_uses_project_opencode_modules_by_default(tmp_path: Path):
@@ -345,6 +376,52 @@ def test_opencode_launcher_reuses_runtime_for_session_list(tmp_path: Path):
         "1",
     ]
     assert lines[5:] == ["session", "list", "--format", "json"]
+
+
+def test_opencode_launcher_keeps_cli_executable_in_docker_mode(tmp_path: Path):
+    """Docker 诊断入口必须保留 opencode 命令并只替换容器内 workspace。"""
+    project = Path(__file__).resolve().parent.parent
+    capture = tmp_path / "capture-docker.txt"
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == info ]]; then exit 0; fi\n"
+        "if [[ \"$1\" == inspect ]]; then printf true; exit 0; fi\n"
+        "if [[ \"$1\" == exec ]]; then\n"
+        f"  printf '%s\\n' \"$@\" > {str(capture)!r}\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    modules = tmp_path / "node_modules"
+    (modules / "@ai-sdk" / "openai").mkdir(parents=True)
+    runtime = tmp_path / "runtime"
+    environment = {
+        **os.environ,
+        "CAPTURE": str(capture),
+        "PATH": f"{tmp_path}:{os.environ.get('PATH', '')}",
+        "MEMEMEOW_AGENT_RUNTIME_MODE": "docker",
+        "MEMEMEOW_AGENT_CONTAINER_NAME": "mememeow-agent-runtime",
+        "MEMEMEOW_OPENCODE_MODEL": "mememeow/gpt-5.6-luna",
+        "MEMEMEOW_OPENCODE_BASE_URL": "https://example.invalid/v1",
+        "MEMEMEOW_OPENCODE_API_KEY": "test-key",
+        "MEMEMEOW_OPENCODE_RUNTIME_ROOT": str(runtime),
+        "MEMEMEOW_PYTHON": sys.executable,
+    }
+    result = subprocess.run(
+        [str(project / "scripts" / "open-opencode.sh"), "--list", "--format", "json"],
+        cwd=project,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    lines = capture.read_text(encoding="utf-8").splitlines()
+    assert "opencode" in lines
+    assert lines[lines.index("opencode") + 1 : lines.index("opencode") + 4] == ["session", "list", "--format"]
 
 
 def test_last_assistant_message_excludes_tool_content(tmp_path: Path):

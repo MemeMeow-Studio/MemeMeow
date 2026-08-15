@@ -16,9 +16,9 @@
   "properties": {
     "title": {
       "type": ["string", "null"],
-      "description": "由 Agent 生成的简短、独立可读单行标题；未知时为 null。标题可作为自动重命名的输入，但不等同于实际文件名。",
+      "description": "由 Agent 生成的简短、独立可读单行标题；只允许 Unicode 字母、汉字、数字和空格，禁止标点、Emoji、下划线及其他符号，未知时为 null。完整 Unicode 字符约束由后端领域模型校验。标题可作为自动重命名的输入，但不等同于实际文件名。",
       "maxLength": 120,
-      "pattern": "^[^\\u0000-\\u001f]*$"
+      "pattern": "^(?:[^\\W_]+(?: [^\\W_]+)*)?$"
     },
     "summary": {
       "type": "string",
