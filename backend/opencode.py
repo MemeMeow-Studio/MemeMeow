@@ -268,6 +268,7 @@ class OpenCodeRunner:
             pass
         temporary = target.with_name(f".{target.name}.tmp.{os.getpid()}.{id(self)}")
         temporary.write_text(content, encoding="utf-8")
+        os.chmod(temporary, 0o600)
         os.replace(temporary, target)
 
     def prepare_runtime(self) -> None:
@@ -306,8 +307,12 @@ class OpenCodeRunner:
             self.slots_root.mkdir(parents=True, exist_ok=True)
             self.log_root.mkdir(parents=True, exist_ok=True)
             self._write_runtime_config()
-            if self.executor_mode or self.docker_mode:
-                # 软链接目标使用容器固定路径，避免把宿主绝对路径暴露给 Agent。
+            if self.executor_mode:
+                # executor 直接挂载只读 skill 和镜像依赖，runtime volume 不保留符号链接，
+                # 这样初始化服务在重启时仍能严格拒绝所有链接节点。
+                pass
+            elif self.docker_mode:
+                # 旧版 Docker exec 兼容模式仍使用容器固定路径，避免暴露宿主绝对路径。
                 self._link(self.workspace / ".opencode" / "skills" / "research-meme-context", CONTAINER_SKILL_ROOT)
                 self._link(self.workspace / "node_modules", CONTAINER_NODE_MODULES)
             else:

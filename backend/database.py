@@ -49,13 +49,14 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 from sqlalchemy.dialects.postgresql import JSONB
 
 from backend.paths import SUPPORTED_EXTENSIONS, validate_business_storage_key
+from backend.storage_security import StorageRootError, validate_controlled_root
 
 
 EMBEDDING_DIMENSIONS = 1024
 VISUAL_EMBEDDING_DIMENSIONS = 768
 SCOPE_LOCAL = "local"
 UTC = timezone.utc
-# 当前公共核心要求的 Alembic head；适配层 revision 由其部署入口单独选择。
+# 当前代码要求的 Alembic head；数据库初始化脚本会显式传入同一 revision。
 CURRENT_SCHEMA_REVISION = "0010_separate_image_pipeline_and_stage_tasks"
 
 
@@ -2547,12 +2548,23 @@ class BlobStore:
 
     def __init__(self, *, root: Path, scope: ScopeContext, storage_namespace: UUID | None = None, local: bool = False):
         self.scope = scope
-        self.root = root.expanduser().resolve() if local else (root / "scopes" / str(storage_namespace or uuid.uuid4()) / "images").resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            base_root = validate_controlled_root(root, create=True, writable=True)
+            candidate = base_root if local else base_root / "scopes" / str(storage_namespace or uuid.uuid4()) / "images"
+            self.root = validate_controlled_root(candidate, create=True, writable=True)
+        except StorageRootError as exc:
+            raise DatabaseError(str(exc)) from exc
         self.staging_root = self.root / ".staging"
         self.quarantine_root = self.root / ".quarantine"
-        self.staging_root.mkdir(exist_ok=True)
-        self.quarantine_root.mkdir(exist_ok=True)
+        try:
+            self.staging_root = validate_controlled_root(self.staging_root, create=True, writable=True)
+            self.quarantine_root = validate_controlled_root(self.quarantine_root, create=True, writable=True)
+            # BlobStore 也可能被离线迁移工具直接构造，确保非 Compose 夹具仍遵守目录契约。
+            os.chmod(self.root, 0o700)
+            os.chmod(self.staging_root, 0o700)
+            os.chmod(self.quarantine_root, 0o700)
+        except (StorageRootError, OSError) as exc:
+            raise DatabaseError("storage_root_permissions_invalid") from exc
 
     def resolve(self, storage_key: str, *, must_exist: bool = True) -> Path:
         """安全解析 scope 内相对 key，拒绝绝对路径、穿越和符号链接逃逸。"""

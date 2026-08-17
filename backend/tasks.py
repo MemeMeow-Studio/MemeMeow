@@ -247,6 +247,7 @@ class PersistentTaskService:
         try:
             with temporary.open("w", encoding="utf-8") as handle:
                 handle.write(payload)
+                os.fchmod(handle.fileno(), 0o600)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, target)

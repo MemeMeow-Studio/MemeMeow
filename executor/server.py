@@ -154,6 +154,8 @@ class Executor:
 
     def __init__(self) -> None:
         """初始化共享目录、认证配置和有限并发池。"""
+        # Agent 运行身份创建的 runtime 文件不应继承镜像默认 umask 的 group/other 位。
+        os.umask(0o077)
         self.token_file = os.getenv("MEMEMEOW_AGENT_EXECUTOR_TOKEN_FILE", "").strip()
         self.token = os.getenv("MEMEMEOW_AGENT_EXECUTOR_TOKEN", "")
         self.token_error: str | None = None
@@ -290,7 +292,7 @@ class Executor:
         """构造 OpenCode 最小环境白名单，不继承 executor 容器中的无关变量。"""
         values = {
             "PATH": os.getenv("PATH", "/usr/local/bin:/usr/bin:/bin"),
-            "HOME": os.getenv("HOME", "/home/mememeow-agent"),
+            "HOME": os.getenv("HOME", "/runtime/home"),
             "OPENCODE_DB": str(RUNTIME_ROOT / "opencode.db"),
             "OPENCODE_CONFIG": str(WORKSPACE / "opencode.json"),
             "OPENCODE_CONFIG_DIR": str(WORKSPACE / ".opencode"),
@@ -304,10 +306,9 @@ class Executor:
             "MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL": os.getenv("MEMEMEOW_AGENT_VISUAL_SEARCH_INTERNAL_URL", ""),
             "MEMEMEOW_DATA_ROOT": str(RUNTIME_ROOT),
             "MEMEMEOW_REVERSE_IMAGE_CACHE_ROOT": str(RUNTIME_ROOT / "reverse_image_cache" / "serpapi_google_lens"),
+            # 依赖位于镜像只读目录，避免在 runtime volume 内创建 node_modules 链接。
+            "NODE_PATH": "/opt/mememeow/node_modules",
         }
-        node_path = WORKSPACE / "node_modules"
-        if node_path.exists():
-            values["NODE_PATH"] = str(node_path)
         return values
 
     def _prompt(self, task: TaskState) -> str:

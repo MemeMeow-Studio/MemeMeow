@@ -148,6 +148,7 @@ class SearchService:
         }
         temporary = self.cache_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.chmod(temporary, 0o600)
         os.replace(temporary, self.cache_path)
         with self._lock:
             self._items = items

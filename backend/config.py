@@ -21,6 +21,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from backend.visual_models import ACTIVE_VISUAL_MODEL_ID, active_visual_model_spec, source_repository_valid, visual_model_spec
 from executor.token import ExecutorTokenError, read_token_file
+from backend.storage_security import StorageRootError, validate_controlled_root
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -258,9 +259,23 @@ class Settings(BaseSettings):
         return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
     def ensure_directories(self) -> None:
-        """创建受控数据目录，应用启动时调用。"""
-        self.data_root.mkdir(parents=True, exist_ok=True)
-        self.image_root.mkdir(parents=True, exist_ok=True)
+        """创建并校验数据、图片、runtime 和缓存目录，应用启动时调用。"""
+        # 业务进程创建的 sidecar、缓存和 runtime 文件默认只允许运行身份访问。
+        os.umask(0o077)
+        roots = (
+            ("data_root", self.data_root),
+            ("image_root", self.image_root),
+            ("opencode_runtime_root", self.opencode_runtime_root),
+            ("reverse_image_cache_root", self.reverse_image_cache_root),
+        )
+        try:
+            for name, value in roots:
+                if value is None:
+                    raise StorageRootError(f"{name}_missing")
+                setattr(self, name, validate_controlled_root(value, create=True, writable=True))
+        except StorageRootError:
+            # 不把宿主绝对路径写入启动日志，只向调用方保留稳定错误码。
+            raise
 
     @staticmethod
     def _configured(value: object) -> bool:

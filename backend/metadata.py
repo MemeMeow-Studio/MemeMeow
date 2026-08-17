@@ -264,6 +264,7 @@ class MetadataService:
         try:
             with temporary.open("w", encoding="utf-8") as handle:
                 handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+                os.fchmod(handle.fileno(), 0o600)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, sidecar)

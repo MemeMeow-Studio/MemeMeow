@@ -198,6 +198,7 @@ class ReverseImageCache:
                 temporary_path = Path(handle.name)
                 json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
                 handle.write("\n")
+                os.fchmod(handle.fileno(), 0o600)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary_path, self.path(key))

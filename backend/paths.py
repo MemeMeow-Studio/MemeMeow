@@ -7,6 +7,8 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
+from backend.storage_security import StorageRootError, validate_controlled_root
+
 
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif"}
 SAFE_NAME = re.compile(r"^[^/\\\x00-\x1f\x7f]+$")
@@ -36,8 +38,10 @@ class PathResolver:
     """将客户端相对标识解析到图片根目录内的真实文件。"""
 
     def __init__(self, image_root: Path):
-        self.root = image_root.expanduser().resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            self.root = validate_controlled_root(image_root, create=True, writable=True)
+        except StorageRootError as exc:
+            raise ValueError(str(exc)) from exc
 
     def resolve_file(self, filename: str, *, must_exist: bool = True) -> Path:
         """解析图片文件并校验扩展名、根目录边界与符号链接。"""
