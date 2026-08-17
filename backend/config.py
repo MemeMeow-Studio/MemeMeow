@@ -192,22 +192,17 @@ class Settings(BaseSettings):
 
     @property
     def expected_database_revision(self) -> str:
-        """返回当前应用构建期要求的 Alembic head，供启动门禁比较。"""
-        from alembic.config import Config
-        from alembic.script import ScriptDirectory
+        """返回公共核心固定要求的 schema revision。"""
+        from backend.database import CURRENT_SCHEMA_REVISION
 
-        config = Config(str(PROJECT_ROOT / "alembic.ini"))
-        heads = ScriptDirectory.from_config(config).get_heads()
-        if len(heads) != 1:
-            raise ValueError("schema_heads_invalid")
-        return heads[0]
+        return CURRENT_SCHEMA_REVISION
 
     @classmethod
     def from_env(cls, env_file: str | Path | None = ".env") -> "Settings":
         """读取 `.env` 和进程环境，并在 Compose 模式加载共享 token 文件。
 
         进程环境由 Pydantic Settings 自动优先；当配置了 token 文件时，文件是
-        Compose executor 的唯一认证来源，避免 `.env` 中的旧 token 与 named
+        Compose executor 的唯一凭据来源，避免 `.env` 中的旧 token 与 named
         volume 中的持久凭据不一致。
         """
         path = Path(env_file).expanduser() if env_file else None

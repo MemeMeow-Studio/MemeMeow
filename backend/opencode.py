@@ -281,7 +281,7 @@ class OpenCodeRunner:
                 raise OpenCodeError("opencode_not_configured", "未配置 OpenCode 服务地址或密钥")
             if self.executor_mode:
                 if not self.executor.configured:
-                    raise OpenCodeError("agent_executor_not_configured", "Agent executor 地址或认证 token 未配置")
+                    raise OpenCodeError("agent_executor_not_configured", "Agent executor 地址或凭据 token 未配置")
                 health = self.executor.health()
                 if not bool(health.get("ready")):
                     raise OpenCodeError("agent_runtime_unavailable", "Agent executor 健康检查未通过")

@@ -14,7 +14,7 @@ import re
 import secrets
 import tempfile
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -72,11 +72,59 @@ from backend.callbacks import (
     verify_content_length,
 )
 from backend.image_processing import ImageProcessingError, ImageProcessingRepository, ImageProcessingSnapshot, ImageProcessingWorker, SingleImageEmbeddingService
+from backend.app_extensions import ApplicationExtension, extension_paths, path_is_exempt
 
 
 STORAGE_PREFLIGHT_BLOCKING_KEYS = ("non_flat_keys", "nested_images", "missing_files", "mismatched")
 INTERNAL_SCOPE_CALLBACK_PATHS = frozenset({"/internal/reverse-image/search", "/internal/visual-search/match"})
 OPERATION_POLICY_PATH = "/operations/availability"
+SCOPE_SELECTOR_FIELDS = frozenset({"scope_id", "scope-id", "user_id", "user-id"})
+
+
+class StrictRequestModel(BaseModel):
+    """公共业务 JSON 请求基类，拒绝客户端提交范围选择字段。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+def _extension_list(app: FastAPI) -> tuple[ApplicationExtension, ...]:
+    """读取应用创建时冻结的扩展列表，缺失时返回空元组。"""
+    value = getattr(app.state, "extensions", ())
+    return tuple(value) if isinstance(value, (tuple, list)) else ()
+
+
+def _extension_scope_exempt(app: FastAPI, path: str) -> bool:
+    """判断路径是否由任一宿主扩展声明为不需要业务 scope。"""
+    paths: list[str] = []
+    for extension in _extension_list(app):
+        paths.extend(extension_paths(extension))
+    return path_is_exempt(path, paths)
+
+
+def _scope_field_name(value: str) -> bool:
+    """判断请求字段名是否为客户端提交的范围选择器。"""
+    lowered = value.strip().lower()
+    if lowered in SCOPE_SELECTOR_FIELDS:
+        return True
+    return lowered.startswith("x-") and lowered[2:] in SCOPE_SELECTOR_FIELDS
+
+
+def _request_declares_scope(request: Request) -> bool:
+    """只检查 query/header 的范围字段，不读取可能包含文件的请求体。"""
+    query_params = getattr(request, "query_params", {})
+    headers = getattr(request, "headers", {})
+    return any(_scope_field_name(str(key)) for key in query_params.keys()) or any(_scope_field_name(str(key)) for key in headers.keys())
+
+
+async def _invoke_extension_hook(extension: ApplicationExtension, name: str, *args: Any) -> Any:
+    """调用可选扩展钩子并兼容同步和异步实现。"""
+    hook = getattr(extension, name, None)
+    if not callable(hook):
+        return None
+    result = hook(*args)
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 def _callback_verification_keys(settings: Settings) -> dict[str, str] | None:
@@ -95,7 +143,7 @@ def _callback_verification_keys(settings: Settings) -> dict[str, str] | None:
     return values
 
 
-class SearchRequest(BaseModel):
+class SearchRequest(StrictRequestModel):
     """规范检索请求。"""
 
     query: str = Field(min_length=1, max_length=500)
@@ -103,27 +151,27 @@ class SearchRequest(BaseModel):
     llm_enhance: bool = False
 
 
-class RenameRequest(BaseModel):
+class RenameRequest(StrictRequestModel):
     """图片重命名请求。"""
 
     meme_id: str | None = None
     new_name: str = Field(min_length=1, max_length=255)
 
 
-class DeleteRequest(BaseModel):
+class DeleteRequest(StrictRequestModel):
     """按稳定 meme_id 删除图片的请求。"""
 
     meme_id: str | None = None
 
 
-class ContextRequest(BaseModel):
+class ContextRequest(StrictRequestModel):
     """按稳定 meme_id 创建图片语境任务的请求。"""
 
     meme_id: str | None = None
     reverse_image_policy: str = Field(default="forbid", pattern="^(forbid|auto)$")
 
 
-class ContextBatchRequest(BaseModel):
+class ContextBatchRequest(StrictRequestModel):
     """批量补齐既有图片语境的请求。"""
 
     items: list[ContextRequest] = Field(default_factory=list, max_length=500)
@@ -131,14 +179,14 @@ class ContextBatchRequest(BaseModel):
     reverse_image_policy: str = Field(default="forbid", pattern="^(forbid|auto)$")
 
 
-class ProcessingRetryRequest(BaseModel):
+class ProcessingRetryRequest(StrictRequestModel):
     """图片处理 job 的显式重试请求；重试策略由服务端规范化。"""
 
     model_config = ConfigDict(extra="forbid")
     reverse_image_policy: str | None = Field(default=None, pattern="^(forbid|auto)$")
 
 
-class ImageStageSubmissionRequest(BaseModel):
+class ImageStageSubmissionRequest(StrictRequestModel):
     """受限独立图片阶段提交请求；目标输入由当前 scope 的 Meme 派生。"""
 
     model_config = ConfigDict(extra="forbid")
@@ -147,14 +195,14 @@ class ImageStageSubmissionRequest(BaseModel):
     reverse_image_policy: str = Field(default="forbid", pattern="^(forbid|auto)$")
 
 
-class ProcessingBatchRequest(BaseModel):
+class ProcessingBatchRequest(StrictRequestModel):
     """图片库逐图显式处理请求。"""
 
     model_config = ConfigDict(extra="forbid")
     reverse_image_policy: str = Field(default="forbid", pattern="^(forbid|auto)$")
 
 
-class VisualMatchRequest(BaseModel):
+class VisualMatchRequest(StrictRequestModel):
     """Agent 视觉匹配请求；scope 和查询图片只能由 task_id 推导。"""
 
     task_id: str = Field(min_length=1, max_length=255)
@@ -163,21 +211,21 @@ class VisualMatchRequest(BaseModel):
     exclude_self: bool = True
 
 
-class CollectionRequest(BaseModel):
+class CollectionRequest(StrictRequestModel):
     """合集创建和重命名请求。"""
 
     model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=100)
 
 
-class CollectionItemsRequest(BaseModel):
+class CollectionItemsRequest(StrictRequestModel):
     """合集批量成员请求；空数组在 API 边界拒绝。"""
 
     model_config = ConfigDict(extra="forbid")
     meme_ids: list[str] = Field(min_length=1, max_length=500)
 
 
-class ConcurrencyUpdateRequest(BaseModel):
+class ConcurrencyUpdateRequest(StrictRequestModel):
     """后端设置页唯一允许持久化的安全参数。"""
 
     opencode_concurrency: StrictInt = Field(ge=1, le=8, validation_alias=AliasChoices("opencode_concurrency", "agent_concurrency", "concurrency", "value"))
@@ -492,7 +540,8 @@ async def lifespan(app: FastAPI):
     settings.ensure_directories()
     try:
         engine = create_engine_for_settings(settings)
-        check_database(engine, expected_revision=settings.expected_database_revision, require_local_installation=local_mode)
+        expected_revision = getattr(app.state, "expected_schema_revision", settings.expected_database_revision)
+        check_database(engine, expected_revision=expected_revision, require_local_installation=local_mode)
     except DatabaseError:
         # 启动门禁拒绝任何可能回退到旧 JSON 的业务请求；测试和生产都必须显式准备 PostgreSQL。
         raise
@@ -1010,9 +1059,17 @@ async def lifespan(app: FastAPI):
     if tasks is not None:
         app.state.tasks = tasks
     app.state.task_scope_diagnostics = factory.start_all()
+    started_extensions: list[ApplicationExtension] = []
     try:
+        # 扩展启动发生在公共数据库、factory 和 Worker 全部就绪之后，适配器可以
+        # 在这里绑定自己的运行时资源，而不让公共核心知道其具体业务语义。
+        for extension in _extension_list(app):
+            await _invoke_extension_hook(extension, "on_startup", app)
+            started_extensions.append(extension)
         yield
     finally:
+        for extension in reversed(started_extensions):
+            await _invoke_extension_hook(extension, "on_shutdown", app)
         app.state.opencode.shutdown()
         for image_worker in list(getattr(app.state, "image_processing_workers", {}).values()):
             image_worker.shutdown()
@@ -1226,17 +1283,47 @@ async def bind_request_scope(request: Request, call_next):
             log_callback_rejection(request.url.path, exc, binding=getattr(request.state, "callback_binding", None))
             status = 413 if exc.code == "agent_callback_body_too_large" else 401
             return JSONResponse(status_code=status, content={"error": exc.code, "message": "内部执行凭据无效"})
+    if _request_declares_scope(request):
+        return JSONResponse(status_code=400, content={"error": "scope_selector_forbidden", "message": "请求不得提交范围选择字段"})
+    if _extension_scope_exempt(request.app, request.url.path):
+        try:
+            for extension in _extension_list(request.app):
+                await _invoke_extension_hook(extension, "authorize_exempt_request", request)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) and "error" in exc.detail else {"error": "request_forbidden", "message": "请求未获授权"}
+            return JSONResponse(status_code=exc.status_code, content=detail, headers=exc.headers)
+        except Exception as exc:  # noqa: BLE001 - 宿主可声明身份失败或可用性边界
+            status = getattr(exc, "status_code", None)
+            code = getattr(exc, "code", None)
+            if status in {401, 403, 429, 503} and isinstance(code, str) and code:
+                message = "需要有效会话" if status == 401 else "请求未获授权" if status in {403, 429} else "请求授权服务当前不可用"
+                return JSONResponse(status_code=status, content={"error": code, "message": message})
+            if not isinstance(exc, (DatabaseError, ValueError, RuntimeError)):
+                raise
+            return JSONResponse(status_code=503, content={"error": "request_authorization_unavailable", "message": "请求授权服务当前不可用"})
+        return await call_next(request)
     try:
         scope = await resolve_scope_async(request)
         factory = getattr(request.app.state, "service_factory", None)
         if factory is None or not callable(getattr(factory, "for_scope", None)):
             raise ScopeResolutionError("应用未配置 scope service factory")
         services = validate_scope_services(scope, factory.for_scope(scope))
+        for extension in _extension_list(request.app):
+            await _invoke_extension_hook(extension, "authorize_request", request, scope, services)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) and "error" in exc.detail else {"error": "request_forbidden", "message": "请求未获授权"}
+        return JSONResponse(status_code=exc.status_code, content=detail, headers=exc.headers)
     except ScopeResolutionError as exc:
         return JSONResponse(status_code=exc.status_code, content={"error": exc.code, "message": "请求 scope 无法解析"})
-    except (DatabaseError, ValueError, RuntimeError) as exc:
-        # scope 不存在、namespace 不可用和宿主工厂异常都不能通过 500 暴露细节。
-        code = getattr(exc, "code", None) or "scope_unavailable"
+    except Exception as exc:  # noqa: BLE001 - 适配器可声明稳定的身份/可用性边界
+        status = getattr(exc, "status_code", None)
+        code = getattr(exc, "code", None)
+        if status in {401, 503} and isinstance(code, str) and code:
+            message = "需要有效会话" if status == 401 else "请求 scope 当前不可用"
+            return JSONResponse(status_code=status, content={"error": code, "message": message})
+        if not isinstance(exc, (DatabaseError, ValueError, RuntimeError)):
+            raise
+        code = code if isinstance(code, str) and code else "scope_unavailable"
         return JSONResponse(status_code=503, content={"error": code, "message": "请求 scope 当前不可用"})
     request.state.scope = scope
     request.state.services = services
@@ -1343,10 +1430,12 @@ async def config_status(request: Request) -> dict[str, object]:
     """返回脱敏配置状态，绝不返回完整密钥。"""
     status = request.app.state.settings.status()
     # embedding 缓存属于运行时状态，供前端判断当前是否可以直接检索。
-    engine = _service(request, "search")
+    services = getattr(request.state, "services", None)
+    engine = services.search if isinstance(services, ScopeServices) else getattr(request.app.state, "search_engine", None)
     status["embedding_cache_ready"] = bool(engine and engine.has_cache())
     status["database_ready"] = True
-    status["scope_id"] = _request_scope(request).scope_id
+    if getattr(request.app.state, "expose_scope", True):
+        status["scope_id"] = _request_scope(request).scope_id
     status["storage_preflight"] = _storage_preflight_summary(getattr(request.app.state, "storage_preflight", None))
     reverse_service = _service(request, "reverse_image") if hasattr(request.app.state, "reverse_image") or getattr(request, "state", None) and getattr(request.state, "services", None) is not None else None
     status["reverse_image_available"] = bool(reverse_service and reverse_service.available)
@@ -1555,7 +1644,8 @@ def _backend_settings_status(request: Request) -> dict[str, object]:
     """构造设置页脱敏状态，运行时探针仅返回布尔和固定标识。"""
     settings: Settings = request.app.state.settings
     runner: OpenCodeRunner = request.app.state.opencode
-    engine = _service(request, "search")
+    services = getattr(request.state, "services", None)
+    engine = services.search if isinstance(services, ScopeServices) else getattr(request.app.state, "search_engine", None)
     status = settings.backend_status(
         cache_ready=bool(engine and engine.has_cache()),
         runtime_ready=bool(runner.runtime_probe().get("verified")),
@@ -2595,7 +2685,7 @@ async def repair_metadata(request: Request) -> dict[str, object]:
     return {"task_id": record.task_id, "task_type": record.task_type, "status": record.status}
 
 
-def create_app(*, scope_resolver, service_factory: ScopeServiceFactory | None = None, operation_policy=None, callback_issuer=None, callback_verifier=None, agent_input_provider: Callable[[ScopeContext, Path], str | Path] | None = None) -> FastAPI:
+def create_app(*, scope_resolver, service_factory: ScopeServiceFactory | None = None, operation_policy=None, callback_issuer=None, callback_verifier=None, agent_input_provider: Callable[[ScopeContext, Path], str | Path] | None = None, extensions: Sequence[ApplicationExtension] | None = None) -> FastAPI:
     """创建显式绑定 scope resolver 的 FastAPI 应用。
 
     ``scope_resolver`` 是必填参数；适配宿主可注入自己的可信 resolver、兼容的
@@ -2606,8 +2696,11 @@ def create_app(*, scope_resolver, service_factory: ScopeServiceFactory | None = 
         raise ScopeResolutionError("应用必须显式配置 scope resolver")
     if not any(callable(getattr(scope_resolver, name, None)) for name in ("resolve", "resolve_scope")) and not callable(scope_resolver):
         raise ScopeResolutionError("scope resolver 不可调用")
+    if isinstance(scope_resolver, LocalScopeResolver) and scope_resolver.scope.scope_id != "local":
+        raise ScopeResolutionError("local resolver 只能绑定 local scope")
     if operation_policy is not None and not all(callable(getattr(operation_policy, name, None)) for name in ("probe", "acquire", "commit", "release")):
         raise OperationPolicyError("operation_policy_unavailable")
+    configured_extensions = tuple(extensions or ())
     created = FastAPI(
         title=_route_template.title,
         version=_route_template.version,
@@ -2620,6 +2713,12 @@ def create_app(*, scope_resolver, service_factory: ScopeServiceFactory | None = 
     created.exception_handlers.update(_route_template.exception_handlers)
     for middleware in reversed(_route_template.user_middleware):
         created.add_middleware(middleware.cls, *middleware.args, **middleware.kwargs)
+    created.state.extensions = configured_extensions
+    created.state.expose_scope = True
+    for extension in configured_extensions:
+        register_routes = getattr(extension, "register_routes", None)
+        if callable(register_routes):
+            register_routes(created)
     created.state.scope_resolver = scope_resolver
     # policy、callback issuer/verifier 与 scope resolver 分属不同信任边界，均只从
     # 同一个 keyword-only factory 进入应用，不使用模块级可变依赖。

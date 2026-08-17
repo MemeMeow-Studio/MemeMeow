@@ -55,7 +55,7 @@ EMBEDDING_DIMENSIONS = 1024
 VISUAL_EMBEDDING_DIMENSIONS = 768
 SCOPE_LOCAL = "local"
 UTC = timezone.utc
-# 当前代码要求的 Alembic head；数据库初始化脚本会显式传入同一 revision。
+# 当前公共核心要求的 Alembic head；适配层 revision 由其部署入口单独选择。
 CURRENT_SCHEMA_REVISION = "0010_separate_image_pipeline_and_stage_tasks"
 
 
@@ -109,7 +109,7 @@ class Scope(Base):
 
 
 class InstallationState(Base):
-    """单实例安装门禁；不表示用户或账户。"""
+    """单实例安装门禁；不表示具体调用方或访问主体。"""
 
     __tablename__ = "installation_state"
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -769,7 +769,7 @@ def check_database(engine: Engine, *, expected_revision: str | None = None, requ
 
 
 def initialize_local(engine: Engine, *, revision: str = CURRENT_SCHEMA_REVISION) -> None:
-    """幂等创建 ``local`` scope 与安装标记，不扫描图片、不创建账户。"""
+    """幂等创建 ``local`` scope 与安装标记，不扫描图片或扩展业务归属。"""
     try:
         with Session(engine) as session, session.begin():
             scope = session.scalar(select(Scope).where(Scope.id == SCOPE_LOCAL))

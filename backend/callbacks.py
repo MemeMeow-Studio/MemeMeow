@@ -1,6 +1,6 @@
 """Agent 内部 callback 的服务身份和当前 claim 绑定。
 
-callback 凭据与用户认证、operation grant、executor token 和 provider secret 分离。
+callback 凭据与其他服务凭据、operation grant、executor token 和 provider secret 分离。
 本模块只验证最小执行声明；业务路由仍必须从 PostgreSQL Task 记录恢复 scope、目标
 SHA 和当前租约，并在副作用前完成二次校验。
 """
@@ -374,7 +374,7 @@ def validate_callback_headers(headers: Mapping[str, str], binding: CallbackBindi
 
 
 def install_body_guard(request: Any, *, limit: int) -> None:
-    """给已认证 callback 安装 ASGI receive 累计上限，不缓冲无限请求体。"""
+    """给已校验 callback 安装 ASGI receive 累计上限，不缓冲无限请求体。"""
     original_receive = request._receive
     total = 0
 

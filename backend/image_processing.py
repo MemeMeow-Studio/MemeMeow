@@ -1,7 +1,7 @@
 """逐图图片处理 job、阶段状态和专用 Worker 控制面。
 
 该模块把视觉、Agent 和单图文本 embedding 作为三个可恢复阶段保存到 PostgreSQL。
-它不负责用户、订阅或支付，只在创建新的 Agent 逻辑 Task 时调用 operation policy；
+它不负责配额或计费，只在创建新的 Agent 逻辑 Task 时调用 operation policy；
 叶子 Task 的 claim/heartbeat/fencing 仍复用 ``PostgresTaskService``。
 """
 

@@ -2,7 +2,7 @@
 
 该模块位于 FastAPI 应用装配层和 PostgreSQL 领域服务之间。它只负责把宿主
 提供的可信 scope 转换为不可变 ``ScopeContext``，以及为一次请求或一次后台
-任务创建绑定该 scope 的服务视图；账户、登录和鉴权仍由适配宿主负责。
+任务创建绑定该 scope 的服务视图；调用方身份和访问策略仍由适配宿主负责。
 """
 
 from __future__ import annotations
@@ -180,6 +180,8 @@ def resolve_scope(request: Any) -> ScopeContext:
     except ScopeResolutionError:
         raise
     except Exception as exc:  # noqa: BLE001 - 宿主异常统一收敛为稳定错误
+        if getattr(exc, "status_code", None) in {401, 503} and getattr(exc, "code", None):
+            raise
         raise ScopeResolutionError() from exc
 
 
@@ -197,6 +199,8 @@ async def resolve_scope_async(request: Any) -> ScopeContext:
     except ScopeResolutionError:
         raise
     except Exception as exc:  # noqa: BLE001 - 宿主异常统一收敛为稳定错误
+        if getattr(exc, "status_code", None) in {401, 503} and getattr(exc, "code", None):
+            raise
         raise ScopeResolutionError() from exc
 
 
@@ -286,44 +290,45 @@ class ScopeServiceFactory:
             initialize = context.scope_id not in self._initialized_scopes
             if initialize:
                 self._initialized_scopes.add(context.scope_id)
-        # 局部导入避免 database 与 pg_services 在启动期形成循环导入。
-        from backend.pg_services import PostgresMetadataService, PostgresSearchService, PostgresTaskService
-        from backend.reverse_image import ReverseImageService
-        from backend.visual import VisualSearchService
-
-        metadata = PostgresMetadataService(self.resources, scope_id=context.scope_id)
-        search = PostgresSearchService(self.settings, self.resources, metadata, scope_id=context.scope_id)
-        reverse_kwargs: dict[str, Any] = {
-            "scope_id": context.scope_id,
-            "provider": self._task_config.get("reverse_provider"),
-        }
-        if self._task_config.get("operation_policy") is not None:
-            reverse_kwargs["operation_policy"] = self._task_config["operation_policy"]
-        if self._task_config.get("grant_store") is not None:
-            reverse_kwargs["grant_store"] = self._task_config["grant_store"]
-        reverse_image = ReverseImageService(self.settings, self.resources, **reverse_kwargs)
-        visual_search = VisualSearchService(self.settings, self.resources, scope_id=context.scope_id)
-        tasks = PostgresTaskService(
-            self.resources,
-            scope_id=context.scope_id,
-            agent_concurrency=self._task_config.get("agent_concurrency", getattr(self.settings, "opencode_concurrency", 1)),
-            agent_backpressure=self._task_config.get("agent_backpressure", getattr(self.settings, "agent_backpressure", 32)),
-            settings_version=self._task_config.get("settings_version", getattr(self.settings, "settings_version", None)),
-            lease_seconds=self._task_config.get("lease_seconds", getattr(self.settings, "worker_lease_seconds", 120)),
-            max_attempts=self._task_config.get("max_attempts", getattr(self.settings, "worker_max_attempts", 3)),
-            worker_manager=self._worker_manager,
-        )
-        register = self._task_config.get("register_handlers")
-        services = ScopeServices(context, metadata, search, tasks, reverse_image, visual_search)
-        # 在注册 handler 或启动子服务前完成一致性校验，避免装配错误已经产生副作用。
-        validate_scope_services(context, services)
         try:
+            # 局部导入避免 database 与 pg_services 在启动期形成循环导入。
+            from backend.pg_services import PostgresMetadataService, PostgresSearchService, PostgresTaskService
+            from backend.reverse_image import ReverseImageService
+            from backend.visual import VisualSearchService
+
+            metadata = PostgresMetadataService(self.resources, scope_id=context.scope_id)
+            search = PostgresSearchService(self.settings, self.resources, metadata, scope_id=context.scope_id)
+            reverse_kwargs: dict[str, Any] = {
+                "scope_id": context.scope_id,
+                "provider": self._task_config.get("reverse_provider"),
+            }
+            if self._task_config.get("operation_policy") is not None:
+                reverse_kwargs["operation_policy"] = self._task_config["operation_policy"]
+            if self._task_config.get("grant_store") is not None:
+                reverse_kwargs["grant_store"] = self._task_config["grant_store"]
+            reverse_image = ReverseImageService(self.settings, self.resources, **reverse_kwargs)
+            visual_search = VisualSearchService(self.settings, self.resources, scope_id=context.scope_id)
+            tasks = PostgresTaskService(
+                self.resources,
+                scope_id=context.scope_id,
+                agent_concurrency=self._task_config.get("agent_concurrency", getattr(self.settings, "opencode_concurrency", 1)),
+                agent_backpressure=self._task_config.get("agent_backpressure", getattr(self.settings, "agent_backpressure", 32)),
+                settings_version=self._task_config.get("settings_version", getattr(self.settings, "settings_version", None)),
+                lease_seconds=self._task_config.get("lease_seconds", getattr(self.settings, "worker_lease_seconds", 120)),
+                max_attempts=self._task_config.get("max_attempts", getattr(self.settings, "worker_max_attempts", 3)),
+                worker_manager=self._worker_manager,
+            )
+            register = self._task_config.get("register_handlers")
+            services = ScopeServices(context, metadata, search, tasks, reverse_image, visual_search)
+            # 在注册 handler 或启动子服务前完成一致性校验，避免装配错误已经产生副作用。
+            validate_scope_services(context, services)
             if callable(register):
                 register(services)
             start = self._task_config.get("start_services") if initialize else None
             if callable(start):
                 start(services)
         except Exception:
+            # 构造器、scope 校验或启动回调任一步失败，都允许下一次请求重新尝试。
             with self._lock:
                 if initialize:
                     self._initialized_scopes.discard(context.scope_id)

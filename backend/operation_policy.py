@@ -1,4 +1,4 @@
-"""与用户账户无关的 operation policy 和 grant 生命周期。
+"""与调用方身份无关的 operation policy 和 grant 生命周期。
 
 该模块位于图片上传、任务 Worker 与外部 provider 的真实副作用边界。核心只传递
 已验证的 ``ScopeContext``、稳定 operation 名称和服务端幂等键，不解析用户、套餐或

@@ -63,6 +63,8 @@ from backend.visual import VisualEmbeddingError, VisualInferenceClient, identity
 
 
 logger = logging.getLogger(__name__)
+# 任务 payload 只承载业务输入；范围事实始终来自持久 Task.scope_id。
+UNTRUSTED_SCOPE_FIELDS = frozenset({"scope_id", "scope-id", "user_id", "user-id"})
 
 
 def _iso(value: datetime | str | None) -> str:
@@ -1159,6 +1161,8 @@ class PostgresTaskService:
         通过额外 scope、Job、grant 或 claim 字段改变这些事实。
         """
         payload = dict(payload or {})
+        for field in UNTRUSTED_SCOPE_FIELDS:
+            payload.pop(field, None)
         # scope/user 只能由 resolver 或 Task.scope_id 提供；即使调用方伪造字段，
         # 也不得让它们进入后续 handler 作为授权事实。
         payload.pop("scope_id", None)

@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 
 import api as api_module
 from api import bind_request_scope, create_app
@@ -277,6 +278,167 @@ def test_create_app_keeps_host_factory_injection() -> None:
     application = create_app(scope_resolver=LocalScopeResolver("local"), service_factory=factory, agent_input_provider=provider)
     assert application.state.service_factory is factory
     assert application.state.agent_input_provider is provider
+
+
+def test_application_extension_registers_routes_once() -> None:
+    """宿主扩展可以附加路由，且公共工厂不会复制业务路由。"""
+    from fastapi import FastAPI
+
+    class RouteExtension:
+        """只注册一个测试路由的最小扩展。"""
+
+        def register_routes(self, app: FastAPI) -> None:
+            """向应用注册扩展路由。"""
+            app.add_api_route("/extension-probe", lambda: {"ok": True}, methods=["GET"])
+
+    application = create_app(scope_resolver=LocalScopeResolver("local"), extensions=(RouteExtension(),))
+    paths = [getattr(route, "path", None) for route in application.routes]
+    assert paths.count("/extension-probe") == 1
+
+
+def test_application_extension_lifecycle_runs_after_factory_and_before_shutdown(monkeypatch, tmp_path: Path) -> None:
+    """扩展启动发生在公共服务就绪后，关闭发生在公共资源释放前。"""
+    doubles = _install_lifespan_doubles(monkeypatch, tmp_path)
+    events: list[tuple[str, bool]] = []
+
+    class LifecycleExtension:
+        """记录扩展生命周期相对公共工厂的顺序。"""
+
+        async def on_startup(self, app) -> None:
+            """记录启动时公共 factory 已完成装配。"""
+            events.append(("startup", callable(getattr(app.state.service_factory, "start_all", None))))
+
+        async def on_shutdown(self, app) -> None:
+            """记录关闭时公共运行时仍可访问。"""
+            events.append(("shutdown", hasattr(app.state, "opencode")))
+
+    application = create_app(scope_resolver=_ClosedScopeResolver(), extensions=(LifecycleExtension(),))
+
+    async def exercise() -> None:
+        """运行一次生命周期以收集扩展事件。"""
+        async with api_module.lifespan(application):
+            events.append(("body", doubles.worker_class.last_instance is not None))
+
+    asyncio.run(exercise())
+    assert events == [("startup", True), ("body", True), ("shutdown", True)]
+
+
+def test_scope_exempt_extension_skips_resolver_and_authorizes_path() -> None:
+    """scope 豁免路径只执行扩展的独立授权，不调用业务 resolver。"""
+    events: list[str] = []
+
+    class BrokenResolver:
+        """一旦被调用就失败，证明豁免路径未解析 scope。"""
+
+        def resolve(self, _request):
+            """返回不应到达的分支。"""
+            raise AssertionError("scope 豁免路径不应调用 resolver")
+
+    class ExemptExtension:
+        """声明健康检查路径为 scope 豁免并记录授权。"""
+
+        def scope_exempt_paths(self):
+            """返回精确豁免路径。"""
+            return ("/health",)
+
+        async def authorize_exempt_request(self, _request) -> None:
+            """记录豁免路径已通过独立授权。"""
+            events.append("exempt-authorized")
+
+    app = SimpleNamespace(state=SimpleNamespace(scope_resolver=BrokenResolver(), extensions=(ExemptExtension(),)))
+    request = SimpleNamespace(
+        url=SimpleNamespace(path="/health"),
+        app=app,
+        query_params={},
+        headers={},
+        state=SimpleNamespace(),
+    )
+
+    async def call_next(_request):
+        """记录豁免 handler 继续执行。"""
+        events.append("handler")
+        return "ok"
+
+    assert asyncio.run(bind_request_scope(request, call_next)) == "ok"
+    assert events == ["exempt-authorized", "handler"]
+
+
+def test_scope_authorization_hook_runs_after_services_and_before_handler() -> None:
+    """scope-bound 授权钩子收到完整服务视图，并先于业务 handler 执行。"""
+    events: list[str] = []
+
+    class Resolver:
+        """返回固定可信 scope 的测试 resolver。"""
+
+        def resolve(self, _request):
+            """记录 scope 解析并返回 scope-a。"""
+            events.append("resolver")
+            return "scope-a"
+
+    class Factory:
+        """返回与 scope 一致的最小服务视图。"""
+
+        def for_scope(self, scope):
+            """记录服务装配后返回绑定视图。"""
+            events.append("factory")
+            return _scope_services(scope.scope_id)
+
+    class Extension:
+        """记录 scope-bound 授权钩子的参数。"""
+
+        async def authorize_request(self, _request, scope, services) -> None:
+            """确认钩子收到解析后的 scope 和服务。"""
+            assert scope == ScopeContext("scope-a")
+            assert validate_scope_services(scope, services) is services
+            events.append("authorize")
+
+    app = SimpleNamespace(state=SimpleNamespace(scope_resolver=Resolver(), service_factory=Factory(), extensions=(Extension(),)))
+    request = SimpleNamespace(
+        url=SimpleNamespace(path="/images"),
+        app=app,
+        query_params={},
+        headers={},
+        state=SimpleNamespace(),
+    )
+
+    async def call_next(_request):
+        """记录业务 handler 执行。"""
+        events.append("handler")
+        return "ok"
+
+    assert asyncio.run(bind_request_scope(request, call_next)) == "ok"
+    assert events == ["resolver", "factory", "authorize", "handler"]
+    assert request.state.scope == ScopeContext("scope-a")
+
+
+def test_scope_authorization_hook_rejection_skips_handler() -> None:
+    """scope-bound 授权拒绝时返回稳定响应且不进入业务 handler。"""
+    called: list[str] = []
+
+    class Extension:
+        """拒绝所有 scope-bound 请求的测试扩展。"""
+
+        async def authorize_request(self, _request, _scope, _services) -> None:
+            """返回明确的 HTTP 拒绝。"""
+            raise HTTPException(status_code=403, detail={"error": "extension_forbidden", "message": "请求未获授权"})
+
+    app = SimpleNamespace(state=SimpleNamespace(scope_resolver=lambda _request: "scope-a", service_factory=SimpleNamespace(for_scope=lambda scope: _scope_services(scope.scope_id)), extensions=(Extension(),)))
+    request = SimpleNamespace(
+        url=SimpleNamespace(path="/images"),
+        app=app,
+        query_params={},
+        headers={},
+        state=SimpleNamespace(),
+    )
+
+    async def call_next(_request):
+        """该 handler 不应被授权失败路径调用。"""
+        called.append("handler")
+        raise AssertionError("授权失败后不应执行业务 handler")
+
+    response = asyncio.run(bind_request_scope(request, call_next))
+    assert response.status_code == 403
+    assert called == []
 
 
 def test_host_lifespan_never_requires_local_scope_or_preflight(monkeypatch, tmp_path: Path) -> None:

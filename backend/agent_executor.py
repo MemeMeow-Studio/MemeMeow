@@ -2,7 +2,7 @@
 
 API 容器只依赖该模块的结构化请求，不导入 Docker SDK、调用 Docker CLI，也不
 接触宿主 Docker socket。executor 负责 OpenCode 子进程和共享结果目录；本模块
-负责认证、超时、取消及稳定错误码映射。
+负责凭据校验、超时、取消及稳定错误码映射。
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ class AgentExecutorClient:
     def _request(self, method: str, path: str, payload: dict[str, object] | None = None, *, timeout: int | None = None) -> tuple[int, dict[str, object]]:
         """发送 JSON 请求并将 HTTP/JSON 故障映射为稳定错误。"""
         if not self.url or not self.token:
-            raise AgentExecutorError("agent_executor_not_configured", "Agent executor 地址或认证 token 未配置")
+            raise AgentExecutorError("agent_executor_not_configured", "Agent executor 地址或凭据 token 未配置")
         body = None
         headers = {"Accept": "application/json", "Authorization": f"Bearer {self.token}"}
         if payload is not None:
