@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import secrets
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from threading import RLock
 from typing import Any, Mapping, Protocol
@@ -70,6 +72,40 @@ def _validate_field(value: object, *, maximum: int, required: bool = False) -> s
     return value
 
 
+_ASSOCIATION_STATES = frozenset({"acquired", "committed", "released", "unknown"})
+_EXECUTABLE_ASSOCIATION_STATES = frozenset({"acquired"})
+
+
+def _request_fingerprint(
+    *,
+    resource_id: str | None,
+    task_id: str | None,
+    source: str,
+    units: int,
+    input_digest: str | None,
+) -> str:
+    """按服务端可信事实生成稳定摘要，供 grant 关联复用和冲突校验。"""
+    payload = {
+        "input_digest": input_digest,
+        "resource_id": resource_id,
+        "source": source,
+        "task_id": task_id,
+        "units": units,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_input_digest(value: object) -> str | None:
+    """校验可选的服务端输入摘要，避免持久化无法比较的模糊值。"""
+    digest = _validate_field(value, maximum=64)
+    if digest is None:
+        return None
+    if len(digest) != 64 or any(char not in "0123456789abcdefABCDEF" for char in digest):
+        raise OperationPolicyError("operation_grant_invalid")
+    return digest
+
+
 @dataclass(frozen=True, slots=True)
 class OperationRequest:
     """policy 使用的可信请求；客户端提交的身份字段不会进入该对象。"""
@@ -81,6 +117,7 @@ class OperationRequest:
     task_id: str | None = None
     source: str = "core"
     units: int = 1
+    input_digest: str | None = None
 
     def __post_init__(self) -> None:
         """验证 operation、scope 和服务端幂等键的最小安全约束。"""
@@ -96,11 +133,24 @@ class OperationRequest:
         source = _validate_field(self.source, maximum=64, required=True)
         if isinstance(self.units, bool) or not isinstance(self.units, int) or self.units < 1:
             raise OperationPolicyError("operation_grant_invalid")
+        input_digest = _validate_input_digest(self.input_digest)
         object.__setattr__(self, "scope", scope)
         object.__setattr__(self, "idempotency_key", idempotency_key)
         object.__setattr__(self, "resource_id", resource_id)
         object.__setattr__(self, "task_id", task_id)
         object.__setattr__(self, "source", source)
+        object.__setattr__(self, "input_digest", input_digest)
+
+    @property
+    def request_fingerprint(self) -> str:
+        """返回不透明 grant 关联使用的服务端请求事实摘要。"""
+        return _request_fingerprint(
+            resource_id=self.resource_id,
+            task_id=self.task_id,
+            source=self.source,
+            units=self.units,
+            input_digest=self.input_digest,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +249,37 @@ def validate_grant(request: OperationRequest, grant: GrantRef) -> GrantRef:
     return grant
 
 
+def _validate_association(
+    request: OperationRequest,
+    association: "GrantAssociation",
+    *,
+    executable: bool = False,
+) -> "GrantAssociation":
+    """校验关联的完整服务端事实，并可选地要求它仍处于可执行状态。"""
+    if association.request.scope != request.scope or association.request.operation != request.operation or association.request.idempotency_key != request.idempotency_key:
+        raise OperationPolicyError("operation_grant_invalid")
+    if (
+        association.request.resource_id,
+        association.request.task_id,
+        association.request.source,
+        association.request.units,
+        association.request.input_digest,
+    ) != (
+        request.resource_id,
+        request.task_id,
+        request.source,
+        request.units,
+        request.input_digest,
+    ):
+        raise OperationPolicyError("operation_policy_unavailable")
+    if association.request.request_fingerprint != request.request_fingerprint or association.metadata.get("request_fingerprint") != request.request_fingerprint:
+        raise OperationPolicyError("operation_policy_unavailable")
+    validate_grant(request, association.grant)
+    if executable and association.state not in _EXECUTABLE_ASSOCIATION_STATES:
+        raise OperationPolicyError("operation_policy_unavailable")
+    return association
+
+
 class AllowAllOperationPolicy:
     """开源 local 应用显式装配的无额度 policy。"""
 
@@ -220,7 +301,16 @@ class AllowAllOperationPolicy:
 
     def probe(self, request: OperationRequest) -> PolicyDecision:
         """返回允许提示，不创建 grant。"""
-        OperationRequest(request.scope, request.operation, request.idempotency_key, request.resource_id, request.task_id, request.source, request.units)
+        OperationRequest(
+            request.scope,
+            request.operation,
+            request.idempotency_key,
+            request.resource_id,
+            request.task_id,
+            request.source,
+            request.units,
+            request.input_digest,
+        )
         return PolicyDecision(True)
 
     def acquire(self, request: OperationRequest) -> PolicyDecision:
@@ -288,7 +378,7 @@ class OperationPolicyGateway:
         kwargs.pop("scope_id", None)
         kwargs.pop("user_id", None)
         kwargs.pop("grant", None)
-        return OperationRequest(scope if isinstance(scope, ScopeContext) else ScopeContext(scope), operation, idempotency_key, **{key: value for key, value in kwargs.items() if key in {"resource_id", "task_id", "source", "units"}})
+        return OperationRequest(scope if isinstance(scope, ScopeContext) else ScopeContext(scope), operation, idempotency_key, **{key: value for key, value in kwargs.items() if key in {"resource_id", "task_id", "source", "units", "input_digest"}})
 
     def probe(self, request: OperationRequest) -> PolicyDecision:
         """执行非权威可用性查询。"""
@@ -353,6 +443,25 @@ class GrantAssociation:
     state: str = "acquired"
     metadata: dict[str, object] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        """校验关联绑定、状态和请求指纹，防止构造不可信的执行授权。"""
+        if not isinstance(self.request, OperationRequest):
+            raise OperationPolicyError("operation_grant_invalid")
+        if self.state not in _ASSOCIATION_STATES:
+            raise OperationPolicyError("operation_policy_unavailable")
+        validate_grant(self.request, self.grant)
+        if not isinstance(self.metadata, dict):
+            raise OperationPolicyError("operation_grant_invalid")
+        self.metadata = dict(self.metadata)
+        expected = self.request.request_fingerprint
+        stored = self.metadata.get("request_fingerprint")
+        if stored is not None and stored != expected:
+            raise OperationPolicyError("operation_policy_unavailable")
+        stored_input_digest = self.metadata.get("input_digest")
+        if stored_input_digest is not None and stored_input_digest != self.request.input_digest:
+            raise OperationPolicyError("operation_policy_unavailable")
+        self.metadata["request_fingerprint"] = expected
+
 
 class GrantAssociationStore:
     """按 scope/operation/key 保存不透明 grant 关联并提供幂等读取。"""
@@ -364,13 +473,30 @@ class GrantAssociationStore:
     def get(self, request: OperationRequest) -> GrantAssociation | None:
         """读取当前 scope 的关联，不接受客户端 grant 作为查找键。"""
         with self._lock:
-            return self._values.get((request.scope.scope_id, request.operation, request.idempotency_key))
+            association = self._values.get((request.scope.scope_id, request.operation, request.idempotency_key))
+            return _validate_association(request, association) if association is not None else None
 
     def put(self, association: GrantAssociation) -> GrantAssociation:
         """幂等写入 grant 关联；冲突时保留最初服务端事实。"""
+        _validate_association(association.request, association)
         key = (association.request.scope.scope_id, association.request.operation, association.request.idempotency_key)
         with self._lock:
-            return self._values.setdefault(key, association)
+            existing = self._values.get(key)
+            if existing is not None:
+                return _validate_association(association.request, existing)
+            self._values[key] = association
+            return association
+
+    def _refresh(self, association: GrantAssociation) -> GrantAssociation:
+        """用持久层刚读取的同一 grant 事实刷新进程缓存。"""
+        _validate_association(association.request, association)
+        key = (association.request.scope.scope_id, association.request.operation, association.request.idempotency_key)
+        with self._lock:
+            existing = self._values.get(key)
+            if existing is not None and existing.grant != association.grant:
+                raise OperationPolicyError("operation_policy_unavailable")
+            self._values[key] = association
+            return association
 
     def acquire(self, request: OperationRequest, gateway: OperationPolicyGateway) -> GrantAssociation:
         """在同一进程内串行化同一幂等键的 acquire，避免并发预占多个 grant。"""
@@ -378,7 +504,7 @@ class GrantAssociationStore:
         with self._lock:
             existing = self._values.get(key)
             if existing is not None:
-                return existing
+                return _validate_association(request, existing, executable=True)
             grant = validate_grant(request, require_allowed(gateway.acquire(request)))
             association = GrantAssociation(request, grant)
             self._values[key] = association
@@ -406,6 +532,10 @@ class GrantAssociationStore:
             association = self._values.get(key)
             if association is None or association.grant != grant:
                 return False
+            if association.state not in _EXECUTABLE_ASSOCIATION_STATES or association.request.task_id not in {None, task_id}:
+                return False
+            association.request = replace(association.request, task_id=task_id)
+            association.metadata["request_fingerprint"] = association.request.request_fingerprint
             association.metadata["task_id"] = task_id
             return True
 
@@ -425,27 +555,35 @@ class PersistentGrantAssociationStore:
 
     def get(self, request: OperationRequest) -> GrantAssociation | None:
         """先查进程缓存，再查持久事实；跨 scope 不共享关联。"""
-        cached = self._memory.get(request)
+        try:
+            cached = self._memory.get(request)
+        except OperationPolicyError:
+            # 另一个进程可能刚完成 task 绑定；持久事实可确认时允许刷新缓存，
+            # 但真正的请求冲突仍会由 repository 再次 fail-closed。
+            cached = None
         if cached is not None:
             return cached
         value = self._repository(self.resources, request.scope).get(request)
         if value is not None:
-            self._memory.put(value)
+            self._memory._refresh(value)
         return value
 
     def put(self, association: GrantAssociation) -> GrantAssociation:
         """持久写入并同步内存缓存。"""
         value = self._repository(self.resources, association.request.scope).put(association)
-        return self._memory.put(value)
+        return self._memory._refresh(value)
 
     def acquire(self, request: OperationRequest, gateway: OperationPolicyGateway) -> GrantAssociation:
         """在数据库 advisory lock 下完成跨进程幂等 acquire。"""
         with self._lock:
-            cached = self.get(request)
+            try:
+                cached = self._memory.get(request)
+            except OperationPolicyError:
+                cached = None
             if cached is not None:
-                return cached
+                return _validate_association(request, cached, executable=True)
             value = self._repository(self.resources, request.scope).acquire(request, gateway)
-            return self._memory.put(value)
+            return self._memory._refresh(value)
 
     def transition(self, grant: GrantRef, state: str) -> bool:
         """持久且幂等地提交 grant 状态，再更新进程缓存。"""
@@ -469,6 +607,48 @@ class PersistentGrantRepository:
         self.resources = resources
         self.scope = scope if isinstance(scope, ScopeContext) else ScopeContext(scope)
 
+    @staticmethod
+    def _row_fingerprint(row: OperationGrant) -> str:
+        """从持久列重建请求指纹；旧行缺字段时必须拒绝执行。"""
+        if row.source is None or row.units is None or row.request_fingerprint is None:
+            raise OperationPolicyError("operation_policy_unavailable")
+        expected = _request_fingerprint(
+            resource_id=row.resource_id,
+            task_id=row.task_id,
+            source=row.source,
+            units=row.units,
+            input_digest=row.input_digest,
+        )
+        if row.request_fingerprint != expected:
+            raise OperationPolicyError("operation_policy_unavailable")
+        return expected
+
+    def _association_from_row(self, row: OperationGrant, request: OperationRequest) -> GrantAssociation:
+        """将一条持久行转换为已验证的 scope-bound association。"""
+        if row.scope_id != self.scope.scope_id or row.operation != request.operation or row.idempotency_key != request.idempotency_key:
+            raise OperationPolicyError("operation_grant_invalid")
+        fingerprint = self._row_fingerprint(row)
+        if (
+            row.resource_id,
+            row.task_id,
+            row.source,
+            row.units,
+            row.input_digest,
+        ) != (
+            request.resource_id,
+            request.task_id,
+            request.source,
+            request.units,
+            request.input_digest,
+        ) or fingerprint != request.request_fingerprint:
+            raise OperationPolicyError("operation_policy_unavailable")
+        return GrantAssociation(
+            request,
+            GrantRef(row.grant_id, row.operation, row.idempotency_key, self.scope),
+            row.state,
+            {"attempt_id": row.attempt_id, "input_digest": row.input_digest, "request_fingerprint": fingerprint},
+        )
+
     def get(self, request: OperationRequest) -> GrantAssociation | None:
         """按服务端 scope/operation/key 幂等读取 grant。"""
         if request.scope != self.scope:
@@ -477,22 +657,37 @@ class PersistentGrantRepository:
             row = session.get(OperationGrant, (self.scope.scope_id, request.operation, request.idempotency_key))
             if row is None:
                 return None
-            grant = GrantRef(row.grant_id, row.operation, row.idempotency_key, self.scope)
-            return GrantAssociation(request, grant, row.state, {"attempt_id": row.attempt_id, "input_digest": row.input_digest})
+            return self._association_from_row(row, request)
 
     def put(self, association: GrantAssociation) -> GrantAssociation:
         """原子保存 grant 关联；重复 key 返回最初事实。"""
         request, grant = association.request, association.grant
         if request.scope != self.scope or grant.scope != self.scope:
             raise OperationPolicyError("operation_grant_invalid")
+        _validate_association(request, association)
         with self.resources.factory() as session:
             row = session.get(OperationGrant, (self.scope.scope_id, request.operation, request.idempotency_key), with_for_update=True)
             if row is None:
-                row = OperationGrant(scope_id=self.scope.scope_id, operation=request.operation, idempotency_key=request.idempotency_key, grant_id=grant.grant_id, task_id=request.task_id, resource_id=request.resource_id, state=association.state, attempt_id=association.metadata.get("attempt_id"), input_digest=association.metadata.get("input_digest"))
+                row = OperationGrant(
+                    scope_id=self.scope.scope_id,
+                    operation=request.operation,
+                    idempotency_key=request.idempotency_key,
+                    grant_id=grant.grant_id,
+                    task_id=request.task_id,
+                    resource_id=request.resource_id,
+                    source=request.source,
+                    units=request.units,
+                    input_digest=request.input_digest,
+                    request_fingerprint=request.request_fingerprint,
+                    state=association.state,
+                    attempt_id=association.metadata.get("attempt_id"),
+                )
                 session.add(row)
                 session.flush()
+            else:
+                return self._association_from_row(row, request)
             session.commit()
-            return GrantAssociation(request, GrantRef(row.grant_id, row.operation, row.idempotency_key, self.scope), row.state, association.metadata)
+            return GrantAssociation(request, GrantRef(row.grant_id, row.operation, row.idempotency_key, self.scope), row.state, {**association.metadata, "request_fingerprint": request.request_fingerprint})
 
     def acquire(self, request: OperationRequest, gateway: OperationPolicyGateway) -> GrantAssociation:
         """在 scope/operation/key advisory lock 下只向宿主 policy acquire 一次。"""
@@ -503,8 +698,11 @@ class PersistentGrantRepository:
             session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": key})
             row = session.get(OperationGrant, (self.scope.scope_id, request.operation, request.idempotency_key), with_for_update=True)
             if row is not None:
+                association = self._association_from_row(row, request)
                 session.commit()
-                return GrantAssociation(request, GrantRef(row.grant_id, row.operation, row.idempotency_key, self.scope), row.state, {"attempt_id": row.attempt_id, "input_digest": row.input_digest})
+                if association.state not in _EXECUTABLE_ASSOCIATION_STATES:
+                    raise OperationPolicyError("operation_policy_unavailable")
+                return association
             grant = require_allowed(gateway.acquire(request))
             row = OperationGrant(
                 scope_id=self.scope.scope_id,
@@ -513,6 +711,10 @@ class PersistentGrantRepository:
                 grant_id=grant.grant_id,
                 task_id=request.task_id,
                 resource_id=request.resource_id,
+                source=request.source,
+                units=request.units,
+                input_digest=request.input_digest,
+                request_fingerprint=request.request_fingerprint,
                 state="acquired",
             )
             session.add(row)
@@ -524,7 +726,10 @@ class PersistentGrantRepository:
                 if existing is None:
                     raise OperationPolicyError("operation_policy_unavailable") from exc
                 row = existing
-            return GrantAssociation(request, GrantRef(row.grant_id, row.operation, row.idempotency_key, self.scope), row.state)
+            association = self._association_from_row(row, request)
+            if association.state not in _EXECUTABLE_ASSOCIATION_STATES:
+                raise OperationPolicyError("operation_policy_unavailable")
+            return association
 
     def transition(self, grant: GrantRef, state: str) -> bool:
         """按不透明 grant id 幂等更新 commit/release 状态。"""
@@ -577,11 +782,29 @@ class PersistentGrantRepository:
                 if row.task_id not in {None, task_id}:
                     session.commit()
                     return False
+                if row.state not in _EXECUTABLE_ASSOCIATION_STATES:
+                    session.commit()
+                    return False
+                if row.source is None or row.units is None or row.request_fingerprint is None:
+                    raise OperationPolicyError("operation_policy_unavailable")
                 task = session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.id == task_id))
                 if task is None or row.state != "acquired":
                     session.commit()
                     return False
+                next_fingerprint = _request_fingerprint(
+                    resource_id=row.resource_id,
+                    task_id=task_id,
+                    source=row.source,
+                    units=row.units,
+                    input_digest=row.input_digest,
+                )
+                if row.task_id == task_id:
+                    if row.request_fingerprint != next_fingerprint:
+                        raise OperationPolicyError("operation_policy_unavailable")
+                    session.commit()
+                    return True
                 row.task_id = task_id
+                row.request_fingerprint = next_fingerprint
                 row.updated_at = utcnow()
                 session.commit()
                 return True

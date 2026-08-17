@@ -52,7 +52,7 @@ from backend.database import (
 from backend.config import Settings
 from backend.image_processing import ImageProcessingError, ImageProcessingRepository, ImageProcessingWorker, STAGES
 from backend.metadata import MemeContext
-from backend.operation_policy import AllowAllOperationPolicy, GrantAssociationStore, OperationPolicyGateway, Operations, PersistentGrantAssociationStore
+from backend.operation_policy import AllowAllOperationPolicy, GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations, PersistentGrantAssociationStore
 from backend.visual import VisualSearchError, VisualSearchService
 from backend.scope import ScopeServiceFactory
 from backend.pg_services import PostgresTaskWorkerManager
@@ -245,6 +245,72 @@ def test_persistent_operation_grant_is_idempotent_and_does_not_refund_other_oper
     with resources.factory() as session:
         rows = list(session.scalars(select(OperationGrant).where(OperationGrant.scope_id == "local")))
         assert {row.operation for row in rows} >= {Operations.IMAGE_UPLOAD, Operations.IMAGE_DELETE}
+
+
+def test_persistent_grant_checks_request_facts_and_terminal_states(postgres_resources) -> None:
+    """PostgreSQL association 必须比较完整请求事实并拒绝旧终态复用。"""
+    resources = postgres_resources
+    policy = _CountingAllowAllPolicy()
+    gateway = OperationPolicyGateway(policy, allow_all=True)
+    store = PersistentGrantAssociationStore(resources)
+    request = gateway.request(
+        "local",
+        Operations.ANALYSIS_AGENT,
+        "agent:fact-check",
+        resource_id="meme-fact",
+        task_id=None,
+        source="image-processing",
+        units=1,
+        input_digest="a" * 64,
+    )
+    association = store.acquire(request, gateway)
+    assert store.acquire(request, gateway).grant == association.grant
+    assert policy.requests and len(policy.requests) == 1
+    with resources.factory() as session:
+        row = session.get(OperationGrant, ("local", Operations.ANALYSIS_AGENT, "agent:fact-check"))
+        assert row is not None
+        assert row.request_fingerprint == request.request_fingerprint
+        assert row.source == request.source
+        assert row.units == request.units
+
+    conflicting = gateway.request(
+        "local",
+        Operations.ANALYSIS_AGENT,
+        "agent:fact-check",
+        resource_id="meme-other",
+        source="image-processing",
+        input_digest="a" * 64,
+    )
+    with pytest.raises(OperationPolicyError) as error:
+        store.acquire(conflicting, gateway)
+    assert error.value.code == "operation_policy_unavailable"
+    assert store.transition(association.grant, "unknown") is True
+    assert store.get(request) is not None
+    with pytest.raises(OperationPolicyError) as terminal_error:
+        store.acquire(request, gateway)
+    assert terminal_error.value.code == "operation_policy_unavailable"
+
+
+def test_persistent_legacy_grant_without_request_facts_fails_closed(postgres_resources) -> None:
+    """迁移前留下的缺少 source/units/fingerprint 的 grant 不能被执行路径采用。"""
+    resources = postgres_resources
+    with resources.factory() as session:
+        session.add(
+            OperationGrant(
+                scope_id="local",
+                operation=Operations.IMAGE_UPLOAD,
+                idempotency_key="legacy:missing-facts",
+                grant_id=f"legacy-{uuid4().hex}",
+                state="acquired",
+            )
+        )
+        session.commit()
+    gateway = OperationPolicyGateway(AllowAllOperationPolicy(), allow_all=True)
+    store = PersistentGrantAssociationStore(resources)
+    request = gateway.request("local", Operations.IMAGE_UPLOAD, "legacy:missing-facts")
+    with pytest.raises(OperationPolicyError) as error:
+        store.get(request)
+    assert error.value.code == "operation_policy_unavailable"
 
 
 def test_image_processing_repository_enforces_stage_order_claim_fencing_and_retry(postgres_resources) -> None:

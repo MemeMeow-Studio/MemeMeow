@@ -159,6 +159,72 @@ def test_concurrent_same_key_acquire_creates_one_grant() -> None:
     assert len(set(values)) == 1
 
 
+def test_grant_association_reuses_only_identical_server_facts() -> None:
+    """同一事实可复用 grant，resource/task/source/units/input 摘要冲突必须拒绝。"""
+    gateway = OperationPolicyGateway(AllowAllOperationPolicy(), allow_all=True)
+    store = GrantAssociationStore()
+    base = gateway.request(
+        "tenant-facts",
+        Operations.ANALYSIS_AGENT,
+        "agent:facts",
+        resource_id="meme-1",
+        task_id="task-1",
+        source="image-processing",
+        units=1,
+        input_digest="a" * 64,
+    )
+    association = store.acquire(base, gateway)
+    assert store.acquire(base, gateway).grant == association.grant
+    for mutation in (
+        {"resource_id": "meme-2"},
+        {"task_id": "task-2"},
+        {"source": "other"},
+        {"units": 2},
+        {"input_digest": "b" * 64},
+    ):
+        conflicting = gateway.request(
+            "tenant-facts",
+            Operations.ANALYSIS_AGENT,
+            "agent:facts",
+            resource_id=mutation.get("resource_id", base.resource_id),
+            task_id=mutation.get("task_id", base.task_id),
+            source=mutation.get("source", base.source),
+            units=mutation.get("units", base.units),
+            input_digest=mutation.get("input_digest", base.input_digest),
+        )
+        with pytest.raises(OperationPolicyError) as error:
+            store.acquire(conflicting, gateway)
+        assert error.value.code == "operation_policy_unavailable"
+
+
+@pytest.mark.parametrize("terminal_state", ("committed", "released", "unknown"))
+def test_terminal_association_cannot_be_reused_as_execution_grant(terminal_state: str) -> None:
+    """已提交、已释放和未知关联只能用于恢复观察，不能再次 acquire。"""
+    gateway = OperationPolicyGateway(AllowAllOperationPolicy(), allow_all=True)
+    store = GrantAssociationStore()
+    request = gateway.request("tenant-terminal", Operations.IMAGE_UPLOAD, f"upload:{terminal_state}", input_digest="a" * 64)
+    association = store.acquire(request, gateway)
+    assert store.transition(association.grant, terminal_state) is True
+    observed = store.get(request)
+    assert observed is not None and observed.state == terminal_state
+    with pytest.raises(OperationPolicyError) as error:
+        store.acquire(request, gateway)
+    assert error.value.code == "operation_policy_unavailable"
+
+
+def test_pipeline_task_binding_updates_the_persisted_request_fingerprint() -> None:
+    """pipeline 先取得 grant 后绑定叶子 Task 时，新的可信事实仍可幂等命中。"""
+    gateway = OperationPolicyGateway(AllowAllOperationPolicy(), allow_all=True)
+    store = GrantAssociationStore()
+    initial = gateway.request("tenant-pipeline", Operations.ANALYSIS_AGENT, "agent:pipeline", resource_id="meme-1", source="image-processing", input_digest="a" * 64)
+    association = store.acquire(initial, gateway)
+    assert store.bind_task(association.grant, "task-1") is True
+    bound = gateway.request("tenant-pipeline", Operations.ANALYSIS_AGENT, "agent:pipeline", resource_id="meme-1", task_id="task-1", source="image-processing", input_digest="a" * 64)
+    assert store.get(bound) is association
+    with pytest.raises(OperationPolicyError):
+        store.get(initial)
+
+
 def test_commit_and_release_are_idempotent_without_refunding_committed_grant() -> None:
     """commit/release 重复调用稳定收束，已 commit 的 grant 不会被 release 改写。"""
     gateway = OperationPolicyGateway(AllowAllOperationPolicy(), allow_all=True)

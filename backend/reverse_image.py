@@ -567,33 +567,34 @@ class ReverseImageService:
                     resource_id=str((task.payload or {}).get("meme_id")) if (task.payload or {}).get("meme_id") else None,
                     task_id=task.id,
                     source="reverse-image-provider",
+                    input_digest=request.input_digest,
                 )
-                association = self.grants.get(operation_request)
-                if association is None:
-                    try:
+                try:
+                    association = self.grants.get(operation_request)
+                    if association is None:
                         if hasattr(self.grants, "acquire"):
                             association = self.grants.acquire(operation_request, self.operation_policy)
                         else:
                             grant = require_allowed(self.operation_policy.acquire(operation_request))
                             association = self.grants.put(GrantAssociation(operation_request, grant))
-                    except OperationPolicyError as exc:
-                        event = environment.reverse_image_usage.create(
-                            request_id=request_id,
-                            task_id=request.task_id,
-                            meme_id=(task.payload or {}).get("meme_id"),
-                            cache_key=key,
-                            cache_status="refresh" if record else "miss",
-                            provider="serpapi",
-                            **self._usage_binding(request),
-                        )
-                        event = environment.reverse_image_usage.finish(
-                            request_id,
-                            outcome="forbidden",
-                            result={"used": False, "degraded": True, "reason": exc.code},
-                            error={"error": exc.code},
-                        )
-                        return self._event_output(event)
-                elif association.state in {"committed", "released", "unknown"}:
+                except OperationPolicyError as exc:
+                    event = environment.reverse_image_usage.create(
+                        request_id=request_id,
+                        task_id=request.task_id,
+                        meme_id=(task.payload or {}).get("meme_id"),
+                        cache_key=key,
+                        cache_status="refresh" if record else "miss",
+                        provider="serpapi",
+                        **self._usage_binding(request),
+                    )
+                    event = environment.reverse_image_usage.finish(
+                        request_id,
+                        outcome="forbidden",
+                        result={"used": False, "degraded": True, "reason": exc.code},
+                        error={"error": exc.code},
+                    )
+                    return self._event_output(event)
+                if association.state in {"committed", "released", "unknown"}:
                     # 已计量或结果未知的逻辑 request 不得再次联系 provider。
                     event = environment.reverse_image_usage.finish(
                         request_id,

@@ -100,7 +100,7 @@ app = create_app(scope_resolver=LocalScopeResolver("local"))
 
 `GET /operations/availability` 或传入单个 `operation` 参数只执行非权威 `probe`，返回可用状态、稳定拒绝原因和可选 `retry_at`，不会创建 reservation 或返回 grant。首期 operation 名称为 `image.upload`、`analysis.agent`、`analysis.reverse_image_search` 和 `image.delete`。适配宿主通过服务端 policy 注入额度与策略规则；grant 只保存在服务端并绑定 scope、稳定幂等键和真实 Task，客户端字段不能伪造或覆盖它。
 
-图片上传、合集导入、删除和 Agent/反向图片外部副作用分别在 durable 副作用边界执行 acquire/commit；只有能够证明副作用尚未开始时才 release。策略拒绝、额度限制和策略不可用分别映射为 `403 operation_forbidden`、`429 operation_limit_exceeded` 和 `503 operation_policy_unavailable`。
+图片上传、合集导入、删除和 Agent/反向图片外部副作用分别在 durable 副作用边界执行 acquire/commit；只有能够证明副作用尚未开始时才 release。grant association 还会比较服务端 resource、Task、source、units 和 input digest 指纹；已提交、已释放或未知的关联只能供恢复观察，不能再次作为执行授权。策略拒绝、额度限制和策略不可用分别映射为 `403 operation_forbidden`、`429 operation_limit_exceeded` 和 `503 operation_policy_unavailable`。
 
 ## 内部 Agent callback
 

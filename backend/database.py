@@ -57,7 +57,7 @@ VISUAL_EMBEDDING_DIMENSIONS = 768
 SCOPE_LOCAL = "local"
 UTC = timezone.utc
 # 当前代码要求的 Alembic head；数据库初始化脚本会显式传入同一 revision。
-CURRENT_SCHEMA_REVISION = "0010_separate_image_pipeline_and_stage_tasks"
+CURRENT_SCHEMA_REVISION = "0011_harden_operation_grant_association"
 
 
 def utcnow() -> datetime:
@@ -438,9 +438,12 @@ class OperationGrant(Base):
     grant_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     task_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     resource_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    source: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    units: Mapped[int | None] = mapped_column(Integer, nullable=True)
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="acquired")
     attempt_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     input_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
@@ -450,6 +453,9 @@ class OperationGrant(Base):
         ForeignKeyConstraint(["scope_id", "task_id"], ["tasks.scope_id", "tasks.id"], ondelete="CASCADE"),
         CheckConstraint("operation IN ('image.upload','analysis.agent','analysis.reverse_image_search','image.delete')", name="ck_operation_grant_operation"),
         CheckConstraint("state IN ('acquired','committed','released','unknown')", name="ck_operation_grant_state"),
+        CheckConstraint("source IS NULL OR (length(source) > 0 AND length(source) <= 64)", name="ck_operation_grant_source"),
+        CheckConstraint("units IS NULL OR units > 0", name="ck_operation_grant_units"),
+        CheckConstraint("request_fingerprint IS NULL OR length(request_fingerprint) = 64", name="ck_operation_grant_fingerprint"),
         Index("ix_operation_grants_scope_task", "scope_id", "task_id"),
     )
 
@@ -592,7 +598,7 @@ class SearchMigrationState(Base):
 
 
 # 这些表属于图片处理控制面；在已安装旧 revision 的部署启动时用 ``checkfirst``
-# 幂等补齐，标准部署仍以 Alembic 0010 迁移作为唯一 schema 版本事实。
+# 幂等补齐，标准部署仍以 Alembic 0011 迁移作为唯一 schema 版本事实。
 OPTIONAL_CONTROL_TABLES = (
     OperationGrant.__table__,
     ImageProcessingJob.__table__,
@@ -741,6 +747,25 @@ def ensure_optional_control_schema(engine: Engine) -> None:
             connection.execute(text("ALTER TABLE reverse_image_usage_events ADD COLUMN IF NOT EXISTS target_sha256 VARCHAR(64)"))
             connection.execute(text("ALTER TABLE reverse_image_usage_events ADD COLUMN IF NOT EXISTS input_digest VARCHAR(64)"))
             connection.execute(text("ALTER TABLE search_migration_states ADD COLUMN IF NOT EXISTS model VARCHAR(255)"))
+            connection.execute(text("ALTER TABLE operation_grants ADD COLUMN IF NOT EXISTS source VARCHAR(64)"))
+            connection.execute(text("ALTER TABLE operation_grants ADD COLUMN IF NOT EXISTS units INTEGER"))
+            connection.execute(text("ALTER TABLE operation_grants ADD COLUMN IF NOT EXISTS request_fingerprint VARCHAR(64)"))
+            connection.execute(text("""
+                DO $$ BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_operation_grant_source') THEN
+                        ALTER TABLE operation_grants ADD CONSTRAINT ck_operation_grant_source
+                            CHECK(source IS NULL OR (length(source) > 0 AND length(source) <= 64));
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_operation_grant_units') THEN
+                        ALTER TABLE operation_grants ADD CONSTRAINT ck_operation_grant_units
+                            CHECK(units IS NULL OR units > 0);
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_operation_grant_fingerprint') THEN
+                        ALTER TABLE operation_grants ADD CONSTRAINT ck_operation_grant_fingerprint
+                            CHECK(request_fingerprint IS NULL OR length(request_fingerprint) = 64);
+                    END IF;
+                END $$;
+            """))
     except SQLAlchemyError as exc:
         raise DatabaseError("control_schema_unavailable") from exc
 

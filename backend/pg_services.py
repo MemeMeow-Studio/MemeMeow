@@ -1132,7 +1132,7 @@ class PostgresTaskService:
         else:
             logical_key = f"agent:{meme_id}:{image_sha256}:{config_hash}:{policy}:r{revision}"
             source = "image-processing"
-        request = self._operation_policy.request(self.scope, Operations.ANALYSIS_AGENT, logical_key, resource_id=meme_id, task_id=claim.id, source=source)
+        request = self._operation_policy.request(self.scope, Operations.ANALYSIS_AGENT, logical_key, resource_id=meme_id, task_id=claim.id, source=source, input_digest=image_sha256)
         association = self._grant_store.get(request)
         if association is None or association.grant.scope != self.scope or association.grant.operation != Operations.ANALYSIS_AGENT:
             raise OperationPolicyError("operation_grant_invalid")

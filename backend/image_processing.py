@@ -647,12 +647,12 @@ class ImageProcessingWorker:
             grant_key = f"standalone-agent:{identifier}:{image_sha256}:{config_hash}:{policy}:{payload['standalone_submission_nonce']}"
             payload["agent_grant_key"] = grant_key
             association: GrantAssociation | None = None
-            request = self.policy.request(self.scope, Operations.ANALYSIS_AGENT, grant_key, resource_id=str(identifier), task_id=task_id, source="image-processing-standalone")
+            request = self.policy.request(self.scope, Operations.ANALYSIS_AGENT, grant_key, resource_id=str(identifier), task_id=task_id, source="image-processing-standalone", input_digest=image_sha256)
             try:
                 association = self.grants.get(request)
                 if association is None:
                     association = self.grants.acquire(request, self.policy)
-                if association.state in {"unknown", "released"}:
+                if association.state in {"unknown", "released", "committed"}:
                     raise OperationPolicyError("operation_grant_invalid")
                 if callable(getattr(self.grants, "bind_task", None)) and not self.grants.bind_task(association.grant, task_id):
                     raise OperationPolicyError("operation_grant_invalid")
@@ -1052,20 +1052,20 @@ class ImageProcessingWorker:
             logical_key = f"agent:{job.meme_id}:{job.image_sha256}:{job.processing_config_hash}:{policy}:r{job.revision}"
             # 任务尚未提交时不能把 job UUID 写入 operation_grants.task_id 外键；
             # 先取得按 logical key 去重的 grant，提交后再绑定真实 Task ID。
-            gateway_request = self.policy.request(self.scope, Operations.ANALYSIS_AGENT, logical_key, resource_id=str(job.meme_id), source="image-processing")
-            association = self.grants.get(gateway_request)
-            if association is None:
-                try:
+            gateway_request = self.policy.request(self.scope, Operations.ANALYSIS_AGENT, logical_key, resource_id=str(job.meme_id), source="image-processing", input_digest=job.image_sha256)
+            try:
+                association = self.grants.get(gateway_request)
+                if association is None:
                     if hasattr(self.grants, "acquire"):
                         association = self.grants.acquire(gateway_request, self.policy)
                     else:
                         grant = require_allowed(self.policy.acquire(gateway_request))
                         association = self.grants.put(GrantAssociation(gateway_request, grant))
-                except OperationPolicyError as exc:
-                    self.jobs.transition(job.id, stage, owner=self.owner, claim_generation=job.claim_generation, status="blocked", error={"error": exc.code}, retry_at=exc.retry_at)
-                    raise ImageProcessingError("blocked", retry_at=exc.retry_at) from exc
-            if association is not None and association.state == "unknown":
-                raise ImageProcessingError("unknown_execution")
+            except OperationPolicyError as exc:
+                self.jobs.transition(job.id, stage, owner=self.owner, claim_generation=job.claim_generation, status="blocked", error={"error": exc.code}, retry_at=exc.retry_at)
+                raise ImageProcessingError("blocked", retry_at=exc.retry_at) from exc
+            if association is not None and association.state in {"unknown", "committed"}:
+                raise ImageProcessingError("unknown_execution" if association.state == "unknown" else "operation_grant_invalid")
             if association is not None and association.state == "released":
                 raise ImageProcessingError("operation_grant_invalid")
             # grant 只保存在服务端 association，绝不进入普通 Task payload。

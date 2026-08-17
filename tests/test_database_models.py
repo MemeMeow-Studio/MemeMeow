@@ -11,5 +11,5 @@ from alembic.script import ScriptDirectory
 def test_single_forward_migration_head():
     """仓库只暴露一个前向 revision head，回滚由 migration 明确拒绝。"""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == ["0010_separate_image_pipeline_and_stage_tasks"]
+    assert script.get_heads() == ["0011_harden_operation_grant_association"]
     assert (Path("alembic/versions/0001_postgres_scoped.py")).is_file()

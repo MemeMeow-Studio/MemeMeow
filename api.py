@@ -249,14 +249,13 @@ def _operation_gateway(request: Request) -> OperationPolicyGateway:
     return gateway
 
 
-def _acquire_operation(request: Request, operation: str, idempotency_key: str, *, resource_id: str | None = None, task_id: str | None = None, source: str = "core"):
+def _acquire_operation(request: Request, operation: str, idempotency_key: str, *, resource_id: str | None = None, task_id: str | None = None, source: str = "core", input_digest: str | None = None):
     """在真实副作用前 acquire，并把 grant 关联保存在服务端内存/宿主替换边界。"""
     scope = _request_scope(request)
     gateway = _operation_gateway(request)
-    operation_request = gateway.request(scope, operation, idempotency_key, resource_id=resource_id, task_id=task_id, source=source)
-    existing = request.app.state.operation_grants.get(operation_request)
-    if existing is not None:
-        return existing.grant
+    operation_request = gateway.request(scope, operation, idempotency_key, resource_id=resource_id, task_id=task_id, source=source, input_digest=input_digest)
+    # store.acquire 同时校验请求指纹和 association 状态；不能先 get 再把 terminal grant
+    # 当作新的执行权返回给上传、删除或其它真实副作用路径。
     association = request.app.state.operation_grants.acquire(operation_request, gateway)
     return association.grant
 
@@ -760,22 +759,29 @@ async def lifespan(app: FastAPI):
                 raise RuntimeError("operation_grant_invalid")
             grant_source = "image-processing-standalone"
         else:
-            logical_key = f"agent:{meme_id}:{expected_sha}:{config_hash}:{payload['reverse_image_policy']}"
+            revision = payload.get("job_revision") or "legacy"
+            logical_key = f"agent:{meme_id}:{expected_sha}:{config_hash}:{payload['reverse_image_policy']}:r{revision}"
             grant_source = "image-processing"
         if grants is not None and gateway is not None:
-            grant_request = gateway.request(service.scope, Operations.ANALYSIS_AGENT, logical_key, resource_id=meme_id, task_id=str(payload.get("_claim_task_id") or ""), source=grant_source)
+            claim_task_id = payload.get("_claim_task_id")
+            if not isinstance(claim_task_id, str) or not claim_task_id:
+                raise RuntimeError("operation_grant_invalid")
+            grant_request = gateway.request(service.scope, Operations.ANALYSIS_AGENT, logical_key, resource_id=meme_id, task_id=claim_task_id, source=grant_source, input_digest=expected_sha)
             association = grants.get(grant_request)
             if association is None and mode == "standalone":
                 raise RuntimeError("operation_grant_invalid")
             if association is not None:
+                if association.state not in {"acquired", "committed"}:
+                    raise RuntimeError("operation_grant_invalid")
                 grant = association.grant
                 try:
-                    commit_result = gateway.commit(grant)
-                    if not commit_result.ok:
-                        raise OperationPolicyError(commit_result.reason or "operation_policy_unavailable", retry_at=commit_result.retry_at)
-                    if callable(getattr(grants, "transition", None)):
-                        grants.transition(grant, "committed")
-                    association.state = "committed"
+                    if association.state == "acquired":
+                        commit_result = gateway.commit(grant)
+                        if not commit_result.ok:
+                            raise OperationPolicyError(commit_result.reason or "operation_policy_unavailable", retry_at=commit_result.retry_at)
+                        if callable(getattr(grants, "transition", None)):
+                            grants.transition(grant, "committed")
+                        association.state = "committed"
                 except OperationPolicyError as exc:
                     raise RuntimeError(exc.code) from exc
         elif mode == "standalone":
@@ -2179,6 +2185,7 @@ async def import_collection(request: Request) -> dict[str, object]:
                         f"upload:{member.sha256}:{target.filename}",
                         resource_id=target.filename,
                         source="collection_import",
+                        input_digest=member.sha256,
                     )
                 except OperationPolicyError as exc:
                     result.update(exc.payload())
@@ -2475,8 +2482,9 @@ async def upload_images(
             continue
         grant = None
         try:
-            upload_key = f"upload:{sha256_bytes(content)}:{clean}"
-            grant = _acquire_operation(request, Operations.IMAGE_UPLOAD, upload_key, resource_id=clean, source="upload")
+            content_digest = sha256_bytes(content)
+            upload_key = f"upload:{content_digest}:{clean}"
+            grant = _acquire_operation(request, Operations.IMAGE_UPLOAD, upload_key, resource_id=clean, source="upload", input_digest=content_digest)
         except OperationPolicyError as exc:
             results.append({"filename": original, "ok": False, **exc.payload()})
             continue
