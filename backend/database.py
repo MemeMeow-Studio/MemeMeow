@@ -12,8 +12,10 @@ import math
 import os
 import errno
 import uuid
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from typing import Any, Iterator, Sequence
@@ -54,7 +56,7 @@ VISUAL_EMBEDDING_DIMENSIONS = 768
 SCOPE_LOCAL = "local"
 UTC = timezone.utc
 # 当前代码要求的 Alembic head；数据库初始化脚本会显式传入同一 revision。
-CURRENT_SCHEMA_REVISION = "0009_dinov2_vitb14_visual_search"
+CURRENT_SCHEMA_REVISION = "0010_separate_image_pipeline_and_stage_tasks"
 
 
 def utcnow() -> datetime:
@@ -70,16 +72,27 @@ class DatabaseError(RuntimeError):
         self.code = code
 
 
+@dataclass(frozen=True, slots=True)
 class ScopeContext:
-    """不可为空的数据范围上下文；公共开源适配层固定使用 ``local``。"""
+    """不可变且不可为空的数据范围上下文。
 
-    def __init__(self, scope_id: str):
-        if not isinstance(scope_id, str) or not scope_id.strip():
+    scope ID 由宿主 resolver 或持久任务记录提供，不能包含路径分隔符、控制字符
+    或超出数据库列长度；文件 namespace 由数据库 ``Scope.storage_namespace``
+    决定，而不是由这个外部标识直接拼接。
+    """
+
+    scope_id: str
+
+    def __post_init__(self) -> None:
+        """在创建边界拒绝空值、路径片段和不可存储的 scope 标识。"""
+        if not isinstance(self.scope_id, str):
             raise ValueError("scope_required")
-        self.scope_id = scope_id.strip()
-
-    def __repr__(self) -> str:
-        return f"ScopeContext({self.scope_id!r})"
+        value = self.scope_id.strip()
+        if not value:
+            raise ValueError("scope_required")
+        if len(value) > 128 or value in {".", ".."} or "/" in value or "\\" in value or any(unicodedata.category(char) == "Cc" for char in value):
+            raise ValueError("scope_invalid")
+        object.__setattr__(self, "scope_id", value)
 
 
 class Base(DeclarativeBase):
@@ -284,12 +297,20 @@ class MemeVisualEmbedding(Base):
 
 
 class Task(Base):
-    """字符串任务 ID、状态、去重键和 Worker 租约。"""
+    """字符串任务 ID、图片提交来源、状态、去重键和 Worker 租约。
+
+    ``submission_mode``、``image_stage`` 和 ``processing_job_id`` 是图片阶段任务
+    的持久化归属事实。历史记录允许三者为空，但新建图片阶段必须由受信控制面
+    写入完整来源，不能以普通 payload 推断 Job 或独立任务归属。
+    """
 
     __tablename__ = "tasks"
     id: Mapped[str] = mapped_column(String(255), primary_key=True)
     scope_id: Mapped[str] = mapped_column(String(128), nullable=False)
     task_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    submission_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    image_stage: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    processing_job_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     lane: Mapped[str] = mapped_column(String(64), nullable=False, default="default")
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     dedupe_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
@@ -312,9 +333,15 @@ class Task(Base):
 
     __table_args__ = (
         ForeignKeyConstraint(["scope_id"], ["scopes.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(["scope_id", "processing_job_id"], ["image_processing_jobs.scope_id", "image_processing_jobs.id"], ondelete="CASCADE"),
         CheckConstraint("status IN ('queued','running','succeeded','failed')", name="ck_task_status"),
         CheckConstraint("attempt_count >= 0 AND max_attempts > 0", name="ck_task_attempts"),
+        CheckConstraint("submission_mode IS NULL OR submission_mode IN ('pipeline','standalone')", name="ck_task_submission_mode"),
+        CheckConstraint("image_stage IS NULL OR image_stage IN ('visual','agent','text_embedding')", name="ck_task_image_stage"),
+        CheckConstraint("submission_mode IS NULL OR (submission_mode = 'standalone' AND processing_job_id IS NULL) OR (submission_mode = 'pipeline' AND processing_job_id IS NOT NULL)", name="ck_task_submission_job_exclusivity"),
+        CheckConstraint("task_type NOT IN ('visual_embedding_generation','meme_context_generation','text_embedding_generation') OR (submission_mode IS NULL OR (image_stage IS NOT NULL AND ((task_type = 'visual_embedding_generation' AND image_stage = 'visual') OR (task_type = 'meme_context_generation' AND image_stage = 'agent') OR (task_type = 'text_embedding_generation' AND image_stage = 'text_embedding'))))", name="ck_task_image_stage_type"),
         UniqueConstraint("scope_id", "id", name="uq_task_scope_id"),
+        Index("ix_tasks_image_submission", "scope_id", "submission_mode", "image_stage", "processing_job_id", "created_at"),
     )
 
 
@@ -336,6 +363,11 @@ class ReverseImageUsageEvent(Base):
     cache_status: Mapped[str] = mapped_column(String(16), nullable=False)
     provider_called: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    claim_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    attempt: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    operation: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    target_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    input_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     outcome: Mapped[str] = mapped_column(String(32), nullable=False, default="started")
     retryable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
@@ -350,9 +382,225 @@ class ReverseImageUsageEvent(Base):
         CheckConstraint("cache_status IN ('hit','miss','refresh')", name="ck_reverse_usage_cache_status"),
         CheckConstraint("outcome IN ('started','success','empty','failed','forbidden')", name="ck_reverse_usage_outcome"),
         CheckConstraint("provider_called = false OR provider_started_at IS NOT NULL", name="ck_reverse_usage_provider_started"),
+        CheckConstraint("claim_generation IS NULL OR claim_generation > 0", name="ck_reverse_usage_claim_generation"),
+        CheckConstraint("attempt IS NULL OR attempt > 0", name="ck_reverse_usage_attempt"),
+        CheckConstraint("target_sha256 IS NULL OR length(target_sha256) = 64", name="ck_reverse_usage_target_sha"),
         Index("ix_reverse_usage_scope_created", "scope_id", "created_at"),
         Index("ix_reverse_usage_scope_task", "scope_id", "task_id", "created_at"),
     )
+
+
+class AgentCallbackRequest(Base):
+    """内部 callback 的请求绑定和幂等结果事实。"""
+
+    __tablename__ = "agent_callback_requests"
+
+    scope_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    claim_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    operation: Mapped[str] = mapped_column(String(128), nullable=False)
+    target_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="started")
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        ForeignKeyConstraint(["scope_id"], ["scopes.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(["scope_id", "task_id"], ["tasks.scope_id", "tasks.id"], ondelete="CASCADE"),
+        CheckConstraint("claim_generation > 0", name="ck_agent_callback_request_generation"),
+        CheckConstraint("attempt > 0", name="ck_agent_callback_request_attempt"),
+        CheckConstraint("length(target_sha256) = 64", name="ck_agent_callback_request_target_sha"),
+        CheckConstraint("length(input_digest) = 64", name="ck_agent_callback_request_input_digest"),
+        CheckConstraint("state IN ('started','completed','failed','unknown_execution')", name="ck_agent_callback_request_state"),
+        Index("ix_agent_callback_requests_scope_task", "scope_id", "task_id", "created_at"),
+    )
+
+
+class OperationGrant(Base):
+    """服务端 operation grant 关联事实，不接受客户端 payload 覆盖。
+
+    开源 allow-all 主要在进程内完成幂等；该表为适配宿主和任务恢复提供同一
+    个 scope-safe 持久化边界，grant 本身仍是不透明引用。
+    """
+
+    __tablename__ = "operation_grants"
+
+    scope_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    operation: Mapped[str] = mapped_column(String(128), primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    grant_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    task_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    resource_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="acquired")
+    attempt_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    input_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(["scope_id"], ["scopes.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(["scope_id", "task_id"], ["tasks.scope_id", "tasks.id"], ondelete="CASCADE"),
+        CheckConstraint("operation IN ('image.upload','analysis.agent','analysis.reverse_image_search','image.delete')", name="ck_operation_grant_operation"),
+        CheckConstraint("state IN ('acquired','committed','released','unknown')", name="ck_operation_grant_state"),
+        Index("ix_operation_grants_scope_task", "scope_id", "task_id"),
+    )
+
+
+class ImageProcessingJob(Base):
+    """一张图片一个 revision 的统一处理控制面。"""
+
+    __tablename__ = "image_processing_jobs"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    scope_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    meme_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    image_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    metadata_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    processing_config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    processing_config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    reverse_image_policy: Mapped[str] = mapped_column(String(16), nullable=False, default="forbid")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    current_stage: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claim_generation: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        ForeignKeyConstraint(["scope_id"], ["scopes.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(["scope_id", "meme_id"], ["memes.scope_id", "memes.id"], ondelete="CASCADE"),
+        UniqueConstraint("scope_id", "id", name="uq_image_processing_jobs_scope_id"),
+        UniqueConstraint("scope_id", "meme_id", "image_sha256", "revision", name="uq_image_processing_jobs_revision"),
+        CheckConstraint("reverse_image_policy IN ('forbid','auto')", name="ck_image_processing_policy"),
+        CheckConstraint("status IN ('queued','running','succeeded','failed','blocked','unknown_execution')", name="ck_image_processing_status"),
+        CheckConstraint("claim_generation >= 0", name="ck_image_processing_generation"),
+        Index("ix_image_processing_jobs_active", "scope_id", "meme_id", "image_sha256", "status"),
+    )
+
+
+class ImageProcessingStage(Base):
+    """图片处理 job 的视觉、Agent、文本 embedding 阶段状态。"""
+
+    __tablename__ = "image_processing_stages"
+
+    scope_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    job_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    stage: Mapped[str] = mapped_column(String(64), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    task_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(["scope_id", "job_id"], ["image_processing_jobs.scope_id", "image_processing_jobs.id"], ondelete="CASCADE"),
+        # scope_id 是阶段主键，不能被复合外键的 SET NULL 一并置空；任务删除时
+        # 由同 scope 处理阶段事实一起级联清理。
+        ForeignKeyConstraint(["scope_id", "task_id"], ["tasks.scope_id", "tasks.id"], ondelete="CASCADE"),
+        CheckConstraint("stage IN ('visual','agent','text_embedding')", name="ck_image_processing_stage_name"),
+        CheckConstraint("status IN ('queued','running','succeeded','failed','blocked','unknown_execution')", name="ck_image_processing_stage_status"),
+        Index("ix_image_processing_stages_task", "scope_id", "task_id"),
+    )
+
+
+class ImageProcessingAttempt(Base):
+    """外部叶子 Task 的输入摘要和未知执行恢复事实。"""
+
+    __tablename__ = "image_processing_attempts"
+
+    scope_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    attempt: Mapped[int] = mapped_column(Integer, primary_key=True)
+    attempt_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    stage: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="prepared")
+    request_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    session_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    input_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    claim_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(["scope_id", "task_id"], ["tasks.scope_id", "tasks.id"], ondelete="CASCADE"),
+        CheckConstraint("state IN ('prepared','grant_committed','external_started','completed','failed','unknown_execution')", name="ck_image_processing_attempt_state"),
+        Index("ix_image_processing_attempts_task", "scope_id", "task_id", "attempt"),
+    )
+
+
+class MemeTextEmbedding(Base):
+    """单图增量文本向量，唯一键包含图片、语境和模型指纹。"""
+
+    __tablename__ = "meme_text_embeddings"
+
+    scope_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    meme_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    image_sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    metadata_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    embedding_model_version: Mapped[str] = mapped_column(String(255), primary_key=True)
+    dimensions: Mapped[int] = mapped_column(Integer, nullable=False, default=EMBEDDING_DIMENSIONS)
+    semantic_document: Mapped[str] = mapped_column(String(6000), nullable=False)
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIMENSIONS), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(["scope_id"], ["scopes.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(["scope_id", "meme_id"], ["memes.scope_id", "memes.id"], ondelete="CASCADE"),
+        CheckConstraint(f"dimensions = {EMBEDDING_DIMENSIONS}", name="ck_meme_text_embedding_dimensions"),
+        CheckConstraint("status IN ('pending','ready','failed')", name="ck_meme_text_embedding_status"),
+        Index("ix_meme_text_embeddings_current", "scope_id", "meme_id", "image_sha256", "metadata_hash", "embedding_model_version", "status"),
+    )
+
+
+class SearchMigrationState(Base):
+    """按 scope 和当前 embedding model 记录单一迁移来源。"""
+
+    __tablename__ = "search_migration_states"
+
+    scope_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    # 一个 scope 同时可能保留多个模型的历史 generation；该字段用于防止
+    # 新模型误用旧模型的 epoch 和 legacy generation。旧安装没有此列时按空值兼容读取。
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    mode: Mapped[str] = mapped_column(String(32), nullable=False, default="legacy_only")
+    epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    legacy_generation_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    completed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(["scope_id"], ["scopes.id"], ondelete="CASCADE"),
+        CheckConstraint("mode IN ('legacy_only','backfill','incremental_only')", name="ck_search_migration_mode"),
+    )
+
+
+# 这些表属于图片处理控制面；在已安装旧 revision 的部署启动时用 ``checkfirst``
+# 幂等补齐，标准部署仍以 Alembic 0010 迁移作为唯一 schema 版本事实。
+OPTIONAL_CONTROL_TABLES = (
+    OperationGrant.__table__,
+    ImageProcessingJob.__table__,
+    ImageProcessingStage.__table__,
+    ImageProcessingAttempt.__table__,
+    MemeTextEmbedding.__table__,
+    SearchMigrationState.__table__,
+    AgentCallbackRequest.__table__,
+)
 
 
 class TaskBatch(Base):
@@ -395,6 +643,7 @@ class TaskLaneSlot(Base):
     task_scope_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     task_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    claim_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
@@ -442,14 +691,67 @@ def create_engine_for_settings(settings: Any) -> Engine:
     )
 
 
-def check_database(engine: Engine, *, expected_revision: str | None = None) -> dict[str, Any]:
-    """执行连接、pgvector、Alembic revision 和安装标记健康检查。"""
+def ensure_optional_control_schema(engine: Engine) -> None:
+    """幂等创建图片处理与 operation grant 控制面表。
+
+    该兼容保证只处理新增 ORM 表，既不推进也不回退 Alembic revision；生产部署仍
+    应先运行标准 migration，启动期只负责让 0009 之后新增的控制面安全可用。
+    """
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("SELECT pg_advisory_xact_lock(hashtext('mememeow:optional-control-schema'))"))
+            connection.execute(text("ALTER TABLE task_lane_slots ADD COLUMN IF NOT EXISTS claim_generation BIGINT"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS submission_mode VARCHAR(16)"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS image_stage VARCHAR(32)"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS processing_job_id UUID"))
+            Base.metadata.create_all(connection, tables=list(OPTIONAL_CONTROL_TABLES), checkfirst=True)
+            # 现有 0009 安装没有新列上的复合外键和约束；以幂等 DO 块补齐，避免
+            # 启动期因重复安装产生 DDL 冲突。
+            connection.execute(text("""
+                DO $$ BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_tasks_processing_job') THEN
+                        ALTER TABLE tasks ADD CONSTRAINT fk_tasks_processing_job
+                            FOREIGN KEY (scope_id, processing_job_id)
+                            REFERENCES image_processing_jobs(scope_id, id) ON DELETE CASCADE;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_task_submission_mode') THEN
+                        ALTER TABLE tasks ADD CONSTRAINT ck_task_submission_mode
+                            CHECK (submission_mode IS NULL OR submission_mode IN ('pipeline','standalone'));
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_task_image_stage') THEN
+                        ALTER TABLE tasks ADD CONSTRAINT ck_task_image_stage
+                            CHECK (image_stage IS NULL OR image_stage IN ('visual','agent','text_embedding'));
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_task_submission_job_exclusivity') THEN
+                        ALTER TABLE tasks ADD CONSTRAINT ck_task_submission_job_exclusivity
+                            CHECK (submission_mode IS NULL OR (submission_mode = 'standalone' AND processing_job_id IS NULL) OR (submission_mode = 'pipeline' AND processing_job_id IS NOT NULL));
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_task_image_stage_type') THEN
+                        ALTER TABLE tasks ADD CONSTRAINT ck_task_image_stage_type
+                            CHECK (task_type NOT IN ('visual_embedding_generation','meme_context_generation','text_embedding_generation') OR submission_mode IS NULL OR (image_stage IS NOT NULL AND ((task_type = 'visual_embedding_generation' AND image_stage = 'visual') OR (task_type = 'meme_context_generation' AND image_stage = 'agent') OR (task_type = 'text_embedding_generation' AND image_stage = 'text_embedding'))));
+                    END IF;
+                END $$;
+            """))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_image_submission ON tasks(scope_id, submission_mode, image_stage, processing_job_id, created_at)"))
+            connection.execute(text("ALTER TABLE image_processing_jobs ADD COLUMN IF NOT EXISTS processing_config JSONB NOT NULL DEFAULT '{}'::jsonb"))
+            connection.execute(text("ALTER TABLE reverse_image_usage_events ADD COLUMN IF NOT EXISTS claim_generation BIGINT"))
+            connection.execute(text("ALTER TABLE reverse_image_usage_events ADD COLUMN IF NOT EXISTS attempt INTEGER"))
+            connection.execute(text("ALTER TABLE reverse_image_usage_events ADD COLUMN IF NOT EXISTS operation VARCHAR(128)"))
+            connection.execute(text("ALTER TABLE reverse_image_usage_events ADD COLUMN IF NOT EXISTS target_sha256 VARCHAR(64)"))
+            connection.execute(text("ALTER TABLE reverse_image_usage_events ADD COLUMN IF NOT EXISTS input_digest VARCHAR(64)"))
+            connection.execute(text("ALTER TABLE search_migration_states ADD COLUMN IF NOT EXISTS model VARCHAR(255)"))
+    except SQLAlchemyError as exc:
+        raise DatabaseError("control_schema_unavailable") from exc
+
+
+def check_database(engine: Engine, *, expected_revision: str | None = None, require_local_installation: bool = True) -> dict[str, Any]:
+    """执行连接、pgvector 和 Alembic revision 检查，并按部署模式校验 local 安装标记。"""
     try:
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
             vector_enabled = bool(connection.execute(text("SELECT 1 FROM pg_extension WHERE extname='vector'")).scalar())
             revision = connection.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).scalar()
-            installed = connection.execute(text("SELECT schema_revision FROM installation_state WHERE key='local'")).scalar()
+            installed = connection.execute(text("SELECT schema_revision FROM installation_state WHERE key='local'")).scalar() if require_local_installation else None
     except SQLAlchemyError as exc:
         raise DatabaseError("database_unavailable") from exc
     if not vector_enabled:
@@ -458,10 +760,11 @@ def check_database(engine: Engine, *, expected_revision: str | None = None) -> d
         raise DatabaseError("schema_revision_missing")
     if expected_revision and revision != expected_revision:
         raise DatabaseError("schema_revision_mismatch")
-    if installed is None:
-        raise DatabaseError("installation_required")
-    if installed != revision or (expected_revision and installed != expected_revision):
-        raise DatabaseError("installation_revision_mismatch")
+    if require_local_installation:
+        if installed is None:
+            raise DatabaseError("installation_required")
+        if installed != revision or (expected_revision and installed != expected_revision):
+            raise DatabaseError("installation_revision_mismatch")
     return {"revision": revision, "installed": installed, "pgvector": True}
 
 
@@ -816,6 +1119,229 @@ class SearchRepository:
         generation = self.session.scalar(select(SearchGeneration).where(SearchGeneration.scope_id == self.scope.scope_id, SearchGeneration.id == head.active_generation_id, SearchGeneration.model == model, SearchGeneration.status == "active"))
         return generation
 
+    def migration_state(self, model: str | None = None) -> SearchMigrationState | None:
+        """读取当前 scope 的迁移状态，并避免跨模型复用 epoch。"""
+        state = self.session.scalar(select(SearchMigrationState).where(SearchMigrationState.scope_id == self.scope.scope_id))
+        if state is None or model is None or state.model is None or state.model == model:
+            return state
+        return None
+
+    def begin_incremental_backfill(self, model: str, *, total_count: int = 0, legacy_generation_id: UUID | str | None = None) -> SearchMigrationState:
+        """以新 epoch 开始当前 scope 的增量向量回填，并冻结旧 generation 来源。"""
+        if not isinstance(model, str) or not model.strip():
+            raise DatabaseError("migration_model_invalid")
+        model = model.strip()
+        if isinstance(total_count, bool) or not isinstance(total_count, int) or total_count < 0:
+            raise DatabaseError("migration_count_invalid")
+        normalized_total = total_count
+        state = self.migration_state()
+        if state is None:
+            state = SearchMigrationState(scope_id=self.scope.scope_id, model=model, mode="backfill", epoch=1, total_count=normalized_total)
+            self.session.add(state)
+        else:
+            state.model = model
+            state.mode = "backfill"
+            state.epoch += 1
+            state.completed_count = 0
+            state.total_count = normalized_total
+        # 新 epoch 没有合法旧 generation 时必须清掉上一次模型的引用，避免
+        # 空 generation 边界下把旧模型的行当作当前迁移来源。
+        state.legacy_generation_id = None
+        if legacy_generation_id is None:
+            head = self.session.scalar(select(SearchHead).where(SearchHead.scope_id == self.scope.scope_id, SearchHead.model == model).with_for_update())
+            legacy_generation_id = head.active_generation_id if head is not None else None
+        if legacy_generation_id is not None:
+            try:
+                identifier = UUID(str(legacy_generation_id))
+            except (TypeError, ValueError) as exc:
+                raise DatabaseError("migration_generation_invalid") from exc
+            generation = self.session.scalar(select(SearchGeneration).where(SearchGeneration.scope_id == self.scope.scope_id, SearchGeneration.id == identifier, SearchGeneration.model == model, SearchGeneration.status == "active"))
+            if generation is None:
+                raise DatabaseError("migration_generation_invalid")
+            state.legacy_generation_id = identifier
+        state.updated_at = utcnow()
+        self.session.flush()
+        return state
+
+    def record_incremental_backfill(self, *, epoch: int, completed_count: int, total_count: int | None = None, model: str | None = None) -> bool:
+        """仅更新同一迁移 epoch 的回填进度，拒绝旧 Worker 覆盖新 epoch。"""
+        if isinstance(epoch, bool) or not isinstance(epoch, int):
+            return False
+        requested_epoch = epoch
+        if requested_epoch < 1:
+            return False
+        if model is not None and (not isinstance(model, str) or not model.strip()):
+            return False
+        filters = [SearchMigrationState.scope_id == self.scope.scope_id, SearchMigrationState.mode == "backfill", SearchMigrationState.epoch == requested_epoch]
+        if model is not None:
+            filters.append(SearchMigrationState.model == str(model).strip())
+        state = self.session.scalar(select(SearchMigrationState).where(*filters).with_for_update())
+        if state is None:
+            return False
+        if isinstance(completed_count, bool) or not isinstance(completed_count, int) or completed_count < 0:
+            return False
+        requested_count = completed_count
+        if total_count is not None and (isinstance(total_count, bool) or not isinstance(total_count, int) or total_count < 0):
+            return False
+        requested_total = total_count if total_count is not None else state.total_count
+        if not isinstance(requested_total, int) or requested_total < 0 or requested_count > requested_total:
+            return False
+        if state.completed_count < 0 or state.total_count < 0:
+            return False
+        # 回填进度只能前进；旧 worker 不能把新 epoch 的已完成计数回拨。
+        if requested_count < state.completed_count:
+            return False
+        if total_count is not None and requested_total < state.total_count:
+            return False
+        state.completed_count = requested_count
+        if total_count is not None:
+            state.total_count = requested_total
+        state.updated_at = utcnow()
+        self.session.flush()
+        return True
+
+    def switch_incremental_only(self, *, epoch: int, model: str | None = None) -> bool:
+        """在同一事务中将完成的回填 epoch 原子切换为增量唯一来源。"""
+        if isinstance(epoch, bool) or not isinstance(epoch, int):
+            return False
+        requested_epoch = epoch
+        if requested_epoch < 1:
+            return False
+        if model is not None and (not isinstance(model, str) or not model.strip()):
+            return False
+        filters = [SearchMigrationState.scope_id == self.scope.scope_id, SearchMigrationState.mode == "backfill", SearchMigrationState.epoch == requested_epoch]
+        if model is not None:
+            filters.append(SearchMigrationState.model == str(model).strip())
+        state = self.session.scalar(select(SearchMigrationState).where(*filters).with_for_update())
+        if state is None or state.completed_count < state.total_count:
+            return False
+        state.mode = "incremental_only"
+        state.updated_at = utcnow()
+        self.session.flush()
+        return True
+
+    @staticmethod
+    def _metadata_hash(meme: Meme) -> str | None:
+        """按数据库语境模型计算可 embedding metadata hash。"""
+        try:
+            from backend.metadata import MemeContext, Provenance, SidecarMetadata
+
+            payload: dict[str, Any] = {
+                "schema_version": meme.metadata_schema_version,
+                "image": {
+                    "relative_path": meme.storage_key,
+                    "extension": meme.extension,
+                    "size_bytes": meme.size_bytes,
+                    "sha256": meme.sha256,
+                },
+                "context_status": meme.context_status,
+                "meme_context": MemeContext.model_validate(meme.meme_context or {}).model_dump(mode="json", exclude_none=False),
+                "provenance": Provenance.model_validate(meme.provenance or {}).model_dump(mode="json", exclude_none=False),
+            }
+            payload.update(meme.extensions or {})
+            metadata = SidecarMetadata.model_validate(payload)
+            serialized = json.dumps(metadata.model_dump(mode="json", exclude_none=False), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return None
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def _incremental_rows(self, model: str) -> list[tuple[MemeTextEmbedding, Meme]]:
+        """读取当前 scope 中通过 SHA、语境和 metadata hash 校验的单图向量。"""
+        rows = self.session.execute(
+            select(MemeTextEmbedding, Meme)
+            .join(Meme, (Meme.scope_id == MemeTextEmbedding.scope_id) & (Meme.id == MemeTextEmbedding.meme_id))
+            .where(
+                MemeTextEmbedding.scope_id == self.scope.scope_id,
+                MemeTextEmbedding.embedding_model_version == model,
+                MemeTextEmbedding.dimensions == EMBEDDING_DIMENSIONS,
+                MemeTextEmbedding.status == "ready",
+                MemeTextEmbedding.embedding.is_not(None),
+                Meme.context_status.in_(("partial", "ready")),
+                Meme.sha256 == MemeTextEmbedding.image_sha256,
+            )
+            # 不在去重和 metadata 校验前截断结果；历史 hash 或损坏行可能占据
+            # 前部，固定 limit 会让后面的有效 Meme 永远无法参与查询。
+            .order_by(MemeTextEmbedding.meme_id.asc(), MemeTextEmbedding.updated_at.desc())
+        ).all()
+        valid: list[tuple[MemeTextEmbedding, Meme]] = []
+        seen: set[UUID] = set()
+        for row, meme in rows:
+            if meme.id in seen or self._metadata_hash(meme) != row.metadata_hash:
+                continue
+            try:
+                if len(row.embedding or []) != EMBEDDING_DIMENSIONS:
+                    continue
+            except TypeError:
+                continue
+            seen.add(meme.id)
+            valid.append((row, meme))
+        return valid
+
+    def _legacy_rows(self, model: str) -> list[tuple[MemeEmbedding, Meme]]:
+        """逐条校验迁移回退 generation 的 scope、版本、语境和安全 storage key。"""
+        # 迁移状态一旦存在就代表旧 generation 来源已经被控制面冻结；即使
+        # legacy_generation_id 为空，也不能重新读取会随时变化的 SearchHead。
+        state = self.session.scalar(select(SearchMigrationState).where(SearchMigrationState.scope_id == self.scope.scope_id))
+        if state is not None:
+            if state.model is not None and state.model != model:
+                return []
+            generation_id = state.legacy_generation_id
+        else:
+            head = self.session.scalar(select(SearchHead).where(SearchHead.scope_id == self.scope.scope_id, SearchHead.model == model))
+            generation_id = head.active_generation_id if head is not None else None
+        if generation_id is None:
+            return []
+        generation = self.session.scalar(select(SearchGeneration).where(SearchGeneration.scope_id == self.scope.scope_id, SearchGeneration.id == generation_id, SearchGeneration.model == model, SearchGeneration.status == "active"))
+        if generation is None or generation.dimensions != EMBEDDING_DIMENSIONS:
+            return []
+        rows = self.session.execute(
+            select(MemeEmbedding, Meme)
+            .join(Meme, (Meme.scope_id == MemeEmbedding.scope_id) & (Meme.id == MemeEmbedding.meme_id))
+            .where(
+                MemeEmbedding.scope_id == self.scope.scope_id,
+                MemeEmbedding.generation_id == generation_id,
+                MemeEmbedding.item_status == "ready",
+                MemeEmbedding.meme_revision == Meme.revision,
+                MemeEmbedding.image_sha256 == Meme.sha256,
+                Meme.context_status.in_(("partial", "ready")),
+            )
+            # generation 与 meme_id 是复合主键；不能引用不存在的单列 id。
+            .order_by(MemeEmbedding.meme_id.asc())
+        ).all()
+        valid: list[tuple[MemeEmbedding, Meme]] = []
+        seen: set[UUID] = set()
+        for row, meme in rows:
+            if meme.id in seen or not isinstance(meme.storage_key, str):
+                continue
+            try:
+                validate_business_storage_key(meme.storage_key)
+                if row.dimensions != EMBEDDING_DIMENSIONS or len(row.embedding or []) != EMBEDDING_DIMENSIONS:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if self._metadata_hash(meme) != row.metadata_hash:
+                continue
+            seen.add(meme.id)
+            valid.append((row, meme))
+        return valid
+
+    def source_mode(self, model: str) -> str:
+        """选择一次查询唯一的数据来源，不混合 legacy 与增量向量。"""
+        state = self.migration_state(model)
+        if state is not None:
+            return "incremental" if state.mode == "incremental_only" else "legacy"
+        # 新控制面尚未建立迁移行时，以实际存在的增量向量作为安全来源；
+        # 没有增量向量则兼容读取旧 active generation。
+        return "incremental" if self._incremental_rows(model) else "legacy"
+
+    def has_incremental(self, model: str) -> bool:
+        """判断当前 scope 是否至少有一条可检索的单图向量。"""
+        return bool(self._incremental_rows(model))
+
+    def has_legacy(self, model: str) -> bool:
+        """判断迁移回退 generation 是否仍有逐条校验通过的条目。"""
+        return bool(self._legacy_rows(model))
+
     def create_generation(self, model: str, source_snapshot_hash: str) -> SearchGeneration:
         """创建 building generation，维度固定为 1024。"""
         generation = SearchGeneration(scope_id=self.scope.scope_id, model=model, dimensions=EMBEDDING_DIMENSIONS, source_snapshot_hash=source_snapshot_hash, status="building")
@@ -966,12 +1492,56 @@ class SearchRepository:
         """执行 scope/head 限定的精确余弦距离查询并按 meme_id 稳定排序。"""
         if len(vector) != EMBEDDING_DIMENSIONS:
             raise DatabaseError("embedding_dimensions_mismatch")
-        generation = self.active_generation(model)
-        if generation is None:
+        if self.source_mode(model) == "incremental":
+            return self.query_incremental(model, vector, limit)
+        ranked = self._query_legacy_validated(model, vector, limit)
+        if not ranked:
             raise DatabaseError("cache_not_ready")
-        distance = MemeEmbedding.embedding.cosine_distance(list(vector))
-        statement = select(MemeEmbedding.meme_id, (1 - distance).label("score")).join(Meme, (Meme.scope_id == MemeEmbedding.scope_id) & (Meme.id == MemeEmbedding.meme_id)).where(MemeEmbedding.scope_id == self.scope.scope_id, MemeEmbedding.generation_id == generation.id, MemeEmbedding.item_status == "ready", Meme.context_status.in_(("partial", "ready")), MemeEmbedding.meme_revision == Meme.revision, MemeEmbedding.image_sha256 == Meme.sha256).order_by(distance, MemeEmbedding.meme_id).limit(max(1, min(max(limit, 1) * 4, 120)))
-        return [(identifier, float(score)) for identifier, score in self.session.execute(statement).all()]
+        return ranked
+
+    def _query_legacy_validated(self, model: str, vector: Sequence[float], limit: int) -> list[tuple[UUID, float]]:
+        """对通过旧 generation 逐条校验的向量执行单一来源排序。"""
+        values = [float(value) for value in vector]
+        norm = math.sqrt(sum(value * value for value in values))
+        if not math.isfinite(norm) or norm <= 0:
+            raise DatabaseError("embedding_zero_norm")
+        ranked: list[tuple[UUID, float]] = []
+        for row, _meme in self._legacy_rows(model):
+            try:
+                candidate = [float(item) for item in row.embedding or []]
+                candidate_norm = math.sqrt(sum(item * item for item in candidate))
+                if len(candidate) != EMBEDDING_DIMENSIONS or not math.isfinite(candidate_norm) or candidate_norm <= 0:
+                    continue
+                score = sum(left * right for left, right in zip(values, candidate)) / (norm * candidate_norm)
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+            ranked.append((row.meme_id, float(score)))
+        ranked.sort(key=lambda item: (-item[1], str(item[0])))
+        return ranked[: max(1, min(int(limit), 100))]
+
+    def query_incremental(self, model: str, vector: Sequence[float], limit: int = 5) -> list[tuple[UUID, float]]:
+        """对当前有效单图向量执行稳定余弦排序，历史 hash 自动排除。"""
+        if len(vector) != EMBEDDING_DIMENSIONS:
+            raise DatabaseError("embedding_dimensions_mismatch")
+        values = [float(value) for value in vector]
+        norm = math.sqrt(sum(value * value for value in values))
+        if not math.isfinite(norm) or norm <= 0:
+            raise DatabaseError("embedding_zero_norm")
+        ranked: list[tuple[UUID, float]] = []
+        for row, meme in self._incremental_rows(model):
+            try:
+                candidate = [float(item) for item in row.embedding or []]
+                candidate_norm = math.sqrt(sum(item * item for item in candidate))
+                if len(candidate) != EMBEDDING_DIMENSIONS or not math.isfinite(candidate_norm) or candidate_norm <= 0:
+                    continue
+                score = sum(left * right for left, right in zip(values, candidate)) / (norm * candidate_norm)
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+            ranked.append((meme.id, float(score)))
+        if not ranked:
+            raise DatabaseError("cache_not_ready")
+        ranked.sort(key=lambda item: (-item[1], str(item[0])))
+        return ranked[: max(1, min(int(limit), 100))]
 
 
 def validate_visual_vector(vector: Sequence[float], *, dimensions: int = VISUAL_EMBEDDING_DIMENSIONS) -> list[float]:
@@ -1157,8 +1727,61 @@ class TaskRepository:
             statement = statement.with_for_update()
         return self.session.scalar(statement)
 
-    def submit(self, *, task_type: str, payload: dict[str, Any], lane: str = "default", dedupe_key: str | None = None, settings_version: str | None = None, max_attempts: int = 3, task_id: str | None = None, lane_backpressure: int | None = None) -> Task:
-        """在事务中插入或复用活动 dedupe_key 任务。"""
+    def submit(
+        self,
+        *,
+        task_type: str,
+        payload: dict[str, Any],
+        lane: str = "default",
+        dedupe_key: str | None = None,
+        settings_version: str | None = None,
+        max_attempts: int = 3,
+        task_id: str | None = None,
+        lane_backpressure: int | None = None,
+        submission_mode: str | None = None,
+        image_stage: str | None = None,
+        processing_job_id: UUID | str | None = None,
+    ) -> Task:
+        """在事务中插入或复用活动任务，并保存图片提交来源事实。
+
+        ``submission_mode`` 等参数只应由图片控制面传入。为兼容无法回填来源的
+        历史测试任务，未提供来源时保留 NULL，但任何带来源的新图片任务都会在
+        这里校验阶段、Job 关联和模式互斥关系。
+        """
+        image_task_stages = {
+            "visual_embedding_generation": "visual",
+            "meme_context_generation": "agent",
+            "text_embedding_generation": "text_embedding",
+        }
+        expected_stage = image_task_stages.get(task_type)
+        if expected_stage is not None:
+            submission_mode = submission_mode or (str(payload.get("submission_mode")) if payload.get("submission_mode") in {"pipeline", "standalone"} else None)
+            if submission_mode not in {None, "pipeline", "standalone"}:
+                raise DatabaseError("image_submission_mode_invalid")
+            requested_stage = payload.get("stage")
+            if requested_stage is not None and requested_stage != expected_stage:
+                raise DatabaseError("image_stage_mismatch")
+            candidate_job = processing_job_id or payload.get("job_id")
+            if candidate_job is not None:
+                try:
+                    processing_job_id = UUID(str(candidate_job))
+                except (TypeError, ValueError) as exc:
+                    raise DatabaseError("image_processing_job_invalid") from exc
+            # 无来源且无显式阶段的旧任务保留 NULL 阶段，供迁移脚本区分
+            # “仍可兼容执行的旧 facade 任务”和“已经明确为历史图片阶段”的记录。
+            explicit_source = image_stage is not None or requested_stage is not None or submission_mode is not None or processing_job_id is not None
+            if explicit_source:
+                image_stage = image_stage or (str(requested_stage) if requested_stage is not None else expected_stage)
+            else:
+                image_stage = None
+            if image_stage is not None and image_stage != expected_stage:
+                raise DatabaseError("image_stage_mismatch")
+            if submission_mode == "pipeline" and processing_job_id is None:
+                raise DatabaseError("image_processing_job_required")
+            if submission_mode == "standalone" and processing_job_id is not None:
+                raise DatabaseError("image_task_job_conflict")
+            if submission_mode == "standalone" and payload.get("job_id") is not None:
+                raise DatabaseError("image_task_job_conflict")
         # Agent 任务先锁定 lane，再检查活动去重，避免策略请求并发穿过预检窗口。
         if lane == "agent" or lane_backpressure is not None:
             self._lock_lane(lane)
@@ -1170,7 +1793,19 @@ class TaskRepository:
             active = self.session.scalar(select(func.count()).select_from(Task).where(Task.lane == lane, Task.status.in_(("queued", "running")))) or 0
             if int(active) >= int(lane_backpressure):
                 raise DatabaseError("agent_backpressure")
-        task = Task(id=task_id or uuid.uuid4().hex, scope_id=self.scope.scope_id, task_type=task_type, lane=lane, payload=payload, dedupe_key=dedupe_key, settings_version=settings_version, max_attempts=max_attempts)
+        task = Task(
+            id=task_id or uuid.uuid4().hex,
+            scope_id=self.scope.scope_id,
+            task_type=task_type,
+            submission_mode=submission_mode,
+            image_stage=image_stage,
+            processing_job_id=processing_job_id,
+            lane=lane,
+            payload=payload,
+            dedupe_key=dedupe_key,
+            settings_version=settings_version,
+            max_attempts=max_attempts,
+        )
         try:
             with self.session.begin_nested():
                 self.session.add(task)
@@ -1195,35 +1830,48 @@ class TaskRepository:
                 self.session.add(TaskLaneSlot(lane=lane, slot_number=number))
         self.session.flush()
 
-    def _release_lane_slot(self, task_scope_id: str, task_id: str, *, owner: str | None = None, claim_generation: int | None = None) -> None:
+    def _release_lane_slot(self, task_scope_id: str, task_id: str, *, owner: str | None = None, claim_generation: int | None = None) -> bool:
         """释放任务占用的数据库槽位；owner/generation 用于旧 Worker fencing。"""
         statement = select(TaskLaneSlot).where(TaskLaneSlot.task_scope_id == task_scope_id, TaskLaneSlot.task_id == task_id).with_for_update()
         slot = self.session.scalar(statement)
         if slot is None:
-            return
+            return False
         if owner is not None and slot.lease_owner not in {None, owner}:
-            return
+            return False
+        if claim_generation is not None and slot.claim_generation not in {None, claim_generation}:
+            return False
         slot.task_scope_id = None
         slot.task_id = None
         slot.lease_owner = None
+        slot.claim_generation = None
         slot.lease_expires_at = None
+        return True
 
     def slot_for_task(self, task_id: str) -> TaskLaneSlot | None:
         """读取当前 scope 任务占用的槽位，用于安全摘要和诊断。"""
         return self.session.scalar(select(TaskLaneSlot).where(TaskLaneSlot.task_scope_id == self.scope.scope_id, TaskLaneSlot.task_id == task_id))
 
-    def recover_expired(self, *, owner: str, limit: int = 1000) -> list[str]:
-        """恢复失效租约；未达到上限的任务重新排队，达到上限的任务进入失败终态。"""
+    def recover_expired(self, *, owner: str, limit: int = 1000, exclude_task_types: set[str] | frozenset[str] | None = None, include_task_types: set[str] | frozenset[str] | None = None) -> list[str]:
+        """恢复失效租约；可按任务类型限制专用 Worker 的恢复范围。"""
         now = utcnow()
-        rows = list(self.session.scalars(
-            select(Task)
-            .where(Task.scope_id == self.scope.scope_id, Task.status == "running", Task.lease_expires_at < now)
-            .order_by(Task.lease_expires_at, Task.id)
-            .with_for_update(skip_locked=True)
-            .limit(max(1, min(int(limit), 5000)))
-        ))
+        filters = [Task.scope_id == self.scope.scope_id, Task.status == "running", Task.lease_expires_at < now]
+        if exclude_task_types:
+            filters.append(~Task.task_type.in_(exclude_task_types))
+        if include_task_types:
+            filters.append(Task.task_type.in_(include_task_types))
+        rows = list(
+            self.session.scalars(
+                select(Task)
+                .where(*filters)
+                .order_by(Task.lease_expires_at, Task.id)
+                .with_for_update(skip_locked=True)
+                .limit(max(1, min(int(limit), 5000)))
+            )
+        )
         queued: list[str] = []
         for task in rows:
+            previous_owner = task.lease_owner
+            previous_generation = task.claim_generation
             if task.attempt_count < task.max_attempts:
                 task.status = "queued"
                 task.available_at = now
@@ -1238,7 +1886,7 @@ class TaskRepository:
             task.lease_owner = None
             task.lease_expires_at = None
             task.updated_at = now
-            self._release_lane_slot(task.scope_id, task.id, owner=None)
+            self._release_lane_slot(task.scope_id, task.id, owner=previous_owner, claim_generation=previous_generation)
         self.session.flush()
         return queued
 
@@ -1294,6 +1942,7 @@ class TaskRepository:
         slot.task_scope_id = task.scope_id
         slot.task_id = task.id
         slot.lease_owner = owner
+        slot.claim_generation = None
         slot.lease_expires_at = lease_expires_at
         self.session.flush()
         return True
@@ -1333,7 +1982,7 @@ class TaskRepository:
             .where(
                 Task.scope_id == self.scope.scope_id,
                 Task.task_type == "meme_context_generation",
-                Task.dedupe_key == dedupe_key,
+                (Task.dedupe_key == dedupe_key) | Task.dedupe_key.like(f"{dedupe_key}:%"),
             )
             .order_by(Task.created_at.desc(), Task.id.desc())
         )
@@ -1404,10 +2053,10 @@ class TaskRepository:
         self.session.flush()
         return task
 
-    def claim(self, *, owner: str, lease_seconds: int = 120, lane: str | None = None, task_id: str | None = None, lane_capacity: int | None = None) -> Task | None:
+    def claim(self, *, owner: str, lease_seconds: int = 120, lane: str | None = None, task_id: str | None = None, lane_capacity: int | None = None, exclude_task_types: set[str] | frozenset[str] | None = None) -> Task | None:
         """使用 FOR UPDATE SKIP LOCKED 原子认领一个到期任务并递增 claim generation。"""
         now = utcnow()
-        self.recover_expired(owner=owner)
+        self.recover_expired(owner=owner, exclude_task_types=exclude_task_types)
         if lane and lane_capacity:
             self._lock_lane(lane)
             self._ensure_lane_slots(lane, lane_capacity)
@@ -1416,6 +2065,8 @@ class TaskRepository:
             filters.append(Task.lane == lane)
         if task_id:
             filters.append(Task.id == task_id)
+        if exclude_task_types:
+            filters.append(~Task.task_type.in_(exclude_task_types))
         statement = select(Task).where(*filters).order_by(Task.available_at, Task.created_at, Task.id).with_for_update(skip_locked=True).limit(1)
         task = self.session.scalar(statement)
         if task is None:
@@ -1424,6 +2075,8 @@ class TaskRepository:
                 filters.append(Task.lane == lane)
             if task_id:
                 filters.append(Task.id == task_id)
+            if exclude_task_types:
+                filters.append(~Task.task_type.in_(exclude_task_types))
             statement = select(Task).where(*filters).order_by(Task.lease_expires_at, Task.created_at, Task.id).with_for_update(skip_locked=True).limit(1)
             task = self.session.scalar(statement)
         if task is None:
@@ -1442,6 +2095,10 @@ class TaskRepository:
         task.lease_expires_at = expires_at
         task.started_at = task.started_at or now
         task.updated_at = now
+        if lane and lane_capacity:
+            slot = self.session.scalar(select(TaskLaneSlot).where(TaskLaneSlot.task_scope_id == task.scope_id, TaskLaneSlot.task_id == task.id).with_for_update())
+            if slot is not None and slot.lease_owner == owner:
+                slot.claim_generation = task.claim_generation
         self.session.flush()
         return task
 
@@ -1453,7 +2110,7 @@ class TaskRepository:
         if result.rowcount != 1:
             return False
         slot = self.session.scalar(select(TaskLaneSlot).where(TaskLaneSlot.task_scope_id == self.scope.scope_id, TaskLaneSlot.task_id == task_id).with_for_update())
-        if slot is not None and slot.lease_owner == owner:
+        if slot is not None and slot.lease_owner == owner and slot.claim_generation in {None, claim_generation}:
             slot.lease_expires_at = expires_at
             self.session.flush()
         return True
@@ -1510,6 +2167,66 @@ class TaskRepository:
             self.session.flush()
         return True
 
+    def complete_fenced_with_provenance(self, task_id: str, claim_generation: int, owner: str, *, result: Any) -> bool:
+        """原子提交图片 Agent 成功终态及反向图片 provenance。
+
+        图片任务的审计结果和 Meme provenance 必须与 claim fencing 处于同一
+        事务，否则查询方可能在任务已显示成功时读到尚未写入的 provenance。
+        只有当前 owner、generation 和租约仍有效时才会修改两者。
+        """
+        now = utcnow()
+        task = self.session.scalar(
+            select(Task)
+            .where(
+                Task.scope_id == self.scope.scope_id,
+                Task.id == task_id,
+                Task.claim_generation == claim_generation,
+                Task.lease_owner == owner,
+                Task.status == "running",
+                Task.lease_expires_at > now,
+            )
+            .with_for_update()
+        )
+        if task is None:
+            return False
+        task.status = "succeeded"
+        task.progress = 1.0
+        task.message = "任务完成"
+        task.result = result
+        task.completed_at = now
+        task.updated_at = now
+        task.lease_expires_at = None
+        if task.task_type == "meme_context_generation":
+            meme_id = (task.payload or {}).get("meme_id")
+            if meme_id:
+                try:
+                    meme_id_value = UUID(str(meme_id))
+                except (TypeError, ValueError):
+                    meme_id_value = None
+                if meme_id_value is not None:
+                    try:
+                        meme = self.session.scalar(
+                            select(Meme)
+                            .where(Meme.scope_id == self.scope.scope_id, Meme.id == meme_id_value)
+                            .with_for_update()
+                        )
+                        if meme is not None:
+                            # provenance 是可重建的附属事实；任务成功不能因为
+                            # 历史用量行损坏而被回滚。
+                            audit = ReverseImageUsageRepository(self.session, self.scope).aggregate_task(task_id)
+                            provenance = dict(meme.provenance or {})
+                            provenance["reverse_image"] = {
+                                "policy": str((task.payload or {}).get("reverse_image_policy") or "forbid"),
+                                **audit,
+                            }
+                            meme.provenance = provenance
+                            meme.updated_at = now
+                    except Exception:  # noqa: BLE001 - 附属写回失败不回滚任务终态
+                        pass
+        self._release_lane_slot(self.scope.scope_id, task_id, owner=owner, claim_generation=claim_generation)
+        self.session.flush()
+        return True
+
     def list(self, *, statuses: set[str] | None = None, task_types: set[str] | None = None, cursor: str | None = None, limit: int = 50) -> tuple[list[Task], str | None]:
         """按更新时间和 ID 稳定分页列出当前 scope 任务。"""
         statement = select(Task).where(Task.scope_id == self.scope.scope_id)
@@ -1544,9 +2261,25 @@ class ReverseImageUsageRepository:
         return self.session.scalar(statement)
 
     @staticmethod
-    def _same_request(event: ReverseImageUsageEvent, *, task_id: str, cache_key: str) -> ReverseImageUsageEvent:
-        """校验幂等请求仍指向同一任务和缓存身份，防止复用标识覆盖另一项检索。"""
+    def _same_request(
+        event: ReverseImageUsageEvent,
+        *,
+        task_id: str,
+        cache_key: str,
+        claim_generation: int | None = None,
+        attempt: int | None = None,
+        operation: str | None = None,
+        target_sha256: str | None = None,
+        input_digest: str | None = None,
+    ) -> ReverseImageUsageEvent:
+        """校验 request id 的完整执行绑定，防止旧 claim 借新输入复用事实。"""
         if event.task_id != task_id or event.cache_key != cache_key:
+            raise DatabaseError("usage_request_conflict")
+        expected = (claim_generation, attempt, operation, target_sha256, input_digest)
+        actual = (event.claim_generation, event.attempt, event.operation, event.target_sha256, event.input_digest)
+        # 旧事件的全空绑定仍可由旧兼容入口读取；一旦事件或本次请求带有
+        # 执行绑定，就必须逐字段一致，不能用缺省字段绕过 request id 约束。
+        if (any(value is not None for value in expected) or any(value is not None for value in actual)) and actual != expected:
             raise DatabaseError("usage_request_conflict")
         return event
 
@@ -1559,6 +2292,11 @@ class ReverseImageUsageRepository:
         cache_key: str,
         cache_status: str,
         provider: str | None = None,
+        claim_generation: int | None = None,
+        attempt: int | None = None,
+        operation: str | None = None,
+        target_sha256: str | None = None,
+        input_digest: str | None = None,
     ) -> ReverseImageUsageEvent:
         """创建一次逻辑检索事件；重复 request_id 返回现有事件以保持幂等。"""
         parsed_meme_id: UUID | None = None
@@ -1569,7 +2307,16 @@ class ReverseImageUsageRepository:
                 raise DatabaseError("meme_not_found") from exc
         existing = self.get(request_id, for_update=True)
         if existing is not None:
-            return self._same_request(existing, task_id=task_id, cache_key=cache_key)
+            return self._same_request(
+                existing,
+                task_id=task_id,
+                cache_key=cache_key,
+                claim_generation=claim_generation,
+                attempt=attempt,
+                operation=operation,
+                target_sha256=target_sha256,
+                input_digest=input_digest,
+            )
         event = ReverseImageUsageEvent(
             request_id=request_id,
             scope_id=self.scope.scope_id,
@@ -1578,6 +2325,11 @@ class ReverseImageUsageRepository:
             cache_key=cache_key,
             cache_status=cache_status,
             provider=provider,
+            claim_generation=claim_generation,
+            attempt=attempt,
+            operation=operation,
+            target_sha256=target_sha256,
+            input_digest=input_digest,
         )
         try:
             # 保存点只回滚这次幂等插入，不能撤销调用方 UOW 中已经完成的任务写入。
@@ -1588,7 +2340,16 @@ class ReverseImageUsageRepository:
             existing = self.get(request_id, for_update=True)
             if existing is None:
                 raise DatabaseError("usage_event_conflict")
-            return self._same_request(existing, task_id=task_id, cache_key=cache_key)
+            return self._same_request(
+                existing,
+                task_id=task_id,
+                cache_key=cache_key,
+                claim_generation=claim_generation,
+                attempt=attempt,
+                operation=operation,
+                target_sha256=target_sha256,
+                input_digest=input_digest,
+            )
         return event
 
     def mark_provider_started(self, request_id: str) -> ReverseImageUsageEvent:
@@ -1658,6 +2419,105 @@ class ReverseImageUsageRepository:
         }
 
 
+class AgentCallbackRequestRepository:
+    """按 scope 保存 callback request 绑定，供只读和副作用 callback 复用。"""
+
+    def __init__(self, session: Session, scope: ScopeContext):
+        self.session, self.scope = session, scope
+
+    def get(self, request_id: str, *, for_update: bool = False) -> AgentCallbackRequest | None:
+        """读取当前 scope 的 request 事实，不让 request id 跨 scope 产生命中。"""
+        statement = select(AgentCallbackRequest).where(
+            AgentCallbackRequest.scope_id == self.scope.scope_id,
+            AgentCallbackRequest.request_id == request_id,
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return self.session.scalar(statement)
+
+    @staticmethod
+    def _same(
+        row: AgentCallbackRequest,
+        *,
+        task_id: str,
+        claim_generation: int,
+        attempt: int,
+        operation: str,
+        target_sha256: str,
+        input_digest: str,
+    ) -> AgentCallbackRequest:
+        """比较 callback request 的完整可信绑定，拒绝改绑重放。"""
+        actual = (row.task_id, row.claim_generation, row.attempt, row.operation, row.target_sha256, row.input_digest)
+        expected = (task_id, claim_generation, attempt, operation, target_sha256, input_digest)
+        if actual != expected:
+            raise DatabaseError("callback_request_conflict")
+        return row
+
+    def create(
+        self,
+        *,
+        request_id: str,
+        task_id: str,
+        claim_generation: int,
+        attempt: int,
+        operation: str,
+        target_sha256: str,
+        input_digest: str,
+    ) -> AgentCallbackRequest:
+        """创建或复用同一 callback request 的持久绑定。"""
+        existing = self.get(request_id, for_update=True)
+        if existing is not None:
+            return self._same(existing, task_id=task_id, claim_generation=claim_generation, attempt=attempt, operation=operation, target_sha256=target_sha256, input_digest=input_digest)
+        row = AgentCallbackRequest(
+            scope_id=self.scope.scope_id,
+            request_id=request_id,
+            task_id=task_id,
+            claim_generation=claim_generation,
+            attempt=attempt,
+            operation=operation,
+            target_sha256=target_sha256,
+            input_digest=input_digest,
+        )
+        try:
+            with self.session.begin_nested():
+                self.session.add(row)
+                self.session.flush()
+        except IntegrityError:
+            existing = self.get(request_id, for_update=True)
+            if existing is None:
+                raise DatabaseError("callback_request_conflict")
+            return self._same(existing, task_id=task_id, claim_generation=claim_generation, attempt=attempt, operation=operation, target_sha256=target_sha256, input_digest=input_digest)
+        return row
+
+    def finish(
+        self,
+        request_id: str,
+        *,
+        state: str,
+        result: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> AgentCallbackRequest:
+        """以幂等终态保存 callback 结果，不覆盖已完成事实。"""
+        if state not in {"completed", "failed", "unknown_execution"}:
+            raise DatabaseError("callback_request_state_invalid")
+        row = self.get(request_id, for_update=True)
+        if row is None:
+            raise DatabaseError("callback_request_not_found")
+        if row.completed_at is not None:
+            # ``unknown_execution`` 只表示外部调用当时无法确认；当前同一进程若已
+            # 拿到确定响应，可以把这一次事实收束为 completed，但重试请求不会
+            # 重新触发 provider，因为调用方会先读取该终态。
+            if row.state != "unknown_execution" or state != "completed":
+                return row
+        row.state = state
+        row.result = result
+        row.error = error
+        row.completed_at = utcnow()
+        row.updated_at = row.completed_at
+        self.session.flush()
+        return row
+
+
 class DataEnvironment:
     """请求或任务级 scope-bound Session、repository 和 BlobStore 组合。"""
 
@@ -1672,6 +2532,7 @@ class DataEnvironment:
         self.visual_embeddings = self.visual
         self.tasks = TaskRepository(self.uow.session, scope)
         self.reverse_image_usage = ReverseImageUsageRepository(self.uow.session, scope)
+        self.callback_requests = AgentCallbackRequestRepository(self.uow.session, scope)
 
     def __enter__(self) -> "DataEnvironment":
         self.uow.__enter__()
@@ -1852,10 +2713,11 @@ class StorageCoordinator:
         "blocked": set(),
     }
 
-    def __init__(self, resources: "DatabaseResources", *, scope_id: str = SCOPE_LOCAL):
+    def __init__(self, resources: "DatabaseResources", *, scope_id: str | ScopeContext = SCOPE_LOCAL):
+        """创建绑定 scope 的协调器；local 默认仅保留给开源兼容夹具。"""
         self.resources = resources
-        self.scope = ScopeContext(scope_id)
-        self.blob_store = resources.blob_store_for_scope(scope_id)
+        self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
+        self.blob_store = resources.blob_store_for_scope(self.scope.scope_id)
 
     def _set_status(self, operation: StorageOperation, status: str, *, error: dict[str, Any] | None = None, session: Session | None = None) -> None:
         """执行 storage operation 合法状态转移并保存诊断信息。"""
@@ -2154,34 +3016,46 @@ class StorageCoordinator:
 
 
 class DatabaseResources:
-    """生命周期共享 Engine、Session 工厂、local scope 和 BlobStore。"""
+    """生命周期共享 Engine、Session 工厂和按 scope 创建的 BlobStore。"""
 
-    def __init__(self, engine: Engine, *, image_root: Path, data_root: Path, settings: Any | None = None):
+    def __init__(self, engine: Engine, *, image_root: Path, data_root: Path, settings: Any | None = None, require_local_scope: bool = True):
         self.engine = engine
         self.factory = sessionmaker(engine, expire_on_commit=False, class_=Session)
         self.image_root = image_root
         self.data_root = data_root
         self._scope_cache: dict[str, Scope] = {}
         self._lock = Lock()
+        ensure_optional_control_schema(engine)
         with self.factory() as session:
             scope = session.scalar(select(Scope).where(Scope.id == SCOPE_LOCAL))
-            if scope is None:
+            if scope is None and require_local_scope:
                 raise DatabaseError("installation_required")
-            self._scope_cache[SCOPE_LOCAL] = scope
+            if scope is not None:
+                self._scope_cache[SCOPE_LOCAL] = scope
             namespace = scope.storage_namespace if scope else None
-        self.blob_store = BlobStore(root=image_root, scope=ScopeContext(SCOPE_LOCAL), storage_namespace=namespace, local=True)
+        # 适配宿主未必部署 local scope；此时保留 None，任何误用 local 都会稳定失败。
+        self.blob_store = BlobStore(root=image_root, scope=ScopeContext(SCOPE_LOCAL), storage_namespace=namespace, local=True) if scope is not None or require_local_scope else None
 
-    def environment(self, scope_id: str = SCOPE_LOCAL) -> DataEnvironment:
-        """创建请求级 DataEnvironment；当前公共适配器只允许 local。"""
-        return DataEnvironment(self.factory, ScopeContext(scope_id))
+    def environment(self, scope_id: str | ScopeContext | None = None) -> DataEnvironment:
+        """创建指定 scope 的请求级环境；缺失 scope 时 fail-closed。"""
+        if scope_id is None:
+            raise DatabaseError("scope_required")
+        context = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
+        return DataEnvironment(self.factory, context)
 
-    def flat_preflight(self, scope_id: str = SCOPE_LOCAL) -> dict[str, Any]:
-        """执行当前 scope 的扁平图片库只读预检。"""
+    def flat_preflight(self, scope_id: str | ScopeContext | None = None) -> dict[str, Any]:
+        """执行指定 scope 的扁平图片库只读预检；缺失 scope 时 fail-closed。"""
+        if scope_id is None:
+            raise DatabaseError("scope_required")
         return StorageCoordinator(self, scope_id=scope_id).flat_preflight()
 
-    def blob_store_for_scope(self, scope_id: str) -> BlobStore:
+    def blob_store_for_scope(self, scope_id: str | ScopeContext) -> BlobStore:
         """读取 scope 的不可变 storage_namespace 并创建绑定 BlobStore。"""
+        context = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
+        scope_id = context.scope_id
         if scope_id == SCOPE_LOCAL:
+            if self.blob_store is None:
+                raise DatabaseError("scope_not_found")
             return self.blob_store
         with self.factory() as session:
             scope = session.scalar(select(Scope).where(Scope.id == scope_id))

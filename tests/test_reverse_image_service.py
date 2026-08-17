@@ -34,7 +34,13 @@ def _clear_database(engine: Any) -> None:
     """删除测试 scope 的业务记录，保留 schema、local scope 和安装标记。"""
     with engine.begin() as connection:
         for table in (
+            "agent_callback_requests",
             "reverse_image_usage_events",
+            "operation_grants",
+            "image_processing_attempts",
+            "image_processing_stages",
+            "image_processing_jobs",
+            "search_migration_states",
             "task_lane_slots",
             "task_batch_items",
             "task_batches",

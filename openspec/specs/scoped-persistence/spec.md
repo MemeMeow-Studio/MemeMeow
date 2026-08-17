@@ -1,7 +1,7 @@
 # scoped-persistence Specification
 
 ## Purpose
-为 MemeMeow 的公共核心提供统一、可验证的数据范围和 PostgreSQL 权威存储契约，使单用户开源部署与未来的多用户闭源适配层能够复用同一套业务能力，同时避免身份系统进入公共核心。
+为 MemeMeow 的公共核心提供统一、可验证的数据范围和 PostgreSQL 权威存储契约，使单用户开源部署与未来的多用户宿主适配层能够复用同一套业务能力，同时避免身份系统进入公共核心。
 ## Requirements
 ### Requirement: 结构化业务数据必须由 PostgreSQL 权威保存
 系统 MUST 将 Meme 记录、meme 语境、检索向量和任务状态保存到 PostgreSQL，并 MUST 在数据库不可用或 schema 版本不受支持时拒绝启动业务服务。系统不得静默回退到 sidecar、搜索缓存或任务 JSON。

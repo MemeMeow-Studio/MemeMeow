@@ -212,6 +212,7 @@ def test_local_visual_cli_prints_success_json() -> None:
     try:
         environment = dict(os.environ)
         environment["MEMEMEOW_AGENT_TASK_ID"] = "task-123"
+        environment["MEMEMEOW_AGENT_CALLBACK_TOKEN"] = "test-callback-token"
         environment["MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL"] = url
         result = subprocess.run([sys.executable, "skills/research-meme-context/scripts/local_visual_match.py", "--top-k", "2"], capture_output=True, text=True, env=environment, check=False)
     finally:
@@ -228,6 +229,7 @@ def test_local_visual_cli_reports_stable_http_business_error() -> None:
     try:
         environment = dict(os.environ)
         environment["MEMEMEOW_AGENT_TASK_ID"] = "task-123"
+        environment["MEMEMEOW_AGENT_CALLBACK_TOKEN"] = "test-callback-token"
         environment["MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL"] = url
         result = subprocess.run([sys.executable, "skills/research-meme-context/scripts/local_visual_match.py"], capture_output=True, text=True, env=environment, check=False)
     finally:

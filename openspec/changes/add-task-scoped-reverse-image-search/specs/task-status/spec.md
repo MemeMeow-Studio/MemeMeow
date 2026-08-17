@@ -20,12 +20,12 @@
 - **THEN** 失败任务仍保留根据后端用量记录生成的反向图片审计摘要
 
 ### Requirement: 活动语境任务去重必须保持策略一致
-系统 MUST 继续阻止同一图片内容被多个活动语境任务并发处理。相同图片内容且策略相同的重复提交 MUST 复用现有活动任务；策略不同的重复提交 MUST 返回可诊断冲突，不得复用策略不一致的任务或并发覆盖同一图片语境。
+系统 MUST 继续阻止同一 scope、Meme 和目标图片 SHA 被多个活动图片处理 job 或语境 Task 并发处理。只有目标 SHA、Agent/处理配置指纹和 `reverse_image_policy` 全部相同的重复提交才能复用现有活动 job/Task；策略或配置不同的重复提交 MUST 返回 `generation_policy_conflict`，不得复用不一致的执行或并发覆盖同一图片语境。
 
 #### Scenario: 相同策略重复提交
-- **WHEN** 同一图片内容已有活动任务且新请求使用相同 `reverse_image_policy`
-- **THEN** 系统返回或关联现有任务，不创建第二个活动任务
+- **WHEN** 同一 scope、Meme 和目标 SHA 已有活动 job/Task，且新请求使用相同 Agent/处理配置指纹和 `reverse_image_policy`
+- **THEN** 系统返回或关联现有 job/Task，不创建第二个活动执行
 
 #### Scenario: 不同策略重复提交
-- **WHEN** 同一图片内容已有活动任务但新请求使用不同 `reverse_image_policy`
-- **THEN** 系统返回 `generation_policy_conflict`，不复用现有任务且不创建并发任务
+- **WHEN** 同一 scope、Meme 和目标 SHA 已有活动 job/Task，但新请求使用不同 Agent/处理配置指纹或 `reverse_image_policy`
+- **THEN** 系统返回 `generation_policy_conflict`，不复用现有执行且不创建并发 job/Task

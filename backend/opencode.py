@@ -301,6 +301,7 @@ class OpenCodeRunner:
                 if not ready:
                     raise OpenCodeError("agent_runtime_unavailable", diagnostic)
             self.runtime_root.mkdir(parents=True, exist_ok=True)
+            (self.runtime_root / "home").mkdir(parents=True, exist_ok=True)
             self.workspace.mkdir(parents=True, exist_ok=True)
             self.slots_root.mkdir(parents=True, exist_ok=True)
             self.log_root.mkdir(parents=True, exist_ok=True)
@@ -426,7 +427,7 @@ class OpenCodeRunner:
             return str(visual_search)
         return str(self.settings.visual_internal_url).replace("/visual-embedding", "/visual-search/match")
 
-    def build_environment(self, slot_id: int | None = None, task_id: str | None = None) -> dict[str, str]:
+    def build_environment(self, slot_id: int | None = None, task_id: str | None = None, callback_token: str | None = None) -> dict[str, str]:
         """构造隔离的 OpenCode 进程环境，供后台任务和交互检查入口共同使用。"""
         if self.executor_mode:
             # API 不启动 OpenCode 子进程；该快照仅供诊断，绝不把 executor token
@@ -444,32 +445,41 @@ class OpenCodeRunner:
                 values["MEMEMEOW_OPENCODE_SLOT"] = str(slot_id)
             if task_id:
                 values["MEMEMEOW_AGENT_TASK_ID"] = str(task_id)
+            if callback_token:
+                values["MEMEMEOW_AGENT_CALLBACK_TOKEN"] = callback_token
             return values
-        environment = dict(os.environ)
-        environment["OPENCODE_DB"] = str(CONTAINER_RUNTIME_ROOT / "opencode.db" if self.docker_mode else self.db_path)
-        environment["OPENCODE_CONFIG"] = str(CONTAINER_RUNTIME_ROOT / "workspace" / "opencode.json" if self.docker_mode else self.workspace / "opencode.json")
-        environment["OPENCODE_CONFIG_DIR"] = str(CONTAINER_RUNTIME_ROOT / "workspace" / ".opencode" if self.docker_mode else self.workspace / ".opencode")
-        # 禁止向上合并项目根配置，避免任务意外使用其他 provider 或本地凭据。
-        environment["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
+        # host/dedicated 兼容模式也必须使用白名单；继承整个 API 环境会把 callback
+        # 根 secret、executor token、数据库配置或其它 scope 配置带进 Agent 子进程。
+        runtime_root = CONTAINER_RUNTIME_ROOT if self.docker_mode else self.runtime_root
+        workspace = runtime_root / "workspace"
+        environment = {
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            # 使用 runtime 专属 HOME，避免 host 兼容模式读取调用用户的凭据目录。
+            "HOME": str(self.runtime_root / "home"),
+            "OPENCODE_DB": str(runtime_root / "opencode.db"),
+            "OPENCODE_CONFIG": str(workspace / "opencode.json"),
+            "OPENCODE_CONFIG_DIR": str(workspace / ".opencode"),
+            # 禁止向上合并项目根配置，避免任务意外使用其他 provider 或本地凭据。
+            "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+            "MEMEMEOW_DATA_ROOT": str(runtime_root),
+            "MEMEMEOW_REVERSE_IMAGE_CACHE_ROOT": str(runtime_root / "reverse_image_cache" / "serpapi_google_lens"),
+            "MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL": self._agent_reverse_image_url(),
+            # 视觉 Skill 只接收 task-scoped 内部地址，不获得数据库或模型运行时权限。
+            "MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL": self._agent_visual_search_url(),
+        }
+        if not self.docker_mode:
+            environment["MEMEMEOW_OPENCODE_BASE_URL"] = str(self.settings.opencode_base_url or "")
+            environment["MEMEMEOW_OPENCODE_API_KEY"] = str(self.settings.opencode_api_key or "")
+            environment["NODE_PATH"] = str(self.workspace / "node_modules")
         if slot_id is not None:
             environment["MEMEMEOW_OPENCODE_SLOT"] = str(slot_id)
         if task_id:
             environment["MEMEMEOW_AGENT_TASK_ID"] = str(task_id)
-        else:
-            environment.pop("MEMEMEOW_AGENT_TASK_ID", None)
-        environment["MEMEMEOW_OPENCODE_BASE_URL"] = str(self.settings.opencode_base_url)
-        environment["MEMEMEOW_OPENCODE_API_KEY"] = str(self.settings.opencode_api_key)
-        environment["MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL"] = self._agent_reverse_image_url()
-        # 视觉 Skill 只接收 task-scoped 内部地址，不获得数据库或模型运行时权限。
-        environment["MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL"] = self._agent_visual_search_url()
-        environment.pop("SERPAPI_API_KEY", None)
-        node_path = str(self.workspace / "node_modules")
-        if inherited := environment.get("NODE_PATH"):
-            node_path = os.pathsep.join((node_path, inherited))
-        environment["NODE_PATH"] = node_path
+        if callback_token:
+            environment["MEMEMEOW_AGENT_CALLBACK_TOKEN"] = callback_token
         return environment
 
-    def _allowed_container_environment(self, slot_id: int, task_id: str | None = None) -> dict[str, str]:
+    def _allowed_container_environment(self, slot_id: int, task_id: str | None = None, callback_token: str | None = None) -> dict[str, str]:
         """返回 Docker exec 白名单环境，禁止继承宿主其他环境变量。"""
         values = {
             "OPENCODE_DB": "/runtime/opencode.db",
@@ -488,6 +498,8 @@ class OpenCodeRunner:
         }
         if task_id:
             values["MEMEMEOW_AGENT_TASK_ID"] = task_id
+        if callback_token:
+            values["MEMEMEOW_AGENT_CALLBACK_TOKEN"] = callback_token
         return values
 
     def _acquire_slot(self) -> tuple[int, Any]:
@@ -1100,7 +1112,7 @@ class OpenCodeRunner:
                     removed += 1
             return removed
 
-    def _run_command(self, image: Path, prompt: str, *, slot_id: int | None = None, task_id: str | None = None, result_path: Path | None = None) -> list[str]:
+    def _run_command(self, image: Path, prompt: str, *, slot_id: int | None = None, task_id: str | None = None, result_path: Path | None = None, callback_token: str | None = None) -> list[str]:
         """构造单图研究 CLI 参数，固定模型推理变体以保证结果质量一致。"""
         image_path = self.map_image_path(image) if self.docker_mode else image.expanduser().resolve()
         executable = str(self.settings.opencode_executable or "opencode")
@@ -1129,11 +1141,11 @@ class OpenCodeRunner:
         if self.docker_mode:
             if slot_id is None:
                 slot_id = 0
-            environment = self._allowed_container_environment(slot_id, task_id)
+            environment = self._allowed_container_environment(slot_id, task_id, callback_token)
             return self._container_exec(*command, environment=environment, workdir="/runtime/workspace")
         return command
 
-    def run(self, image: Path, progress: Callable[[float | None, str | None], None], *, task_id: str | None = None, reverse_image_policy: str = "forbid") -> tuple[dict[str, Any], str]:
+    def run(self, image: Path, progress: Callable[[float | None, str | None], None], *, task_id: str | None = None, reverse_image_policy: str = "forbid", callback_token: str | None = None) -> tuple[dict[str, Any], str]:
         """执行单张图片研究并从任务专属结果文件接收候选与 session ID。"""
         self.prepare_runtime()
         slot_id, lock_handle = self._acquire_slot()
@@ -1159,6 +1171,7 @@ class OpenCodeRunner:
                         image_relative_path=relative_image,
                         reverse_image_policy=reverse_image_policy if reverse_image_policy in {"forbid", "auto"} else "forbid",
                         timeout_seconds=min(int(self.settings.opencode_timeout_seconds), int(getattr(self.settings, "agent_executor_max_timeout_seconds", 1800))),
+                        callback_token=callback_token,
                     )
                 except AgentExecutorError as exc:
                     if exc.code == "agent_timeout":
@@ -1185,11 +1198,11 @@ class OpenCodeRunner:
                 "使用 output-schema.json 校验完整 JSON 对象后，使用同一文件系统的原子 rename/mv 将草稿替换为最终文件。"
                 "不要把业务 JSON 作为 assistant 文本交付，不要写入数据库；完成后简短说明即可。"
             )
-            command = self._run_command(image, prompt, slot_id=slot_id, task_id=task_id, result_path=result_path)
+            command = self._run_command(image, prompt, slot_id=slot_id, task_id=task_id, result_path=result_path, callback_token=callback_token)
             execution_command = self._docker_command_for_execution(command) if self.docker_mode else command
-            environment = self.build_environment(slot_id, task_id) if not self.docker_mode else {
+            environment = self.build_environment(slot_id, task_id, callback_token) if not self.docker_mode else {
                 "PATH": os.environ.get("PATH", ""),
-                **self._allowed_container_environment(slot_id, task_id),
+                **self._allowed_container_environment(slot_id, task_id, callback_token),
             }
             progress(0.1, f"正在启动语境研究（slot {slot_id}）")
             # 由临时文件承接完整事件流，避免按总字节数拒绝合法的大输出，也避免管道缓存堆积在内存。

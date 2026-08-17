@@ -44,8 +44,11 @@ def main(argv: list[str] | None = None) -> int:
         return _error("visual_search_url_missing", "运行时未注入视觉匹配内部地址")
     if args.top_k < 1 or args.top_k > 50:
         return _error("invalid_top_k", "top_k 必须在 1 至 50 之间")
+    callback_token = os.getenv("MEMEMEOW_AGENT_CALLBACK_TOKEN")
+    if not callback_token:
+        return _error("agent_callback_missing", "运行时未注入当前任务 callback 凭据")
     request_payload = json.dumps({"task_id": task_id, "top_k": args.top_k, "exclude_self": not args.include_self}, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(url, data=request_payload, headers={"Content-Type": "application/json", "Accept": "application/json"}, method="POST")
+    request = urllib.request.Request(url, data=request_payload, headers={"Content-Type": "application/json", "Accept": "application/json", "X-MemeMeow-Callback": callback_token}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             raw = response.read().decode("utf-8")

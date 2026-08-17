@@ -43,6 +43,7 @@ const dialogCollectionName = shallowRef('')
 const collectionTrigger = shallowRef<HTMLElement | null>(null)
 const previewImage = shallowRef<MemeImage | null>(null)
 const previewTrigger = shallowRef<HTMLElement | null>(null)
+const stageBusy = shallowRef('')
 let libraryRequestId = 0
 
 const selectedIds = computed(() => [...selectedImages.value])
@@ -189,6 +190,21 @@ async function retryImages(items: Array<{ meme_id: string }>, label: string): Pr
   }
 }
 
+/** 为当前图片提交一个不带父 Job 的独立阶段任务。 */
+async function retryStage(item: MemeImage, stage: 'visual' | 'agent' | 'text_embedding'): Promise<void> {
+  if (stageBusy.value || typeof api.submitImageStage !== 'function') return
+  stageBusy.value = `${item.meme_id}:${stage}`
+  emit('clearError')
+  try {
+    await api.submitImageStage({ meme_id: item.meme_id, stage, reverse_image_policy: 'forbid' })
+    retryNotice.value = `${item.filename}：已提交${stage === 'visual' ? '视觉向量' : stage === 'agent' ? 'Agent 语境' : '文本 embedding'}独立任务`
+  } catch (reason) {
+    emit('error', errorMessage(reason))
+  } finally {
+    stageBusy.value = ''
+  }
+}
+
 /** 重试当前选中且未就绪的图片。 */
 function retrySelected(): Promise<void> {
   return retryImages(
@@ -241,10 +257,10 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
           加入合集<span v-if="selectedCount">（{{ selectedCount }}）</span>
         </button>
         <button class="quiet" type="button" :disabled="retryBusy || !selectedRetryableCount" @click="retrySelected">
-          重试选中<span v-if="selectedRetryableCount">（{{ selectedRetryableCount }}）</span>
+          完整重试选中<span v-if="selectedRetryableCount">（{{ selectedRetryableCount }}）</span>
         </button>
         <button class="primary toolbar-primary" type="button" :disabled="retryBusy || !hasRetryable" @click="retryAll">
-          {{ retryBusy ? '提交中...' : '重试所有未就绪' }}
+          {{ retryBusy ? '提交中...' : '完整重试所有未就绪' }}
         </button>
         <button
           class="primary toolbar-primary cache-action"
@@ -288,6 +304,11 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
         <span class="visual-embedding-state" :class="item.visual_embedding_status || 'unknown'">{{ visualEmbeddingLabel(item.visual_embedding_status) }}</span>
         <button class="quiet metadata-button" type="button" @click="openImagePreview(item, $event)">查看元数据</button>
         <button class="quiet" type="button" @click="rename(item)">重命名</button>
+        <div class="stage-actions" aria-label="图片阶段操作">
+          <button class="quiet" type="button" :disabled="retryBusy || !!stageBusy" @click.stop="retryStage(item, 'visual')">仅视觉</button>
+          <button class="quiet" type="button" :disabled="retryBusy || !!stageBusy" @click.stop="retryStage(item, 'agent')">仅 Agent</button>
+          <button class="quiet" type="button" :disabled="retryBusy || !!stageBusy" @click.stop="retryStage(item, 'text_embedding')">仅文本</button>
+        </div>
       </article>
       <div v-if="!images.length" class="empty-state compact"><h2>图片库还没有图片</h2><p>上传图片后，它们会出现在这里。</p></div>
     </div>

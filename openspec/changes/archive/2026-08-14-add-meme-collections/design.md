@@ -80,7 +80,7 @@ POST   /collections/{collection_id}/items
 DELETE /collections/{collection_id}/items/{meme_id}
 ```
 
-创建和更新只接受 `name`；成员写入只接受 `meme_ids`。任何请求体和查询参数都不接受 `scope_id` 或 `user_id`。当前适配器从服务端固定得到 `ScopeContext("local")`，未来闭源适配器可以从已认证会话得到另一可信 scope，而无需修改合集领域 API。
+创建和更新只接受 `name`；成员写入只接受 `meme_ids`。任何请求体和查询参数都不接受 `scope_id` 或 `user_id`。当前适配器从服务端固定得到 `ScopeContext("local")`，未来宿主适配器可以从已认证会话得到另一可信 scope，而无需修改合集领域 API。
 
 列表返回 `items/total/page/page_size`，每项包含 `collection_id/name/member_count/cover_media_url/timestamps`。详情在同一响应中包含合集字段和分页 `members`；成员字段复用当前图片库的稳定 `meme_id`、文件信息、媒体 URL 和状态表达。所有 UUID 参数在边界统一校验；不存在和跨 scope 资源都映射为同一 404，重名映射为 409，无效名称或空成员数组映射为 422。
 

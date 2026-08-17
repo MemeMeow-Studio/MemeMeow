@@ -134,7 +134,7 @@ class AgentExecutorClient:
             if key in value
         }
 
-    def run(self, *, task_id: str, image_relative_path: str, reverse_image_policy: str, timeout_seconds: int) -> ExecutorTaskResponse:
+    def run(self, *, task_id: str, image_relative_path: str, reverse_image_policy: str, timeout_seconds: int, callback_token: str | None = None) -> ExecutorTaskResponse:
         """提交固定语境任务并同步等待其终态。"""
         _status, value = self._request(
             "POST",
@@ -145,6 +145,7 @@ class AgentExecutorClient:
                 "reverse_image_policy": reverse_image_policy,
                 "timeout_seconds": int(timeout_seconds),
                 "wait": True,
+                **({"callback_token": callback_token} if callback_token else {}),
             },
             timeout=max(self.timeout, int(timeout_seconds) + 10),
         )

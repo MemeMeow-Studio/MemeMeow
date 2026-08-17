@@ -2,7 +2,7 @@
 /** 处理任务工作区：管理筛选、分页、轮询和详情打开状态。 */
 import { computed, onBeforeUnmount, onMounted, shallowRef } from 'vue'
 import { api } from '../api'
-import type { TaskItem } from '../types'
+import type { ImageProcessingJob, TaskItem } from '../types'
 import {
   errorMessage,
   formatTaskTime,
@@ -10,6 +10,8 @@ import {
   taskRowAriaLabel,
   taskStatusLabel,
   taskTypeLabel,
+  imageStageLabel,
+  submissionModeLabel,
 } from '../utils/presentation'
 import TaskDrawer from './TaskDrawer.vue'
 
@@ -22,6 +24,7 @@ const emit = defineEmits<{
 }>()
 
 const taskItems = shallowRef<TaskItem[]>([])
+const processingJobs = shallowRef<ImageProcessingJob[]>([])
 const cursor = shallowRef<string | null>(null)
 const loading = shallowRef(false)
 const status = shallowRef('')
@@ -34,8 +37,20 @@ let disposed = false
 let listRequestId = 0
 let detailRequestId = 0
 
-const hasActiveTasks = computed(() => taskItems.value.some((item) => item.status === 'queued' || item.status === 'running'))
+const visibleTaskItems = computed(() => taskItems.value.filter((item) => !(item.submission_mode === 'pipeline' && item.processing_job_id)))
+const hasActiveTasks = computed(() => taskItems.value.some((item) => item.status === 'queued' || item.status === 'running') || processingJobs.value.some((item) => ['queued', 'running'].includes(item.status)))
 const activityById = computed(() => new Map(taskItems.value.map((item) => [item.task_id, taskActivity(item)])))
+
+/** 加载完整图片处理 Job；旧测试夹具没有该 API 时保持任务列表兼容。 */
+async function loadProcessingJobs(): Promise<void> {
+  if (typeof api.processingJobs !== 'function') return
+  try {
+    const response = await api.processingJobs({ limit: 100 })
+    if (!disposed) processingJobs.value = response.items || []
+  } catch (reason) {
+    if (!disposed) emit('error', errorMessage(reason))
+  }
+}
 
 /** 加载任务列表，可选追加分页，并同步已打开任务的最新摘要。 */
 async function loadTasks({ append = false }: { append?: boolean } = {}): Promise<void> {
@@ -54,6 +69,7 @@ async function loadTasks({ append = false }: { append?: boolean } = {}): Promise
       const refreshed = taskItems.value.find((item) => item.task_id === selectedTask.value?.task_id)
       if (refreshed) selectedTask.value = refreshed
     }
+    void loadProcessingJobs()
   } catch (reason) {
     if (!disposed && requestId === listRequestId) emit('error', errorMessage(reason))
   } finally {
@@ -87,9 +103,17 @@ async function retryTask(): Promise<void> {
   if (!image?.meme_id || retrying.value) return
   retrying.value = true
   try {
-    const response = await api.context({ meme_id: image.meme_id })
+    let response
+    if (selectedTask.value?.submission_mode === 'pipeline' && selectedTask.value.processing_job_id && typeof api.retryProcessingJob === 'function') {
+      response = await api.retryProcessingJob(selectedTask.value.processing_job_id)
+    } else if (selectedTask.value?.submission_mode === 'standalone' && selectedTask.value.image_stage && typeof api.submitImageStage === 'function') {
+      response = await api.submitImageStage({ meme_id: image.meme_id, stage: selectedTask.value.image_stage, reverse_image_policy: 'forbid' })
+    } else {
+      // 未归类历史只保留旧诊断兼容，不把新的图片任务送入通用 retry。
+      response = await api.context({ meme_id: image.meme_id })
+    }
     await loadTasks()
-    await openTask(response.task_id)
+    if (response?.task_id) await openTask(response.task_id)
   } catch (reason) {
     if (!disposed) emit('error', errorMessage(reason))
   } finally {
@@ -142,12 +166,30 @@ onBeforeUnmount(() => {
     </div>
     <div class="task-toolbar">
       <label>状态<select v-model="status" aria-label="按状态筛选" @change="loadTasks()"><option value="">全部</option><option value="queued">排队中</option><option value="running">处理中</option><option value="succeeded">已完成</option><option value="failed">失败</option></select></label>
-      <label>类型<select v-model="type" aria-label="按类型筛选" @change="loadTasks()"><option value="">全部</option><option value="meme_context_generation">语境生成</option><option value="cache_generation">检索缓存</option><option value="metadata_repair">元数据修复</option></select></label>
+      <label>类型<select v-model="type" aria-label="按类型筛选" @change="loadTasks()"><option value="">全部</option><option value="meme_context_generation">语境生成</option><option value="visual_embedding_generation">图片向量</option><option value="text_embedding_generation">文本 embedding</option><option value="cache_generation">检索缓存</option><option value="metadata_repair">元数据修复</option></select></label>
     </div>
     <div class="task-table" :class="{ loading }" role="table" aria-label="处理任务列表">
-      <div class="task-head" role="row"><span role="columnheader">状态</span><span role="columnheader">类型</span><span role="columnheader">关联图片</span><span role="columnheader">进度</span><span role="columnheader">最近更新</span></div>
+      <div class="task-head" role="row"><span role="columnheader">状态</span><span role="columnheader">类型</span><span role="columnheader">来源</span><span role="columnheader">关联图片</span><span role="columnheader">进度</span><span role="columnheader">最近更新</span></div>
+      <details v-for="job in processingJobs" :key="job.job_id" class="processing-job" open>
+        <summary class="processing-job-parent">
+          <span class="task-status-cell"><i :class="`status-dot ${job.status}`" aria-hidden="true"></i>{{ taskStatusLabel(job.status) }}</span>
+          <span><strong>完整图片处理</strong><small> Job #{{ job.revision }} · {{ job.meme_id }}</small></span>
+          <span class="task-source">{{ submissionModeLabel('pipeline') }}</span>
+          <span>{{ job.current_stage ? imageStageLabel(job.current_stage) : '三阶段流水线' }}</span>
+          <span>{{ job.progress == null ? '—' : `${Math.round(job.progress * 100)}%` }}</span>
+          <time>{{ formatTaskTime(job.updated_at) }}</time>
+        </summary>
+        <div class="processing-job-stages">
+          <button v-for="stage in job.stages" :key="`${job.job_id}:${stage.stage}`" class="task-stage-row" type="button" :disabled="!stage.task_id" @click="stage.task_id && openTask(stage.task_id)">
+            <span><i :class="`status-dot ${stage.status}`" aria-hidden="true"></i>{{ imageStageLabel(stage.stage) }}</span>
+            <span>{{ taskStatusLabel(stage.status) }}</span>
+            <span>{{ stage.task_id || '等待创建叶子任务' }}</span>
+            <span v-if="stage.error" class="task-error">{{ stage.error.error || '阶段失败' }}</span>
+          </button>
+        </div>
+      </details>
       <button
-        v-for="item in taskItems"
+        v-for="item in visibleTaskItems"
         :key="item.task_id"
         class="task-row"
         :class="{ selected: selectedTask?.task_id === item.task_id }"
@@ -163,6 +205,7 @@ onBeforeUnmount(() => {
             <b>{{ activityById.get(item.task_id)?.turns }}</b><time>{{ activityById.get(item.task_id)?.lastActivity }}</time>
           </span>
         </span>
+        <span class="task-source" role="cell" data-label="来源">{{ submissionModeLabel(item.historical_unclassified ? 'unclassified' : item.submission_mode) }}<small v-if="item.image_stage"> · {{ imageStageLabel(item.image_stage) }}</small></span>
         <span class="task-image" role="cell" data-label="图片">{{ item.image?.filename || '—' }}</span>
         <span class="task-progress" role="cell" data-label="进度">{{ item.progress == null ? '—' : `${Math.round(item.progress * 100)}%` }}</span>
         <time role="cell">{{ formatTaskTime(item.updated_at) }}</time>
@@ -178,6 +221,8 @@ onBeforeUnmount(() => {
       :return-focus="taskTrigger"
       @close="closeTask"
       @retry="retryTask"
+      @retry-stage="retryTask"
+      @retry-full="retryTask"
     />
   </section>
 </template>

@@ -1,0 +1,145 @@
+"""图片处理 Worker 的去重与 Agent grant 生命周期单元测试。"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
+
+from backend.image_processing import ImageProcessingError, ImageProcessingWorker
+from backend.operation_policy import AllowAllOperationPolicy, GrantAssociationStore, OperationPolicyGateway, PolicyDecision
+
+
+class _CountingPolicy(AllowAllOperationPolicy):
+    """记录 acquire/release 次数的测试 policy。"""
+
+    def __init__(self, *, allowed: bool = True) -> None:
+        super().__init__()
+        self.allowed = allowed
+        self.acquire_count = 0
+        self.release_count = 0
+
+    def acquire(self, request):
+        """返回允许或拒绝结果，并统计真实 acquire。"""
+        self.acquire_count += 1
+        if not self.allowed:
+            return PolicyDecision(False, "operation_forbidden")
+        return super().acquire(request)
+
+    def release(self, grant):
+        """统计补偿 release 后复用 allow-all 幂等实现。"""
+        self.release_count += 1
+        return super().release(grant)
+
+
+class _TaskService:
+    """只实现 Worker 准备阶段所需的活动查询和提交协议。"""
+
+    def __init__(self, *, fail_submit: bool = False) -> None:
+        self.active: dict[str, SimpleNamespace] = {}
+        self.fail_submit = fail_submit
+
+    def find_active(self, task_type: str, dedupe_key: str):
+        """返回活动任务快照。"""
+        return self.active.get(dedupe_key)
+
+    def submit(self, task_type: str, payload: dict[str, object], *, schedule: bool = True):
+        """按 Worker 传入的 dedupe key 记录一个活动任务。"""
+        del schedule
+        if self.fail_submit:
+            raise RuntimeError("submit_failed")
+        dedupe_key = ImageProcessingWorker._task_dedupe_key(task_type, payload)
+        task = self.active.get(dedupe_key)
+        if task is None:
+            task = SimpleNamespace(task_id=uuid4().hex, status="queued", payload=dict(payload), task_type=task_type)
+            self.active[dedupe_key] = task
+        return task
+
+
+def _job() -> SimpleNamespace:
+    """构造一份不依赖 ORM session 的图片 job 快照。"""
+    return SimpleNamespace(
+        id=uuid4(),
+        meme_id=uuid4(),
+        revision=1,
+        claim_generation=1,
+        image_sha256="a" * 64,
+        reverse_image_policy="auto",
+        processing_config_hash="b" * 64,
+        processing_config={"agent_model": "test-model", "embedding_model": "test-embedding"},
+    )
+
+
+def _worker(tasks: _TaskService, policy: _CountingPolicy) -> ImageProcessingWorker:
+    """构造不启动数据库 facade 的 Worker，并替换阶段绑定写入。"""
+    worker = ImageProcessingWorker(
+        object(),
+        scope_id="local",
+        task_service=tasks,
+        policy=OperationPolicyGateway(policy),
+        grant_store=GrantAssociationStore(),
+    )
+    worker.jobs.attach_task = lambda job_id, stage, task_id: True
+    return worker
+
+
+def test_active_agent_task_is_bound_before_policy_acquire() -> None:
+    """已有活动 Agent Task 直接复用，不建立新的 policy reservation。"""
+    tasks = _TaskService()
+    policy = _CountingPolicy()
+    worker = _worker(tasks, policy)
+    try:
+        job = _job()
+        first = worker._prepare_task(job, "agent")
+        second = worker._prepare_task(job, "agent")
+        assert first == second
+        assert policy.acquire_count == 1
+    finally:
+        worker.shutdown()
+
+
+def test_submit_failure_releases_only_uncommitted_grant() -> None:
+    """叶子 Task 未创建时才补偿释放已取得的 grant。"""
+    tasks = _TaskService(fail_submit=True)
+    policy = _CountingPolicy()
+    worker = _worker(tasks, policy)
+    try:
+        with pytest.raises(RuntimeError, match="submit_failed"):
+            worker._prepare_task(_job(), "agent")
+        assert policy.acquire_count == 1
+        assert policy.release_count == 1
+    finally:
+        worker.shutdown()
+
+
+def test_policy_denial_blocks_stage_without_task() -> None:
+    """Agent policy 拒绝时阶段进入 blocked，且不提交叶子 Task。"""
+    tasks = _TaskService()
+    policy = _CountingPolicy(allowed=False)
+    worker = _worker(tasks, policy)
+    transitions: list[dict[str, object]] = []
+    worker.jobs.transition = lambda *args, **kwargs: transitions.append(kwargs) or True
+    try:
+        with pytest.raises(ImageProcessingError, match="blocked"):
+            worker._prepare_task(_job(), "agent")
+        assert policy.acquire_count == 1
+        assert tasks.active == {}
+        assert transitions[-1]["status"] == "blocked"
+    finally:
+        worker.shutdown()
+
+
+def test_standalone_stage_aliases_are_canonical_and_mode_isolated() -> None:
+    """公开任务类型别名必须落到固定阶段，且 standalone 不复用 pipeline key。"""
+    assert ImageProcessingWorker._canonical_stage("visual_embedding_generation") == "visual"
+    assert ImageProcessingWorker._canonical_stage("meme_context_generation") == "agent"
+    pipeline = ImageProcessingWorker._task_dedupe_key(
+        "meme_context_generation",
+        {"submission_mode": "pipeline", "job_id": "job-1", "meme_id": "meme", "image_sha256": "a" * 64, "processing_config_hash": "b" * 64, "reverse_image_policy": "forbid", "job_revision": 1},
+    )
+    standalone = ImageProcessingWorker._task_dedupe_key(
+        "meme_context_generation",
+        {"submission_mode": "standalone", "meme_id": "meme", "image_sha256": "a" * 64, "processing_config_hash": "b" * 64, "reverse_image_policy": "forbid"},
+    )
+    assert pipeline != standalone

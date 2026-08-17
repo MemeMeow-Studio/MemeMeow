@@ -17,7 +17,7 @@ import tempfile
 from io import BytesIO
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -28,7 +28,9 @@ from urllib.request import Request, urlopen
 from sqlalchemy import select
 
 from backend.config import Settings
-from backend.database import DatabaseError, DatabaseResources, ReverseImageUsageEvent, Task
+from backend.callbacks import binding_input_digest, validate_request_binding
+from backend.database import DatabaseError, DatabaseResources, ReverseImageUsageEvent, ScopeContext, Task, utcnow
+from backend.operation_policy import AllowAllOperationPolicy, GrantAssociation, GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations, require_allowed
 
 
 MAX_UPLOAD_BYTES = 500 * 1024
@@ -47,6 +49,8 @@ REMOVED_RESPONSE_KEYS = {
     "serpapi_exact_matches_link",
     "about_page_serpapi_link",
 }
+PROVIDER_RESULT_LIST_FIELDS = ("visual_matches", "exact_matches", "related_content", "products", "text_results")
+PROVIDER_RESULT_OBJECT_FIELDS = ("knowledge_graph", "about_this_image")
 
 
 class ReverseImageError(RuntimeError):
@@ -73,6 +77,9 @@ class ReverseImageRequest:
     query: str | None = None
     auto_crop: bool = False
     refresh: bool = False
+    source_image_sha256: str | None = None
+    callback_binding: object | None = None
+    input_digest: str | None = None
 
     def normalized(self) -> "ReverseImageRequest":
         """校验文件格式和检索参数，返回不含外围空白的规范化请求。"""
@@ -96,6 +103,9 @@ class ReverseImageRequest:
         language = self.language.strip()[:32] or "zh-cn"
         country = self.country.strip().lower()[:8] if self.country else None
         query = self.query.strip()[:200] if self.query else None
+        source_sha = self.source_image_sha256.lower() if self.source_image_sha256 else None
+        if source_sha is not None and (len(source_sha) != 64 or any(char not in "0123456789abcdef" for char in source_sha)):
+            raise ReverseImageError("agent_callback_invalid_execution", "内部执行绑定无效", status_code=401)
         return ReverseImageRequest(
             image=self.image,
             filename=name,
@@ -107,6 +117,9 @@ class ReverseImageRequest:
             query=query,
             auto_crop=bool(self.auto_crop),
             refresh=bool(self.refresh),
+            source_image_sha256=source_sha,
+            callback_binding=self.callback_binding,
+            input_digest=self.input_digest,
         )
 
     def identity(self, image_sha256: str) -> dict[str, object]:
@@ -121,6 +134,34 @@ class ReverseImageRequest:
             "query": self.query,
             "auto_crop": self.auto_crop,
         }
+
+
+def derive_controlled_crop(content: bytes, *, filename: str = "image.png") -> tuple[bytes, str]:
+    """从已验证的任务源图生成固定中心方形派生图及其 SHA。
+
+    裁剪不接受 Agent 提供的物理路径或任意坐标；调用方必须先证明 ``content``
+    是当前任务目标整图，随后服务端只使用确定性的中心裁剪并限制输出大小。
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(BytesIO(content)) as source:
+            source.load()
+            width, height = source.size
+            if width <= 0 or height <= 0 or width * height > 25_000_000:
+                raise ValueError("image_dimensions_invalid")
+            side = min(width, height)
+            left = (width - side) // 2
+            top = (height - side) // 2
+            cropped = source.convert("RGB").crop((left, top, left + side, top + side))
+            output = BytesIO()
+            cropped.save(output, format="PNG", optimize=False)
+            value = output.getvalue()
+    except Exception as exc:  # noqa: BLE001 - 统一隐藏解码器细节
+        raise ReverseImageError("invalid_image", "上传内容不是有效图片", status_code=400) from exc
+    if not value or len(value) > MAX_UPLOAD_BYTES:
+        raise ReverseImageError("image_too_large", "图片超过 500 KB 上传限制", status_code=413)
+    return value, hashlib.sha256(value).hexdigest()
 
 
 class ReverseImageCache:
@@ -226,8 +267,18 @@ def _reusable(snapshot: Mapping[str, object] | None, now: datetime) -> bool:
 
 
 def _is_empty(response: Mapping[str, object]) -> bool:
-    """判断供应商成功响应是否没有候选结果。"""
-    return not any(isinstance(response.get(field), list) and response[field] for field in ("visual_matches", "exact_matches", "related_content"))
+    """区分合法空结果和缺少结果结构的非法供应商响应。"""
+    if not isinstance(response, Mapping):
+        raise ReverseImageError("reverse_image_provider_invalid", "反向图片服务返回了无效结果", retryable=True, status_code=503)
+    present_lists = [field for field in PROVIDER_RESULT_LIST_FIELDS if field in response]
+    present_objects = [field for field in PROVIDER_RESULT_OBJECT_FIELDS if field in response]
+    if not present_lists and not present_objects:
+        raise ReverseImageError("reverse_image_provider_invalid", "反向图片服务返回了无效结果", retryable=True, status_code=503)
+    if any(not isinstance(response[field], list) for field in present_lists):
+        raise ReverseImageError("reverse_image_provider_invalid", "反向图片服务返回了无效结果", retryable=True, status_code=503)
+    if any(not isinstance(response[field], Mapping) for field in present_objects):
+        raise ReverseImageError("reverse_image_provider_invalid", "反向图片服务返回了无效结果", retryable=True, status_code=503)
+    return not any(response[field] for field in (*present_lists, *present_objects))
 
 
 class SerpApiGoogleLensProvider:
@@ -297,13 +348,29 @@ class SerpApiGoogleLensProvider:
 
 
 class ReverseImageService:
-    """执行任务级策略、缓存互斥、供应商访问和 usage event 编排。"""
+    """执行指定 scope 的任务策略、缓存互斥、供应商访问和 usage event 编排。
 
-    def __init__(self, settings: Settings, resources: DatabaseResources, *, provider: Callable[[ReverseImageRequest], dict[str, Any]] | None = None):
+    local 默认值只服务于开源兼容夹具；应用请求使用 scope-bound facade。
+    """
+
+    def __init__(self, settings: Settings, resources: DatabaseResources, *, scope_id: str | ScopeContext = "local", provider: Callable[[ReverseImageRequest], dict[str, Any]] | None = None, operation_policy: OperationPolicyGateway | object | None = None, grant_store: GrantAssociationStore | None = None):
         self.settings = settings
         self.resources = resources
-        self.cache = ReverseImageCache(settings.reverse_image_cache_root or settings.data_root / "reverse_image_cache" / "serpapi_google_lens")
+        self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
+        cache_root = settings.reverse_image_cache_root or settings.data_root / "reverse_image_cache" / "serpapi_google_lens"
+        if self.scope.scope_id != "local":
+            # 非 local scope 使用数据库分配的物理 namespace，客户端不能决定缓存目录。
+            blob_root = resources.blob_store_for_scope(self.scope.scope_id).root
+            cache_root = Path(cache_root) / "scopes" / blob_root.parent.name
+        self.cache = ReverseImageCache(cache_root)
         self._provider_factory = provider
+        if isinstance(operation_policy, OperationPolicyGateway):
+            self.operation_policy = operation_policy
+        elif operation_policy is None:
+            self.operation_policy = OperationPolicyGateway(AllowAllOperationPolicy(), allow_all=True)
+        else:
+            self.operation_policy = OperationPolicyGateway(operation_policy)
+        self.grants = grant_store or GrantAssociationStore()
 
     @property
     def available(self) -> bool:
@@ -311,7 +378,7 @@ class ReverseImageService:
         return bool(self.settings.serpapi_api_key or self._provider_factory)
 
     @staticmethod
-    def _locked_auto_task(task: Task | None) -> Task:
+    def _locked_auto_task(task: Task | None, request: ReverseImageRequest | None = None, *, scope_id: str | None = None) -> Task:
         """在缓存键锁内重新确认任务仍可执行且策略为 auto。
 
         缓存锁可能等待另一个进程完成供应商调用；等待期间任务状态或持久化策略
@@ -321,9 +388,27 @@ class ReverseImageService:
             raise ReverseImageError("invalid_task", "任务不存在或不是语境生成任务", status_code=404)
         if task.status != "running":
             raise ReverseImageError("task_not_running", "任务当前不可执行反向图片检索", status_code=409)
+        if task.claim_generation <= 0 or not task.lease_owner or task.lease_expires_at is None or task.lease_expires_at <= utcnow():
+            raise ReverseImageError("task_not_running", "任务当前不可执行反向图片检索", status_code=409)
         policy = str((task.payload or {}).get("reverse_image_policy") or "forbid")
         if policy != "auto":
             raise ReverseImageError("reverse_image_forbidden", "当前任务禁止反向图片检索", status_code=403)
+        binding = getattr(request, "callback_binding", None) if request is not None else None
+        if binding is not None:
+            try:
+                if (
+                    task.id != binding.task_id
+                    or (scope_id is not None and task.scope_id != scope_id)
+                    or task.scope_id != binding.scope_id
+                    or task.claim_generation != binding.claim_generation
+                    or task.lease_owner != binding.owner
+                    or task.attempt_count != binding.attempt
+                    or not binding.allows("analysis.reverse_image_search")
+                    or str((task.payload or {}).get("image_sha256") or "") != binding.target_sha256
+                ):
+                    raise ValueError("callback_execution_mismatch")
+            except Exception as exc:  # noqa: BLE001 - callback 失败不得暴露任务状态
+                raise ReverseImageError("agent_callback_invalid_execution", "内部执行绑定无效", status_code=401) from exc
         return task
 
     def search(self, request: ReverseImageRequest) -> dict[str, object]:
@@ -331,23 +416,104 @@ class ReverseImageService:
         request = request.normalized()
         image_sha = hashlib.sha256(request.image).hexdigest()
         key = _fingerprint(request.identity(image_sha))
-        request_id = request.request_id or secrets.token_urlsafe(24)
-        with self.resources.environment("local") as environment:
+        if request.callback_binding is not None and request.input_digest is None:
+            binding = request.callback_binding
+            request = replace(
+                request,
+                input_digest=binding_input_digest(
+                    binding.task_id,
+                    binding.scope_id,
+                    binding.claim_generation,
+                    binding.attempt,
+                    "analysis.reverse_image_search",
+                    binding.target_sha256,
+                    image_sha,
+                    request.search_type,
+                    request.language,
+                    request.country,
+                    request.query,
+                    request.auto_crop,
+                    request.refresh,
+                ),
+            )
+        request_id = request.request_id
+        if request_id is None and request.callback_binding is not None:
+            binding = request.callback_binding
+            request_id = "cb-" + str(getattr(binding, "nonce", "")) + "-" + _fingerprint(
+                {
+                    "task_id": getattr(binding, "task_id", ""),
+                    "claim_generation": getattr(binding, "claim_generation", 0),
+                    "attempt": getattr(binding, "attempt", 0),
+                    "operation": "analysis.reverse_image_search",
+                    "target_sha256": getattr(binding, "target_sha256", ""),
+                    "input_digest": request.input_digest,
+                    "cache_key": key,
+                }
+            )[:24]
+        if request_id is None:
+            request_id = secrets.token_urlsafe(24)
+        if request.callback_binding is not None:
+            request_id, input_digest = validate_request_binding(
+                request_id,
+                request.callback_binding,
+                input_digest=request.input_digest,
+            )
+            if request_id is None or input_digest is None:
+                raise ReverseImageError("agent_callback_invalid_execution", "内部执行绑定无效", status_code=401)
+            request = replace(request, request_id=request_id, input_digest=input_digest)
+        with self.resources.environment(self.scope.scope_id) as environment:
             task = environment.tasks.get(request.task_id, for_update=False)
             if task is None or task.task_type != "meme_context_generation":
                 raise ReverseImageError("invalid_task", "任务不存在或不是语境生成任务", status_code=404)
+            callback_row = None
+            if request.callback_binding is not None:
+                try:
+                    callback_row = environment.callback_requests.create(
+                        request_id=request_id,
+                        task_id=request.task_id,
+                        claim_generation=request.callback_binding.claim_generation,
+                        attempt=request.callback_binding.attempt,
+                        operation="analysis.reverse_image_search",
+                        target_sha256=request.callback_binding.target_sha256,
+                        input_digest=request.input_digest or "",
+                    )
+                except DatabaseError as exc:
+                    raise ReverseImageError("agent_callback_invalid_execution", "内部执行绑定无效", status_code=401) from exc
             # 先恢复同一 request_id，已完成或中断事件都不得因重试再次联系供应商。
             existing = environment.reverse_image_usage.get(request_id, for_update=True)
             if existing is not None:
-                if existing.task_id != request.task_id or existing.cache_key != key:
+                if existing.task_id != request.task_id or existing.cache_key != key or (
+                    request.callback_binding is not None
+                    and (
+                        existing.claim_generation != request.callback_binding.claim_generation
+                        or existing.attempt != request.callback_binding.attempt
+                        or existing.operation != "analysis.reverse_image_search"
+                        or existing.target_sha256 != request.callback_binding.target_sha256
+                        or existing.input_digest != request.input_digest
+                    )
+                ):
                     raise ReverseImageError("usage_request_conflict", "请求标识已用于另一项检索", status_code=409)
+                if callback_row is not None and existing.provider_called and callback_row.completed_at is None:
+                    environment.callback_requests.finish(request_id, state="unknown_execution", error={"error": "reverse_image_unknown_execution"})
                 return self._event_output(existing)
             if task.status != "running":
                 raise ReverseImageError("task_not_running", "任务当前不可执行反向图片检索", status_code=409)
+            if task.claim_generation <= 0 or not task.lease_owner or task.lease_expires_at is None or task.lease_expires_at <= utcnow():
+                raise ReverseImageError("task_not_running", "任务当前不可执行反向图片检索", status_code=409)
+            if request.callback_binding is not None:
+                self._locked_auto_task(task, request, scope_id=self.scope.scope_id)
+            task_meme_id = (task.payload or {}).get("meme_id")
+            if isinstance(task_meme_id, str):
+                meme = environment.memes.get(task_meme_id)
+                source_sha = request.source_image_sha256 or hashlib.sha256(request.image).hexdigest()
+                if meme is None or source_sha != meme.sha256 or (request.auto_crop and not request.source_image_sha256):
+                    raise ReverseImageError("task_not_running", "任务当前不可执行反向图片检索", status_code=409)
             policy = str((task.payload or {}).get("reverse_image_policy") or "forbid")
             if policy != "auto":
-                event = environment.reverse_image_usage.create(request_id=request_id, task_id=task.id, meme_id=(task.payload or {}).get("meme_id"), cache_key=key, cache_status="miss")
+                event = environment.reverse_image_usage.create(request_id=request_id, task_id=task.id, meme_id=(task.payload or {}).get("meme_id"), cache_key=key, cache_status="miss", **self._usage_binding(request))
                 environment.reverse_image_usage.finish(event.request_id, outcome="forbidden", result={"used": False})
+                if callback_row is not None:
+                    environment.callback_requests.finish(request_id, state="failed", result={"used": False}, error={"error": "reverse_image_forbidden"})
                 # 异常响应会触发 UOW 回滚；先提交禁止请求的审计记录，确保拒绝也可追溯。
                 environment.uow.session.commit()
                 raise ReverseImageError("reverse_image_forbidden", "当前任务禁止反向图片检索", status_code=403)
@@ -357,24 +523,109 @@ class ReverseImageService:
             record = self.cache.load(key)
             snapshot = _latest(record)
             if not request.refresh and _reusable(snapshot, timestamp):
-                with self.resources.environment("local") as environment:
-                    task = self._locked_auto_task(environment.tasks.get(request.task_id))
-                    event = environment.reverse_image_usage.create(request_id=request_id, task_id=request.task_id, meme_id=(task.payload or {}).get("meme_id"), cache_key=key, cache_status="hit")
+                with self.resources.environment(self.scope.scope_id) as environment:
+                    task = self._locked_auto_task(environment.tasks.get(request.task_id), request, scope_id=self.scope.scope_id)
+                    event = environment.reverse_image_usage.create(request_id=request_id, task_id=request.task_id, meme_id=(task.payload or {}).get("meme_id"), cache_key=key, cache_status="hit", **self._usage_binding(request))
                     event = environment.reverse_image_usage.finish(event.request_id, cache_status="hit", outcome="success", result={"used": bool(snapshot and snapshot.get("outcome") == "success"), "snapshot": snapshot})
+                    if request.callback_binding is not None:
+                        environment.callback_requests.create(
+                            request_id=request_id,
+                            task_id=request.task_id,
+                            claim_generation=request.callback_binding.claim_generation,
+                            attempt=request.callback_binding.attempt,
+                            operation="analysis.reverse_image_search",
+                            target_sha256=request.callback_binding.target_sha256,
+                            input_digest=request.input_digest or "",
+                        )
+                        environment.callback_requests.finish(request_id, state="completed", result={"cache_status": "hit"})
                     return self._event_output(event)
-            with self.resources.environment("local") as environment:
-                task = self._locked_auto_task(environment.tasks.get(request.task_id))
-                if not self.available:
-                    raise ReverseImageError("reverse_image_unavailable", "反向图片服务尚未配置", status_code=503)
-                event = environment.reverse_image_usage.create(request_id=request_id, task_id=request.task_id, meme_id=(task.payload or {}).get("meme_id"), cache_key=key, cache_status="refresh" if record else "miss", provider="serpapi")
+            with self.resources.environment(self.scope.scope_id) as environment:
+                task = self._locked_auto_task(environment.tasks.get(request.task_id), request, scope_id=self.scope.scope_id)
+                event = environment.reverse_image_usage.create(request_id=request_id, task_id=request.task_id, meme_id=(task.payload or {}).get("meme_id"), cache_key=key, cache_status="refresh" if record else "miss", provider="serpapi", **self._usage_binding(request))
                 if event.task_id != request.task_id or event.cache_key != key:
                     raise ReverseImageError("usage_request_conflict", "请求标识已用于另一项检索", status_code=409)
                 if event.completed_at is not None:
                     return self._event_output(event)
                 if event.provider_called:
                     # 进程可能在供应商调用后中断；未知结果只保留已计数状态，不自动重放付费请求。
+                    if request.callback_binding is not None:
+                        environment.callback_requests.finish(request_id, state="unknown_execution", error={"error": "reverse_image_unknown_execution"})
                     return self._event_output(event)
-                environment.reverse_image_usage.mark_provider_started(event.request_id)
+                if not self.available:
+                    environment.reverse_image_usage.finish(request_id, outcome="failed", retryable=True, error={"error": "reverse_image_unavailable"})
+                    if request.callback_binding is not None:
+                        environment.callback_requests.finish(request_id, state="failed", error={"error": "reverse_image_unavailable"})
+                    environment.uow.session.commit()
+                    raise ReverseImageError("reverse_image_unavailable", "反向图片服务尚未配置", retryable=True, status_code=503)
+                operation_request = self.operation_policy.request(
+                    self.scope,
+                    Operations.ANALYSIS_REVERSE_IMAGE_SEARCH,
+                    f"reverse:{request_id}",
+                    # 任务允许没有关联 Meme 的历史/夹具记录；缺失资源必须保持
+                    # ``None``，不能把空字符串伪装成可信资源标识交给 policy。
+                    resource_id=str((task.payload or {}).get("meme_id")) if (task.payload or {}).get("meme_id") else None,
+                    task_id=task.id,
+                    source="reverse-image-provider",
+                )
+                association = self.grants.get(operation_request)
+                if association is None:
+                    try:
+                        if hasattr(self.grants, "acquire"):
+                            association = self.grants.acquire(operation_request, self.operation_policy)
+                        else:
+                            grant = require_allowed(self.operation_policy.acquire(operation_request))
+                            association = self.grants.put(GrantAssociation(operation_request, grant))
+                    except OperationPolicyError as exc:
+                        event = environment.reverse_image_usage.create(
+                            request_id=request_id,
+                            task_id=request.task_id,
+                            meme_id=(task.payload or {}).get("meme_id"),
+                            cache_key=key,
+                            cache_status="refresh" if record else "miss",
+                            provider="serpapi",
+                            **self._usage_binding(request),
+                        )
+                        event = environment.reverse_image_usage.finish(
+                            request_id,
+                            outcome="forbidden",
+                            result={"used": False, "degraded": True, "reason": exc.code},
+                            error={"error": exc.code},
+                        )
+                        return self._event_output(event)
+                elif association.state in {"committed", "released", "unknown"}:
+                    # 已计量或结果未知的逻辑 request 不得再次联系 provider。
+                    event = environment.reverse_image_usage.finish(
+                        request_id,
+                        outcome="failed",
+                        error={"error": "reverse_image_unknown_execution"},
+                    )
+                    if request.callback_binding is not None:
+                        environment.callback_requests.finish(request_id, state="unknown_execution", error={"error": "reverse_image_unknown_execution"})
+                    return self._event_output(event)
+                try:
+                    commit_result = self.operation_policy.commit(association.grant)
+                    if not commit_result.ok or commit_result.state not in {"committed", "already_committed"}:
+                        raise OperationPolicyError(commit_result.reason or "operation_policy_unavailable", retry_at=commit_result.retry_at)
+                    transition = getattr(self.grants, "transition", None)
+                    if not callable(transition) or not transition(association.grant, "committed"):
+                        raise OperationPolicyError("operation_grant_invalid")
+                    # commit 成功后再持久化 provider_started，避免策略拒绝被误记为
+                    # 已经联系供应商；该事实提交后才离开缓存锁调用 provider。
+                    environment.reverse_image_usage.mark_provider_started(event.request_id)
+                except (OperationPolicyError, DatabaseError) as exc:
+                    # provider 尚未启动但计量或审计状态无法确认，保留 unknown 事实并禁止重放。
+                    transition = getattr(self.grants, "transition", None)
+                    if callable(transition):
+                        try:
+                            transition(association.grant, "unknown")
+                        except OperationPolicyError:
+                            pass
+                    environment.reverse_image_usage.finish(request_id, outcome="failed", error={"error": "reverse_image_unknown_execution"})
+                    if request.callback_binding is not None:
+                        environment.callback_requests.finish(request_id, state="unknown_execution", error={"error": "reverse_image_unknown_execution"})
+                    raise ReverseImageError("reverse_image_unknown_execution", "反向图片调用状态未知", status_code=503) from exc
+                if request.callback_binding is not None:
+                    environment.callback_requests.finish(request_id, state="unknown_execution", error={"error": "reverse_image_unknown_execution"})
             try:
                 provider = self._provider_factory or SerpApiGoogleLensProvider(str(self.settings.serpapi_api_key))
                 response = provider(request) if callable(provider) else provider.search(request)
@@ -383,17 +634,23 @@ class ReverseImageService:
                 next_record = {"schema_version": CACHE_SCHEMA_VERSION, "provider": "serpapi", "engine": "google_lens", "request": request.identity(image_sha), "snapshots": [*(record or {}).get("snapshots", []), snapshot]}
                 self.cache.write(key, next_record)
             except ReverseImageError as exc:
-                with self.resources.environment("local") as environment:
+                with self.resources.environment(self.scope.scope_id) as environment:
                     event = environment.reverse_image_usage.finish(request_id, outcome="failed", retryable=exc.retryable, error={"error": exc.code})
+                    if request.callback_binding is not None:
+                        environment.callback_requests.finish(request_id, state="failed", error={"error": exc.code})
                 raise
             except Exception as exc:  # noqa: BLE001
                 # 供应商适配器异常也必须收束 started 事件，避免永久悬挂且不回显原始正文。
                 error = ReverseImageError("reverse_image_provider_unavailable", "反向图片服务暂时不可用", retryable=True, status_code=503)
-                with self.resources.environment("local") as environment:
+                with self.resources.environment(self.scope.scope_id) as environment:
                     environment.reverse_image_usage.finish(request_id, outcome="failed", retryable=True, error={"error": error.code})
+                    if request.callback_binding is not None:
+                        environment.callback_requests.finish(request_id, state="failed", error={"error": error.code})
                 raise error from exc
-            with self.resources.environment("local") as environment:
+            with self.resources.environment(self.scope.scope_id) as environment:
                 event = environment.reverse_image_usage.finish(request_id, cache_status="refresh" if record else "miss", outcome=outcome, result={"used": outcome == "success", "snapshot": snapshot})
+                if request.callback_binding is not None:
+                    environment.callback_requests.finish(request_id, state="completed", result={"outcome": outcome})
                 return self._event_output(event, snapshot=snapshot)
 
     @staticmethod
@@ -401,9 +658,29 @@ class ReverseImageService:
         """将事件映射为稳定供应商无关 JSON。"""
         payload = event.result or {}
         selected = snapshot or payload.get("snapshot")
-        return {
+        result = selected.get("response") if isinstance(selected, Mapping) else None
+        output: dict[str, object] = {
             "request_id": event.request_id,
             "cache": {"key": event.cache_key, "status": event.cache_status, "outcome": event.outcome, "fetched_at": selected.get("fetched_at") if isinstance(selected, Mapping) else None},
             "provider": {"called": event.provider_called, "outcome": event.outcome, "retryable": event.retryable},
-            "result": selected.get("response") if isinstance(selected, Mapping) else None,
+            "result": result,
+        }
+        if isinstance(payload.get("degraded"), bool):
+            output["degraded"] = payload["degraded"]
+        if isinstance(payload.get("reason"), str):
+            output["reason"] = payload["reason"]
+        return output
+
+    @staticmethod
+    def _usage_binding(request: ReverseImageRequest) -> dict[str, object]:
+        """提取已由 callback 边界验证的执行绑定，普通直连请求保持兼容。"""
+        binding = request.callback_binding
+        if binding is None:
+            return {}
+        return {
+            "claim_generation": binding.claim_generation,
+            "attempt": binding.attempt,
+            "operation": "analysis.reverse_image_search",
+            "target_sha256": binding.target_sha256,
+            "input_digest": request.input_digest,
         }

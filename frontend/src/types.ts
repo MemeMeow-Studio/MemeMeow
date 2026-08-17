@@ -46,6 +46,12 @@ export interface AgentActivityView {
 export interface TaskItem {
   task_id: string
   task_type: string
+  submission_mode?: 'pipeline' | 'standalone' | null
+  image_stage?: 'visual' | 'agent' | 'text_embedding' | null
+  processing_job_id?: string | null
+  historical_unclassified?: boolean
+  read_only?: boolean
+  retry_allowed?: boolean
   status: string
   progress?: number | null
   message?: string
@@ -62,6 +68,39 @@ export interface TaskItem {
   agent_completed_turns?: number
   agent_turn_running?: boolean
   agent_last_activity_at?: string
+}
+
+export interface ImageProcessingStage {
+  stage: 'visual' | 'agent' | 'text_embedding'
+  status: string
+  task_id?: string | null
+  attempt?: number
+  error?: { error?: string; message?: string } | null
+  retry_at?: string | null
+  submission_mode?: 'pipeline'
+  processing_job_id?: string
+}
+
+export interface ImageProcessingJob {
+  task_id: string
+  task_type: 'image_processing'
+  job_id: string
+  meme_id: string
+  submission_mode: 'pipeline'
+  image_stage?: null
+  processing_job_id: string
+  revision: number
+  image_sha256: string
+  reverse_image_policy: string
+  status: string
+  current_stage?: string | null
+  stages: ImageProcessingStage[]
+  error?: { error?: string; message?: string } | null
+  progress?: number | null
+  message?: string | null
+  created_at?: string
+  updated_at?: string
+  completed_at?: string | null
 }
 
 export interface UploadResult {

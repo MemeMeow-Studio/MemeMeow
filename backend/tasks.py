@@ -41,6 +41,7 @@ STABLE_TASK_ERRORS = {
     "agent_executor_invalid_response",
     "agent_timeout_limit_exceeded",
     "agent_image_root_mismatch",
+    "agent_input_provider_unavailable",
     "agent_image_path_forbidden",
     "agent_result_path_invalid",
     "target_changed",
@@ -80,7 +81,30 @@ STABLE_TASK_ERRORS = {
     "visual_embedding_sha256_invalid",
     "visual_embedding_sha256_mismatch",
     "query_embedding_not_ready",
+    "embedding_not_configured",
+    "embedding_dimensions_mismatch",
+    "embedding_non_finite",
+    "embedding_zero_norm",
+    "task_scope_invalid",
+    "task_scope_mismatch",
+    "task_scope_unavailable",
+    "unknown_execution",
+    "reverse_image_unknown_execution",
+    "operation_forbidden",
+    "operation_limit_exceeded",
+    "operation_policy_unavailable",
+    "operation_grant_invalid",
+    "blocked",
 }
+# 这三类任务由逐图图片处理 Worker 独占扫描、认领和执行；通用任务 Worker
+# 只能处理其它系统任务，避免旧调度器把图片链误判为缺少 handler。
+IMAGE_PROCESSING_TASK_TYPES = frozenset(
+    {
+        "visual_embedding_generation",
+        "meme_context_generation",
+        "text_embedding_generation",
+    }
+)
 TaskHandler = Callable[[dict[str, Any], Callable[[float | None, str | None], None]], Any]
 
 
@@ -91,10 +115,17 @@ def now() -> str:
 
 @dataclass
 class TaskRecord:
-    """一条可序列化任务记录，承载状态、有限诊断与执行输入。"""
+    """一条可序列化任务记录，承载状态、图片来源事实和有限诊断。
+
+    图片阶段任务的来源字段由数据库控制面填充；前端只能读取这些安全摘要，不能
+    通过 ``payload`` 改写 Job 归属或执行阶段。
+    """
 
     task_id: str
     task_type: str
+    submission_mode: str | None = None
+    image_stage: str | None = None
+    processing_job_id: str | None = None
     payload: dict[str, Any] = field(default_factory=dict)
     status: str = "queued"
     progress: float | None = 0.0
@@ -108,12 +139,18 @@ class TaskRecord:
     settings_version: str | None = None
     agent_concurrency: int | None = None
     slot_id: int | None = None
+    # 数据库任务服务内部使用；公共 ``as_dict`` 不暴露 scope 身份。
+    scope_id: str | None = None
 
     def as_dict(self, *, include_payload: bool = True) -> dict[str, Any]:
         """返回稳定 API 结构；列表调用方可排除内部 payload。"""
         result = {
             "task_id": self.task_id,
             "task_type": self.task_type,
+            "submission_mode": self.submission_mode,
+            "image_stage": self.image_stage,
+            "processing_job_id": self.processing_job_id,
+            "job_id": self.processing_job_id,
             "status": self.status,
             "progress": self.progress,
             "message": self.message,
@@ -142,6 +179,9 @@ class TaskRecord:
         return cls(
             task_id=task_id,
             task_type=task_type,
+            submission_mode=value.get("submission_mode") if value.get("submission_mode") in {None, "pipeline", "standalone"} else None,
+            image_stage=value.get("image_stage") if value.get("image_stage") in {None, "visual", "agent", "text_embedding"} else None,
+            processing_job_id=(value.get("processing_job_id") or value.get("job_id")) if isinstance(value.get("processing_job_id") or value.get("job_id"), str) else None,
             payload=payload,
             status=str(value.get("status", "queued")),
             progress=value.get("progress"),
@@ -155,6 +195,7 @@ class TaskRecord:
             settings_version=value.get("settings_version"),
             agent_concurrency=value.get("agent_concurrency"),
             slot_id=value.get("slot_id"),
+            scope_id=value.get("scope_id") if isinstance(value.get("scope_id"), str) else None,
         )
 
 
@@ -423,6 +464,35 @@ class PersistentTaskService:
         with self._lock:
             record = self._records.get(task_id)
             return TaskRecord.from_dict(record.as_dict(include_payload=True)) if record else None
+
+    def find_active(self, task_type: str, dedupe_key: str) -> TaskRecord | None:
+        """按兼容任务服务的规范化 payload 查找活动任务。
+
+        本地 JSON 服务没有数据库 dedupe 列；该方法只为图片 Worker 的统一查询
+        协议保留，PostgreSQL 服务使用持久 dedupe_key 实现更严格的判断。
+        """
+        if not isinstance(task_type, str) or not task_type or not isinstance(dedupe_key, str) or not dedupe_key:
+            return None
+
+        def comparable(record: TaskRecord) -> str:
+            """按 PostgreSQL facade 的规则重建兼容服务去重键。"""
+            payload = record.payload
+            if task_type == "meme_context_generation":
+                return "context:{meme}:{sha}:{config}:{policy}:r{revision}".format(
+                    meme=payload.get("meme_id"),
+                    sha=payload.get("image_sha256"),
+                    config=payload.get("processing_config_hash") or payload.get("skill_hash") or payload.get("model"),
+                    policy=payload.get("reverse_image_policy") or "forbid",
+                    revision=payload.get("job_revision") or "legacy",
+                )
+            return f"{task_type}:{json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
+
+        with self._lock:
+            records = [record for record in self._records.values() if record.task_type == task_type and record.status not in TERMINAL and comparable(record) == dedupe_key]
+            if not records:
+                return None
+            record = min(records, key=lambda item: (item.created_at, item.task_id))
+            return TaskRecord.from_dict(record.as_dict(include_payload=True))
 
     def list(self, *, statuses: set[str] | None = None, task_types: set[str] | None = None, cursor: str | None = None, limit: int = 50) -> tuple[list[TaskRecord], str | None]:
         """按更新时间和 ID 稳定倒序分页，返回受调用方控制的记录快照。"""

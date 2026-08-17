@@ -211,10 +211,19 @@ button, input, select, textarea { border-radius: var(--radius-control); }
 .task-toolbar label { display: grid; gap: 7px; color: var(--muted); font-size: 15px; }
 .task-toolbar select { min-width: 160px; height: 46px; border: 1px solid var(--line-strong); border-radius: 5px; padding: 0 12px; color: var(--ink-soft); background: var(--surface); font-size: 15px; }
 .task-table { min-width: 0; border-top: 1px solid var(--line); }
-.task-head, .task-row { display: grid; grid-template-columns: 112px minmax(150px, 1.35fr) minmax(120px, 1.1fr) 78px minmax(130px, 1fr); align-items: center; column-gap: 16px; width: 100%; min-height: 62px; text-align: left; }
+.task-head, .task-row, .processing-job-parent { display: grid; grid-template-columns: 112px minmax(150px, 1.35fr) minmax(120px, 1.1fr) minmax(120px, 1fr) 78px minmax(130px, 1fr); align-items: center; column-gap: 16px; width: 100%; min-height: 62px; text-align: left; }
 .task-head { color: var(--muted); font-size: 14px; font-weight: 700; }
 .task-row { border: 0; border-top: 1px solid var(--line); border-radius: 0; padding: 0; color: var(--ink-soft); background: transparent; font-size: 15px; cursor: pointer; transition: background-color .18s ease; }
 .task-row:hover, .task-row.selected { background: var(--surface-muted); }
+.processing-job { border-top: 1px solid var(--line); }
+.processing-job-parent { cursor: pointer; padding: 0 6px; list-style-position: inside; }
+.processing-job-parent small, .task-source small { display: block; color: var(--muted); font-size: 12px; }
+.processing-job-stages { display: grid; gap: 1px; padding: 0 0 8px 32px; background: var(--surface-muted); }
+.task-stage-row { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(100px, .7fr) minmax(180px, 1fr) minmax(100px, .8fr); gap: 12px; align-items: center; border: 0; border-top: 1px solid var(--line); padding: 11px 12px; color: var(--ink-soft); background: transparent; text-align: left; }
+.task-stage-row:not(:disabled) { cursor: pointer; }
+.task-stage-row:hover:not(:disabled) { background: var(--surface); }
+.stage-actions { display: flex; flex-wrap: wrap; gap: 4px; grid-column: 1 / -1; padding: 0 8px 10px; }
+.stage-actions .quiet { padding: 6px 9px; font-size: 12px; }
 .task-row > span, .task-row time { min-width: 0; overflow: hidden; padding: 0 6px; text-overflow: ellipsis; white-space: nowrap; }
 .task-row time { color: var(--muted); font-size: 14px; font-variant-numeric: tabular-nums; }
 .status-dot { margin-right: 8px; vertical-align: middle; background: var(--warning); }

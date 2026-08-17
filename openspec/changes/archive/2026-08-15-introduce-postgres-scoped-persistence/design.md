@@ -2,7 +2,7 @@
 
 当前服务在 FastAPI lifespan 中创建一套进程级服务：`PathResolver`、`MetadataService`、`SearchService`、`PersistentTaskService` 和 `OpenCodeRunner`。图片文件是主资源；meme 语境保存为同目录 sidecar，搜索向量保存在一个全局 JSON 文件并整体加载到 Python 内存，任务保存为逐任务 JSON，同时在进程内维护完整记录和线程池。
 
-本设计需要在保留现有图片目录安全边界、语境证据约束、任务去重和批次行为的前提下，建立 PostgreSQL 权威存储。公共核心必须能够运行在一个已绑定的数据范围内，但不得引入登录、用户表或闭源账户语义。参见 `proposal.md` 和本 change 的 delta specs。
+本设计需要在保留现有图片目录安全边界、语境证据约束、任务去重和批次行为的前提下，建立 PostgreSQL 权威存储。公共核心必须能够运行在一个已绑定的数据范围内，但不得引入登录、用户表或宿主账户语义。参见 `proposal.md` 和本 change 的 delta specs。
 
 另一个已完成但尚未归档的 `image-sidecar-metadata` change 定义了现有 sidecar 行为。本 change 接管其中的语义 schema、证据边界、指纹校验和人工字段保护，但有意替换其物理持久化决策；归档时不能让主规范同时要求 sidecar 和 PostgreSQL 两套权威来源。
 
@@ -37,7 +37,7 @@ FastAPI 的数据库型路由应运行在工作线程，或仅在明确的线程
 
 ### 2. scope 是公共核心的唯一数据边界，不是用户模型
 
-新增不可为空的 `ScopeContext(scope_id)`。开源适配层在请求入口和任务提交入口固定产生 `scope_id="local"`，不接受客户端传入的 scope。以后闭源层可以从可信登录会话解析 scope，但该映射不属于公共核心。
+新增不可为空的 `ScopeContext(scope_id)`。开源适配层在请求入口和任务提交入口固定产生 `scope_id="local"`，不接受客户端传入的 scope。以后宿主层可以从可信登录会话解析 scope，但该映射不属于公共核心。
 
 每个 Unit of Work 根据 `ScopeContext` 创建已经绑定的 repository：
 
@@ -56,7 +56,7 @@ FastAPI 的数据库型路由应运行在工作线程，或仅在明确的线程
 └── TaskRepository（已绑定 scope）
 ```
 
-repository 的公开方法不再接收任意 `scope_id` 参数，而是在构造时绑定 scope；所有 SELECT、UPDATE、DELETE 和关联校验都包含该边界。数据库约束使用复合唯一键或复合外键防止跨 scope 关联。未来闭源部署可额外启用 PostgreSQL Row-Level Security 作为纵深防御，但本 change 不依赖 RLS 才能正确隔离。
+repository 的公开方法不再接收任意 `scope_id` 参数，而是在构造时绑定 scope；所有 SELECT、UPDATE、DELETE 和关联校验都包含该边界。数据库约束使用复合唯一键或复合外键防止跨 scope 关联。未来宿主部署可额外启用 PostgreSQL Row-Level Security 作为纵深防御，但本 change 不依赖 RLS 才能正确隔离。
 
 文件访问同样由 scope-bound `BlobStore` 绑定命名空间。`scopes` 保存内部生成、不可变且不可由客户端提交的 `storage_namespace`。`local` scope 特殊映射到当前 `image_root`，因此迁移不移动现有图片；未来其他 scope 映射到独立的 `<data_root>/scopes/<storage_namespace>/images` 根目录。业务 `storage_key` 只在其 scope 命名空间内有意义，客户端即使提交其他 scope 的前缀也不能改变 BlobStore 根目录。
 
@@ -169,7 +169,7 @@ search_heads
 
 查询必须同时限定 scope、active generation，并关联当前 `memes` 记录，从而立即排除已删除资源。相同分数使用 `meme_id` 排序。应用不再把全部 embedding 加载到 Python 内存。
 
-备选方案是原地 upsert 单张向量，更新简单但难以保证全量刷新期间索引一致和失败回滚；使用外部向量数据库会增加部署组件并削弱开闭源环境统一。
+备选方案是原地 upsert 单张向量，更新简单但难以保证全量刷新期间索引一致和失败回滚；使用外部向量数据库会增加部署组件并削弱开宿主环境统一。
 
 ### 6. PostgreSQL 同时承担持久任务队列和全局并发租约
 

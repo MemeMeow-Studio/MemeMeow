@@ -10,10 +10,11 @@ import hashlib
 import json
 import os
 import shutil
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import numpy as np
 from openai import OpenAI
@@ -28,6 +29,7 @@ from backend.database import (
     DataEnvironment,
     DatabaseError,
     DatabaseResources,
+    ImageProcessingAttempt,
     Meme,
     MemeEmbedding,
     MemeVisualEmbedding,
@@ -36,6 +38,8 @@ from backend.database import (
     StorageCoordinator,
     StorageOperation,
     Task,
+    TaskBatch,
+    TaskLaneSlot,
     UnitOfWork,
     utcnow,
 )
@@ -51,9 +55,14 @@ from backend.metadata import (
     SidecarMetadata,
     semantic_document,
 )
+from backend.operation_policy import GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations
 from backend.paths import SUPPORTED_EXTENSIONS
-from backend.tasks import TaskRecord, TERMINAL, STABLE_TASK_ERRORS
+from backend.tasks import IMAGE_PROCESSING_TASK_TYPES, TaskRecord, TERMINAL, STABLE_TASK_ERRORS
+from backend.scope import validate_scope_services
 from backend.visual import VisualEmbeddingError, VisualInferenceClient, identity_from_settings
+
+
+logger = logging.getLogger(__name__)
 
 
 def _iso(value: datetime | str | None) -> str:
@@ -64,15 +73,19 @@ def _iso(value: datetime | str | None) -> str:
 
 
 class PostgresMetadataService:
-    """以 scope-bound repository 管理 Meme 元数据和图片指纹。"""
+    """以 scope-bound repository 管理 Meme 元数据和图片指纹。
 
-    def __init__(self, resources: DatabaseResources, *, scope_id: str = "local"):
+    ``scope_id`` 的 local 默认值只为开源旧夹具保留；应用运行时由
+    ``ScopeServiceFactory`` 显式传入 scope。
+    """
+
+    def __init__(self, resources: DatabaseResources, *, scope_id: str | ScopeContext = "local"):
         self.resources = resources
-        self.scope = ScopeContext(scope_id)
-        self.blob_store = resources.blob_store_for_scope(scope_id)
+        self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
+        self.blob_store = resources.blob_store_for_scope(self.scope.scope_id)
         self.root = self.blob_store.root
         self.root.mkdir(parents=True, exist_ok=True)
-        self.storage = StorageCoordinator(resources, scope_id=scope_id)
+        self.storage = StorageCoordinator(resources, scope_id=self.scope)
 
     def image_sha256(self, image: Path) -> str:
         """计算受控图片 SHA-256；不可读文件转换为稳定 MetadataError。"""
@@ -86,7 +99,7 @@ class PostgresMetadataService:
         return digest.hexdigest()
 
     def _relative(self, image: Path) -> str:
-        """将图片解析为 local scope 内的 POSIX storage_key。"""
+        """将图片解析为当前 scope 内的 POSIX storage_key。"""
         try:
             return self.blob_store.relative(image)
         except (ValueError, OSError) as exc:
@@ -363,11 +376,14 @@ class PostgresMetadataService:
 
 
 class PostgresSearchService:
-    """基于 search_generations/meme_embeddings 的 pgvector 检索服务。"""
+    """基于 search_generations/meme_embeddings 的 pgvector 检索服务。
 
-    def __init__(self, settings: Any, resources: DatabaseResources, metadata: PostgresMetadataService, *, scope_id: str = "local"):
+    直接构造时的 local 默认值仅用于开源兼容夹具；生产请求通过 scope facade 获取。
+    """
+
+    def __init__(self, settings: Any, resources: DatabaseResources, metadata: PostgresMetadataService, *, scope_id: str | ScopeContext = "local"):
         self.settings, self.resources, self.metadata = settings, resources, metadata
-        self.scope = ScopeContext(scope_id)
+        self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
         self.model = settings.embedding_model
         self._generation_lock = __import__("threading").Lock()
 
@@ -386,9 +402,13 @@ class PostgresSearchService:
         return (vector / np.linalg.norm(vector)).tolist()
 
     def has_cache(self) -> bool:
-        """检查当前 scope/model 是否存在 active generation。"""
+        """检查当前 scope/model 的唯一检索来源是否已有有效数据。"""
         with self.resources.environment(self.scope.scope_id) as environment:
-            return environment.search.active_generation(self.model) is not None
+            if environment.search.source_mode(self.model) == "incremental":
+                return environment.search.has_incremental(self.model)
+            # active generation 只说明控制面存在一代索引，不能证明其中仍有
+            # 与当前 Meme SHA、语境 hash、维度和文件身份一致的可检索条目。
+            return environment.search.has_legacy(self.model)
 
     def invalidate_cache(self) -> None:
         """数据库索引不在进程内缓存；此方法保留兼容调用但无副作用。"""
@@ -476,7 +496,10 @@ class PostgresSearchService:
                 pass
         vector = self._embedding(query)
         with self.resources.environment(self.scope.scope_id) as environment:
-            ranked = environment.search.query(self.model, vector, top_k)
+            if environment.search.source_mode(self.model) == "incremental":
+                ranked = environment.search.query_incremental(self.model, vector, top_k)
+            else:
+                ranked = environment.search.query(self.model, vector, top_k)
             result: list[str] = []
             for meme_id, _score in ranked:
                 try:
@@ -491,28 +514,375 @@ class PostgresSearchService:
             return result
 
 
-class PostgresTaskService:
-    """使用 PostgreSQL 记录、去重、租约和 claim fencing 的任务执行器。"""
+class PostgresTaskWorkerManager:
+    """进程级任务协调器，统一管理线程池、处理器注册和任务恢复扫描。
 
-    def __init__(self, resources: DatabaseResources, *, scope_id: str = "local", agent_concurrency: int = 1, agent_backpressure: int = 32, settings_version: str | None = None, lease_seconds: int = 120, max_attempts: int = 3):
+    任务的数据库操作仍由 scope-bound ``PostgresTaskService`` 执行；协调器只按任务
+    ID 调度工作，并在真正认领后根据持久 ``Task.scope_id`` 创建轻量服务视图。这样
+    历史 scope 数量不会复制 Worker、线程池、handler registry 或全局 Agent lane。
+    """
+
+    def __init__(
+        self,
+        resources: DatabaseResources,
+        *,
+        agent_concurrency: int = 1,
+        agent_backpressure: int = 32,
+        settings_version: str | None = None,
+        lease_seconds: int = 120,
+        max_attempts: int = 3,
+        executor: ThreadPoolExecutor | None = None,
+    ) -> None:
         self.resources = resources
-        self.scope = ScopeContext(scope_id)
         self.agent_concurrency = max(1, min(int(agent_concurrency), 8))
         self.agent_backpressure = max(1, min(int(agent_backpressure), 500))
         self.settings_version = settings_version
         self.lease_seconds = lease_seconds
         self.max_attempts = max_attempts
+        self._executor = executor or ThreadPoolExecutor(max_workers=max(2, self.agent_concurrency + 1), thread_name_prefix="mememeow-scope-worker")
+        self._owns_executor = executor is None
+        self._service_resolver: Callable[[str], Any] | None = None
+        self._scope_service_resolver: Callable[[str | ScopeContext], Any] | None = None
         self._handlers: dict[str, Callable[[dict[str, Any], Callable[[float | None, str | None], None]], Any]] = {}
-        self._batch_finalizer: Callable[[str], Any] | None = None
-        self._executor = ThreadPoolExecutor(max_workers=max(2, self.agent_concurrency + 1), thread_name_prefix="mememeow-pg-task")
         self._lock = Lock()
         self._stopped = Event()
+        self._started = False
         self._scheduled: set[str] = set()
         self.owner = f"worker-{os.getpid()}-{id(self)}"
 
+    @property
+    def worker_count(self) -> int:
+        """返回当前进程协调器数量；一个 manager 代表一个 Worker 控制面。"""
+        return 0 if self._stopped.is_set() else 1
+
+    @property
+    def executor(self) -> ThreadPoolExecutor:
+        """返回共享线程池，供 scope facade 复用而不自行创建调度资源。"""
+        return self._executor
+
+    def set_service_resolvers(self, task_resolver: Callable[[str], Any], scope_resolver: Callable[[str | ScopeContext], Any]) -> None:
+        """安装按持久任务或显式 scope 创建轻量服务视图的回调。"""
+        self._service_resolver = task_resolver
+        self._scope_service_resolver = scope_resolver
+
+    def register(self, task_type: str, handler: Callable[[dict[str, Any], Callable[[float | None, str | None], None]], Any]) -> None:
+        """在进程级 registry 注册一个任务处理器，所有 scope 共用该注册表。"""
+        self._handlers[task_type] = handler
+
+    def handler(self, task_type: str) -> Callable[[dict[str, Any], Callable[[float | None, str | None], None]], Any] | None:
+        """读取当前任务类型的全局处理器。"""
+        return self._handlers.get(task_type)
+
+    def start(self) -> dict[str, list[str]]:
+        """执行一次全局租约恢复、批次恢复和 queued 任务扫描。"""
+        with self._lock:
+            if self._started:
+                return {"started": [], "invalid_tasks": []}
+            self._started = True
+        try:
+            queued = self._recover_expired()
+            invalid = self._fail_invalid_scope_tasks()
+            queued.extend(self._recover_pending_batches())
+            with self.resources.factory() as session:
+                queued.extend(
+                    session.scalars(
+                        select(Task.id).where(
+                            Task.status == "queued",
+                            ~Task.task_type.in_(IMAGE_PROCESSING_TASK_TYPES),
+                        )
+                    )
+                )
+            for task_id in dict.fromkeys(queued):
+                self.schedule(task_id)
+            return {"started": [self.owner], "invalid_tasks": sorted(set(invalid))}
+        except Exception:
+            with self._lock:
+                self._started = False
+            raise
+
+    def _recover_expired(self) -> list[str]:
+        """跨所有 scope 恢复过期 claim，并释放旧 lane 槽位。"""
+        now = utcnow()
+        queued: list[str] = []
+        with self.resources.factory() as session:
+            rows = list(
+                session.scalars(
+                    select(Task)
+                    .where(
+                        Task.status == "running",
+                        Task.lease_expires_at < now,
+                        ~Task.task_type.in_(IMAGE_PROCESSING_TASK_TYPES),
+                    )
+                    .with_for_update(skip_locked=True)
+                    .limit(5000)
+                )
+            )
+            for task in rows:
+                if task.attempt_count < task.max_attempts:
+                    task.status = "queued"
+                    task.available_at = now
+                    task.message = "租约已过期，等待重新认领"
+                    task.error = {"error": "lease_expired", "message": "Worker 租约已过期"}
+                    queued.append(task.id)
+                else:
+                    task.status = "failed"
+                    task.completed_at = now
+                    task.message = "任务达到最大尝试次数"
+                    task.error = {"error": "max_attempts_exceeded", "message": "任务达到最大尝试次数"}
+                task.lease_owner = None
+                task.lease_expires_at = None
+                task.updated_at = now
+                self._release_slot(session, task.scope_id, task.id, owner=self.owner, claim_generation=task.claim_generation)
+            session.commit()
+        return queued
+
+    @staticmethod
+    def _release_slot(session: Any, scope_id: str, task_id: str, *, owner: str | None = None, claim_generation: int | None = None) -> bool:
+        """在全局恢复事务中按完整 claim 释放 lane 槽位。"""
+        slot = session.scalar(select(TaskLaneSlot).where(TaskLaneSlot.task_scope_id == scope_id, TaskLaneSlot.task_id == task_id).with_for_update())
+        if slot is not None:
+            if owner is not None and slot.lease_owner not in {None, owner}:
+                logger.info("task_lane_fencing_rejection task=%s scope=%s", task_id, scope_id)
+                return False
+            if claim_generation is not None and getattr(slot, "claim_generation", None) not in {None, claim_generation}:
+                logger.info("task_lane_fencing_rejection task=%s scope=%s", task_id, scope_id)
+                return False
+            slot.task_scope_id = None
+            slot.task_id = None
+            slot.lease_owner = None
+            if hasattr(slot, "claim_generation"):
+                slot.claim_generation = None
+            slot.lease_expires_at = None
+            return True
+        return False
+
+    def _fail_invalid_scope_tasks(self) -> list[str]:
+        """启动扫描发现非法持久 scope 时稳定失败，绝不猜测为 local。"""
+        invalid: list[str] = []
+        with self.resources.factory() as session:
+            rows = list(
+                session.scalars(
+                    select(Task).where(
+                        Task.status.in_(("queued", "running")),
+                        ~Task.task_type.in_(IMAGE_PROCESSING_TASK_TYPES),
+                    )
+                )
+            )
+            for task in rows:
+                try:
+                    ScopeContext(task.scope_id)
+                except (TypeError, ValueError):
+                    invalid.append(task.id)
+                    task.status = "failed"
+                    task.completed_at = utcnow()
+                    task.lease_owner = None
+                    task.lease_expires_at = None
+                    task.error = {"error": "task_scope_invalid", "message": "任务缺少有效 scope"}
+                    task.message = "任务 scope 无效"
+                    self._release_slot(session, task.scope_id, task.id)
+            session.commit()
+        return invalid
+
+    def _recover_pending_batches(self) -> list[str]:
+        """按批次所属 scope 恢复未收束的唯一 cache 任务，不扫描并实例化全部历史 scope。"""
+        queued: list[str] = []
+        if self._scope_service_resolver is None:
+            return queued
+        with self.resources.factory() as session:
+            batches = list(session.execute(select(TaskBatch.scope_id, TaskBatch.batch_id).where(TaskBatch.sealed.is_(True), TaskBatch.finalizer_state.in_(('pending', 'submitted'))).limit(5000)).all())
+        for scope_id, batch_id in batches:
+            try:
+                services = self._scope_service_resolver(scope_id)
+                with self.resources.environment(services.scope) as environment:
+                    task = environment.tasks.finalize_batch_with_task(
+                        batch_id,
+                        task_type="cache_generation",
+                        payload={},
+                        dedupe_key="cache_generation",
+                        settings_version=self.settings_version,
+                        max_attempts=self.max_attempts,
+                    )
+                    if task is not None:
+                        queued.append(task.id)
+            except (DatabaseError, RuntimeError, TypeError, ValueError):
+                # 任务 scope 无法装配时由后续任务诊断和宿主日志收束，不回退到 local。
+                continue
+        return queued
+
+    def schedule(self, task_id: str) -> None:
+        """将任务加入进程级调度集合，避免不同 scope 重复提交同一 future。"""
+        with self._lock:
+            if self._stopped.is_set() or task_id in self._scheduled:
+                return
+            self._scheduled.add(task_id)
+        self._executor.submit(self._run, task_id)
+
+    def _run(self, task_id: str) -> None:
+        """先按持久 scope 认领任务，再创建 scope facade 执行处理器。"""
+        service = None
+        claim = None
+        try:
+            claim = self._claim_for_task(task_id)
+            if claim is None:
+                self._task_finished(task_id, claimed=False)
+                return
+            if self._scope_service_resolver is None:
+                raise RuntimeError("task_scope_unavailable")
+            # Worker 认领后仍必须复用统一 factory 校验；宿主自定义 resolver 不能以
+            # 返回错误 scope 的 facade 绕过 claim 的业务隔离边界。
+            services = validate_scope_services(ScopeContext(claim.scope_id), self._scope_service_resolver(claim.scope_id))
+            service = getattr(services, "tasks", None)
+            if service is None:
+                raise RuntimeError("task_scope_unavailable")
+            service._run(task_id, preclaimed=claim)
+        except Exception:
+            if service is None:
+                # 工厂异常发生在 claim 之后时只能用完整 claim fencing 收束；
+                # 没有 claim 证据则不按裸 task_id 修改任意任务。
+                self._fail_unresolvable(claim)
+                self._task_finished(task_id, claimed=claim is not None)
+            else:
+                # 业务 facade 异常不能遗留 scheduled 标记，否则恢复扫描无法再次唤醒任务。
+                self._task_finished(task_id, claimed=claim is not None)
+
+    def _claim_for_task(self, task_id: str) -> Task | None:
+        """从任务控制面读取 scope 并在创建业务 facade 前完成 claim。"""
+        with self.resources.factory() as session:
+            scope_id = session.scalar(select(Task.scope_id).where(Task.id == task_id))
+        if not isinstance(scope_id, str) or not scope_id:
+            return None
+        try:
+            scope = ScopeContext(scope_id)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("task_scope_invalid") from exc
+        with self.resources.environment(scope) as environment:
+            queued = environment.tasks.get(task_id)
+            if queued is None:
+                return None
+            if queued.task_type in IMAGE_PROCESSING_TASK_TYPES:
+                # 图片任务属于专用 Worker；通用 manager 不得认领或收束它们。
+                return None
+            return environment.tasks.claim(
+                owner=self.owner,
+                lease_seconds=self.lease_seconds,
+                task_id=task_id,
+                lane=queued.lane,
+                lane_capacity=self.agent_concurrency if queued.lane == "agent" else None,
+            )
+
+    def _fail_unresolvable(self, claim: Task | None) -> None:
+        """按完整 claim 收束 scope 装配失败，旧 claim 不得终止新 Worker。"""
+        if claim is None:
+            return
+        with self.resources.factory() as session:
+            now = utcnow()
+            statement = select(Task).where(
+                Task.scope_id == claim.scope_id,
+                Task.id == claim.id,
+                Task.status == "running",
+                Task.claim_generation == claim.claim_generation,
+                Task.lease_owner == self.owner,
+                Task.lease_expires_at > now,
+            ).with_for_update()
+            task = session.scalar(statement)
+            if task is None:
+                logger.info("task_scope_assembly_fencing_rejection task=%s scope=%s generation=%s", claim.id, claim.scope_id, claim.claim_generation)
+                session.commit()
+                return
+            task.status = "failed"
+            task.completed_at = utcnow()
+            task.lease_owner = None
+            task.lease_expires_at = None
+            task.message = "任务 scope 无法装配"
+            task.error = {"error": "task_scope_unavailable", "message": "任务 scope 当前不可用"}
+            self._release_slot(session, task.scope_id, task.id, owner=self.owner, claim_generation=claim.claim_generation)
+            session.commit()
+
+    def _task_finished(self, task_id: str, *, claimed: bool) -> None:
+        """释放全局调度标记，并在 lane 槽位释放后扫描下一批任务。"""
+        with self._lock:
+            self._scheduled.discard(task_id)
+            stopped = self._stopped.is_set()
+        if claimed and not stopped:
+            self._schedule_queued()
+
+    def _schedule_queued(self) -> None:
+        """跨 scope 唤醒 queued 任务，保持全局 lane 背压后的前进性。"""
+        if self._stopped.is_set():
+            return
+        with self.resources.factory() as session:
+            task_ids = list(
+                session.scalars(
+                    select(Task.id)
+                    .where(
+                        Task.status == "queued",
+                        ~Task.task_type.in_(IMAGE_PROCESSING_TASK_TYPES),
+                    )
+                    .limit(500)
+                )
+            )
+        for task_id in task_ids:
+            self.schedule(task_id)
+
+    def shutdown(self) -> None:
+        """停止调度并以同一个 owner 收束本进程持有的所有 scope 任务。"""
+        self._stopped.set()
+        now = utcnow()
+        with self.resources.factory() as session:
+            rows = list(session.scalars(select(Task).where(Task.status == "running", Task.lease_owner == self.owner).with_for_update(skip_locked=True)))
+            for task in rows:
+                task.status = "failed"
+                task.completed_at = now
+                task.message = "Worker 已停止"
+                task.error = {"error": "task_interrupted", "message": "任务执行 Worker 已停止"}
+                task.lease_owner = None
+                task.lease_expires_at = None
+                task.updated_at = now
+                self._release_slot(session, task.scope_id, task.id, owner=self.owner, claim_generation=task.claim_generation)
+            session.commit()
+        if self._owns_executor:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+
+
+class PostgresTaskService:
+    """使用指定 scope 记录、去重、租约和 claim fencing 的任务执行器。
+
+    直接构造时的 local 默认值仅用于开源兼容夹具；生产 Worker 由 scope factory 装配。
+    ``scope`` 只用于选择任务表中的候选行；真正执行时仍从刚认领的 Task 行
+    恢复并校验 scope，避免普通 payload 或 Worker 的历史默认值成为归属事实。
+    """
+
+    def __init__(self, resources: DatabaseResources, *, scope_id: str | ScopeContext = "local", agent_concurrency: int = 1, agent_backpressure: int = 32, settings_version: str | None = None, lease_seconds: int = 120, max_attempts: int = 3, executor: ThreadPoolExecutor | None = None, worker_manager: PostgresTaskWorkerManager | None = None, finalize_image_tasks: bool = True, operation_policy: OperationPolicyGateway | None = None, grant_store: GrantAssociationStore | None = None):
+        self.resources = resources
+        self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
+        self.agent_concurrency = max(1, min(int(agent_concurrency), 8))
+        self.agent_backpressure = max(1, min(int(agent_backpressure), 500))
+        self.settings_version = settings_version
+        self.lease_seconds = lease_seconds
+        self.max_attempts = max_attempts
+        # 图片 Worker 执行叶子任务时关闭旧批次 finalizer，避免再次隐式创建
+        # cache_generation；普通兼容 facade 仍保留既有显式批次能力。
+        self._finalize_image_tasks = bool(finalize_image_tasks)
+        self._handlers: dict[str, Callable[[dict[str, Any], Callable[[float | None, str | None], None]], Any]] = {}
+        self._batch_finalizer: Callable[[str], Any] | None = None
+        self._worker_manager = worker_manager
+        # 只有图片专用 facade 注入该二元组时才启用 Agent grant 复核；普通
+        # 兼容任务服务仍可执行历史任务，但不会替客户端伪造计量事实。
+        self._operation_policy = operation_policy
+        self._grant_store = grant_store
+        self._executor = worker_manager.executor if worker_manager is not None else executor or ThreadPoolExecutor(max_workers=max(2, self.agent_concurrency + 1), thread_name_prefix="mememeow-pg-task")
+        self._owns_executor = worker_manager is None and executor is None
+        self._lock = Lock()
+        self._stopped = Event()
+        self._scheduled: set[str] = set()
+        self.owner = worker_manager.owner if worker_manager is not None else f"worker-{os.getpid()}-{id(self)}"
+
     def register(self, task_type: str, handler: Callable[[dict[str, Any], Callable[[float | None, str | None], None]], Any]) -> None:
         """注册由数据库 payload 重建的同步处理器。"""
-        self._handlers[task_type] = handler
+        if self._worker_manager is not None:
+            self._worker_manager.register(task_type, handler)
+        else:
+            self._handlers[task_type] = handler
 
     def set_batch_finalizer(self, callback: Callable[[str], Any] | None) -> None:
         """注册批次全部终态后的单次收束回调。"""
@@ -538,16 +908,44 @@ class PostgresTaskService:
 
     @staticmethod
     def _dedupe(task_type: str, payload: dict[str, Any]) -> str:
-        """为普通任务和图片语境任务生成稳定活动去重键。"""
+        """为普通任务和图片阶段任务生成包含来源模式的稳定活动去重键。"""
+        mode = str(payload.get("submission_mode") or ("pipeline" if payload.get("job_id") else "legacy"))
+        stage = str(payload.get("stage") or {
+            "visual_embedding_generation": "visual",
+            "meme_context_generation": "agent",
+            "text_embedding_generation": "text_embedding",
+        }.get(task_type) or "legacy")
         if task_type == "visual_embedding_generation":
-            return "visual:{meme}:{sha}:{model}:{preprocess}".format(
+            return "visual:{mode}:{stage}:{meme}:{sha}:{model}:{preprocess}:{config}".format(
+                mode=mode,
+                stage=stage,
                 meme=payload.get("meme_id"),
                 sha=payload.get("image_sha256"),
                 model=payload.get("visual_model"),
                 preprocess=payload.get("preprocess_version"),
+                config=payload.get("processing_config_hash") or "legacy",
             )
         if task_type == "meme_context_generation":
-            return f"context:{payload.get('meme_id')}:{payload.get('image_sha256')}"
+            return "context:{mode}:{stage}:{meme}:{sha}:{config}:{policy}:r{revision}".format(
+                mode=mode,
+                stage=stage,
+                meme=payload.get("meme_id"),
+                sha=payload.get("image_sha256"),
+                config=payload.get("processing_config_hash") or payload.get("skill_hash") or payload.get("model"),
+                policy=payload.get("reverse_image_policy") or "forbid",
+                revision=payload.get("job_revision") or "legacy",
+            )
+        if task_type == "text_embedding_generation":
+            return "text:{mode}:{stage}:{meme}:{sha}:{metadata}:{model}:{config}:r{revision}".format(
+                mode=mode,
+                stage=stage,
+                meme=payload.get("meme_id"),
+                sha=payload.get("image_sha256"),
+                metadata=payload.get("metadata_hash") or "unknown",
+                model=payload.get("embedding_model") or payload.get("model"),
+                config=payload.get("processing_config_hash") or "legacy",
+                revision=payload.get("job_revision") or "legacy",
+            )
         if task_type == "cache_generation":
             return "cache_generation"
         return f"{task_type}:{json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
@@ -556,19 +954,23 @@ class PostgresTaskService:
         """拒绝同一图片活动任务的策略不一致提交，避免静默复用错误权限。"""
         if payload.get("reverse_image_policy") not in {"forbid", "auto"}:
             return
+        requested_mode = payload.get("submission_mode") if payload.get("submission_mode") in {"pipeline", "standalone"} else None
         with self.resources.environment(self.scope.scope_id) as environment:
             existing = environment.uow.session.scalar(
                 select(Task)
                 .where(
                     Task.scope_id == self.scope.scope_id,
                     Task.task_type == "meme_context_generation",
-                    Task.dedupe_key == dedupe,
+                    Task.submission_mode == requested_mode,
+                    Task.dedupe_key.like(f"context:%:{payload.get('meme_id')}:{payload.get('image_sha256')}:%"),
                     Task.status.in_(('queued', 'running')),
                 )
             )
             if existing is not None:
                 current = str((existing.payload or {}).get("reverse_image_policy") or "forbid")
-                if current != str(payload.get("reverse_image_policy")):
+                current_config = str((existing.payload or {}).get("processing_config_hash") or (existing.payload or {}).get("skill_hash") or (existing.payload or {}).get("model") or "")
+                requested_config = str(payload.get("processing_config_hash") or payload.get("skill_hash") or payload.get("model") or "")
+                if current != str(payload.get("reverse_image_policy")) or current_config != requested_config:
                     raise RuntimeError("generation_policy_conflict")
 
     @staticmethod
@@ -576,20 +978,35 @@ class PostgresTaskService:
         """在任务 repository 复用活动任务后再次核对策略，覆盖预检与插入之间的竞态。"""
         current = str((existing.payload or {}).get("reverse_image_policy") or "forbid")
         wanted = str(requested.get("reverse_image_policy") or "forbid")
-        if current != wanted:
+        current_config = str((existing.payload or {}).get("processing_config_hash") or (existing.payload or {}).get("skill_hash") or (existing.payload or {}).get("model") or "")
+        wanted_config = str(requested.get("processing_config_hash") or requested.get("skill_hash") or requested.get("model") or "")
+        if current != wanted or current_config != wanted_config:
             raise RuntimeError("generation_policy_conflict")
 
     def start(self) -> None:
         """启动数据库任务恢复调度，包括队列和过期租约。"""
+        if self._worker_manager is not None:
+            self._worker_manager.start()
+            return
+        owned_types = None if self._finalize_image_tasks else IMAGE_PROCESSING_TASK_TYPES
         with self.resources.environment(self.scope.scope_id) as environment:
-            queued = environment.tasks.recover_expired(owner=self.owner, limit=5000)
-            # 批次状态和索引任务在同一事务提交；进程可能在提交后尚未唤醒任务时退出，
-            # 因此启动时重新扫描 pending/submitted 批次，依靠 dedupe_key 恢复唯一任务。
-            pending_batches = environment.tasks.pending_finalizer_batches(limit=5000)
+            queued = environment.tasks.recover_expired(
+                owner=self.owner,
+                limit=5000,
+                exclude_task_types=IMAGE_PROCESSING_TASK_TYPES if owned_types is None else None,
+                include_task_types=owned_types,
+            )
+            # 普通 facade 需要恢复旧批次 finalizer；图片专用 facade 禁止重新
+            # 创建 scope 级 cache_generation。
+            pending_batches = environment.tasks.pending_finalizer_batches(limit=5000) if self._finalize_image_tasks else []
             cursor = None
             while True:
                 records, cursor = environment.tasks.list(statuses={"queued"}, cursor=cursor, limit=100)
-                queued.extend(record.id for record in records)
+                queued.extend(
+                    record.id
+                    for record in records
+                    if owned_types is None or record.task_type in owned_types
+                )
                 if cursor is None:
                     break
             for batch_id in pending_batches:
@@ -608,18 +1025,193 @@ class PostgresTaskService:
 
     def _record_to_dataclass(self, record: Any, *, slot_id: int | None = None) -> TaskRecord:
         """将 ORM 任务转换为 API/旧领域共用的安全快照。"""
-        return TaskRecord(task_id=record.id, task_type=record.task_type, payload=dict(record.payload or {}), status=record.status, progress=record.progress, message=record.message, created_at=_iso(record.created_at), updated_at=_iso(record.updated_at), completed_at=_iso(record.completed_at) if record.completed_at else None, attempts=record.attempt_count, error=record.error, result=record.result, settings_version=record.settings_version, agent_concurrency=self.agent_concurrency if record.lane == "agent" else None, slot_id=slot_id)
+        return TaskRecord(
+            task_id=record.id,
+            task_type=record.task_type,
+            submission_mode=getattr(record, "submission_mode", None),
+            image_stage=getattr(record, "image_stage", None),
+            processing_job_id=str(getattr(record, "processing_job_id", "")) if getattr(record, "processing_job_id", None) else None,
+            payload=dict(record.payload or {}),
+            status=record.status,
+            progress=record.progress,
+            message=record.message,
+            created_at=_iso(record.created_at),
+            updated_at=_iso(record.updated_at),
+            completed_at=_iso(record.completed_at) if record.completed_at else None,
+            attempts=record.attempt_count,
+            error=record.error,
+            result=record.result,
+            settings_version=record.settings_version,
+            agent_concurrency=self.agent_concurrency if record.lane == "agent" else None,
+            slot_id=slot_id,
+            scope_id=record.scope_id,
+        )
+
+    def _image_attempt_state(self, claim: Task, payload: dict[str, Any], state: str) -> None:
+        """保存图片叶子当前 claim 的 attempt 状态，供重启恢复辨认未知执行。"""
+        if claim.task_type not in IMAGE_PROCESSING_TASK_TYPES:
+            return
+        mode = payload.get("submission_mode")
+        if mode == "pipeline" and not isinstance(payload.get("job_id"), str):
+            return
+        if mode not in {None, "pipeline", "standalone"}:
+            return
+        target_sha = payload.get("image_sha256")
+        if not isinstance(target_sha, str) or len(target_sha) != 64:
+            return
+        stable_payload = {key: value for key, value in payload.items() if not key.startswith("_claim_")}
+        input_digest = hashlib.sha256(json.dumps(stable_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        now = utcnow()
+        with self.resources.environment(self.scope.scope_id) as environment:
+            session = environment.uow.session
+            row = session.scalar(
+                select(ImageProcessingAttempt).where(
+                    ImageProcessingAttempt.scope_id == self.scope.scope_id,
+                    ImageProcessingAttempt.task_id == claim.id,
+                    ImageProcessingAttempt.attempt == claim.attempt_count,
+                ).with_for_update()
+            )
+            if row is None:
+                row = ImageProcessingAttempt(
+                    scope_id=self.scope.scope_id,
+                    task_id=claim.id,
+                    attempt=claim.attempt_count,
+                    attempt_id=uuid4().hex,
+                    stage=str(payload.get("stage") or claim.task_type),
+                    state=state,
+                    request_id=str(payload.get("request_id")) if payload.get("request_id") else None,
+                    session_id=str(payload.get("session_id")) if payload.get("session_id") else None,
+                    input_digest=input_digest,
+                    target_sha256=target_sha,
+                    claim_generation=claim.claim_generation,
+                )
+                session.add(row)
+            else:
+                # 旧 Worker 不能把新 claim 的 attempt 状态覆盖回去。
+                if row.claim_generation != claim.claim_generation:
+                    return
+                row.state = state
+                row.updated_at = now
+            session.commit()
+
+    def _image_attempt_requires_unknown(self, claim: Task) -> bool:
+        """判断新 claim 前是否存在无法证明已完成的图片外部 attempt。"""
+        if claim.task_type not in IMAGE_PROCESSING_TASK_TYPES or claim.attempt_count <= 1:
+            return False
+        with self.resources.factory() as session:
+            previous = session.scalar(
+                select(ImageProcessingAttempt)
+                .where(
+                    ImageProcessingAttempt.scope_id == self.scope.scope_id,
+                    ImageProcessingAttempt.task_id == claim.id,
+                    ImageProcessingAttempt.attempt < claim.attempt_count,
+                )
+                .order_by(ImageProcessingAttempt.attempt.desc())
+            )
+            return previous is not None and previous.state in {"grant_committed", "external_started", "completed"}
+
+    def _commit_agent_grant(self, claim: Task, payload: dict[str, Any]) -> None:
+        """在 Agent 外部执行前幂等提交服务端 grant。"""
+        if claim.task_type != "meme_context_generation" or self._operation_policy is None or self._grant_store is None:
+            return
+        meme_id = payload.get("meme_id")
+        image_sha256 = payload.get("image_sha256")
+        config_hash = payload.get("processing_config_hash")
+        revision = payload.get("job_revision")
+        policy = payload.get("reverse_image_policy") or "forbid"
+        if not all(isinstance(value, str) and value for value in (meme_id, image_sha256, config_hash)):
+            raise OperationPolicyError("operation_grant_invalid")
+        mode = payload.get("submission_mode")
+        if mode == "standalone":
+            logical_key = payload.get("agent_grant_key")
+            if not isinstance(logical_key, str) or not logical_key.startswith("standalone-agent:"):
+                raise OperationPolicyError("operation_grant_invalid")
+            source = "image-processing-standalone"
+        else:
+            logical_key = f"agent:{meme_id}:{image_sha256}:{config_hash}:{policy}:r{revision}"
+            source = "image-processing"
+        request = self._operation_policy.request(self.scope, Operations.ANALYSIS_AGENT, logical_key, resource_id=meme_id, task_id=claim.id, source=source)
+        association = self._grant_store.get(request)
+        if association is None or association.grant.scope != self.scope or association.grant.operation != Operations.ANALYSIS_AGENT:
+            raise OperationPolicyError("operation_grant_invalid")
+        if association.state == "committed":
+            return
+        if association.state != "acquired":
+            raise OperationPolicyError("operation_grant_invalid")
+        try:
+            result = self._operation_policy.commit(association.grant)
+        except OperationPolicyError:
+            # policy 返回异常时无法证明计量是否已经生效；保留 unknown，后续
+            # claim 只能收束，不能通过重试再次触发不确定的计量边界。
+            self._grant_store.transition(association.grant, "unknown")
+            raise
+        if not result.ok or result.state not in {"committed", "already_committed"}:
+            self._grant_store.transition(association.grant, "unknown")
+            raise OperationPolicyError("operation_policy_unavailable", retry_at=result.retry_at)
+        if not self._grant_store.transition(association.grant, "committed"):
+            self._grant_store.transition(association.grant, "unknown")
+            raise OperationPolicyError("operation_grant_invalid")
 
     def submit(self, task_type: str, payload: dict[str, Any] | None = None, *, schedule: bool = True) -> TaskRecord:
-        """以事务插入或复用活动任务，并立即安排本进程执行。"""
+        """以事务插入或复用活动任务，并立即安排本进程执行。
+
+        图片阶段来源由当前受信控制面 payload 规范化后落入专用列；客户端不能
+        通过额外 scope、Job、grant 或 claim 字段改变这些事实。
+        """
         payload = dict(payload or {})
+        # scope/user 只能由 resolver 或 Task.scope_id 提供；即使调用方伪造字段，
+        # 也不得让它们进入后续 handler 作为授权事实。
+        payload.pop("scope_id", None)
+        payload.pop("user_id", None)
         lane = "agent" if task_type == "meme_context_generation" else "default"
+        image_stage = None
+        submission_mode = None
+        processing_job_id = None
+        if task_type in IMAGE_PROCESSING_TASK_TYPES:
+            stage_by_type = {
+                "visual_embedding_generation": "visual",
+                "meme_context_generation": "agent",
+                "text_embedding_generation": "text_embedding",
+            }
+            expected_stage = stage_by_type[task_type]
+            requested_stage = payload.get("stage")
+            if requested_stage is not None and requested_stage != expected_stage:
+                raise RuntimeError("image_stage_mismatch")
+            requested_mode = payload.get("submission_mode")
+            if requested_mode not in {"pipeline", "standalone"}:
+                # 没有新来源字段的旧记录仍可被读取/执行，查询时会显示为未归类；
+                # 新控制面入口始终显式传入 mode。
+                requested_mode = None
+            submission_mode = requested_mode
+            if submission_mode == "pipeline":
+                raw_job_id = payload.get("job_id")
+                if not isinstance(raw_job_id, str) or not raw_job_id:
+                    raise RuntimeError("image_processing_job_required")
+                processing_job_id = raw_job_id
+            elif submission_mode == "standalone":
+                if payload.get("job_id") is not None:
+                    raise RuntimeError("image_task_job_conflict")
+            elif payload.get("job_id") is not None:
+                # 旧 job 叶子在来源迁移前仍按 pipeline 处理，避免丢失父 Job
+                # 关联；该分支只接受服务端已有的 Job UUID。
+                submission_mode = "pipeline"
+                processing_job_id = payload.get("job_id")
+            # 没有阶段、Job 或来源字段的旧 facade 调用属于迁移前任务。保留
+            # NULL image_stage 使它可以继续完成既有业务；迁移脚本对能够
+            # 可靠识别阶段的历史任务会补写 image_stage，专用 Worker 随后
+            # 将那类未归类任务收束为只读诊断。
+            explicit_source = requested_stage is not None or requested_mode is not None or processing_job_id is not None
+            if explicit_source:
+                image_stage = expected_stage
+                payload["stage"] = expected_stage
+                if submission_mode is not None:
+                    payload["submission_mode"] = submission_mode
         dedupe = self._dedupe(task_type, payload)
         if task_type == "meme_context_generation":
             self._context_policy_conflict(payload, dedupe)
         with self.resources.environment(self.scope.scope_id) as environment:
             try:
-                record = environment.tasks.submit(task_type=task_type, payload=payload, lane=lane, dedupe_key=dedupe, settings_version=self.settings_version, max_attempts=self.max_attempts, lane_backpressure=self.agent_backpressure if lane == "agent" else None)
+                record = environment.tasks.submit(task_type=task_type, payload=payload, lane=lane, dedupe_key=dedupe, settings_version=self.settings_version, max_attempts=self.max_attempts, lane_backpressure=self.agent_backpressure if lane == "agent" else None, submission_mode=submission_mode, image_stage=image_stage, processing_job_id=processing_job_id)
             except DatabaseError as exc:
                 if exc.code == "agent_backpressure":
                     existing = environment.uow.session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.task_type == task_type, Task.dedupe_key == dedupe, Task.status.in_(("queued", "running"))))
@@ -639,10 +1231,12 @@ class PostgresTaskService:
         return snapshot
 
     def retry(self, task_id: str) -> TaskRecord:
-        """显式重试一个失败阶段，复用其 payload 而不级联重跑下游阶段。"""
+        """重试一个普通失败任务；图片阶段必须通过受限图片入口重试。"""
         record = self.get(task_id)
         if record is None:
             raise RuntimeError("task_not_found")
+        if record.task_type in IMAGE_PROCESSING_TASK_TYPES:
+            raise RuntimeError("image_stage_retry_forbidden")
         if record.status != "failed":
             raise RuntimeError("task_not_failed")
         payload = {key: value for key, value in record.payload.items() if not key.startswith("_claim_")}
@@ -655,33 +1249,98 @@ class PostgresTaskService:
 
     def _schedule(self, task_id: str) -> None:
         """避免同一进程重复调度同一个数据库任务。"""
+        if self._worker_manager is not None:
+            self._worker_manager.schedule(task_id)
+            return
         with self._lock:
             if self._stopped.is_set() or task_id in self._scheduled:
                 return
             self._scheduled.add(task_id)
         self._executor.submit(self._run, task_id)
 
-    def _run(self, task_id: str) -> None:
-        """认领任务、执行处理器并以 claim generation fencing 写回终态。"""
-        claim = None
+    def _run(self, task_id: str, *, preclaimed: Task | None = None) -> None:
+        """执行已认领任务并以 claim generation fencing 写回终态。"""
+        claim = preclaimed
         try:
-            with self.resources.environment(self.scope.scope_id) as environment:
-                queued_record = environment.tasks.get(task_id)
-                if queued_record is None:
-                    return
-                lane = queued_record.lane
-                claim = environment.tasks.claim(owner=self.owner, lease_seconds=self.lease_seconds, task_id=task_id, lane=lane, lane_capacity=self.agent_concurrency if lane == "agent" else None)
-                if claim is None or claim.id != task_id:
+            if claim is None:
+                with self.resources.environment(self.scope.scope_id) as environment:
+                    queued_record = environment.tasks.get(task_id)
+                    if queued_record is None:
+                        return
+                    lane = queued_record.lane
+                    claim = environment.tasks.claim(
+                        owner=self.owner,
+                        lease_seconds=self.lease_seconds,
+                        task_id=task_id,
+                        lane=lane,
+                        lane_capacity=self.agent_concurrency if lane == "agent" else None,
+                        # 专用 facade 必须能恢复自己的过期图片叶子；通用 manager
+                        # 在更早的 ``_claim_for_task`` 边界排除这些类型。
+                        exclude_task_types=None,
+                    )
+                    if claim is None or claim.id != task_id:
+                        return
+                    task_payload = dict(claim.payload or {})
+                    generation = claim.claim_generation
+                    task_payload["_claim_task_id"] = claim.id
+                    task_payload["_claim_generation"] = generation
+                    task_payload["_claim_owner"] = self.owner
+                    task_payload["_claim_attempt"] = claim.attempt_count
+                    try:
+                        claim_scope = ScopeContext(claim.scope_id)
+                    except (TypeError, ValueError) as exc:
+                        # 无效持久 scope 不能猜测为 local；以稳定错误进入 fencing 收束。
+                        environment.tasks.fail_fenced(task_id, generation, self.owner, message="任务 scope 无效", error={"error": "task_scope_invalid", "message": "任务缺少有效 scope"}, retry=False)
+                        raise RuntimeError("task_scope_invalid") from exc
+                    if claim_scope.scope_id != self.scope.scope_id:
+                        environment.tasks.fail_fenced(task_id, generation, self.owner, message="任务 scope 与 Worker 不一致", error={"error": "task_scope_mismatch", "message": "任务 scope 与当前执行环境不一致"}, retry=False)
+                        raise RuntimeError("task_scope_mismatch")
+                    task_payload["_claim_scope_id"] = claim_scope.scope_id
+            else:
+                if claim.id != task_id or claim.scope_id != self.scope.scope_id:
                     return
                 task_payload = dict(claim.payload or {})
                 generation = claim.claim_generation
                 task_payload["_claim_task_id"] = claim.id
                 task_payload["_claim_generation"] = generation
                 task_payload["_claim_owner"] = self.owner
-            handler = self._handlers.get(claim.task_type)
+                task_payload["_claim_attempt"] = claim.attempt_count
+                try:
+                    claim_scope = ScopeContext(claim.scope_id)
+                except (TypeError, ValueError):
+                    return
+                if claim_scope.scope_id != self.scope.scope_id:
+                    return
+                task_payload["_claim_scope_id"] = claim_scope.scope_id
+            handler = self._worker_manager.handler(claim.task_type) if self._worker_manager is not None else self._handlers.get(claim.task_type)
             if handler is None:
                 self._fenced_failure(task_id, generation, message="任务处理器不可用", error={"error": "task_handler_missing", "message": "当前服务未注册此任务类型"}, retry=False)
                 return
+
+            if claim.task_type in IMAGE_PROCESSING_TASK_TYPES and claim.submission_mode not in {"pipeline", "standalone"} and claim.image_stage is not None:
+                # 无法可靠归类的历史图片 Task 只允许查询诊断，不能在启动恢复时
+                # 被旧 Worker 重新执行或通过异常路径产生下游阶段。没有显式
+                # 阶段列的迁移前兼容任务仍由原任务 facade 完成。
+                self._fenced_failure(
+                    task_id,
+                    generation,
+                    message="历史图片任务未归类，只读展示",
+                    error={"error": "image_task_unclassified", "message": "历史图片阶段缺少可信提交来源"},
+                    retry=False,
+                )
+                return
+
+            if self._image_attempt_requires_unknown(claim):
+                self._image_attempt_state(claim, task_payload, "unknown_execution")
+                self._fenced_failure(
+                    task_id,
+                    generation,
+                    message="外部执行结果无法确认",
+                    error={"error": "unknown_execution", "message": "上一次图片阶段已进入外部执行窗口，无法安全重放"},
+                    retry=False,
+                )
+                return
+            self._image_attempt_state(claim, task_payload, "prepared")
 
             def progress(value: float | None, message: str | None = None) -> None:
                 self._fenced_update(task_id, generation, progress=value, message=message)
@@ -696,10 +1355,23 @@ class PostgresTaskService:
             heartbeat_thread = threading.Thread(target=heartbeat, name=f"mememeow-heartbeat-{task_id}", daemon=True)
             heartbeat_thread.start()
             try:
+                if claim.task_type in IMAGE_PROCESSING_TASK_TYPES:
+                    # 图片阶段均可能触发外部模型或持久副作用；Agent 先完成
+                    # grant commit，再进入外部执行窗口，恢复者才能区分计量边界。
+                    self._commit_agent_grant(claim, task_payload)
+                    if claim.task_type == "meme_context_generation":
+                        self._image_attempt_state(claim, task_payload, "grant_committed")
+                    # 恢复者无法证明结果时必须收束 unknown_execution。
+                    self._image_attempt_state(claim, task_payload, "external_started")
                 result = handler(task_payload, progress)
             except Exception as exc:  # noqa: BLE001
-                diagnostic = str(exc)[:500]
-                code = diagnostic.partition(":")[0] if diagnostic.partition(":")[0] in STABLE_TASK_ERRORS else "task_failed"
+                if isinstance(exc, OperationPolicyError):
+                    code = exc.code
+                    diagnostic = code
+                else:
+                    diagnostic = str(exc)[:500]
+                    code = diagnostic.partition(":")[0] if diagnostic.partition(":")[0] in STABLE_TASK_ERRORS else "task_failed"
+                self._image_attempt_state(claim, task_payload, "unknown_execution" if code in {"unknown_execution", "reverse_image_unknown_execution"} else "failed")
                 retry = code not in {
                     "target_changed",
                     "agent_output_schema_invalid",
@@ -710,6 +1382,7 @@ class PostgresTaskService:
                     "agent_result_file_invalid_json",
                     "agent_result_file_schema_invalid",
                     "agent_image_path_forbidden",
+                    "agent_input_provider_unavailable",
                     "agent_result_path_invalid",
                     "task_handler_missing",
                     "opencode_not_configured",
@@ -724,7 +1397,6 @@ class PostgresTaskService:
                     "visual_weights_checksum_mismatch",
                     "visual_embedding_dimensions_mismatch",
                     "visual_embedding_non_finite",
-                    "visual_embedding_non_finite",
                     "visual_embedding_zero_norm",
                     "visual_image_decode_failed",
                     "visual_model_identity_mismatch",
@@ -732,38 +1404,80 @@ class PostgresTaskService:
                     "visual_embedding_invalid",
                     "visual_embedding_sha256_invalid",
                     "visual_embedding_sha256_mismatch",
+                    "embedding_not_configured",
+                    "embedding_dimensions_mismatch",
+                    "embedding_non_finite",
+                    "embedding_zero_norm",
+                    "query_embedding_not_ready",
                     "invalid_task",
                     "task_not_running",
+                    "task_scope_invalid",
+                    "task_scope_mismatch",
+                    "unknown_execution",
+                    "reverse_image_unknown_execution",
+                    "operation_forbidden",
+                    "operation_limit_exceeded",
+                    "operation_policy_unavailable",
+                    "operation_grant_invalid",
+                    "blocked",
                 }
                 audit_result = self._with_reverse_image_audit(task_id, None, write_provenance=False)
                 self._fenced_failure(task_id, generation, message="任务执行失败", error={"error": code, "message": diagnostic}, retry=retry, result=audit_result)
             else:
                 # 只有当前 claim 仍有效时才写入任务终态和 Meme provenance。
+                self._image_attempt_state(claim, task_payload, "completed")
                 audit_result = self._with_reverse_image_audit(task_id, result, write_provenance=False)
-                if self._fenced_update(task_id, generation, status="succeeded", progress=1.0, message="任务完成", result=audit_result):
-                    self._write_reverse_image_provenance(task_id, generation)
+                self._fenced_success(task_id, generation, audit_result)
             finally:
                 heartbeat_stop.set()
             self._maybe_finalize(task_id)
         finally:
-            with self._lock:
-                self._scheduled.discard(task_id)
-            if claim is not None and not self._stopped.is_set():
-                self._schedule_queued()
+            if self._worker_manager is not None:
+                self._worker_manager._task_finished(task_id, claimed=claim is not None)
+            else:
+                with self._lock:
+                    self._scheduled.discard(task_id)
+                if claim is not None and not self._stopped.is_set():
+                    self._schedule_queued()
 
     def _schedule_queued(self) -> None:
         """在槽位释放后唤醒数据库中的排队任务，避免 lane 满载时忙循环。"""
+        if self._worker_manager is not None:
+            self._worker_manager._schedule_queued()
+            return
         if self._stopped.is_set():
             return
         with self.resources.environment(self.scope.scope_id) as environment:
             records, _ = environment.tasks.list(statuses={"queued"}, limit=100)
         for record in records:
-            self._schedule(record.id)
+            if self._finalize_image_tasks or record.task_type in IMAGE_PROCESSING_TASK_TYPES:
+                self._schedule(record.id)
 
     def _fenced_update(self, task_id: str, generation: int, **changes: Any) -> bool:
         """在一个短事务中验证 owner/generation/租约后更新任务。"""
         with self.resources.environment(self.scope.scope_id) as environment:
             return environment.tasks.update_fenced(task_id, generation, self.owner, **changes)
+
+    def _fenced_success(self, task_id: str, generation: int, result: Any) -> bool:
+        """以 claim fencing 原子提交成功结果和图片 Agent provenance。"""
+        with self.resources.environment(self.scope.scope_id) as environment:
+            complete = getattr(environment.tasks, "complete_fenced_with_provenance", None)
+            if callable(complete):
+                return bool(complete(task_id, generation, self.owner, result=result))
+            # 兼容尚未提供原子扩展的宿主 repository；标准 PostgreSQL
+            # repository 始终走上面的单事务路径。
+            changed = environment.tasks.update_fenced(
+                task_id,
+                generation,
+                self.owner,
+                status="succeeded",
+                progress=1.0,
+                message="任务完成",
+                result=result,
+            )
+        if changed:
+            self._write_reverse_image_provenance(task_id, generation)
+        return changed
 
     def _fenced_failure(self, task_id: str, generation: int, *, message: str, error: dict[str, Any], retry: bool, result: Any | None = None) -> bool:
         """按最大尝试次数将当前 claim 重新排队或置为失败。"""
@@ -820,6 +1534,30 @@ class PostgresTaskService:
             slot = environment.tasks.slot_for_task(record.id)
             return self._record_to_dataclass(record, slot_id=slot.slot_number if slot else None)
 
+    def find_active(self, task_type: str, dedupe_key: str) -> TaskRecord | None:
+        """按当前 scope、类型和活动去重键读取叶子 Task。
+
+        图片 Worker 在取得 Agent grant 前调用此方法，避免把已有活动任务误判为
+        新的计量请求；查询结果只是提示，真正提交仍由 TaskRepository 的唯一键兜底。
+        """
+        if not isinstance(task_type, str) or not task_type or not isinstance(dedupe_key, str) or not dedupe_key:
+            return None
+        with self.resources.environment(self.scope.scope_id) as environment:
+            record = environment.uow.session.scalar(
+                select(Task)
+                .where(
+                    Task.scope_id == self.scope.scope_id,
+                    Task.task_type == task_type,
+                    Task.dedupe_key == dedupe_key,
+                    Task.status.in_(("queued", "running")),
+                )
+                .order_by(Task.created_at.asc(), Task.id.asc())
+            )
+            if record is None:
+                return None
+            slot = environment.tasks.slot_for_task(record.id)
+            return self._record_to_dataclass(record, slot_id=slot.slot_number if slot else None)
+
     def cancel(self, task_id: str) -> bool:
         """取消单个任务并仅终止其 Agent session，不停止共享容器。"""
         with self.resources.environment(self.scope.scope_id) as environment:
@@ -846,6 +1584,8 @@ class PostgresTaskService:
         """批次成员全部终态后在数据库中只提交一次 finalizer 标记。"""
         record = self.get(task_id)
         if not record or record.task_type not in {"meme_context_generation", "visual_embedding_generation"}:
+            return
+        if not self._finalize_image_tasks:
             return
         # 批量接口可能复用上传时已存在的活动去重任务；此时 payload 没有
         # batch_id，必须以数据库关联表为准，避免 finalizer 永久遗漏。
@@ -882,7 +1622,10 @@ class PostgresTaskService:
 
     def shutdown(self) -> None:
         """停止新认领并将本 Worker 仍持有的任务标记为可诊断中断。"""
+        if self._worker_manager is not None:
+            return
         self._stopped.set()
         with self.resources.environment(self.scope.scope_id) as environment:
             environment.tasks.interrupt_owner(self.owner)
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        if self._owns_executor:
+            self._executor.shutdown(wait=False, cancel_futures=True)

@@ -149,8 +149,11 @@ def test_runtime_environment_isolates_project_config(tmp_path: Path):
     assert environment["MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL"].endswith("/internal/reverse-image/search")
 
 
-def test_host_runtime_environment_contains_claim_task_id(tmp_path: Path):
+def test_host_runtime_environment_contains_only_claim_scoped_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Host 模式也必须把当前 claim task id 传给薄客户端，避免请求落到错误任务。"""
+    monkeypatch.setenv("MEMEMEOW_AGENT_CALLBACK_SECRET", "root-callback-secret")
+    monkeypatch.setenv("MEMEMEOW_AGENT_EXECUTOR_TOKEN", "executor-token")
+    monkeypatch.setenv("MEMEMEOW_DATABASE_URL", "postgresql://should-not-enter-agent")
     settings = Settings(
         **{
             **make_settings(tmp_path).__dict__,
@@ -164,6 +167,10 @@ def test_host_runtime_environment_contains_claim_task_id(tmp_path: Path):
     environment = runner.build_environment(2, "claim-task-123")
     assert environment["MEMEMEOW_OPENCODE_SLOT"] == "2"
     assert environment["MEMEMEOW_AGENT_TASK_ID"] == "claim-task-123"
+    assert "MEMEMEOW_AGENT_CALLBACK_TOKEN" not in environment
+    assert "MEMEMEOW_AGENT_CALLBACK_SECRET" not in environment
+    assert "MEMEMEOW_AGENT_EXECUTOR_TOKEN" not in environment
+    assert "MEMEMEOW_DATABASE_URL" not in environment
     assert "SERPAPI_API_KEY" not in environment
 
 
@@ -339,7 +346,7 @@ def test_opencode_launcher_reuses_runtime_for_session_list(tmp_path: Path):
     executable.write_text(
         "#!/usr/bin/env bash\n"
         "printf '%s\\n' \"$PWD\" \"$OPENCODE_DB\" \"$OPENCODE_CONFIG\" "
-        "\"$OPENCODE_CONFIG_DIR\" \"$OPENCODE_DISABLE_PROJECT_CONFIG\" \"$@\" > \"$CAPTURE\"\n",
+        f"\"$OPENCODE_CONFIG_DIR\" \"$OPENCODE_DISABLE_PROJECT_CONFIG\" \"$@\" > {str(capture)!r}\n",
         encoding="utf-8",
     )
     executable.chmod(0o755)
@@ -348,7 +355,6 @@ def test_opencode_launcher_reuses_runtime_for_session_list(tmp_path: Path):
     runtime = tmp_path / "runtime"
     environment = {
         **os.environ,
-        "CAPTURE": str(capture),
         "MEMEMEOW_OPENCODE_EXECUTABLE": str(executable),
         "MEMEMEOW_OPENCODE_MODEL": "mememeow/gpt-5.6-luna",
         "MEMEMEOW_OPENCODE_BASE_URL": "https://example.invalid/v1",
@@ -401,7 +407,6 @@ def test_opencode_launcher_keeps_cli_executable_in_docker_mode(tmp_path: Path):
     runtime = tmp_path / "runtime"
     environment = {
         **os.environ,
-        "CAPTURE": str(capture),
         "PATH": f"{tmp_path}:{os.environ.get('PATH', '')}",
         "MEMEMEOW_AGENT_RUNTIME_MODE": "docker",
         "MEMEMEOW_AGENT_CONTAINER_NAME": "mememeow-agent-runtime",

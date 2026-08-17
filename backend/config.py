@@ -66,6 +66,8 @@ class Settings(BaseSettings):
     agent_executor_request_timeout_seconds: int = Field(default=1810, ge=1, le=7200, validation_alias=AliasChoices("MEMEMEOW_AGENT_EXECUTOR_REQUEST_TIMEOUT_SECONDS", "agent_executor_request_timeout_seconds"))
     agent_executor_max_timeout_seconds: int = Field(default=1800, ge=1, le=7200, validation_alias=AliasChoices("MEMEMEOW_AGENT_EXECUTOR_MAX_TIMEOUT_SECONDS", "agent_executor_max_timeout_seconds"))
     visual_internal_token: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_VISUAL_INTERNAL_TOKEN", "VISUAL_INTERNAL_TOKEN", "visual_internal_token"), repr=False)
+    agent_callback_secret: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_AGENT_CALLBACK_SECRET", "agent_callback_secret"), repr=False)
+    agent_callback_verification_keys: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_AGENT_CALLBACK_VERIFICATION_KEYS", "agent_callback_verification_keys"), repr=False)
     visual_model_repo: Path | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_VISUAL_MODEL_REPO", "VISUAL_MODEL_REPO", "visual_model_repo"))
     visual_cpu_threads: int = Field(default=4, ge=1, le=128, validation_alias=AliasChoices("MEMEMEOW_VISUAL_CPU_THREADS", "VISUAL_CPU_THREADS", "visual_cpu_threads"))
     visual_cpu_interop_threads: int = Field(default=1, ge=1, le=32, validation_alias=AliasChoices("MEMEMEOW_VISUAL_CPU_INTEROP_THREADS", "VISUAL_CPU_INTEROP_THREADS", "visual_cpu_interop_threads"))
@@ -150,6 +152,7 @@ class Settings(BaseSettings):
         "reverse_image_cache_root",
         "opencode_node_modules",
         "settings_admin_token",
+        "agent_callback_verification_keys",
         "database_url",
         mode="before",
     )

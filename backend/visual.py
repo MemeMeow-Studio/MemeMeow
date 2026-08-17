@@ -29,6 +29,7 @@ from backend.database import (
     DatabaseError,
     DatabaseResources,
     ScopeContext,
+    utcnow,
     validate_visual_vector,
 )
 from backend.visual_models import (
@@ -493,12 +494,15 @@ class VisualInferenceClient:
 
 
 class VisualSearchService:
-    """从运行中的 Agent 任务推导 scope 并返回受控视觉近邻。"""
+    """从运行中的 Agent 任务推导 scope 并返回受控视觉近邻。
 
-    def __init__(self, settings: Any, resources: DatabaseResources, *, scope_id: str = "local"):
+    local 默认值只服务于开源兼容夹具；应用请求使用 scope-bound facade。
+    """
+
+    def __init__(self, settings: Any, resources: DatabaseResources, *, scope_id: str | ScopeContext = "local"):
         self.settings = settings
         self.resources = resources
-        self.scope = ScopeContext(scope_id)
+        self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
         self.identity = identity_from_settings(settings)
 
     def match(self, *, task_id: str, top_k: int = 20, exclude_self: bool = True) -> dict[str, object]:
@@ -510,7 +514,7 @@ class VisualSearchService:
             task = environment.tasks.get(task_id)
             if task is None or task.task_type != "meme_context_generation":
                 raise VisualSearchError("invalid_task", "任务不存在或不是语境生成任务", status_code=404)
-            if task.status != "running":
+            if task.status != "running" or (task.claim_generation > 0 and (not task.lease_owner or task.lease_expires_at is None or task.lease_expires_at <= utcnow())):
                 raise VisualSearchError("task_not_running", "当前任务不可执行视觉匹配", status_code=409)
             payload = dict(task.payload or {})
             meme_id = payload.get("meme_id")
@@ -527,6 +531,9 @@ class VisualSearchService:
             query_meme = environment.memes.get(meme_id)
             if query_meme is None:
                 raise VisualSearchError("invalid_task", "查询图片不存在", status_code=404)
+            target_sha = payload.get("image_sha256")
+            if not isinstance(target_sha, str) or target_sha != query_meme.sha256:
+                raise VisualSearchError("target_changed", "查询图片内容已变化", status_code=409)
             query_embedding = environment.visual.get(meme_id, model=self.identity.model, preprocess_version=self.identity.preprocess_version, dimensions=self.identity.dimensions)
             if query_embedding is None or query_embedding.image_sha256 != query_meme.sha256:
                 raise VisualSearchError("query_embedding_not_ready", "查询图片视觉向量尚未就绪", status_code=409)

@@ -1,6 +1,6 @@
 # SerpApi Google Lens 图片检索
 
-仅当任务 payload 的 `reverse_image_policy` 为 `auto` 时，使用本说明。Agent 只能调用项目薄 CLI；后端从服务端配置读取供应商密钥，运行时向 Agent 提供 `MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL` 和当前 `MEMEMEOW_AGENT_TASK_ID`。不要读取 `.env`，不要设置或检查 `SERPAPI_API_KEY`。需要准备命令行工具时，读取 [本地工具清单](local-tooling.md)。
+仅当任务 payload 的 `reverse_image_policy` 为 `auto` 时，使用本说明。Agent 只能调用项目薄 CLI；后端从服务端配置读取供应商密钥，Runner 运行时向 Agent 提供 `MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL`、当前 `MEMEMEOW_AGENT_TASK_ID` 和绑定当前 claim 的 `MEMEMEOW_AGENT_CALLBACK_TOKEN`。不要读取 `.env`，不要设置或检查 `SERPAPI_API_KEY`。需要准备命令行工具时，读取 [本地工具清单](local-tooling.md)。
 
 SerpApi 返回的是 Google Lens 的候选网页和图片，不是对表情包含义或出处的结论。它最有价值的作用是为未知角色、模板或普通配文补齐文字检索锚点：先观察图片，再用候选的标题、链接和图片进行核验，最后才将确认过的名称和短语交给文字搜索。
 
@@ -26,7 +26,7 @@ python skills/research-meme-context/scripts/serpapi_google_lens.py \
 `--refresh` 强制请求。成功结果默认长期复用；空结果只复用 3 天；网络或供应商错误
 不会写入可复用快照。重复请求的计数由后端 `request_id` 幂等记录保证。
 
-脚本只调用内部 multipart 接口并输出统一 JSON；缓存、供应商访问、脱敏和 usage event 由后端负责。输出结果不包含 `image_id`、SerpApi 归档地址和其他内部标识，但会保留候选网页及图片的公开链接供 Agent 核验。
+脚本只调用携带当前任务 callback 凭据的内部 multipart 接口并输出统一 JSON；缓存、供应商访问、脱敏和 usage event 由后端负责。输出结果不包含 `image_id`、SerpApi 归档地址和其他内部标识，但会保留候选网页及图片的公开链接供 Agent 核验。
 
 ### 手动调试：公开 URL
 

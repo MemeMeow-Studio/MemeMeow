@@ -51,4 +51,14 @@ describe('请求封装', () => {
       headers: { 'Content-Type': 'application/json' },
     })
   })
+
+  it('独立图片阶段请求只发送业务目标和阶段策略', async () => {
+    await api.submitImageStage({ meme_id: 'meme-1', stage: 'agent', reverse_image_policy: 'forbid' })
+
+    expect(fetch).toHaveBeenCalledWith('/api/images/stages', {
+      method: 'POST',
+      body: JSON.stringify({ meme_id: 'meme-1', stage: 'agent', reverse_image_policy: 'forbid' }),
+      headers: { 'Content-Type': 'application/json' },
+    })
+  })
 })

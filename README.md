@@ -71,6 +71,10 @@ Mememeow 是一个基于自然语言的表情包检索工具。它能让你通�
 - 如启用本地视觉近邻，还需从 Meta 官方公开地址取得 DINOv2 ViT-B/14 `.pth` checkpoint，并提供固定源码提交和只读权重挂载；权重不内嵌公开镜像，缺失时视觉任务以 `visual_model_not_configured` 失败。
 - 嵌入模型 API Key；语境任务的 VLM Base URL/API Key 只通过 Compose 环境显式注入 API 与 Agent executor
 
+应用 scope、适配宿主 resolver、non-local Agent 输入、双 scope staging 和回滚约束见
+[`docs/application-scope.md`](docs/application-scope.md)；单机开源入口仍固定使用显式
+`LocalScopeResolver("local")`。
+
 ### 安装步骤
 
 1. 克隆仓库
@@ -131,7 +135,7 @@ API 只绑定 `127.0.0.1:8275`；Agent executor `8277` 和视觉服务 `8276` �
 
 然后访问 `http://127.0.0.1:8080`。登录时选择 `PostgreSQL`，服务器填写 `postgres`（容器内默认端口 5432），数据库、用户名和密码使用 `.env` 中的 `POSTGRES_*` 配置（默认均为 `mememeow`）。查看器只绑定 `127.0.0.1`，停止服务使用 `./db-viewer.sh stop`。可通过 `MEMEMEOW_DB_VIEWER_PORT=8081 ./db-viewer.sh start` 修改宿主端口。
 
-镜像位于 `docker/agent/Dockerfile`，预装 OpenCode、Node、Python、Bash、curl、jq、file、ImageMagick、ffmpeg、Tesseract 中英文 OCR 和常见文本工具。容器使用 UID 1003 的非 root 用户，入口是固定的 `executor.server` HTTP 服务；只读挂载 `data/images` 和 `skills/research-meme-context`，读写挂载 named volume `mememeow-agent-runtime-data:/runtime`，并在独立的 `mememeow-agent-executor-secret` named volume 中以 0600 权限持久化首次生成的随机 executor token。API 以只读方式读取同一文件，不会把 token 写入 checkout、`.env`、日志、结果文件或 OpenCode 子进程环境。容器不会挂载项目根目录、数据库凭据、用户目录或 Docker socket。后端只向 `http://mememeow-agent-runtime:8277` 发送带 token 的结构化任务；每个任务仍使用独立 OpenCode session 和 `task-results/<task_id>/` 结果目录。反向图片能力由后端内部接口统一代理，Agent 不持有 `SERPAPI_API_KEY`。
+镜像位于 `docker/agent/Dockerfile`，预装 OpenCode、Node、Python、Bash、curl、jq、file、ImageMagick、ffmpeg、Tesseract 中英文 OCR 和常见文本工具。容器使用 UID 1003 的非 root 用户，入口是固定的 `executor.server` HTTP 服务；只读挂载 `data/images` 和 `skills/research-meme-context`，读写挂载 named volume `mememeow-agent-runtime-data:/runtime`，并在独立的 `mememeow-agent-executor-secret` named volume 中以 0600 权限持久化首次生成的随机 executor token。API 以只读方式读取同一文件，不会把 token 写入 checkout、`.env`、日志、结果文件或 OpenCode 子进程环境。容器不会挂载项目根目录、数据库凭据、用户目录或 Docker socket。后端只向 `http://mememeow-agent-runtime:8277` 发送带 token 的结构化任务；每个任务仍使用独立 OpenCode session 和 `task-results/<task_id>/` 结果目录。反向图片能力由后端内部接口统一代理，Agent 不持有 `SERPAPI_API_KEY`。callback 根 secret、密钥轮换和禁用式回滚按 [`docs/agent-callback-migration.md`](docs/agent-callback-migration.md) 执行。
 
 `./scripts/agent-runtime.sh build|start|check|stop|restart|logs` 仍可单独运维 executor；`check` 同时验证 executor 健康接口、非 root、网络、OCR、JSON、挂载权限和 Docker socket 边界。应用服务依赖 executor 健康后才启动；全新 checkout 或干净宿主 shell 无需导出 token，executor 会在首次启动时原子生成并复用该 named volume 中的随机凭据。不要删除该 secret volume；若确需轮换，先停止 API 和 executor，再删除 volume 并重新启动 Compose。
 
@@ -182,16 +186,18 @@ sha256sum data/models/dinov2_vitb14_pretrain.pth
 2. 选择图片文件，图片会直接进入图片库
 3. 可选：启用“处理完成后按标题自动命名”；图片上传立即返回，Agent 完成并成功写入数据库语境后才会异步重命名图片
 
-> [!CAUTION]
-> 每次上传后需要重新生成缓存。
+> [!NOTE]
+> 上传成功后会自动创建或复用逐图处理任务，按“视觉向量 → Agent 语境 → 文本 embedding”
+> 异步推进；通常不需要每次上传后手动重建缓存。只有切换 embedding 模型、迁移存量图片或
+> 进行显式全量维护时，才需要按处理任务中的提示执行回填或 v4 缓存生成。
 
-图片库中的“选择图片”可勾选指定的 `pending` 或 `repair_required` 图片并点击“重试选中”；“重试所有未就绪”会批量提交所有尚未完成语境处理的图片。每行同时显示元数据处理状态、文本 embedding 索引状态和图片视觉向量状态，顶栏显示全局文本 embedding 缓存状态。
+图片库中的“选择图片”可勾选指定的 `pending` 或 `repair_required` 图片并点击“重试选中”；“重试所有未就绪”会批量提交所有尚未完成处理的图片。每行同时显示元数据处理状态、文本 embedding 索引状态和图片视觉向量状态，顶栏显示当前文本 embedding 来源状态。
 
 #### 处理任务
 
-1. 打开“处理任务”查看上传后的语境生成、缓存生成和 metadata repair
+1. 打开“处理任务”查看上传后的逐图处理、显式缓存生成和 metadata repair
 2. 使用状态和类型筛选定位任务
-3. 失败的语境任务可在详情侧栏重试；完成语境后按需重新生成 v4 缓存
+3. 失败的阶段可在详情侧栏按规则重试；模型切换或迁移维护时再按需重新生成 v4 缓存
 
 #### 检查 OpenCode 会话
 
@@ -210,6 +216,9 @@ sha256sum data/models/dinov2_vitb14_pretrain.pth
 删除持久数据。named volume、图片和 PostgreSQL 数据不会被删除；从旧 `data/opencode`
 迁移到 `mememeow-agent-runtime-data` 前先停止 executor 并保留备份。任务结果文件按保留策略保存，便于排查
 `agent_result_file_missing`、`agent_result_file_invalid_json`、`agent_result_file_schema_invalid` 等错误。
+
+callback 强制认证、Runner 的任务级凭据、反向图片调用边界、密钥轮换、旧任务收束和禁用式
+回滚见 [`docs/agent-callback-migration.md`](docs/agent-callback-migration.md)。
 
 
 
@@ -241,7 +250,7 @@ sha256sum data/models/dinov2_vitb14_pretrain.pth
 {"results":["/media/2f3a2a6d-93f6-4cd0-a4c8-1578c5b929b2"]}
 ```
 
-缓存生成、metadata repair 和语境生成都是长任务，接口立即返回 `202` 和 `task_id`，使用 `GET /tasks` 或 `GET /tasks/{task_id}` 查询。图片、语境、向量和任务均由 PostgreSQL 保存；图片字节继续位于 `MEMEMEOW_IMAGE_ROOT`。业务资源使用稳定 `meme_id`，媒体 URL 统一为 `/media/{meme_id}`。本项目不提供登录、账户或多用户界面。
+缓存生成、metadata repair 和逐图处理都是长任务，接口立即返回 `202` 和 `task_id`；逐图处理入口同时返回 `processing_job_id`，使用 `GET /tasks`、`GET /tasks/{task_id}` 或 `GET /images/processing/{job_id}` 查询。图片处理固定按视觉、Agent、文本 embedding 阶段推进，三类图片 Task 由专用 Worker 独占；外部执行结果无法确认时显示 `unknown_execution`，不会自动重放。存量图片迁移和搜索来源切换见 [`docs/image-processing-migration.md`](docs/image-processing-migration.md)。图片、语境、向量和任务均由 PostgreSQL 保存；图片字节继续位于 `MEMEMEOW_IMAGE_ROOT`。业务资源使用稳定 `meme_id`，媒体 URL 统一为 `/media/{meme_id}`。本项目不提供登录、账户或多用户界面。
 
 
 <a id="-related-applications"></a>

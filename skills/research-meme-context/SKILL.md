@@ -10,11 +10,11 @@ description: Research evidence-backed structured representations of image memes,
 
 将本流程用于表情包、反应图、截图、带配文图片，以及含义或传播状态可能随时间变化的视觉引用。当只需要纯粹的图片描述，且不关心出处和社群语义时，不要使用本流程。
 
-首次进行视觉观察前，读取 [references/observation-prompt.md](references/observation-prompt.md)。返回最终表示前，读取 [references/output-schema.json](references/output-schema.json)。当任务 payload 允许使用项目反向图片能力时，读取 [references/serpapi-google-lens.md](references/serpapi-google-lens.md)。供应商访问、缓存和计数由后端完成，Agent 只能调用薄 CLI。
+首次进行视觉观察前，读取 [references/observation-prompt.md](references/observation-prompt.md)。返回最终表示前，读取 [references/output-schema.json](references/output-schema.json)。当任务 payload 允许使用项目反向图片能力时，读取 [references/serpapi-google-lens.md](references/serpapi-google-lens.md)。供应商访问、缓存和计数由后端完成，Agent 只能调用带当前任务 callback 凭据的薄 CLI。
 
 当需要利用当前图片库中已经研究完成的相似 Meme 时，读取本地视觉匹配 JSON：
 `python3 /skills/research-meme-context/scripts/local_visual_match.py --top-k 10`。该脚本只使用
-Runner 注入的 `MEMEMEOW_AGENT_TASK_ID` 和内部 URL，不接受 scope、任意图片 ID、数据库连接或
+Runner 注入的 `MEMEMEOW_AGENT_TASK_ID`、当前任务 callback 凭据和内部 URL，不接受 scope、任意图片 ID、数据库连接或
 模型参数。先阅读返回的 `context`、图片 ID 和分数，再按需打开少量 `/images/...` 图片核验。
 
 ## 工作流
@@ -53,7 +53,7 @@ Runner 注入的 `MEMEMEOW_AGENT_TASK_ID` 和内部 URL，不接受 scope、任�
 
 ## 图片搜索工具
 
-SerpApi Google Lens 是可选的反向图片检索工具，不是本 Skill 的唯一信息源。只有任务 payload 的 `reverse_image_policy` 为 `auto` 时，才可使用项目提供的 `serpapi_google_lens.py` 薄客户端；客户端通过 `MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL` 和 `MEMEMEOW_AGENT_TASK_ID` 调用内部 multipart 接口。Agent 不读取、不传递也不应拥有 `SERPAPI_API_KEY`。调用、本地上传限制、结果字段和重试边界见 [references/serpapi-google-lens.md](references/serpapi-google-lens.md)。
+SerpApi Google Lens 是可选的反向图片检索工具，不是本 Skill 的唯一信息源。只有任务 payload 的 `reverse_image_policy` 为 `auto` 时，才可使用项目提供的 `serpapi_google_lens.py` 薄客户端；客户端通过 Runner 注入的 `MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL`、`MEMEMEOW_AGENT_TASK_ID` 和 `MEMEMEOW_AGENT_CALLBACK_TOKEN` 调用内部 multipart 接口。Agent 不读取、不传递也不应拥有 `SERPAPI_API_KEY`。调用、本地上传限制、结果字段和重试边界见 [references/serpapi-google-lens.md](references/serpapi-google-lens.md)。
 
 ## 判断规则
 

@@ -14,11 +14,17 @@ const props = defineProps<{
 const emit = defineEmits<{
   close: []
   retry: []
+  'retry-stage': []
+  'retry-full': []
 }>()
 
 const drawer = shallowRef<HTMLElement | null>(null)
 const closeButton = shallowRef<HTMLElement | null>(null)
 const activity = computed(() => taskActivity(props.task))
+const isImageStage = computed(() => ['visual_embedding_generation', 'meme_context_generation', 'text_embedding_generation'].includes(props.task.task_type))
+const canRetryStage = computed(() => isImageStage.value && props.task.status === 'failed' && !props.task.read_only && props.task.submission_mode === 'standalone')
+const canRetryFull = computed(() => props.task.submission_mode === 'pipeline' && !!props.task.processing_job_id && props.task.status === 'failed')
+const canRetryLegacy = computed(() => props.task.task_type === 'meme_context_generation' && props.task.status === 'failed' && props.task.submission_mode == null && !props.task.read_only)
 
 useModalDialog({
   dialog: drawer,
@@ -56,7 +62,25 @@ useModalDialog({
         </div>
       </dl>
       <button
-        v-if="task.task_type === 'meme_context_generation' && task.status === 'failed'"
+        v-if="canRetryFull"
+        class="primary"
+        type="button"
+        :disabled="retrying"
+        @click="emit('retry-full')"
+      >
+        {{ retrying ? '重试中...' : '完整重试' }}
+      </button>
+      <button
+        v-if="canRetryStage"
+        class="quiet"
+        type="button"
+        :disabled="retrying"
+        @click="emit('retry-stage')"
+      >
+        {{ retrying ? '提交中...' : '仅重试本阶段' }}
+      </button>
+      <button
+        v-if="canRetryLegacy"
         class="primary"
         type="button"
         :disabled="retrying"

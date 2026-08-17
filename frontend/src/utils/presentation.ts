@@ -58,7 +58,24 @@ export function taskTypeLabel(type?: string): string {
     cache_generation: '检索缓存',
     metadata_repair: '元数据修复',
     visual_embedding_generation: '图片向量生成',
+    text_embedding_generation: '文本 embedding',
+    image_processing: '完整图片处理',
   }[type || ''] || type || '未知任务'
+}
+
+/** 将持久化图片来源转换为稳定展示标签。 */
+export function submissionModeLabel(mode?: string | null): string {
+  return { pipeline: '完整 Job', standalone: '独立阶段', unclassified: '未归类历史' }[mode || 'unclassified'] || '未归类历史'
+}
+
+/** 将图片阶段转换为工作台标签。 */
+export function imageStageLabel(stage?: string | null): string {
+  return { visual: '视觉向量', agent: 'Agent 语境', text_embedding: '文本 embedding' }[stage || ''] || '图片阶段'
+}
+
+/** 将图片处理 Job 阶段状态转换为短标签。 */
+export function imageStageStatusLabel(status?: string): string {
+  return taskStatusLabel(status)
 }
 
 /** 将任务时间压缩为桌面和移动端都能容纳的本地格式。 */
@@ -81,6 +98,7 @@ export function taskRowAriaLabel(item: TaskItem): string {
   return [
     taskStatusLabel(item.status),
     taskTypeLabel(item.task_type),
+    submissionModeLabel(item.historical_unclassified ? 'unclassified' : item.submission_mode),
     item.image?.filename || '无关联图片',
     taskActivity(item)?.ariaLabel,
   ].filter(Boolean).join('，')

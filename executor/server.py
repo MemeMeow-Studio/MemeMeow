@@ -39,7 +39,7 @@ LOG_ROOT = RUNTIME_ROOT / "logs"
 SKILL_ROOT = Path(os.getenv("MEMEMEOW_EXECUTOR_SKILL_ROOT", "/skills/research-meme-context"))
 DEFAULT_MAX_RESULT_BYTES = 1024 * 1024
 ALLOWED_REQUEST_FIELDS = frozenset(
-    {"task_id", "image_relative_path", "reverse_image_policy", "timeout_seconds", "wait"}
+    {"task_id", "image_relative_path", "reverse_image_policy", "timeout_seconds", "wait", "callback_token"}
 )
 REQUIRED_RESULT_FIELDS = frozenset(
     {"title", "summary", "subjects", "visible_text", "references", "meaning", "keywords", "search_queries", "uncertainties"}
@@ -121,6 +121,7 @@ class TaskState:
     image_relative_path: str
     reverse_image_policy: str
     timeout_seconds: int
+    callback_token: str | None = field(default=None, repr=False)
     status: str = "queued"
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -223,7 +224,7 @@ class Executor:
         with self.lock:
             return sum(1 for task in self.tasks.values() if task.status == "queued")
 
-    def _validate_request(self, payload: object) -> tuple[str, str, str, int, bool]:
+    def _validate_request(self, payload: object) -> tuple[str, str, str, int, bool, str | None]:
         """校验固定任务字段并返回规范化参数。"""
         if not isinstance(payload, dict):
             raise ValueError("invalid_task")
@@ -262,11 +263,14 @@ class Executor:
         wait = payload.get("wait", True)
         if not isinstance(wait, bool):
             raise ValueError("invalid_task")
-        return task_id, relative.as_posix(), str(policy), timeout, wait
+        callback_token = payload.get("callback_token")
+        if callback_token is not None and (not isinstance(callback_token, str) or len(callback_token) > 4096):
+            raise ValueError("invalid_task")
+        return task_id, relative.as_posix(), str(policy), timeout, wait, callback_token
 
     def submit(self, payload: object) -> tuple[TaskState, bool]:
         """创建固定研究任务并交给受限线程池，返回状态和同步等待标记。"""
-        task_id, relative, policy, timeout, wait = self._validate_request(payload)
+        task_id, relative, policy, timeout, wait, callback_token = self._validate_request(payload)
         with self.lock:
             if not self.health().get("ready"):
                 raise RuntimeError("agent_runtime_unavailable")
@@ -277,7 +281,7 @@ class Executor:
                 raise RuntimeError("task_exists")
             if self._queued_count() >= self.backpressure:
                 raise RuntimeError("agent_backpressure")
-            task = TaskState(task_id, relative, policy, timeout, result_path=f"task-results/{task_id}/{RESULT_FILE_NAME}")
+            task = TaskState(task_id, relative, policy, timeout, callback_token=callback_token, result_path=f"task-results/{task_id}/{RESULT_FILE_NAME}")
             self.tasks[task_id] = task
             self.futures[task_id] = self.pool.submit(self._run, task)
             return task, wait
@@ -295,6 +299,7 @@ class Executor:
             "MEMEMEOW_OPENCODE_API_KEY": self.api_key,
             "MEMEMEOW_OPENCODE_SLOT": "0",
             "MEMEMEOW_AGENT_TASK_ID": task.task_id,
+            **({"MEMEMEOW_AGENT_CALLBACK_TOKEN": task.callback_token} if task.callback_token else {}),
             "MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL": os.getenv("MEMEMEOW_AGENT_REVERSE_IMAGE_INTERNAL_URL", ""),
             "MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL": os.getenv("MEMEMEOW_AGENT_VISUAL_SEARCH_INTERNAL_URL", ""),
             "MEMEMEOW_DATA_ROOT": str(RUNTIME_ROOT),

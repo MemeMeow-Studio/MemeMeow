@@ -14,26 +14,26 @@
 
 ## 3. 内部接口与运行边界
 
-- [x] 3.1 新增无认证的 `POST /internal/reverse-image/search` multipart 接口，校验 `task_id`、图片格式/大小和检索参数，并映射 `reverse_image_forbidden`、无效任务、不可用和可重试供应商错误。
-- [x] 3.2 让接口只从服务端任务记录读取 scope 与 `reverse_image_policy`，拒绝不存在、非语境生成或非运行中的任务，并忽略调用方任何自报策略。
+- [x] 3.1 将 `POST /internal/reverse-image/search` 接入 `agent-internal-callbacks` 前置层，在读取 multipart 和查询 Task 前验证服务凭据，并校验图片格式/大小与检索参数及稳定错误映射。
+- [x] 3.2 让接口从当前 claim 执行绑定和服务端 Task 读取 scope、目标 SHA 与 `reverse_image_policy`，拒绝不存在、非语境生成、非运行、claim 为零、旧 claim 或租约过期的任务，并拒绝调用方自报策略、scope 和任意目标图片。
 - [x] 3.3 调整 Docker Compose 和运行时地址配置，使共享 Agent 容器能访问内部接口但不向 Agent 注入 `SERPAPI_API_KEY`，同时让后端继续独占读取供应商密钥。
-- [x] 3.4 增加内部接口集成测试，覆盖 `forbid`、`auto`、历史缺省、非运行任务、未知任务、缓存命中和未命中计数，并断言响应不泄露密钥或临时凭据。
+- [x] 3.4 增加内部接口集成测试，覆盖无/错凭据、认证前大 body 拒绝、`forbid`、`auto`、历史缺省、非运行任务、claim 为零、旧 claim、未知任务、目标图片替换、缓存命中和未命中计数，并断言响应不泄露任务存在性、密钥或临时凭据。
 
 ## 4. Agent Runner 与 Skill 薄客户端
 
-- [x] 4.1 修改 Runner，为 Agent 传递内部接口地址和当前 `task_id`，在 prompt 中明确本任务策略，并在 Host 与 Docker 两种模式都移除 SerpApi 密钥注入。
-- [x] 4.2 将 `serpapi_google_lens.py` 改为薄 CLI 客户端：保留现有图片和检索参数，调用内部 multipart 接口，输出统一 JSON，并以稳定消息报告接口错误。
+- [x] 4.1 修改 Runner，为 Agent 传递内部接口地址、当前 `task_id` 和只绑定当前 claim/attempt/operation/目标的 callback 凭据，在 prompt 中明确本任务策略，并确保 Host、Docker 和 executor 模式都不注入根 secret、executor token 或 SerpApi 密钥。
+- [x] 4.2 将 `serpapi_google_lens.py` 薄 CLI 客户端改为携带 callback 凭据，只提交目标整图或后端受控裁剪参数，输出统一 JSON，并以稳定消息报告接口错误。
 - [x] 4.3 更新 `research-meme-context` Skill 与参考文档，只允许 Agent 通过薄客户端使用项目反向图片能力，删除 Agent 可见的供应商直连命令和本地密钥加载说明。
-- [x] 4.4 更新 Agent 镜像、runtime probe 和 Runner/Skill 测试，验证脚本可访问接口、只读图片可上传、Agent 环境不含供应商密钥且 `forbid` prompt 不允许调用。
+- [x] 4.4 更新 Agent 镜像、runtime probe 和 Runner/Skill 测试，验证脚本携带当前任务级凭据访问接口、旧 claim 不可重放、Agent 环境不含根 secret/executor token/供应商密钥且 `forbid` prompt 不允许调用。
 
 ## 5. 任务策略与审计汇总
 
 - [x] 5.1 在上传、单图和批量请求模型中加入严格的 `reverse_image_policy=forbid|auto`，缺省为 `forbid`，并在提交 `auto` 时校验供应商可用状态。
-- [x] 5.2 将规范化策略写入每个语境任务 payload，并让历史缺失字段在 Worker 侧按 `forbid` 读取，不从环境或当前设置推断。
-- [x] 5.3 修改活动任务去重：同图同内容同策略复用；同图同内容不同策略返回 `generation_policy_conflict`；保持单图片活动任务互斥。
+- [x] 5.2 将规范化策略先冻结到图片处理 job revision，再由 `ImageProcessingWorker` 复制到每个语境 Task payload；让历史缺失字段按 `forbid` 读取，不允许客户端直接创建或覆盖叶子 Task payload，也不从环境或当前设置推断。
+- [x] 5.3 修改活动 job/Task 去重：scope、Meme、目标 SHA、Agent/处理配置指纹和策略全部相同才复用；策略或配置不同返回 `generation_policy_conflict`；保持单图片活动执行互斥。
 - [x] 5.4 在语境任务成功和失败终态按 usage events 汇总 `reverse_image` 摘要并写入 Task.result；成功写回语境时同步写入 Meme provenance，拒绝 Agent 自报值覆盖后端统计。
 - [x] 5.5 在脱敏配置状态中增加反向图片服务是否可用的布尔字段，并在任务详情响应中安全返回策略和审计摘要。
-- [x] 5.6 增加 API 与任务服务测试，覆盖上传、单图、批量、重试、默认禁止、无供应商的自动策略、策略冲突、缓存/供应商计数及 Agent 失败后的审计保留。
+- [x] 5.6 增加 API、图片处理 job 与任务服务测试，覆盖上传、单图、一键处理、`failed|blocked|unknown_execution` 重试、默认禁止、无供应商的自动策略、目标/配置/策略冲突、缓存/供应商计数及 Agent 失败后的审计保留。
 
 ## 6. 前端策略与可观察性
 
@@ -45,8 +45,8 @@
 
 ## 7. 回归、文档与验收
 
-- [x] 7.1 更新 API、部署和运行说明，记录两档语义、内部接口信任边界、实际调用计数口径、Agent 不持有供应商密钥及未来认证扩展点。
-- [x] 7.2 使用项目 Python 虚拟环境运行后端单元与集成测试，运行前端单元、构建和 E2E 测试，并修复所有相关回归。
+- [x] 7.1 更新 API、部署和运行说明，记录两档语义、强制 callback 服务认证与当前 claim 绑定、实际调用计数口径，以及 Agent 不持有根 secret、executor token 或供应商密钥。
+- [x] 7.2 在 `make-application-scope-aware` 与 `secure-agent-internal-callbacks` 实施后，使用项目 Python 虚拟环境运行后端单元与集成测试，运行前端单元、构建和 E2E 测试，并修复所有相关回归。
 - [ ] 7.3 在共享 Agent 容器执行端到端验收：分别验证 `forbid` 拒绝、`auto` 缓存命中、`auto` 未命中和供应商失败，核对 usage event、Task.result 与 Meme provenance 一致。（当前会话无权访问 Docker daemon，未执行）
 - [x] 7.4 检查 Agent 进程环境、日志、缓存、接口响应和任务结果，确认不存在 `SERPAPI_API_KEY`、`image_id` 或供应商私有归档 URL。
-- [x] 7.5 对策略绕过、跨 scope 引用、并发重复计数、任务终态竞态、历史 payload 和服务回滚进行多 Agent 对抗性审查，并处理确认的问题。
+- [x] 7.5 对凭据绕过、旧 claim、目标图片替换、策略绕过、跨 scope 引用、并发重复计数、任务终态竞态、历史 payload 和禁用式回滚进行多 Agent 对抗性审查，并处理确认的问题。

@@ -193,11 +193,16 @@ def main(arguments: list[str] | None = None) -> int:
         value = getattr(args, name)
         if value:
             fields[name] = value
-    # 端点只允许由 Runner 注入，避免 Agent 用命令行参数把图片改发到任意外部地址。
+    # 端点和短期 callback 凭据只允许由 Runner 注入，避免 Agent 用命令行参数
+    # 把图片改发到任意外部地址，或绕过当前 Task claim。
     endpoint = os.getenv("MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL", "http://127.0.0.1:8275/internal/reverse-image/search")
+    callback_token = os.getenv("MEMEMEOW_AGENT_CALLBACK_TOKEN")
+    if not callback_token:
+        print("缺少当前任务 callback 凭据，请从 Runner 注入", file=sys.stderr)
+        return 2
     body, content_type = _multipart(fields, content, image.name)
     try:
-        response = urlopen(Request(endpoint, data=body, headers={"Content-Type": content_type, "Accept": "application/json"}, method="POST"), timeout=60)
+        response = urlopen(Request(endpoint, data=body, headers={"Content-Type": content_type, "Accept": "application/json", "X-MemeMeow-Callback": callback_token}, method="POST"), timeout=60)
         payload = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         try:

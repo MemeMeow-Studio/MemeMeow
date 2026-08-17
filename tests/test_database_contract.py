@@ -7,19 +7,34 @@ from uuid import uuid4
 
 import pytest
 
-from backend.database import Base, EMBEDDING_DIMENSIONS, VISUAL_EMBEDDING_DIMENSIONS, BlobStore, DatabaseError, ScopeContext
+from backend.database import Base, EMBEDDING_DIMENSIONS, VISUAL_EMBEDDING_DIMENSIONS, BlobStore, DatabaseError, ScopeContext, SearchRepository
 from backend.paths import validate_business_storage_key
 from api import image_metadata
 
 
 def test_schema_contains_scope_and_queue_tables():
     """首版 schema 必须覆盖业务记录、generation 和持久任务队列。"""
-    expected = {"scopes", "installation_state", "memes", "storage_operations", "search_generations", "search_heads", "meme_embeddings", "meme_visual_embeddings", "tasks", "task_batches", "task_batch_items", "task_lane_slots", "meme_collections", "meme_collection_items", "reverse_image_usage_events"}
+    expected = {"scopes", "installation_state", "memes", "storage_operations", "search_generations", "search_heads", "meme_embeddings", "meme_visual_embeddings", "meme_text_embeddings", "search_migration_states", "image_processing_jobs", "image_processing_stages", "image_processing_attempts", "operation_grants", "agent_callback_requests", "tasks", "task_batches", "task_batch_items", "task_lane_slots", "meme_collections", "meme_collection_items", "reverse_image_usage_events"}
     assert expected <= set(Base.metadata.tables)
     assert EMBEDDING_DIMENSIONS == 1024
     assert Base.metadata.tables["meme_embeddings"].c.embedding.type.dim == 1024
     assert VISUAL_EMBEDDING_DIMENSIONS == 768
     assert Base.metadata.tables["meme_visual_embeddings"].c.embedding.type.dim == 768
+
+
+def test_search_query_dispatches_to_one_migration_source(monkeypatch):
+    """SearchRepository.query 必须遵循迁移来源选择，不能混读两套向量。"""
+    repository = object.__new__(SearchRepository)
+    vector = [1.0] * EMBEDDING_DIMENSIONS
+    monkeypatch.setattr(repository, "source_mode", lambda _model: "incremental")
+    monkeypatch.setattr(repository, "query_incremental", lambda _model, _vector, _limit: [(uuid4(), 1.0)])
+    monkeypatch.setattr(repository, "_query_legacy_validated", lambda *_args: pytest.fail("不应查询旧 generation"))
+    assert len(SearchRepository.query(repository, "model", vector)) == 1
+
+    monkeypatch.setattr(repository, "source_mode", lambda _model: "legacy")
+    monkeypatch.setattr(repository, "_query_legacy_validated", lambda _model, _vector, _limit: [(uuid4(), 0.5)])
+    monkeypatch.setattr(repository, "query_incremental", lambda *_args: pytest.fail("不应查询增量向量"))
+    assert len(SearchRepository.query(repository, "model", vector)) == 1
 
 
 def test_scope_context_rejects_empty_scope():

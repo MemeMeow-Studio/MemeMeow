@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import zipfile
 import os
 import threading
@@ -27,11 +28,19 @@ def _clear_test_scope() -> None:
         pytest.skip("未设置 MEMEMEOW_TEST_DATABASE_URL，拒绝清理开发数据库")
     engine = create_engine_for_url(url, pool_size=1, max_overflow=0)
     statements = (
+        "DELETE FROM agent_callback_requests",
+        "DELETE FROM reverse_image_usage_events",
+        "DELETE FROM operation_grants",
+        "DELETE FROM image_processing_attempts",
+        "DELETE FROM image_processing_stages",
+        "DELETE FROM image_processing_jobs",
+        "DELETE FROM search_migration_states",
         "DELETE FROM task_lane_slots",
         "DELETE FROM task_batch_items",
         "DELETE FROM task_batches",
         "DELETE FROM tasks",
         "DELETE FROM meme_visual_embeddings",
+        "DELETE FROM meme_text_embeddings",
         "DELETE FROM meme_embeddings",
         "DELETE FROM search_heads",
         "DELETE FROM search_generations",
@@ -56,12 +65,27 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("EMBEDDING_API_KEY", "")
     monkeypatch.setenv("EMBEDDING_BASE_URL", "")
     monkeypatch.setenv("MEMEMEOW_OPENCODE_MODEL", "")
+    monkeypatch.setenv("MEMEMEOW_AGENT_CALLBACK_SECRET", "test-agent-callback-secret-1234")
     _clear_test_scope()
     with TestClient(app) as test_client:
         uploaded = test_client.post("/images/upload", files=[("files", ("deleted.png", png_bytes(), "image/png"))]).json()["results"][0]
 
-        def fake_run(path, progress, *, task_id=None):
+        def fake_embed(content, *, filename="image"):
+            """模拟视觉服务，确保夹具直接进入 Agent 阶段而不触发真实模型。"""
+            del content, filename
+            settings = test_client.app.state.settings
+            return {
+                "model": settings.visual_model,
+                "dimensions": settings.visual_model_dimensions,
+                "preprocess_version": settings.visual_preprocess_version,
+                "embedding": [1.0] + [0.0] * (settings.visual_model_dimensions - 1),
+            }
+
+        monkeypatch.setattr(test_client.app.state.visual_inference, "embed", fake_embed)
+
+        def fake_run(path, progress, *, task_id=None, **kwargs):
             """模拟 Agent 完成前目标图片被删除。"""
+            del progress, kwargs
             assert task_id
             path.unlink()
             return {}, "deleted-session"
@@ -70,7 +94,8 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         response = test_client.post("/images/context", json={"meme_id": uploaded["meme_id"]})
         assert response.status_code == 202
         task_id = response.json()["task_id"]
-        for _ in range(100):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
             status = test_client.get(f"/tasks/{task_id}").json()
             if status["status"] in {"succeeded", "failed"}:
                 break
@@ -421,13 +446,14 @@ def test_cache_generation_returns_pollable_task(client):
     assert status["status"] == "succeeded"
 
 
-def test_parallel_context_batch_writes_independent_database_records_and_merges_cache(tmp_path, monkeypatch):
-    """并发度为 2 时两张图片使用独立任务，批次终态只提交一次缓存任务。"""
+def test_parallel_context_batch_writes_independent_database_records_and_incremental_vectors(tmp_path, monkeypatch):
+    """并发度为 2 时两张图片独立完成逐图文本向量，且不隐式创建全库缓存任务。"""
     monkeypatch.setenv("MEMEMEOW_DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("MEMEMEOW_IMAGE_ROOT", str(tmp_path / "images"))
     monkeypatch.setenv("EMBEDDING_API_KEY", "")
     monkeypatch.setenv("EMBEDDING_BASE_URL", "")
     monkeypatch.setenv("MEMEMEOW_OPENCODE_MODEL", "")
+    monkeypatch.setenv("MEMEMEOW_AGENT_CALLBACK_SECRET", "test-agent-callback-secret-1234")
     monkeypatch.setenv("MEMEMEOW_OPENCODE_CONCURRENCY", "2")
     _clear_test_scope()
     with TestClient(app) as test_client:
@@ -436,8 +462,29 @@ def test_parallel_context_batch_writes_independent_database_records_and_merges_c
         started = threading.Barrier(2)
         sessions: list[str] = []
 
-        def fake_run(image, progress, *, task_id=None):
+        def fake_embed(content, *, filename="image"):
+            """模拟视觉服务，使并发断言只覆盖任务调度和 Agent 写回。"""
+            del content, filename
+            settings = test_client.app.state.settings
+            return {
+                "model": settings.visual_model,
+                "dimensions": settings.visual_model_dimensions,
+                "preprocess_version": settings.visual_preprocess_version,
+                "embedding": [1.0] + [0.0] * (settings.visual_model_dimensions - 1),
+            }
+
+        monkeypatch.setattr(test_client.app.state.visual_inference, "embed", fake_embed)
+
+        def fake_text_embedding(text):
+            """模拟文本 embedding，使统一 job 可以完成最后阶段。"""
+            del text
+            return [1.0] + [0.0] * 1023
+
+        monkeypatch.setattr(test_client.app.state.search_engine, "_embedding", fake_text_embedding)
+
+        def fake_run(image, progress, *, task_id=None, **kwargs):
             """模拟两个独立 Agent session，并在 barrier 处确认真正并行。"""
+            del progress, kwargs
             assert task_id
             sessions.append(image.name)
             started.wait(timeout=2)
@@ -459,12 +506,13 @@ def test_parallel_context_batch_writes_independent_database_records_and_merges_c
         assert submitted.status_code == 200
         task_ids = [item["task_id"] for item in submitted.json()["results"]]
         assert len(task_ids) == 2
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + 5
         while len(sessions) < 2 and time.monotonic() < deadline:
             time.sleep(0.01)
         assert set(sessions) == {"parallel-a.png", "parallel-b.png"}
         for task_id in task_ids:
-            for _ in range(100):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
                 record = test_client.get(f"/tasks/{task_id}").json()
                 if record["status"] in {"succeeded", "failed"}:
                     break
@@ -472,12 +520,120 @@ def test_parallel_context_batch_writes_independent_database_records_and_merges_c
         assert record["status"] == "succeeded"
         assert test_client.get(f"/images/metadata?meme_id={first['meme_id']}").json()["context_status"] == "ready"
         assert test_client.get(f"/images/metadata?meme_id={second['meme_id']}").json()["context_status"] == "ready"
-        for _ in range(100):
-            cache_items = test_client.get("/tasks", params={"task_type": "cache_generation"}).json()["items"]
-            if cache_items:
+        text_items = test_client.get("/tasks", params={"task_type": "text_embedding_generation"}).json()["items"]
+        assert len(text_items) == 2
+        assert all(item["status"] == "succeeded" for item in text_items)
+        cache_items = test_client.get("/tasks", params={"task_type": "cache_generation"}).json()["items"]
+        assert cache_items == []
+    _clear_test_scope()
+
+
+def test_pending_agent_ready_sidecar_and_v4_embedding_pipeline_is_backend_owned(tmp_path, monkeypatch):
+    """测试图片从 pending 经 Agent 到 ready/v4 索引，canonical 写回始终由后端掌控。"""
+    monkeypatch.setenv("MEMEMEOW_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("MEMEMEOW_IMAGE_ROOT", str(tmp_path / "images"))
+    monkeypatch.setenv("EMBEDDING_API_KEY", "")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "")
+    monkeypatch.setenv("MEMEMEOW_OPENCODE_MODEL", "mememeow/gpt-5.6-luna")
+    monkeypatch.setenv("MEMEMEOW_AGENT_CALLBACK_SECRET", "test-agent-callback-secret-1234")
+    monkeypatch.setenv("MEMEMEOW_OPENCODE_CONCURRENCY", "1")
+    _clear_test_scope()
+    application_file = Path(__file__).resolve().parent.parent / "api.py"
+    application_before = application_file.read_bytes()
+    with TestClient(app) as test_client:
+        def fake_visual_embed(content, *, filename="image"):
+            """模拟视觉服务，使测试只验证逐图任务衔接。"""
+            del content, filename
+            settings = test_client.app.state.settings
+            return {
+                "model": settings.visual_model,
+                "dimensions": settings.visual_model_dimensions,
+                "preprocess_version": settings.visual_preprocess_version,
+                "embedding": [1.0] + [0.0] * (settings.visual_model_dimensions - 1),
+            }
+
+        def fake_text_embedding(text):
+            """模拟 v4/逐图文本 embedding 服务并保留固定维度。"""
+            assert text
+            return [1.0] + [0.0] * 1023
+
+        def fake_agent_run(image, progress, *, task_id=None, callback_token=None, **kwargs):
+            """模拟 Agent 只交付任务 artifact，拒绝把伪造字段写入 canonical 数据。"""
+            del progress, kwargs
+            assert task_id and callback_token
+            assert callback_token != "test-agent-callback-secret-1234"
+            runner = test_client.app.state.opencode
+            draft_path, result_path = runner.create_task_result_paths(task_id)
+            candidate = {
+                "title": image.stem.replace("-", " "),
+                "summary": "后端拥有 canonical 写回",
+                "subjects": ["测试图片"],
+                "visible_text": [],
+                "references": [],
+                "meaning": None,
+                "keywords": ["测试"],
+                "search_queries": [],
+                "uncertainties": [],
+                "source_urls": [],
+                "canonical_sidecar": "agent cannot set this",
+                "application_code": "agent cannot set this",
+            }
+            # 运行器只接受任务专属结果文件；canonical sidecar 和应用代码不在
+            # Agent artifact 路径中，最终写回由 context_handler 的白名单完成。
+            draft_path.write_text(json.dumps(candidate, ensure_ascii=False), encoding="utf-8")
+            draft_path.replace(result_path)
+            return runner.read_result_file(result_path), f"session-{image.stem}"
+
+        monkeypatch.setattr(test_client.app.state.visual_inference, "embed", fake_visual_embed)
+        monkeypatch.setattr(test_client.app.state.search_engine, "_embedding", fake_text_embedding)
+        monkeypatch.setattr(test_client.app.state.opencode, "run", fake_agent_run)
+
+        uploaded = test_client.post(
+            "/images/upload",
+            files=[("files", ("pending-agent.png", png_bytes("purple"), "image/png"))],
+        )
+        assert uploaded.status_code == 200
+        result = uploaded.json()["results"][0]
+        meme_id = result["meme_id"]
+        assert result["metadata_status"] == "pending"
+        assert application_file.read_bytes() == application_before
+
+        processing_id = result["processing_job_id"]
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            processing = test_client.get(f"/images/processing/{processing_id}").json()
+            if processing["status"] in {"succeeded", "failed", "blocked", "unknown_execution"}:
                 break
-            time.sleep(0.01)
-        assert len(cache_items) == 1
+            time.sleep(0.02)
+        assert processing["status"] == "succeeded"
+        assert [stage["stage"] for stage in processing["stages"]] == ["visual", "agent", "text_embedding"]
+        assert all(stage["status"] == "succeeded" for stage in processing["stages"])
+
+        metadata = test_client.get("/images/metadata", params={"meme_id": meme_id})
+        assert metadata.status_code == 200
+        metadata_payload = metadata.json()
+        assert metadata_payload["context_status"] == "ready"
+        assert metadata_payload["meme_context"]["title"] == "pending agent"
+        assert "canonical_sidecar" not in metadata_payload["meme_context"]
+        assert "application_code" not in metadata_payload["meme_context"]
+        assert application_file.read_bytes() == application_before
+
+        text_tasks = test_client.get("/tasks", params={"task_type": "text_embedding_generation"}).json()["items"]
+        assert len(text_tasks) == 1
+        assert text_tasks[0]["status"] == "succeeded"
+        cache_submission = test_client.post("/generate-cache")
+        assert cache_submission.status_code == 202
+        cache_task_id = cache_submission.json()["task_id"]
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            cache_task = test_client.get(f"/tasks/{cache_task_id}").json()
+            if cache_task["status"] in {"succeeded", "failed"}:
+                break
+            time.sleep(0.02)
+        assert cache_task["status"] == "succeeded"
+        assert cache_task["result"]["indexed_count"] == 1
+        assert cache_task["result"]["model"] == test_client.app.state.settings.embedding_model
+        assert application_file.read_bytes() == application_before
     _clear_test_scope()
 
 
@@ -488,12 +644,27 @@ def test_context_target_deleted_during_agent_is_reported_as_target_changed(tmp_p
     monkeypatch.setenv("EMBEDDING_API_KEY", "")
     monkeypatch.setenv("EMBEDDING_BASE_URL", "")
     monkeypatch.setenv("MEMEMEOW_OPENCODE_MODEL", "")
+    monkeypatch.setenv("MEMEMEOW_AGENT_CALLBACK_SECRET", "test-agent-callback-secret-1234")
     _clear_test_scope()
     with TestClient(app) as test_client:
         uploaded = test_client.post("/images/upload", files=[("files", ("deleted.png", png_bytes(), "image/png"))]).json()["results"][0]
 
-        def fake_run(path, progress, *, task_id=None):
+        def fake_embed(content, *, filename="image"):
+            """模拟视觉服务，避免目标变化测试访问真实视觉模型。"""
+            del content, filename
+            settings = test_client.app.state.settings
+            return {
+                "model": settings.visual_model,
+                "dimensions": settings.visual_model_dimensions,
+                "preprocess_version": settings.visual_preprocess_version,
+                "embedding": [1.0] + [0.0] * (settings.visual_model_dimensions - 1),
+            }
+
+        monkeypatch.setattr(test_client.app.state.visual_inference, "embed", fake_embed)
+
+        def fake_run(path, progress, *, task_id=None, **kwargs):
             """模拟 Agent 完成前目标图片被删除。"""
+            del progress, kwargs
             assert task_id
             path.unlink()
             return {}, "deleted-session"
@@ -502,7 +673,8 @@ def test_context_target_deleted_during_agent_is_reported_as_target_changed(tmp_p
         response = test_client.post("/images/context", json={"meme_id": uploaded["meme_id"]})
         assert response.status_code == 202
         task_id = response.json()["task_id"]
-        for _ in range(100):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
             status = test_client.get(f"/tasks/{task_id}").json()
             if status["status"] in {"succeeded", "failed"}:
                 break

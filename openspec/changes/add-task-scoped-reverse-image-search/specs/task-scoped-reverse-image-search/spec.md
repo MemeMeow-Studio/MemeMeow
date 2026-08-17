@@ -5,18 +5,18 @@
 ## ADDED Requirements
 
 ### Requirement: 反向图片检索策略必须由任务输入决定
-系统 MUST 只接受 `forbid` 和 `auto` 两种 `reverse_image_policy`。策略 MUST 由创建本次语境任务的客户端请求提供并持久化到任务输入；客户端未提供或历史任务缺少该字段时 MUST 使用 `forbid`。`auto` 表示允许 Agent 根据证据缺口按需调用，不表示每个任务都必须调用。
+系统 MUST 只接受 `forbid` 和 `auto` 两种 `reverse_image_policy`。客户端处理请求只提供受校验的业务选项；系统 MUST 将规范化策略冻结到图片处理 job revision，并由 `ImageProcessingWorker` 复制到其创建的 `meme_context_generation` Task 输入，客户端不得直接创建或覆盖叶子 Task payload。客户端未提供或历史 job/Task 缺少该字段时 MUST 使用 `forbid`。`auto` 表示允许 Agent 根据证据缺口按需调用，不表示每个任务都必须调用。
 
 #### Scenario: 创建禁止检索的任务
-- **WHEN** 客户端以 `reverse_image_policy=forbid` 创建语境任务
-- **THEN** 系统将 `forbid` 持久化到该任务，且该任务的反向图片检索请求被拒绝
+- **WHEN** 客户端以 `reverse_image_policy=forbid` 请求图片处理
+- **THEN** 系统将 `forbid` 冻结到 job revision 和必要的 Agent Task，且该 Task 的反向图片检索请求被拒绝
 
 #### Scenario: 创建自动决定的任务
-- **WHEN** 客户端以 `reverse_image_policy=auto` 创建语境任务
-- **THEN** 系统将 `auto` 持久化到该任务，并允许 Agent 在需要时请求反向图片检索
+- **WHEN** 客户端以 `reverse_image_policy=auto` 请求图片处理
+- **THEN** 系统将 `auto` 冻结到 job revision 和必要的 Agent Task，并允许 Agent 在需要时请求反向图片检索
 
 #### Scenario: 请求未提供策略
-- **WHEN** 新请求或待恢复的历史任务不包含 `reverse_image_policy`
+- **WHEN** 新请求或待恢复的历史 job/Task 不包含 `reverse_image_policy`
 - **THEN** 系统按 `forbid` 执行，不从进程环境或当前全局设置推断任务策略
 
 #### Scenario: 请求提供未知策略
@@ -24,30 +24,37 @@
 - **THEN** 系统返回可诊断的请求校验错误，且不创建任务
 
 ### Requirement: Agent 必须通过统一内部接口请求反向图片检索
-系统 MUST 提供供应商无关的内部反向图片检索接口和保持相同输入输出语义的 CLI 客户端。接口 MUST 根据 `task_id` 读取服务端任务记录中的策略，不得接受调用方自行声明或覆盖策略。当前版本 MUST 不要求用户身份、任务 token 或其他认证凭据，但 MUST 拒绝不存在、非语境生成或不处于运行状态的任务。
+系统 MUST 提供供应商无关的内部反向图片检索接口和保持相同输入输出语义的 CLI 客户端。接口 MUST 先验证 Agent callback 服务凭据和当前 Task 执行绑定，再根据受验证的 `task_id` 读取服务端任务记录中的策略；不得接受调用方自行声明或覆盖 scope、策略、claim、目标 Meme 或目标 SHA。系统 MUST 只接受存在、类型为 `meme_context_generation`、处于 `running`、持有非零当前 claim 和未过期租约的 Task。检索图片 MUST 等于该 Task 的目标 SHA，或由后端从该目标生成并绑定到当前执行的受控派生图；调用方不得借用一个任务检索任意图片。
 
 #### Scenario: 自动任务请求检索
-- **WHEN** CLI 客户端为处于运行状态且策略为 `auto` 的语境任务提交合法图片和检索参数
+- **WHEN** 已认证 CLI 客户端为处于运行状态、当前 claim 有效且策略为 `auto` 的语境任务提交绑定目标的合法图片和检索参数
 - **THEN** 内部接口执行缓存感知的反向图片检索并返回统一 JSON
 
 #### Scenario: 禁止任务请求检索
-- **WHEN** CLI 客户端为策略为 `forbid` 的任务请求反向图片检索
+- **WHEN** 已认证 CLI 客户端为策略为 `forbid` 的当前语境任务请求反向图片检索
 - **THEN** 内部接口返回 `reverse_image_forbidden`，且不读取缓存、不联系供应商、不增加调用次数
 
 #### Scenario: 无效任务请求检索
-- **WHEN** 调用方提供不存在、非语境生成或不处于运行状态的 `task_id`
-- **THEN** 内部接口返回稳定错误，不执行供应商调用
+- **WHEN** 调用方使用不存在、非语境生成、非运行、claim 为零、旧 claim 或租约过期的 Task 执行绑定
+- **THEN** 内部接口返回不泄露具体原因的稳定执行无效错误
+- **AND** 不读取缓存、不记录 usage、不执行供应商调用
 
-#### Scenario: 当前版本调用内部接口
-- **WHEN** 受控 Agent 运行环境调用内部反向图片检索接口
-- **THEN** 接口不要求认证凭据，并仍以服务端任务记录执行策略校验
+#### Scenario: 未认证调用内部接口
+- **WHEN** 调用方缺少有效服务凭据，或 callback 验证能力未装配
+- **THEN** 接口在读取 multipart 图片和查询 Task 前返回统一未认证错误
+- **AND** 不回退到内网信任、用户身份或 local scope
+
+#### Scenario: 使用任务检索任意图片
+- **WHEN** 已认证调用方提交的图片既不匹配 Task 目标 SHA，也不是后端绑定到该目标和当前执行的受控派生图
+- **THEN** 接口返回稳定执行无效错误
+- **AND** 不读取缓存、不记录 usage、不联系供应商
 
 ### Requirement: 供应商密钥必须留在后端边界内
 系统 MUST 只在后端反向图片服务中读取供应商密钥。Agent、CLI 客户端、任务输入、任务结果、缓存快照、用量记录和错误响应 MUST NOT 获得或泄露供应商密钥及临时上传凭据。
 
 #### Scenario: 启动 Agent 任务
 - **WHEN** Runner 为任意策略启动 Agent 进程
-- **THEN** Agent 环境不包含 SerpApi 密钥，只包含调用内部接口所需的非秘密地址与任务标识
+- **THEN** Agent 环境不包含 SerpApi 密钥、callback 根 secret 或 API 到 executor 的 Bearer token，只包含内部接口地址、任务标识和绑定当前执行的最小 callback 凭据
 
 #### Scenario: 供应商返回私有标识
 - **WHEN** 供应商响应包含密钥、临时图片标识或供应商归档地址
@@ -84,7 +91,7 @@
 - **THEN** 系统复用已有用量记录，不再次增加实际调用次数
 
 #### Scenario: Agent 请求多个不同检索
-- **WHEN** Agent 分别对整图和一个裁剪图产生两个缓存未命中的逻辑检索
+- **WHEN** Agent 分别对目标整图和后端从该目标生成的一个受控裁剪产生两个缓存未命中的逻辑检索
 - **THEN** 系统分别记录两次实际供应商调用
 
 ### Requirement: 内部接口必须返回稳定且供应商无关的结果
@@ -95,5 +102,10 @@
 - **THEN** 接口返回 `request_id`、`cache`、`provider` 和脱敏 `result`，CLI 客户端原样输出该统一 JSON
 
 #### Scenario: 供应商调用失败
-- **WHEN** 供应商超时、不可达或返回非法响应
+- **WHEN** 供应商明确返回失败、空结果或完整但非法的响应
 - **THEN** 接口返回稳定的反向图片错误与可重试标记，并保留已开始调用的用量记录
+
+#### Scenario: 供应商调用结果无法确认
+- **WHEN** usage 已记录 provider 调用开始，但网络中断或进程退出后无法验证同一 request id 的既有结果
+- **THEN** 系统保留 usage 与计量事实，不重放 provider，并返回稳定 `reverse_image_unknown_execution` 和可降级标记
+- **AND** `auto` Agent 继续离线分析；该反向图片子调用状态不得被冒充为整个 Agent Task 或图片处理阶段的 `unknown_execution`
