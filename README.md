@@ -99,6 +99,19 @@ cp .env.example .env
 executor、视觉服务和 API 的健康状态，并检查 `/`、`/health`、`/config`。重复执行是幂等的，
 不会删除数据库、图片或 named volume。
 
+`start.sh start` 默认把当前服务用户的 `id -u`/`id -g` 导出为
+`MEMEMEOW_RUNTIME_UID`/`MEMEMEOW_RUNTIME_GID`，也可以显式设置这两个变量覆盖自动值。
+两者必须是非 root 正整数；以 root 启动入口会在 Compose 创建服务前失败。直接运行
+`docker compose --profile app up` 时必须在环境或 `.env` 中显式填写同一组身份，否则
+Compose 插值校验失败。完整迁移、排障和回滚顺序见
+[`docs/runtime-identity.md`](docs/runtime-identity.md)。
+
+每次启动先运行一次性的 `runtime-init` 容器。它只挂载图片根、Agent runtime volume
+和 executor token volume，拒绝符号链接、特殊节点和多链接普通文件，并把受控目录设为
+`0700`、普通文件设为 `0600` 后归属目标 UID/GID。历史图片只改变所有权和权限，不改变
+文件字节；初始化失败时 API 与 Agent 不会启动。回滚前应停止新版本并保留 volume 备份，
+旧版本若再次以 root 写入新图片会重新产生权限冲突，不能把回滚当作长期部署方案。
+
 常用运维命令：
 
 ```bash
@@ -135,7 +148,7 @@ API 只绑定 `127.0.0.1:8275`；Agent executor `8277` 和视觉服务 `8276` �
 
 然后访问 `http://127.0.0.1:8080`。登录时选择 `PostgreSQL`，服务器填写 `postgres`（容器内默认端口 5432），数据库、用户名和密码使用 `.env` 中的 `POSTGRES_*` 配置（默认均为 `mememeow`）。查看器只绑定 `127.0.0.1`，停止服务使用 `./db-viewer.sh stop`。可通过 `MEMEMEOW_DB_VIEWER_PORT=8081 ./db-viewer.sh start` 修改宿主端口。
 
-镜像位于 `docker/agent/Dockerfile`，预装 OpenCode、Node、Python、Bash、curl、jq、file、ImageMagick、ffmpeg、Tesseract 中英文 OCR 和常见文本工具。容器使用 UID 1003 的非 root 用户，入口是固定的 `executor.server` HTTP 服务；只读挂载 `data/images` 和 `skills/research-meme-context`，读写挂载 named volume `mememeow-agent-runtime-data:/runtime`，并在独立的 `mememeow-agent-executor-secret` named volume 中以 0600 权限持久化首次生成的随机 executor token。API 以只读方式读取同一文件，不会把 token 写入 checkout、`.env`、日志、结果文件或 OpenCode 子进程环境。容器不会挂载项目根目录、数据库凭据、用户目录或 Docker socket。后端只向 `http://mememeow-agent-runtime:8277` 发送带 token 的结构化任务；每个任务仍使用独立 OpenCode session 和 `task-results/<task_id>/` 结果目录。反向图片能力由后端内部接口统一代理，Agent 不持有 `SERPAPI_API_KEY`。callback 根 secret、密钥轮换和禁用式回滚按 [`docs/agent-callback-migration.md`](docs/agent-callback-migration.md) 执行。
+镜像位于 `docker/agent/Dockerfile`，预装 OpenCode、Node、Python、Bash、curl、jq、file、ImageMagick、ffmpeg、Tesseract 中英文 OCR 和常见文本工具。镜像默认用户本身是非 root；Compose 会以部署提供的 UID/GID 覆盖运行身份，入口是固定的 `executor.server` HTTP 服务。只读挂载 `data/images` 和 `skills/research-meme-context`，读写挂载 named volume `mememeow-agent-runtime-data:/runtime`，并在独立的 `mememeow-agent-executor-secret` named volume 中以 0600 权限持久化首次生成的随机 executor token。Agent 的 HOME、workspace 和任务结果都在初始化过的 runtime volume 中，不依赖镜像内固定用户的 home 所有权。API 以只读方式读取同一 token 文件，不会把 token 写入 checkout、`.env`、日志、结果文件或 OpenCode 子进程环境。容器不会挂载项目根目录、数据库凭据、用户目录或 Docker socket。后端只向 `http://mememeow-agent-runtime:8277` 发送带 token 的结构化任务；每个任务仍使用独立 OpenCode session 和 `task-results/<task_id>/` 结果目录。反向图片能力由后端内部接口统一代理，Agent 不持有 `SERPAPI_API_KEY`。callback 根 secret、密钥轮换和禁用式回滚按 [`docs/agent-callback-migration.md`](docs/agent-callback-migration.md) 执行。
 
 `./scripts/agent-runtime.sh build|start|check|stop|restart|logs` 仍可单独运维 executor；`check` 同时验证 executor 健康接口、非 root、网络、OCR、JSON、挂载权限和 Docker socket 边界。应用服务依赖 executor 健康后才启动；全新 checkout 或干净宿主 shell 无需导出 token，executor 会在首次启动时原子生成并复用该 named volume 中的随机凭据。不要删除该 secret volume；若确需轮换，先停止 API 和 executor，再删除 volume 并重新启动 Compose。
 
