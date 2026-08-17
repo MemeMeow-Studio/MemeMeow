@@ -25,6 +25,8 @@ if [[ ! "$START_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
   START_TIMEOUT_SECONDS=180
 fi
 
+source "$ROOT_DIR/scripts/runtime-identity.sh"
+
 print_usage() {
   # 统一说明 Compose 运维命令和独立 Vite 开发模式，避免混淆两种运行入口。
   printf '用法: %s [--vite|start|stop|status|logs [服务名] [Compose 日志参数...]]\n' "$0"
@@ -53,6 +55,7 @@ compose() {
 
 require_compose() {
   # 启动任何服务前校验 CLI、Compose 文件和插值配置，失败时不触碰旧进程。
+  configure_runtime_identity
   if ! command -v docker >/dev/null 2>&1; then
     echo "未找到 docker；请先安装 Docker Engine/CLI。" >&2
     return 1
@@ -207,14 +210,16 @@ wait_for_stack() {
   (( attempts > 0 )) || attempts=1
   for ((attempt = 1; attempt <= attempts; attempt++)); do
     snapshot="$(compose_snapshot)"
-    line="$(service_line "$snapshot" db-init)"
-    if [[ -n "$line" ]]; then
-      IFS='|' read -r _ state _ exit_code <<< "$line"
-      if [[ "$state" == "exited" && "$exit_code" != "0" ]]; then
-        echo "数据库迁移容器失败（退出码 ${exit_code}）。" >&2
-        return 1
+    for service in runtime-init db-init; do
+      line="$(service_line "$snapshot" "$service")"
+      if [[ -n "$line" ]]; then
+        IFS='|' read -r _ state _ exit_code <<< "$line"
+        if [[ "$state" == "exited" && "$exit_code" != "0" ]]; then
+          echo "${service} 初始化容器失败（退出码 ${exit_code}）。" >&2
+          return 1
+        fi
       fi
-    fi
+    done
     if stack_ready "$snapshot"; then
       return 0
     fi

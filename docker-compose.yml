@@ -27,6 +27,26 @@ services:
     working_dir: /app
     command: ["alembic", "upgrade", "head"]
 
+  runtime-init:
+    build:
+      context: .
+    user: "0:0"
+    restart: "no"
+    network_mode: none
+    environment:
+      MEMEMEOW_RUNTIME_UID: ${MEMEMEOW_RUNTIME_UID:?MEMEMEOW_RUNTIME_UID must be a non-root positive integer}
+      MEMEMEOW_RUNTIME_GID: ${MEMEMEOW_RUNTIME_GID:?MEMEMEOW_RUNTIME_GID must be a non-root positive integer}
+    working_dir: /app
+    command: ["python", "-m", "scripts.runtime_init", "--image-root", "/images", "--runtime-root", "/runtime", "--token-root", "/run/agent-executor-secret"]
+    volumes:
+      - type: bind
+        source: ${MEMEMEOW_IMAGE_ROOT_HOST:-./data/images}
+        target: /images
+        bind:
+          create_host_path: true
+      - mememeow-agent-runtime-data:/runtime
+      - mememeow-agent-executor-secret:/run/agent-executor-secret
+
   db-viewer:
     profiles: ["db-viewer"]
     image: adminer:4
@@ -68,7 +88,7 @@ services:
         bind:
           create_host_path: true
       - type: bind
-        source: ./data/images
+        source: ${MEMEMEOW_IMAGE_ROOT_HOST:-./data/images}
         target: /images
         read_only: true
     cpus: ${MEMEMEOW_VISUAL_CPU_QUOTA:-4.0}
@@ -84,14 +104,19 @@ services:
       context: .
       dockerfile: docker/agent/Dockerfile
     container_name: ${MEMEMEOW_AGENT_CONTAINER_NAME:-mememeow-agent-runtime}
+    depends_on:
+      runtime-init:
+        condition: service_completed_successfully
     init: true
     restart: unless-stopped
+    user: "${MEMEMEOW_RUNTIME_UID:?MEMEMEOW_RUNTIME_UID must be a non-root positive integer}:${MEMEMEOW_RUNTIME_GID:?MEMEMEOW_RUNTIME_GID must be a non-root positive integer}"
     working_dir: /runtime/workspace
     expose:
       - "8277"
     environment:
       # token 首次由非 root executor 写入持久 named volume；API 只读同一文件。
       MEMEMEOW_AGENT_EXECUTOR_TOKEN_FILE: /run/agent-executor-secret/token
+      HOME: /runtime/home
       MEMEMEOW_AGENT_EXECUTOR_HOST: 0.0.0.0
       MEMEMEOW_AGENT_EXECUTOR_PORT: ${MEMEMEOW_AGENT_EXECUTOR_PORT:-8277}
       MEMEMEOW_AGENT_EXECUTOR_MAX_TIMEOUT_SECONDS: ${MEMEMEOW_AGENT_EXECUTOR_MAX_TIMEOUT_SECONDS:-1800}
@@ -109,12 +134,16 @@ services:
       - mememeow-agent-runtime-data:/runtime
       - mememeow-agent-executor-secret:/run/agent-executor-secret
       - type: bind
-        source: ./data/images
+        source: ${MEMEMEOW_IMAGE_ROOT_HOST:-./data/images}
         target: /images
         read_only: true
       - type: bind
         source: ./skills/research-meme-context
         target: /skills/research-meme-context
+        read_only: true
+      - type: bind
+        source: ./skills/research-meme-context
+        target: /runtime/workspace/.opencode/skills/research-meme-context
         read_only: true
     networks:
       - default
@@ -132,19 +161,22 @@ services:
         condition: service_healthy
       db-init:
         condition: service_completed_successfully
+      runtime-init:
+        condition: service_completed_successfully
       mememeow-agent-runtime:
         condition: service_healthy
       mememeow-visual:
         condition: service_healthy
     build:
       context: .
+    user: "${MEMEMEOW_RUNTIME_UID:?MEMEMEOW_RUNTIME_UID must be a non-root positive integer}:${MEMEMEOW_RUNTIME_GID:?MEMEMEOW_RUNTIME_GID must be a non-root positive integer}"
     restart: unless-stopped
     command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8275"]
     ports:
       - "127.0.0.1:8275:8275"
     # 视觉权重缺失时 API 可以降级提供界面，因此探活只阻断 HTTP 未启动状态。
     healthcheck:
-      test: ["CMD-SHELL", "python -c 'import json,urllib.request; payload=json.load(urllib.request.urlopen(\"http://127.0.0.1:8275/health\", timeout=3)); raise SystemExit(0 if payload.get(\"status\") in (\"ok\", \"degraded\") else 1)' "]
+      test: ["CMD-SHELL", "test \"$$(id -u)\" != 0 && python -c 'import json,urllib.request; payload=json.load(urllib.request.urlopen(\"http://127.0.0.1:8275/health\", timeout=3)); raise SystemExit(0 if payload.get(\"status\") in (\"ok\", \"degraded\") else 1)' "]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -154,8 +186,10 @@ services:
         required: false
     environment:
       MEMEMEOW_DATABASE_URL: ${MEMEMEOW_DATABASE_URL_CONTAINER:-postgresql+psycopg://mememeow:mememeow@postgres:5432/mememeow}
+      MEMEMEOW_DATA_ROOT: /app/data/opencode
       MEMEMEOW_IMAGE_ROOT: /app/data/images
       MEMEMEOW_OPENCODE_RUNTIME_ROOT: /app/data/opencode
+      HOME: /app/data/opencode/home
       MEMEMEOW_AGENT_CONTAINER_NAME: ${MEMEMEOW_AGENT_CONTAINER_NAME:-mememeow-agent-runtime}
       MEMEMEOW_AGENT_RUNTIME_MODE: executor
       MEMEMEOW_AGENT_EXECUTOR_URL: http://mememeow-agent-runtime:8277
@@ -181,7 +215,7 @@ services:
         target: /run/agent-executor-secret
         read_only: true
       - type: bind
-        source: ./data/images
+        source: ${MEMEMEOW_IMAGE_ROOT_HOST:-./data/images}
         target: /app/data/images
     networks:
       - default

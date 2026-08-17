@@ -18,15 +18,15 @@ RUN npm install --global --no-fund --no-audit opencode-ai@1.18.18
 COPY skills/research-meme-context /skills/research-meme-context
 COPY executor /opt/mememeow/executor
 
-RUN groupadd --gid 1003 mememeow-agent \
-    && useradd --uid 1003 --gid 1003 --create-home --shell /bin/bash mememeow-agent \
-    && mkdir -p /runtime/task-results /runtime/workspace /images /run/agent-executor-secret \
+RUN groupadd --system mememeow-agent \
+    && useradd --system --gid mememeow-agent --create-home --shell /bin/bash mememeow-agent \
+    && mkdir -p /runtime/home /runtime/task-results /runtime/workspace /runtime/logs /runtime/slots /images /run/agent-executor-secret \
     && chown -R mememeow-agent:mememeow-agent /runtime /images /run/agent-executor-secret \
     && chmod 700 /run/agent-executor-secret \
     && chmod -R a=rX /opt/mememeow/node_modules \
     && chmod -R a=rX /skills/research-meme-context
 
-ENV HOME=/home/mememeow-agent \
+ENV HOME=/runtime/home \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     PYTHONPATH=/opt/mememeow \
     PYTHONUNBUFFERED=1

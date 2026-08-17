@@ -19,4 +19,13 @@ RUN pip install -r requirements.txt
 COPY . .
 COPY --from=frontend-build /frontend/dist ./frontend/dist
 
+RUN groupadd --system mememeow \
+    && useradd --system --create-home --gid mememeow --shell /bin/bash mememeow \
+    && chown -R mememeow:mememeow /app
+
+ENV HOME=/home/mememeow \
+    PYTHONUNBUFFERED=1
+
+USER mememeow
+
 CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8275"]

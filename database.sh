@@ -3,6 +3,8 @@
 
 set -Eeuo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$ROOT_DIR/scripts/runtime-identity.sh"
+configure_runtime_identity
 COMPOSE=(docker compose -f "$ROOT_DIR/docker-compose.yml")
 
 compose() { (cd "$ROOT_DIR" && "${COMPOSE[@]}" "$@"); }

@@ -4,6 +4,8 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$ROOT_DIR/scripts/runtime-identity.sh"
+configure_runtime_identity
 VIEWER_PORT="${MEMEMEOW_DB_VIEWER_PORT:-8080}"
 COMPOSE=(docker compose -f "$ROOT_DIR/docker-compose.yml" --profile db-viewer)
 
