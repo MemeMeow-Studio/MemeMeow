@@ -16,7 +16,13 @@ import pytest
 @pytest.fixture(scope="module")
 def lens_module():
     """从 Skill 目录加载缓存脚本，避免测试依赖全局安装。"""
-    script = Path(__file__).resolve().parents[1] / ".agents/skills/research-meme-context/scripts/serpapi_google_lens.py"
+    root = Path(__file__).resolve().parents[1]
+    candidates = (
+        root / "skills/research-meme-context/scripts/serpapi_google_lens.py",
+        root / ".agents/skills/research-meme-context/scripts/serpapi_google_lens.py",
+    )
+    script = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
+    assert script.is_file()
     specification = importlib.util.spec_from_file_location("serpapi_google_lens", script)
     assert specification and specification.loader
     module = importlib.util.module_from_spec(specification)
