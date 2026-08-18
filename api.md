@@ -51,7 +51,7 @@ app = create_app(scope_resolver=LocalScopeResolver("local"))
 - `GET /images/metadata?meme_id=`：读取当前 scope 指定 Meme 的完整数据库语境；不接受路径式资源标识。
 - `POST /images/rename`：请求 `{ "meme_id": "...", "new_name": "new" }`，保留原扩展名且拒绝覆盖。
 - `POST /images/delete`：请求 `{ "meme_id": "..." }`，隔离并删除图片及数据库 Meme。
-- `POST /images/upload`：multipart 字段 `auto_name`、多个 `files`，逐文件返回成功或失败，图片直接写入当前请求 scope 的受控图片根；成功入库后自动创建或复用逐图处理 job；不接受目标目录、`scope_id` 或 `user_id`。
+- `POST /images/upload`：multipart 字段 `reverse_image_policy=forbid|auto`、`auto_name=true|false` 和多个 `files`，逐文件返回成功或失败，图片直接写入当前请求 scope 的受控图片根；成功入库后自动创建或复用逐图处理 job；不接受目标目录、`scope_id` 或 `user_id`。
 - 上传成功会在 PostgreSQL 创建稳定 `meme_id` 和 `pending` 元数据记录；`meme_context.title` 初始为 `null`。数据库是唯一结构化事实，运行时不读取或写入 sidecar。
 - `GET /media/{meme_id}`：按当前请求 scope 稳定 Meme ID 受控读取 PNG/JPG/JPEG/GIF；跨 scope ID 返回 `404 meme_not_found`。
 
@@ -59,17 +59,19 @@ app = create_app(scope_resolver=LocalScopeResolver("local"))
 - `POST /images/context/batch`：请求 `{ "items": [{"meme_id":"..."}], "include_unready": true, "reverse_image_policy": "forbid|auto" }`，逐图返回处理 job 结果；省略 `items` 时不隐式扫描孤立文件。
 - `POST /images/visual-embedding` 和 `/images/visual-embedding/batch`：为既有图片提交完整图片处理 Job 的视觉前置；视觉任务失败必须使用完整 Job 重试或受限独立阶段入口。
 - `POST /images/metadata/repair`：异步执行数据库记录、图片文件和指纹完整性扫描；不读取 sidecar、不默认调用模型或外部搜索。
-- 图片库的“选择图片”“重试选中”和“重试所有未就绪”会调用上述逐图处理接口；有效文本向量写回后会立即具备当前 scope 的搜索资格，不需要为每次上传重建全库缓存。模型切换和存量迁移的显式回填见 [`docs/image-processing-migration.md`](docs/image-processing-migration.md)。
+- 图片库的“选择图片”“重试选中”和“完整重试所有未就绪”会调用上述逐图处理接口；有效文本向量写回后会立即具备当前 scope 的搜索资格，不需要为每次上传重建全库缓存。模型切换和存量迁移的显式回填见 [`docs/image-processing-migration.md`](docs/image-processing-migration.md)。
 
 ### 图片处理 job
 
-`POST /images/processing?page=1&page_size=100` 按当前 scope 分页枚举图片并提交或复用逐图处理 job，请求体为 `{ "reverse_image_policy": "forbid|auto" }`。单图处理固定为 `visual -> agent -> text_embedding` 三个阶段；每个阶段拥有独立叶子 Task，视觉和文本阶段不消耗 Agent operation grant。活动 job 的配置、目标 SHA、metadata hash 或策略不一致时返回 `409 generation_policy_conflict`。
+`POST /images/processing?page=1&page_size=100` 按当前 scope 分页枚举图片并提交或复用逐图处理 job，请求体为 `{ "reverse_image_policy": "forbid|auto", "auto_name": false }`。单图处理按 `visual -> agent -> auto_rename -> text_embedding` 推进；`auto_name=false` 时自动重命名阶段为 `skipped` 且不创建叶子 Task，每个实际阶段拥有独立叶子 Task，视觉和文本阶段不消耗 Agent operation grant。活动 job 的配置、目标 SHA、metadata hash 或策略不一致时返回 `409 generation_policy_conflict`，仅自动命名选项不一致时返回 `409 processing_options_conflict`。
 
-`GET /images/processing/{job_id}` 返回有限状态：`queued`、`running`、`succeeded`、`failed`、`blocked` 或 `unknown_execution`，以及 `current_stage`、每阶段 `task_id`/attempt/error。跨 scope 或不存在的 ID 都返回 `404 image_processing_job_not_found`。
+`POST /images/processing/unready` 只接受上述两项选项，由服务端枚举当前 scope 全部核心未就绪图片，不接受前端图片列表、筛选或分页参数；响应返回目标、提交、复用、冲突和失败摘要。
 
-`GET /images/processing` 返回当前 scope 的完整 Job 父项及 visual、agent、text_embedding 三个阶段；Job 和叶子 Task 的 `submission_mode` 明确为 `pipeline`。
+`GET /images/processing/{job_id}` 返回有限状态：`queued`、`running`、`succeeded`、`failed`、`blocked` 或 `unknown_execution`，以及 `current_stage`、每阶段 `task_id`/attempt/error、`auto_name`、`has_warnings` 和有限 warning 摘要。跨 scope 或不存在的 ID 都返回 `404 image_processing_job_not_found`。
 
-`POST /images/stages` 请求仅接受 `{ "meme_id": "...", "stage": "visual|agent|text_embedding", "reverse_image_policy": "forbid|auto" }`，创建或复用无父 Job 的独立阶段 Task。scope、图片 SHA、配置、grant 和 callback 均由服务端派生；返回 `submission_mode=standalone` 与 `processing_job_id=null`。
+`GET /images/processing` 返回当前 scope 的完整 Job 父项及 visual、agent、auto_rename、text_embedding 四个阶段；Job 和叶子 Task 的 `submission_mode` 明确为 `pipeline`。历史三阶段 Job 读取时合成 `auto_name=false` 和 `auto_rename=skipped`，不回写历史。
+
+`POST /images/stages` 请求仅接受 `{ "meme_id": "...", "stage": "visual|agent|auto_rename|text_embedding", "reverse_image_policy": "forbid|auto" }`，创建或复用无父 Job 的独立阶段 Task。scope、图片 SHA、配置、grant、标题指纹和目标文件名均由服务端派生；返回 `submission_mode=standalone` 与 `processing_job_id=null`。`image_auto_rename` 不得通过通用 `/tasks/{task_id}/retry` 重试。
 
 `POST /images/processing/{job_id}/retry` 只接受 `failed`、`blocked` 或 `unknown_execution` job，并创建新的 revision、叶子 Task 和必要的 grant；旧 job、Task 和 grant 保持终态。`unknown_execution` 表示外部执行窗口已经开始但结果无法证明，恢复流程不会自动重放，必须由人工确认后显式 retry。兼容路径 `/image-processing/...` 仍可用但不在 OpenAPI 中展示。
 
