@@ -279,7 +279,7 @@ def test_runner_accepts_large_cli_output_without_accumulating_pipe_bytes(tmp_pat
         }
     )
     runner = OpenCodeRunner(settings, project_root=project)
-    monkeypatch.setattr(runner, "_session_messages", lambda session_id, environment: {"messages": [{"role": "assistant", "parts": [{"type": "text", "text": json.dumps(candidate(), ensure_ascii=False)}]}]})
+    monkeypatch.setattr(runner, "_session_messages", lambda session_id, environment, task_id=None: {"messages": [{"role": "assistant", "parts": [{"type": "text", "text": json.dumps(candidate(), ensure_ascii=False)}]}]})
     monkeypatch.setattr(runner, "validate_candidate", lambda value: value)
     image = tmp_path / "image.png"
     image.write_bytes(b"image")

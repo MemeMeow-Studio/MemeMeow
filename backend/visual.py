@@ -483,13 +483,24 @@ class VisualInferenceClient:
             return {"status": "degraded", "available": False, "error": "visual_service_unavailable"}
         if not isinstance(payload, dict):
             return {"status": "degraded", "available": False, "error": "visual_service_invalid_response"}
+        expected_model = str(getattr(self.settings, "visual_model", VISUAL_MODEL_ID))
+        expected_dimensions = int(getattr(self.settings, "visual_model_dimensions", VISUAL_DIMENSIONS))
+        expected_preprocess = str(getattr(self.settings, "visual_preprocess_version", VISUAL_PREPROCESS_VERSION))
+        identity_matches = (
+            payload.get("model") == expected_model
+            and payload.get("dimensions") == expected_dimensions
+            and payload.get("preprocess_version") == expected_preprocess
+        )
+        service_error = payload.get("error") if isinstance(payload.get("error"), str) else None
+        if not identity_matches:
+            service_error = "visual_model_identity_mismatch"
         return {
             "status": payload.get("status") if payload.get("status") in {"ok", "degraded"} else "degraded",
-            "available": bool(payload.get("available")),
+            "available": bool(payload.get("available")) and identity_matches,
             "model": payload.get("model"),
             "dimensions": payload.get("dimensions"),
             "preprocess_version": payload.get("preprocess_version"),
-            "error": payload.get("error") if isinstance(payload.get("error"), str) else None,
+            "error": service_error,
         }
 
 

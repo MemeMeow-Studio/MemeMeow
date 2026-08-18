@@ -12,6 +12,14 @@ from pathlib import Path
 from executor.token import ExecutorTokenError, read_token_file
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """健康探针禁止把 executor token 跟随跳转发送到其它地址。"""
+
+    def redirect_request(self, *_args: object, **_kwargs: object):
+        """拒绝所有重定向。"""
+        return None
+
+
 def main() -> int:
     """读取共享 token 并请求本地健康接口，返回 Compose 探针退出码。
 
@@ -27,7 +35,8 @@ def main() -> int:
             "http://127.0.0.1:8277/health",
             headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
         )
-        with urllib.request.urlopen(request, timeout=5) as response:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler)
+        with opener.open(request, timeout=5) as response:
             payload = json.load(response)
         return 0 if payload.get("ready") is True and payload.get("docker_socket_absent") is True else 1
     except (ExecutorTokenError, OSError, ValueError, urllib.error.URLError, json.JSONDecodeError):

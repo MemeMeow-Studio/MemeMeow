@@ -6,6 +6,8 @@ import json
 import stat
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -143,6 +145,9 @@ def test_executor_rejects_bad_token_and_arbitrary_fields(executor_fixture) -> No
         bad.status("task-1")
     assert error.value.code == "agent_executor_unauthorized"
     with pytest.raises(AgentExecutorError) as error:
+        bad.health()
+    assert error.value.code == "agent_executor_unauthorized"
+    with pytest.raises(AgentExecutorError) as error:
         client._request("POST", "/v1/tasks", {"task_id": "task-1", "image_relative_path": "sample.png", "command": "id"})
     assert error.value.code == "invalid_task"
 
@@ -158,6 +163,45 @@ def test_executor_runs_fixed_task_and_returns_result(executor_fixture) -> None:
     with pytest.raises(AgentExecutorError) as error:
         client._request("POST", "/v1/tasks", {"task_id": "task-path", "image_relative_path": "../outside.png", "wait": True})
     assert error.value.code == "agent_image_path_forbidden"
+
+
+def test_executor_rejects_malformed_json_with_stable_error(executor_fixture) -> None:
+    """损坏的 JSON 请求不能把解析器原文变成不稳定错误码。"""
+    _executor, client, _runtime = executor_fixture
+    request = urllib.request.Request(
+        f"{client.url}/v1/tasks",
+        data=b"{not-json",
+        headers={"Accept": "application/json", "Content-Type": "application/json", "Authorization": f"Bearer {client.token}"},
+        method="POST",
+    )
+    with pytest.raises(urllib.error.HTTPError) as error:
+        urllib.request.urlopen(request, timeout=2)
+    payload = json.loads(error.value.read().decode("utf-8"))
+    assert error.value.code == 400
+    assert payload == {"error": "invalid_task", "message": "任务请求无效"}
+
+
+def test_executor_client_waits_for_nonterminal_sync_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    """同步提交即使先收到 queued/running，也必须轮询到终态后再交付结果。"""
+    client = AgentExecutorClient("http://agent:8277", "executor-token", timeout=2)
+    calls: list[tuple[str, str]] = []
+    responses = iter(
+        [
+            (202, {"task_id": "queued-task", "status": "queued"}),
+            (200, {"task_id": "queued-task", "status": "running"}),
+            (200, {"task_id": "queued-task", "status": "succeeded", "session_id": "session-1"}),
+        ]
+    )
+
+    def request(method: str, path: str, payload=None, *, timeout=None):
+        calls.append((method, path))
+        return next(responses)
+
+    monkeypatch.setattr(client, "_request", request)
+    result = client.run(task_id="queued-task", image_relative_path="sample.png", reverse_image_policy="forbid", timeout_seconds=1)
+    assert result.status == "succeeded"
+    assert result.session_id == "session-1"
+    assert calls == [("POST", "/v1/tasks"), ("GET", "/v1/tasks/queued-task"), ("GET", "/v1/tasks/queued-task")]
 
 
 def test_executor_cancel_terminates_only_one_task(executor_fixture, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -178,6 +222,35 @@ def test_executor_cancel_terminates_only_one_task(executor_fixture, monkeypatch:
     cancelled = client.cancel("task-cancel")
     assert cancelled.status == "cancelled"
     assert client.health()["ready"] is True
+
+
+def test_executor_queue_backpressure_returns_stable_429(executor_fixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    """运行任务占用 worker 时，排队上限必须返回 429 而不是无限积压。"""
+    executor, client, _runtime = executor_fixture
+    executor.backpressure = 1
+    original_environment = executor._task_environment
+    monkeypatch.setattr(executor, "_task_environment", lambda task: {**original_environment(task), "FAKE_SLEEP": "2"})
+    client._request(
+        "POST",
+        "/v1/tasks",
+        {"task_id": "task-running", "image_relative_path": "sample.png", "timeout_seconds": 5, "wait": False},
+    )
+    for _ in range(100):
+        if executor.tasks["task-running"].status == "running":
+            break
+        time.sleep(0.01)
+    client._request(
+        "POST",
+        "/v1/tasks",
+        {"task_id": "task-queued", "image_relative_path": "sample.png", "timeout_seconds": 5, "wait": False},
+    )
+    with pytest.raises(AgentExecutorError) as error:
+        client._request(
+            "POST",
+            "/v1/tasks",
+            {"task_id": "task-overflow", "image_relative_path": "sample.png", "timeout_seconds": 5, "wait": False},
+        )
+    assert error.value.code == "agent_backpressure"
 
 
 def test_runner_executor_mode_uses_http_without_docker_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

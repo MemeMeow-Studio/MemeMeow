@@ -13,6 +13,7 @@ import json
 import os
 import re
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -25,7 +26,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
-from executor.token import ExecutorTokenError, ensure_token_file
+from executor.token import ExecutorTokenError, ensure_token_file, read_token_file
 
 
 TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -44,6 +45,33 @@ ALLOWED_REQUEST_FIELDS = frozenset(
 REQUIRED_RESULT_FIELDS = frozenset(
     {"title", "summary", "subjects", "visible_text", "references", "meaning", "keywords", "search_queries", "uncertainties"}
 )
+TASK_HISTORY_LIMIT = 5000
+_EXECUTOR_ERROR_CODES = frozenset(
+    {
+        "agent_timeout",
+        "task_interrupted",
+        "agent_process_failed",
+        "agent_output_invalid_json",
+        "agent_result_file_missing",
+        "agent_result_file_unreadable",
+        "agent_result_file_too_large",
+        "agent_result_file_invalid_json",
+        "agent_result_file_schema_invalid",
+        "agent_result_path_invalid",
+        "agent_image_path_forbidden",
+        "agent_timeout_limit_exceeded",
+        "agent_runtime_unavailable",
+        "opencode_not_configured",
+        "invalid_task",
+        "invalid_reverse_image_policy",
+        "agent_backpressure",
+        "task_exists",
+    }
+)
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+"),
+    re.compile(r"(?i)((?:api[_-]?key|token|secret|password)\s*[:=]\s*)[^\s,;\"']+"),
+)
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -58,6 +86,16 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 def _json_error(code: str, message: str) -> dict[str, str]:
     """构造不包含本地路径、命令或秘密的稳定错误响应。"""
     return {"error": code, "message": message}
+
+
+def _redact_diagnostic(value: str, secrets: tuple[str, ...] = ()) -> str:
+    """从上游诊断中移除已知密钥和常见凭据格式，保留有限可读错误。"""
+    for secret in secrets:
+        if secret:
+            value = value.replace(secret, "[REDACTED]")
+    for pattern in _SECRET_PATTERNS:
+        value = pattern.sub(r"\1[REDACTED]", value)
+    return value[:500]
 
 
 def _safe_json(value: Any) -> bytes:
@@ -84,11 +122,11 @@ def _session_id_from_event(value: Any) -> str | None:
     return None
 
 
-def _diagnostic(stdout: bytes, stderr: bytes) -> str:
+def _diagnostic(stdout: bytes, stderr: bytes, *, secrets: tuple[str, ...] = ()) -> str:
     """从有限输出中提取安全诊断，不返回完整 transcript 或密钥。"""
     text = stderr[:2048].decode("utf-8", errors="replace").strip()
     if text:
-        return text[:500]
+        return _redact_diagnostic(text, secrets)
     for line in stdout.splitlines()[:128]:
         try:
             event = json.loads(line)
@@ -99,7 +137,7 @@ def _diagnostic(stdout: bytes, stderr: bytes) -> str:
             data = error.get("data") if isinstance(error, dict) else None
             message = data.get("message") if isinstance(data, dict) else None
             if isinstance(message, str) and message.strip():
-                return message.strip()[:500]
+                return _redact_diagnostic(message.strip(), secrets)
     return "OpenCode 进程执行失败"
 
 
@@ -157,7 +195,8 @@ class Executor:
         # Agent 运行身份创建的 runtime 文件不应继承镜像默认 umask 的 group/other 位。
         os.umask(0o077)
         self.token_file = os.getenv("MEMEMEOW_AGENT_EXECUTOR_TOKEN_FILE", "").strip()
-        self.token = os.getenv("MEMEMEOW_AGENT_EXECUTOR_TOKEN", "")
+        # 环境变量兼容显式 host/测试夹具，但空白 token 必须和 token 文件一样失败关闭。
+        self.token = os.getenv("MEMEMEOW_AGENT_EXECUTOR_TOKEN", "").strip()
         self.token_error: str | None = None
         if not self.token and self.token_file:
             try:
@@ -184,7 +223,7 @@ class Executor:
         try:
             for path in (RUNTIME_ROOT, WORKSPACE, RESULT_ROOT, LOG_ROOT):
                 path.mkdir(parents=True, exist_ok=True)
-            if not os.access(RUNTIME_ROOT, os.W_OK) or not os.access(RESULT_ROOT, os.W_OK):
+            if any(not os.access(path, os.R_OK | os.W_OK) for path in (RUNTIME_ROOT, WORKSPACE, RESULT_ROOT, LOG_ROOT)):
                 self.ready_error = "runtime_not_writable"
                 return
             if self.token_error:
@@ -199,22 +238,30 @@ class Executor:
     def health(self) -> dict[str, object]:
         """返回真实 executor 健康状态，供 Compose 和后端探针使用。"""
         runtime_ok = RUNTIME_ROOT.is_dir() and os.access(RUNTIME_ROOT, os.R_OK | os.W_OK)
+        workspace_ok = WORKSPACE.is_dir() and os.access(WORKSPACE, os.R_OK | os.W_OK)
         result_ok = RESULT_ROOT.is_dir() and os.access(RESULT_ROOT, os.R_OK | os.W_OK)
+        logs_ok = LOG_ROOT.is_dir() and os.access(LOG_ROOT, os.R_OK | os.W_OK)
         image_ok = IMAGE_ROOT.is_dir() and os.access(IMAGE_ROOT, os.R_OK) and not os.access(IMAGE_ROOT, os.W_OK)
         skill_ok = SKILL_ROOT.is_dir() and os.access(SKILL_ROOT, os.R_OK) and not os.access(SKILL_ROOT, os.W_OK)
         executable_ok = bool(shutil_which(self.opencode_executable))
         socket_absent = not Path("/var/run/docker.sock").exists()
-        ready = bool(not self.ready_error and runtime_ok and result_ok and image_ok and skill_ok and executable_ok and socket_absent)
+        token_ok = bool(self.token)
+        if self.token_file:
+            try:
+                token_ok = hmac.compare_digest(read_token_file(self.token_file), self.token)
+            except ExecutorTokenError:
+                token_ok = False
+        ready = bool(not self.ready_error and token_ok and runtime_ok and workspace_ok and result_ok and logs_ok and image_ok and skill_ok and executable_ok and socket_absent)
         return {
             "status": "ok" if ready else "degraded",
             "ready": ready,
             "executor": "mememeow-agent-executor",
             "opencode": executable_ok,
-            "runtime_read_write": runtime_ok and result_ok,
+            "runtime_read_write": runtime_ok and workspace_ok and result_ok and logs_ok,
             "images_read_only": image_ok,
             "skills_read_only": skill_ok,
             "docker_socket_absent": socket_absent,
-            "token_configured": bool(self.token),
+            "token_configured": token_ok,
             "opencode_configured": bool(self.model and self.base_url and self.api_key),
             "capacity": self.max_workers,
             "queued": self._queued_count(),
@@ -225,6 +272,19 @@ class Executor:
         """返回尚未开始的任务数量，调用方可在锁外使用。"""
         with self.lock:
             return sum(1 for task in self.tasks.values() if task.status == "queued")
+
+    def _prune_history_locked(self) -> None:
+        """限制内存中的终态历史，避免长期运行的 executor 被任务标识耗尽内存。"""
+        overflow = len(self.tasks) - TASK_HISTORY_LIMIT
+        if overflow <= 0:
+            return
+        terminal = sorted(
+            (task for task in self.tasks.values() if task.status in {"succeeded", "failed", "cancelled"}),
+            key=lambda task: (task.completed_at or task.created_at, task.created_at, task.task_id),
+        )
+        for task in terminal[:overflow]:
+            self.tasks.pop(task.task_id, None)
+            self.futures.pop(task.task_id, None)
 
     def _validate_request(self, payload: object) -> tuple[str, str, str, int, bool, str | None]:
         """校验固定任务字段并返回规范化参数。"""
@@ -256,8 +316,11 @@ class Executor:
         policy = payload.get("reverse_image_policy", "forbid")
         if policy not in {"forbid", "auto"}:
             raise ValueError("invalid_reverse_image_policy")
+        raw_timeout = payload.get("timeout_seconds", self.max_timeout)
+        if isinstance(raw_timeout, bool):
+            raise ValueError("invalid_task")
         try:
-            timeout = int(payload.get("timeout_seconds", self.max_timeout))
+            timeout = int(raw_timeout)
         except (TypeError, ValueError) as exc:
             raise ValueError("invalid_task") from exc
         if timeout < 1 or timeout > self.max_timeout:
@@ -266,7 +329,11 @@ class Executor:
         if not isinstance(wait, bool):
             raise ValueError("invalid_task")
         callback_token = payload.get("callback_token")
-        if callback_token is not None and (not isinstance(callback_token, str) or len(callback_token) > 4096):
+        if callback_token is not None and (
+            not isinstance(callback_token, str)
+            or len(callback_token) > 4096
+            or any(character.isspace() or ord(character) < 0x20 for character in callback_token)
+        ):
             raise ValueError("invalid_task")
         return task_id, relative.as_posix(), str(policy), timeout, wait, callback_token
 
@@ -274,6 +341,7 @@ class Executor:
         """创建固定研究任务并交给受限线程池，返回状态和同步等待标记。"""
         task_id, relative, policy, timeout, wait, callback_token = self._validate_request(payload)
         with self.lock:
+            self._prune_history_locked()
             if not self.health().get("ready"):
                 raise RuntimeError("agent_runtime_unavailable")
             if not self.model or not self.base_url or not self.api_key:
@@ -384,8 +452,13 @@ class Executor:
                 err.seek(0)
                 stdout = out.read(256 * 1024)
                 stderr = err.read(16 * 1024)
+            if task.cancel_event.is_set():
+                raise RuntimeError("task_interrupted")
             if process.returncode != 0:
-                raise RuntimeError("agent_process_failed:" + _diagnostic(stdout, stderr))
+                raise RuntimeError(
+                    "agent_process_failed:"
+                    + _diagnostic(stdout, stderr, secrets=(self.api_key, self.token, task.callback_token or ""))
+                )
             for line in stdout.splitlines():
                 try:
                     session = _session_id_from_event(json.loads(line))
@@ -404,17 +477,30 @@ class Executor:
         except RuntimeError as exc:
             code, _, detail = str(exc).partition(":")
             with self.lock:
+                # 取消与子进程自然退出可能同时发生；持锁后以取消为最终事实，避免把
+                # 用户明确取消的任务误记为普通进程失败。
+                if task.cancel_event.is_set():
+                    code, detail = "task_interrupted", ""
+                if code not in _EXECUTOR_ERROR_CODES:
+                    code = "agent_process_failed"
                 task.status = "cancelled" if code == "task_interrupted" else "failed"
                 fallback = {
                     "agent_timeout": "OpenCode 执行超时",
                     "task_interrupted": "任务已取消",
                 }.get(code, "任务执行失败")
-                task.error = _json_error(code, detail[:500] if detail else fallback)
+                task.error = _json_error(code, _redact_diagnostic(detail, (self.api_key, self.token, task.callback_token or "")) if detail else fallback)
                 task.completed_at = time.time()
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             with self.lock:
-                task.status = "failed"
-                task.error = _json_error("agent_process_failed", str(exc)[:500])
+                code = "task_interrupted" if task.cancel_event.is_set() else "agent_process_failed"
+                task.status = "cancelled" if code == "task_interrupted" else "failed"
+                task.error = _json_error(code, "任务已取消" if code == "task_interrupted" else _redact_diagnostic(str(exc), (self.api_key, self.token, task.callback_token or "")))
+                task.completed_at = time.time()
+        except Exception as exc:  # noqa: BLE001 - 任务必须以终态收束，不能留下永久 running
+            with self.lock:
+                code = "task_interrupted" if task.cancel_event.is_set() else "agent_process_failed"
+                task.status = "cancelled" if code == "task_interrupted" else "failed"
+                task.error = _json_error(code, "任务已取消" if code == "task_interrupted" else _redact_diagnostic(str(exc), (self.api_key, self.token, task.callback_token or "")))
                 task.completed_at = time.time()
         finally:
             with self.lock:
@@ -423,27 +509,56 @@ class Executor:
 
     def _validate_result_file(self, path: Path) -> None:
         """验证结果文件位置、大小和基本 JSON 结构；完整 schema 由后端复核。"""
-        root = RESULT_ROOT.resolve()
         current = RESULT_ROOT
         try:
+            root_metadata = RESULT_ROOT.lstat()
+            if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+                raise RuntimeError("agent_result_path_invalid")
             relative = path.relative_to(RESULT_ROOT)
         except ValueError as exc:
             raise RuntimeError("agent_result_path_invalid") from exc
+        except OSError as exc:
+            raise RuntimeError("agent_result_path_invalid") from exc
+        if len(relative.parts) != 2 or relative.name != RESULT_FILE_NAME:
+            raise RuntimeError("agent_result_path_invalid")
         for part in relative.parts:
             current = current / part
             if current.is_symlink():
                 raise RuntimeError("agent_result_path_invalid")
-        candidate = path.resolve(strict=True)
-        candidate.relative_to(root)
-        if path.is_symlink() or not candidate.is_file():
-            raise RuntimeError("agent_result_file_unreadable")
-        if candidate.stat().st_size > self.max_result_bytes:
-            raise RuntimeError("agent_result_file_too_large")
         try:
-            value = json.loads(candidate.read_text(encoding="utf-8"))
+            metadata = path.lstat()
         except FileNotFoundError as exc:
             raise RuntimeError("agent_result_file_missing") from exc
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except OSError as exc:
+            raise RuntimeError("agent_result_file_unreadable") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RuntimeError("agent_result_path_invalid")
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("agent_result_file_unreadable")
+        if metadata.st_size > self.max_result_bytes:
+            raise RuntimeError("agent_result_file_too_large")
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            try:
+                chunks: list[bytes] = []
+                total = 0
+                while total <= self.max_result_bytes:
+                    chunk = os.read(descriptor, min(64 * 1024, self.max_result_bytes + 1 - total))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+                if total > self.max_result_bytes:
+                    raise RuntimeError("agent_result_file_too_large")
+            finally:
+                os.close(descriptor)
+            value = json.loads(b"".join(chunks).decode("utf-8"))
+        except FileNotFoundError as exc:
+            raise RuntimeError("agent_result_file_missing") from exc
+        except RuntimeError:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
             raise RuntimeError("agent_result_file_invalid_json") from exc
         if not isinstance(value, dict) or not REQUIRED_RESULT_FIELDS.issubset(value):
             raise RuntimeError("agent_result_file_schema_invalid")
@@ -459,7 +574,11 @@ class Executor:
         except (OSError, subprocess.TimeoutExpired):
             try:
                 os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=2)
             except OSError:
+                pass
+            except subprocess.TimeoutExpired:
+                # 进程组仍未收束时不阻塞 executor；调用方会把任务标记为失败。
                 pass
 
     def cancel(self, task_id: str) -> TaskState:
@@ -508,6 +627,11 @@ class Handler(BaseHTTPRequestHandler):
 
     server: "ExecutorHTTPServer"
 
+    def setup(self) -> None:
+        """为请求体读取设置有限超时，避免慢速连接长期占用线程。"""
+        super().setup()
+        self.connection.settimeout(30)
+
     def log_message(self, _format: str, *_args: object) -> None:
         """禁止将认证头、任务输入或 OpenCode 诊断写入访问日志。"""
         return
@@ -539,12 +663,19 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("invalid_task") from exc
         if length < 0 or length > 64 * 1024:
             raise ValueError("invalid_task")
-        return json.loads(self.rfile.read(length).decode("utf-8"))
+        try:
+            raw = self.rfile.read(length)
+            return json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+            raise ValueError("invalid_task") from exc
 
     def do_GET(self) -> None:  # noqa: N802
         """处理健康和任务状态查询。"""
         path = urlsplit(self.path).path.rstrip("/") or "/"
         if path == "/health":
+            if not self._authorized():
+                self._send(401, _json_error("executor_unauthorized", "executor 认证失败"))
+                return
             self._send(200, self.server.executor.health())
             return
         if not self._authorized():
@@ -591,10 +722,14 @@ class Handler(BaseHTTPRequestHandler):
                 "invalid_reverse_image_policy": "反向图片策略无效",
                 "agent_timeout_limit_exceeded": "任务超时超过 executor 上限",
             }
+            if code not in messages and code not in {"invalid_task"}:
+                code = "invalid_task"
             self._send(400, _json_error(code, messages.get(code, "任务请求无效")))
             return
         except RuntimeError as exc:
             code = str(exc)
+            if code not in {"agent_backpressure", "task_exists", "agent_runtime_unavailable", "opencode_not_configured"}:
+                code = "agent_runtime_unavailable"
             status = {
                 "agent_backpressure": 429,
                 "task_exists": 409,

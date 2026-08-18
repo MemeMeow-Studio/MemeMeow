@@ -20,7 +20,7 @@ import tempfile
 import time
 import uuid
 from io import BytesIO
-from queue import Queue
+from queue import Empty, Queue
 from urllib.error import URLError
 from urllib.request import urlopen
 from pathlib import Path
@@ -143,6 +143,7 @@ class OpenCodeRunner:
         self._process_tasks: dict[subprocess.Popen[bytes], str | None] = {}
         self._active_task_ids: set[str] = set()
         self._active_executor_task_ids: set[str] = set()
+        self._cancelled_task_ids: set[str] = set()
         self.executor = AgentExecutorClient(
             getattr(settings, "agent_executor_url", None),
             getattr(settings, "agent_executor_token", None),
@@ -158,6 +159,37 @@ class OpenCodeRunner:
         if mode == "executor":
             return True
         return mode == "auto" and self.executor.configured
+
+    @staticmethod
+    def _executor_error_code(code: str, *, health: bool = False) -> str:
+        """把 executor 客户端异常收口为任务服务可识别的稳定错误码。"""
+        if health and code in {"agent_timeout", "agent_executor_unavailable", "agent_executor_http_error"}:
+            return "agent_runtime_unavailable"
+        known = {
+            "agent_timeout",
+            "task_interrupted",
+            "agent_process_failed",
+            "agent_output_invalid_json",
+            "agent_result_file_missing",
+            "agent_result_file_unreadable",
+            "agent_result_file_too_large",
+            "agent_result_file_invalid_json",
+            "agent_result_file_schema_invalid",
+            "agent_result_path_invalid",
+            "agent_image_path_forbidden",
+            "agent_timeout_limit_exceeded",
+            "agent_runtime_unavailable",
+            "opencode_not_configured",
+            "invalid_task",
+            "invalid_reverse_image_policy",
+            "agent_backpressure",
+            "task_exists",
+            "agent_executor_not_configured",
+            "agent_executor_unavailable",
+            "agent_executor_unauthorized",
+            "agent_executor_invalid_response",
+        }
+        return code if code in known else "agent_executor_invalid_response"
 
     def _configured_image_root(self) -> Path:
         """解析设置中的图片根目录，统一相对路径基准以匹配 Compose 挂载。"""
@@ -208,7 +240,7 @@ class OpenCodeRunner:
                 except AgentExecutorError as exc:
                     # 健康探针失败也必须进入任务稳定错误协议，不能把客户端异常
                     # 直接交给长任务服务并退化成 task_failed。
-                    code = "agent_runtime_unavailable" if exc.code == "agent_timeout" else exc.code
+                    code = self._executor_error_code(exc.code, health=True)
                     raise OpenCodeError(code, str(exc)[:500]) from exc
                 if not bool(health.get("ready")):
                     raise OpenCodeError("agent_runtime_unavailable", "Agent executor 健康检查未通过")
@@ -235,10 +267,12 @@ class OpenCodeRunner:
     def runtime_probe(self) -> dict[str, object]:
         """返回共享 runtime、skill 和依赖探针结果，供启动诊断使用。"""
         if self.executor_mode:
+            error_code: str | None = None
             try:
                 health = self.executor.health()
-            except AgentExecutorError:
+            except AgentExecutorError as exc:
                 health = {}
+                error_code = self._executor_error_code(exc.code, health=True)
             ready = bool(health.get("ready"))
             runtime_ready = bool(health.get("runtime_read_write"))
             images_ready = bool(health.get("images_read_only"))
@@ -263,6 +297,7 @@ class OpenCodeRunner:
                 "network_ready": ready,
                 "docker_socket_absent": socket_absent,
                 "concurrency": self.concurrency,
+                "error_code": error_code,
                 "verified": bool(ready and self.executor.configured and runtime_ready and images_ready and skills_ready and executable_ready and socket_absent),
             }
         executable = self.settings.opencode_executable
@@ -378,9 +413,25 @@ class OpenCodeRunner:
             if self._closing.is_set():
                 self._slot_semaphore.release()
                 raise OpenCodeError("task_interrupted", "OpenCode runner 正在关闭")
-            return self._slot_ids.get(), None
+            try:
+                slot_id = self._slot_ids.get(timeout=0.2)
+            except Empty as exc:
+                self._slot_semaphore.release()
+                raise OpenCodeError("opencode_slot_unavailable", "无法获取 OpenCode slot") from exc
+            if self._closing.is_set():
+                self._slot_ids.put(slot_id)
+                self._slot_semaphore.release()
+                raise OpenCodeError("task_interrupted", "OpenCode runner 正在关闭")
+            return slot_id, None
         while not self._closing.is_set():
-            slot_id = self._slot_ids.get()
+            try:
+                slot_id = self._slot_ids.get(timeout=0.2)
+            except Empty:
+                continue
+            if self._closing.is_set():
+                self._slot_ids.put(slot_id)
+                self._slot_semaphore.release()
+                raise OpenCodeError("task_interrupted", "OpenCode runner 正在关闭")
             lock_path = self.slots_root / f"slot-{slot_id}.lock"
             try:
                 lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -441,6 +492,14 @@ class OpenCodeRunner:
             self._processes.discard(process)
             self._process_tasks.pop(process, None)
             self._process = next(iter(self._processes), None)
+
+    def _take_pre_cancelled(self, task_id: str) -> bool:
+        """消费任务开始前收到的取消标记，阻止取消竞态继续启动外部进程。"""
+        with self._process_lock:
+            if task_id not in self._cancelled_task_ids:
+                return False
+            self._cancelled_task_ids.discard(task_id)
+            return True
 
     @staticmethod
     def _event_session(event: object) -> str | None:
@@ -581,7 +640,11 @@ class OpenCodeRunner:
         except (OSError, subprocess.TimeoutExpired):
             try:
                 os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=2)
             except OSError:
+                pass
+            except subprocess.TimeoutExpired:
+                # 无法继续等待时由上层任务状态收束，避免关闭流程无限阻塞。
                 pass
 
     def _terminate_task(self, task_id: str | None) -> None:
@@ -683,7 +746,7 @@ class OpenCodeRunner:
                 continue
             raise json.JSONDecodeError("JSON 数组缺少分隔符", buffer, position)
 
-    def _session_messages(self, session_id: str, environment: dict[str, str]) -> object:
+    def _session_messages(self, session_id: str, environment: dict[str, str], task_id: str | None = None) -> object:
         """经临时 loopback server 读取完整 session，规避 export 内联附件的 CLI 截断。"""
         self.log_root.mkdir(parents=True, exist_ok=True)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -705,7 +768,7 @@ class OpenCodeRunner:
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        self._track_process(server)
+        self._track_process(server, task_id)
         endpoint = f"http://127.0.0.1:{port}/session/{session_id}/message"
         deadline = time.monotonic() + min(15, self.settings.opencode_timeout_seconds)
         try:
@@ -955,9 +1018,11 @@ class OpenCodeRunner:
 
     def run(self, image: Path, progress: Callable[[float | None, str | None], None], *, task_id: str | None = None, reverse_image_policy: str = "forbid", callback_token: str | None = None) -> tuple[dict[str, Any], str]:
         """执行单张图片研究并从任务专属结果文件接收候选与 session ID。"""
+        task_id = task_id or uuid.uuid4().hex
+        if self._take_pre_cancelled(task_id) or self._closing.is_set():
+            raise OpenCodeError("task_interrupted", "OpenCode runner 正在关闭或任务已取消")
         self.prepare_runtime()
         slot_id, lock_handle = self._acquire_slot()
-        task_id = task_id or uuid.uuid4().hex
         try:
             with self._process_lock:
                 self._active_task_ids.add(task_id)
@@ -972,6 +1037,8 @@ class OpenCodeRunner:
                     relative_image = mapped_image.relative_to(EXECUTOR_IMAGE_ROOT).as_posix()
                 except ValueError as exc:
                     raise OpenCodeError("agent_image_path_forbidden", "图片路径不在 executor 受控目录内") from exc
+                if self._take_pre_cancelled(task_id):
+                    raise OpenCodeError("task_interrupted", "Agent 任务已取消")
                 progress(0.1, "正在提交 Agent executor 任务")
                 try:
                     response = self.executor.run(
@@ -982,14 +1049,22 @@ class OpenCodeRunner:
                         callback_token=callback_token,
                     )
                 except AgentExecutorError as exc:
-                    if exc.code == "agent_timeout":
+                    code = self._executor_error_code(exc.code)
+                    if code in {"agent_timeout", "agent_executor_unavailable", "agent_runtime_unavailable", "agent_executor_invalid_response"}:
                         try:
                             self.executor.cancel(task_id)
                         except AgentExecutorError:
                             pass
+                    if code == "agent_timeout":
                         raise OpenCodeError("agent_timeout", "OpenCode 执行超时") from exc
-                    raise OpenCodeError(exc.code, str(exc)) from exc
-                if response.status not in {"succeeded", "running", "queued"}:
+                    raise OpenCodeError(code, str(exc)[:500]) from exc
+                if self._take_pre_cancelled(task_id):
+                    try:
+                        self.executor.cancel(task_id)
+                    except AgentExecutorError:
+                        pass
+                    raise OpenCodeError("task_interrupted", "Agent 任务已取消")
+                if response.status != "succeeded":
                     raise OpenCodeError("agent_executor_invalid_response", "Agent executor 任务未返回成功状态")
                 progress(0.65, "正在读取研究结果文件")
                 candidate = self._read_result_file(result_path)
@@ -1024,6 +1099,9 @@ class OpenCodeRunner:
                 )
                 self._track_process(process, task_id)
                 try:
+                    if self._take_pre_cancelled(task_id):
+                        self._terminate(process)
+                        raise OpenCodeError("task_interrupted", "Agent 任务已取消")
                     # stdout/stderr 已重定向到临时文件；communicate 只等待进程。
                     process.communicate(timeout=self.settings.opencode_timeout_seconds)
                 except subprocess.TimeoutExpired as exc:
@@ -1031,6 +1109,8 @@ class OpenCodeRunner:
                     raise OpenCodeError("agent_timeout", "OpenCode 执行超时") from exc
                 finally:
                     self._untrack_process(process)
+                if self._take_pre_cancelled(task_id):
+                    raise OpenCodeError("task_interrupted", "Agent 任务已取消")
                 log_path = self.log_root / f"{hashlib.sha256(str(image).encode()).hexdigest()[:16]}.jsonl"
                 stdout_stream.flush()
                 stderr_stream.flush()
@@ -1054,7 +1134,7 @@ class OpenCodeRunner:
                 candidate = self._read_result_file(result_path)
             except OpenCodeError:
                 # 显式 host 回滚继续兼容旧 session 结果读取；executor 任务在上方已直接失败。
-                data = self._session_messages(session_id, environment)
+                data = self._session_messages(session_id, environment, task_id)
                 candidate = self.validate_candidate(self.extract_candidate(self._last_assistant_text(data)))
             progress(0.9, "正在校验并写入语境")
             return candidate, session_id
@@ -1063,6 +1143,7 @@ class OpenCodeRunner:
             self._unmark_task_active(task_id)
             with self._process_lock:
                 self._active_executor_task_ids.discard(task_id)
+                self._cancelled_task_ids.discard(task_id)
             self._release_slot(slot_id, lock_handle)
 
     @staticmethod
@@ -1082,6 +1163,7 @@ class OpenCodeRunner:
         """终止当前受管理进程，供应用生命周期收束调用。"""
         self._closing.set()
         with self._process_lock:
+            self._cancelled_task_ids.update(self._active_task_ids)
             executor_task_ids = list(self._active_executor_task_ids)
         for task_id in executor_task_ids:
             try:
@@ -1099,6 +1181,13 @@ class OpenCodeRunner:
         """取消指定研究任务；executor 请求远端取消，host 终止对应本地进程组。"""
         if not task_id:
             return
+        with self._process_lock:
+            if len(self._cancelled_task_ids) >= 5000:
+                for stale_id in list(self._cancelled_task_ids - self._active_task_ids):
+                    self._cancelled_task_ids.discard(stale_id)
+                    if len(self._cancelled_task_ids) < 4000:
+                        break
+            self._cancelled_task_ids.add(task_id)
         if self.executor_mode:
             try:
                 self.executor.cancel(task_id)

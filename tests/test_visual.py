@@ -59,6 +59,43 @@ def test_visual_client_rejects_default_endpoint_without_model_configuration(tmp_
     assert captured.value.code == "visual_model_not_configured"
 
 
+def test_visual_client_health_rejects_mismatched_model_identity(tmp_path: Path) -> None:
+    """视觉服务即使自报 available，也不能以错误模型身份被 API 采用。"""
+    settings = Settings(
+        _env_file=None,
+        database_url="postgresql+psycopg://test:test@localhost/test",
+        data_root=tmp_path / "data",
+        image_root=tmp_path / "images",
+        visual_health_url="http://visual:8276/health",
+    )
+
+    class Response:
+        """提供固定健康 JSON 的最小 HTTP 响应夹具。"""
+
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self, _size: int = -1) -> bytes:
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "available": True,
+                    "model": "wrong-model",
+                    "dimensions": VISUAL_DIMENSIONS,
+                    "preprocess_version": VISUAL_PREPROCESS_VERSION,
+                }
+            ).encode("utf-8")
+
+    health = VisualInferenceClient(settings, opener=lambda *_args, **_kwargs: Response()).health()
+    assert health["available"] is False
+    assert health["error"] == "visual_model_identity_mismatch"
+
+
 def test_visual_runner_requires_fixed_official_source_for_file_weights(tmp_path: Path) -> None:
     """仅提供 checkpoint 而没有固定 DINOv2 源码时不得尝试 TorchScript 或随机模型。"""
     weights = tmp_path / "model.pth"

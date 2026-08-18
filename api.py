@@ -393,6 +393,9 @@ def _submit_context_task(request: Request, image: Path, *, auto_name: bool = Fal
         if not runner.executor.configured:
             raise RuntimeError("agent_executor_not_configured")
         runtime = runner.runtime_probe()
+        runtime_error = runtime.get("error_code")
+        if isinstance(runtime_error, str) and runtime_error:
+            raise RuntimeError(runtime_error)
         if not bool(runtime.get("verified")):
             raise RuntimeError("agent_runtime_unavailable")
     if reverse_image_policy not in {"forbid", "auto"}:

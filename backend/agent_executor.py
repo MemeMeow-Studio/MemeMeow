@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
+from urllib.parse import quote, urlsplit
 
 
 class AgentExecutorError(RuntimeError):
@@ -21,6 +23,42 @@ class AgentExecutorError(RuntimeError):
     def __init__(self, code: str, message: str | None = None):
         super().__init__(message or code)
         self.code = code
+
+
+_PENDING_STATUSES = frozenset({"queued", "running"})
+_KNOWN_TASK_ERRORS = frozenset(
+    {
+        "agent_timeout",
+        "task_interrupted",
+        "agent_process_failed",
+        "agent_output_invalid_json",
+        "agent_result_file_missing",
+        "agent_result_file_unreadable",
+        "agent_result_file_too_large",
+        "agent_result_file_invalid_json",
+        "agent_result_file_schema_invalid",
+        "agent_result_path_invalid",
+        "agent_image_path_forbidden",
+        "agent_timeout_limit_exceeded",
+        "agent_runtime_unavailable",
+        "opencode_not_configured",
+        "invalid_task",
+        "invalid_reverse_image_policy",
+        "agent_backpressure",
+        "task_exists",
+    }
+)
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """executor 内部请求禁止跟随跳转，避免把 Bearer token 转发到其它主机。"""
+
+    def redirect_request(self, *_args: Any, **_kwargs: Any):
+        """拒绝所有 HTTP 重定向。"""
+        return None
+
+
+_DEFAULT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler)
 
 
 @dataclass(frozen=True)
@@ -41,17 +79,23 @@ class AgentExecutorClient:
         """保存内部地址和 token；token 只存在内存，不写入日志或结果文件。"""
         self.url = (url or "").strip().rstrip("/")
         self.token = (token or "").strip()
-        self.opener = opener or urllib.request.urlopen
+        self.opener = opener or _DEFAULT_OPENER.open
         self.timeout = max(1, int(timeout))
 
     @property
     def configured(self) -> bool:
-        """判断 URL 和不可为空 token 是否同时存在。"""
-        return bool(self.url and self.token)
+        """判断 URL 和不可为空 token 是否同时存在且 URL 是 HTTP(S)。"""
+        if not self.url or not self.token:
+            return False
+        try:
+            parsed = urlsplit(self.url)
+        except ValueError:
+            return False
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc) and not parsed.query and not parsed.fragment
 
     def _request(self, method: str, path: str, payload: dict[str, object] | None = None, *, timeout: int | None = None) -> tuple[int, dict[str, object]]:
         """发送 JSON 请求并将 HTTP/JSON 故障映射为稳定错误。"""
-        if not self.url or not self.token:
+        if not self.configured:
             raise AgentExecutorError("agent_executor_not_configured", "Agent executor 地址或凭据 token 未配置")
         body = None
         headers = {"Accept": "application/json", "Authorization": f"Bearer {self.token}"}
@@ -113,6 +157,44 @@ class AgentExecutorClient:
             result_path=value.get("result_path") if isinstance(value.get("result_path"), str) else None,
         )
 
+    @staticmethod
+    def _for_task(response: ExecutorTaskResponse, task_id: str) -> ExecutorTaskResponse:
+        """确认响应仍绑定原始任务，避免代理或服务错误串接其它任务状态。"""
+        if response.task_id != task_id:
+            raise AgentExecutorError("agent_executor_invalid_response", "Agent executor 任务标识不匹配")
+        return response
+
+    @staticmethod
+    def _failure_code(response: ExecutorTaskResponse) -> str:
+        """把 executor 返回的失败码限制在后端可持久化的稳定集合内。"""
+        code = (response.error or {}).get("error")
+        return code if code in _KNOWN_TASK_ERRORS else "agent_process_failed"
+
+    def _wait_for_terminal(self, response: ExecutorTaskResponse, *, task_id: str, timeout_seconds: int) -> ExecutorTaskResponse:
+        """轮询同步提交的非终态响应，超时后只取消当前任务。"""
+        deadline = time.monotonic() + max(5, int(timeout_seconds) + 10)
+        poll_delay = 0.2
+        while response.status in _PENDING_STATUSES:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                try:
+                    self.cancel(task_id)
+                except AgentExecutorError:
+                    pass
+                raise AgentExecutorError("agent_timeout", "Agent executor 等待任务终态超时")
+            time.sleep(min(poll_delay, remaining))
+            poll_delay = min(2.0, poll_delay * 1.5)
+            try:
+                response = self._for_task(self.status(task_id), task_id)
+            except AgentExecutorError:
+                # 轮询链路断开时尽力取消已提交任务，防止 HTTP 响应丢失后孤儿执行。
+                try:
+                    self.cancel(task_id)
+                except AgentExecutorError:
+                    pass
+                raise
+        return response
+
     def health(self) -> dict[str, object]:
         """读取 executor 健康状态并隐藏响应中的未知字段。"""
         _status, value = self._request("GET", "/health", timeout=min(10, self.timeout))
@@ -136,6 +218,7 @@ class AgentExecutorClient:
 
     def run(self, *, task_id: str, image_relative_path: str, reverse_image_policy: str, timeout_seconds: int, callback_token: str | None = None) -> ExecutorTaskResponse:
         """提交固定语境任务并同步等待其终态。"""
+        timeout_value = int(timeout_seconds)
         _status, value = self._request(
             "POST",
             "/v1/tasks",
@@ -143,29 +226,30 @@ class AgentExecutorClient:
                 "task_id": task_id,
                 "image_relative_path": image_relative_path,
                 "reverse_image_policy": reverse_image_policy,
-                "timeout_seconds": int(timeout_seconds),
+                "timeout_seconds": timeout_value,
                 "wait": True,
                 **({"callback_token": callback_token} if callback_token else {}),
             },
-            timeout=max(self.timeout, int(timeout_seconds) + 10),
+            timeout=max(self.timeout, timeout_value + 10),
         )
-        response = self._response(value)
+        response = self._for_task(self._response(value), task_id)
+        response = self._wait_for_terminal(response, task_id=task_id, timeout_seconds=timeout_value)
         if response.status == "failed":
+            code = self._failure_code(response)
             error = response.error or {}
-            code = error.get("error") or "agent_process_failed"
             raise AgentExecutorError(code, str(error.get("message") or code)[:500])
         if response.status == "cancelled":
             raise AgentExecutorError("task_interrupted", "Agent 任务已取消")
-        if response.status not in {"succeeded", "running", "queued"}:
+        if response.status != "succeeded":
             raise AgentExecutorError("agent_executor_invalid_response", "Agent executor 任务状态无效")
         return response
 
     def cancel(self, task_id: str) -> ExecutorTaskResponse:
         """取消指定任务，超时或服务关闭时调用。"""
-        _status, value = self._request("POST", f"/v1/tasks/{task_id}/cancel", timeout=min(10, self.timeout))
-        return self._response(value)
+        _status, value = self._request("POST", f"/v1/tasks/{quote(task_id, safe='')}/cancel", timeout=min(10, self.timeout))
+        return self._for_task(self._response(value), task_id)
 
     def status(self, task_id: str) -> ExecutorTaskResponse:
         """读取指定任务状态，用于诊断和异步调用方。"""
-        _status, value = self._request("GET", f"/v1/tasks/{task_id}", timeout=min(10, self.timeout))
-        return self._response(value)
+        _status, value = self._request("GET", f"/v1/tasks/{quote(task_id, safe='')}", timeout=min(10, self.timeout))
+        return self._for_task(self._response(value), task_id)

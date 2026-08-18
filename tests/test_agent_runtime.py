@@ -124,6 +124,18 @@ def test_executor_health_failure_is_stable_and_does_not_fallback_to_host(tmp_pat
     assert error.value.code == "agent_executor_unauthorized"
 
 
+def test_cancel_before_runner_starts_prevents_late_process_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """取消尚未进入 Runner 的任务时，后续调度不能再启动宿主进程。"""
+    runner = OpenCodeRunner(make_settings(tmp_path, agent_runtime_mode="host"), project_root=tmp_path)
+    monkeypatch.setattr(runner, "prepare_runtime", lambda: (_ for _ in ()).throw(AssertionError("cancelled task must not prepare runtime")))
+    image = tmp_path / "image.png"
+    image.write_bytes(b"image")
+    runner.cancel("pre-cancelled")
+    with pytest.raises(OpenCodeError) as error:
+        runner.run(image, lambda *_args: None, task_id="pre-cancelled")
+    assert error.value.code == "task_interrupted"
+
+
 def test_executor_image_path_is_mapped_and_host_path_is_checked(tmp_path: Path) -> None:
     """executor 图片只能映射到 /images，根目录外和符号链接均被拒绝。"""
     image_root = tmp_path / "data" / "images"

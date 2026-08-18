@@ -112,7 +112,7 @@ def ensure_token_file(path: str | Path) -> str:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(target, TOKEN_FILE_MODE)
+            os.fchmod(handle.fileno(), TOKEN_FILE_MODE)
     except OSError as exc:
         try:
             target.unlink(missing_ok=True)
