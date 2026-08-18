@@ -29,3 +29,12 @@
 - [x] 5.1 添加 executor HTTP 集成测试，覆盖认证、非法字段/路径、结果传递和取消。
 - [x] 5.2 运行后端全量测试、Python 编译、`git diff --check` 和 OpenSpec strict validation。
 - [ ] 5.3 在可用 Docker daemon、模型凭据和视觉权重条件下运行完整 Compose 真实 e2e；当前需在发布环境复核。
+
+## 6. 删除旧 Docker 兼容层
+
+- [x] 6.1 补充运行模式选择测试，覆盖 `auto` 的 executor/host 选择、显式 `executor` 缺少 URL 或 token 时失败关闭，以及旧 `docker` mode 不再受支持。
+- [x] 6.2 从配置模型、环境示例和 Compose 注入中删除 Agent 容器名、容器运行时及相关旧字段，只保留 `auto`、`executor`、`host` 和 executor 必需配置。
+- [x] 6.3 删除 `OpenCodeRunner` 的 `docker_mode`、Docker 权限探测、容器 inspect/exec/kill、容器路径和进程控制分支，确保 executor 错误不会回退 host 或 Docker。
+- [x] 6.4 简化 `scripts/open_opencode.py` 及相关诊断入口，删除真实容器名和旧 Docker runtime 分支，同时保留基于 `docker compose exec <service>` 的 project 内诊断。
+- [x] 6.5 删除 Agent 与 Visual service 的固定 `container_name`，更新 Compose/运行时身份测试，验证多 project 自动生成的容器名互不冲突且内部 DNS 不变。
+- [x] 6.6 删除旧 Docker 模式夹具和文档说明，记录迁移到 executor 或显式 host，并运行相关测试、完整 Compose 配置渲染、OpenSpec strict validation 与 `git diff --check`。

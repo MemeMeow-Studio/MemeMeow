@@ -18,8 +18,8 @@ from backend.opencode import OpenCodeError, OpenCodeRunner  # noqa: E402
 
 
 COMPOSE_SERVICE = "mememeow-agent-runtime"
-CONTAINER_WORKSPACE = "/runtime/workspace"
-CONTAINER_ENVIRONMENT = {
+EXECUTOR_WORKSPACE = "/runtime/workspace"
+EXECUTOR_ENVIRONMENT = {
     "OPENCODE_DB": "/runtime/opencode.db",
     "OPENCODE_CONFIG": "/runtime/workspace/opencode.json",
     "OPENCODE_CONFIG_DIR": "/runtime/workspace/.opencode",
@@ -78,9 +78,9 @@ def _compose_runtime_running() -> bool:
     return result.returncode == 0 and COMPOSE_SERVICE in result.stdout.splitlines()
 
 
-def _compose_runtime_selected(runtime_mode: str) -> bool:
-    """判断启动器是否应以 Compose 为权威来源；显式 host/docker 保留旧路径。"""
-    return runtime_mode in {"auto", "executor"} and _compose_file().is_file()
+def _compose_runtime_selected(runner: OpenCodeRunner) -> bool:
+    """判断 executor 模式是否应使用当前 Compose project 的 service 诊断入口。"""
+    return runner.executor_mode and runner.executor.configured and _compose_file().is_file()
 
 
 def _compose_launcher_command(*, session_list: bool, passthrough: list[str]) -> list[str]:
@@ -89,8 +89,8 @@ def _compose_launcher_command(*, session_list: bool, passthrough: list[str]) -> 
     if session_list:
         # 非交互查询关闭 TTY，便于重定向、测试和脚本消费 JSON。
         arguments.append("-T")
-    arguments.extend(("--workdir", CONTAINER_WORKSPACE))
-    for key, value in CONTAINER_ENVIRONMENT.items():
+    arguments.extend(("--workdir", EXECUTOR_WORKSPACE))
+    for key, value in EXECUTOR_ENVIRONMENT.items():
         arguments.extend(("--env", f"{key}={value}"))
     arguments.append(COMPOSE_SERVICE)
     if session_list:
@@ -114,9 +114,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     known, passthrough = parser.parse_known_args(argv)
     settings = Settings.from_env(PROJECT_ROOT / ".env")
+    runner = OpenCodeRunner(settings, project_root=PROJECT_ROOT)
 
-    # Compose named volume 是部署态权威数据源；显式 host/docker 才允许绕过它。
-    if _compose_runtime_selected(settings.agent_runtime_mode):
+    # Compose named volume 是 executor 部署态权威数据源；诊断只按 service key 定位当前 project。
+    if _compose_runtime_selected(runner):
         if not _compose_runtime_running():
             parser.exit(1, f"Compose Agent 服务 {COMPOSE_SERVICE} 未运行，无法打开共享 OpenCode runtime。\n")
         command = _compose_launcher_command(session_list=known.list, passthrough=passthrough)
@@ -125,18 +126,13 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as exc:
             parser.exit(1, f"无法进入 Compose OpenCode runtime: {exc}\n")
 
-    runner = OpenCodeRunner(settings, project_root=PROJECT_ROOT)
     try:
         runner.prepare_runtime()
     except OpenCodeError as exc:
         parser.exit(1, f"OpenCode runtime 初始化失败 [{exc.code}]: {exc}\n")
 
-    if runner.executor_mode:
-        parser.exit(1, f"Compose Agent 服务 {COMPOSE_SERVICE} 未运行，无法打开共享 OpenCode runtime。\n")
-
-    # Docker 模式只使用镜像内的固定命令，避免把宿主绝对路径传入容器。
-    executable = "opencode" if runner.docker_mode else str(settings.opencode_executable or "opencode")
-    environment = runner._allowed_container_environment(0) if runner.docker_mode else runner.build_environment()
+    executable = str(settings.opencode_executable or "opencode")
+    environment = runner.build_environment()
     if known.list:
         command = [executable, "session", "list", *passthrough]
     else:
@@ -149,25 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         ]
     try:
         os.chdir(runner.workspace)
-        if runner.docker_mode:
-            # 诊断入口沿用共享容器和同一 runtime DB，不会启动第二个容器。
-            container_command = list(command)
-            if not known.list:
-                # 宿主 workspace 路径不能传给容器；runtime 在容器内固定挂载到 /runtime。
-                container_command[1] = "/runtime/workspace"
-            docker_command = runner._container_exec(
-                *container_command,
-                environment=runner._allowed_container_environment(0),
-                workdir="/runtime/workspace",
-            )
-            if not known.list:
-                # 旧 Docker 兼容模式同样需要真实终端，否则 OpenCode TUI 无法接收输入。
-                docker_command.insert(2, "-it")
-            docker_command = runner._docker_command_for_execution(docker_command)
-            launcher_environment = {"PATH": os.environ.get("PATH", ""), **environment}
-            os.execvpe(docker_command[0], docker_command, launcher_environment)
-        else:
-            os.execvpe(executable, command, environment)
+        os.execvpe(executable, command, environment)
     except OSError as exc:
         parser.exit(1, f"无法启动 OpenCode: {exc}\n")
     return 0

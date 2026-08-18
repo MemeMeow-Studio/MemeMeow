@@ -152,6 +152,8 @@ API 只绑定 `127.0.0.1:8275`；Agent executor `8277` 和视觉服务 `8276` �
 
 `./scripts/agent-runtime.sh build|start|check|stop|restart|logs` 仍可单独运维 executor；`check` 同时验证 executor 健康接口、非 root、网络、OCR、JSON、挂载权限和 Docker socket 边界。应用服务依赖 executor 健康后才启动；全新 checkout 或干净宿主 shell 无需导出 token，executor 会在首次启动时原子生成并复用该 named volume 中的随机凭据。不要删除该 secret volume；若确需轮换，先停止 API 和 executor，再删除 volume 并重新启动 Compose。
 
+Agent 运行模式仅支持 `auto`、`executor` 和 `host`。`auto` 只有在 executor 地址与非空 token 同时可用时才选择 executor，否则使用 host；显式 `executor` 缺少任一配置会失败关闭，不会回退到 host。旧的 Docker runtime、容器名和容器运行时字段不再受支持；本地回滚请明确设置 `MEMEMEOW_AGENT_RUNTIME_MODE=host`。人工诊断仍可在当前 Compose project 中运行 `docker compose exec mememeow-agent-runtime ...`，不需要也不应配置真实容器名。
+
 4. （可选）准备视觉服务权重
 ```bash
 mkdir -p data/models

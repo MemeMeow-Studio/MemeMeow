@@ -39,8 +39,8 @@ class AgentExecutorClient:
 
     def __init__(self, url: str | None, token: str | None, *, opener: Callable[..., Any] | None = None, timeout: int = 1810):
         """保存内部地址和 token；token 只存在内存，不写入日志或结果文件。"""
-        self.url = (url or "").rstrip("/")
-        self.token = token or ""
+        self.url = (url or "").strip().rstrip("/")
+        self.token = (token or "").strip()
         self.opener = opener or urllib.request.urlopen
         self.timeout = max(1, int(timeout))
 

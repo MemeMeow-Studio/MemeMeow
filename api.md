@@ -115,6 +115,7 @@ Agent 只获得当前任务 token、内部地址和 executor token，不获得 c
 - 视觉源码目录由 `MEMEMEOW_VISUAL_MODEL_REPO` 配置，仅服务端读取；源码提交和权重许可要求见 [`docs/visual-model-baseline.md`](docs/visual-model-baseline.md)。
 - Agent 通过内部 `POST /internal/visual-search/match` 发送 `{ "task_id": "...", "top_k": 20, "exclude_self": true }`。scope、查询图片和向量空间均从运行中的 Agent 任务推导；候选必须同 scope、当前 SHA 有效并有成功 research provenance。
 - `.env` 关键字段：`EMBEDDING_API_KEY`、`EMBEDDING_BASE_URL`、`EMBEDDING_MODEL`、`MEMEMEOW_OPENCODE_BASE_URL`、`MEMEMEOW_OPENCODE_API_KEY`、`MEMEMEOW_OPENCODE_MODEL`、`MEMEMEOW_OPENCODE_RUNTIME_ROOT`、`MEMEMEOW_IMAGE_ROOT`、`MEMEMEOW_AGENT_CALLBACK_SECRET`。Compose 首次启动会在 `mememeow-agent-executor-secret` named volume 中生成 0600 的随机 executor token，API 以只读方式读取；旧版 host 运维模式仍可显式设置 `MEMEMEOW_AGENT_EXECUTOR_TOKEN`。生产 API 通过 Compose DNS 调用 executor，不使用 Docker CLI 或 socket。
+- Agent 运行模式只接受 `auto`、`executor` 和 `host`。`auto` 在 executor URL 与 token 同时可用时选择 executor，否则选择 host；显式 `executor` 缺少配置时失败关闭。旧 Docker runtime、容器名和运行时字段不能启用任何执行分支；回滚使用显式 host，运维诊断使用当前 project 的 `docker compose exec <service>`。
 - `MEMEMEOW_PROTECTED_MODE=true` 时仅放行 `MEMEMEOW_ALLOWED_ENDPOINTS`；限流由 `MEMEMEOW_RATE_LIMIT_*` 控制，超限返回 `429` 和 `Retry-After`。
 
 系统不提供注册、JWT、角色或多租户权限接口。资源包和社区同步功能已从生产入口移除。

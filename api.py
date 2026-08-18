@@ -389,10 +389,10 @@ def _context_payload(request: Request, image: Path, *, auto_name: bool = False, 
 def _submit_context_task(request: Request, image: Path, *, auto_name: bool = False, batch_id: str | None = None, expected_sha256: str | None = None, reverse_image_policy: str = "forbid", schedule: bool = True) -> TaskRecord:
     """提交或复用同一图片内容的语境生成任务。"""
     runner: OpenCodeRunner = request.app.state.opencode
-    if runner.executor_mode or runner.docker_mode:
+    if runner.executor_mode:
+        if not runner.executor.configured:
+            raise RuntimeError("agent_executor_not_configured")
         runtime = runner.runtime_probe()
-        if runtime.get("image_root_match") is False:
-            raise RuntimeError("agent_image_root_mismatch")
         if not bool(runtime.get("verified")):
             raise RuntimeError("agent_runtime_unavailable")
     if reverse_image_policy not in {"forbid", "auto"}:
@@ -436,7 +436,7 @@ def _context_enqueue_error(exc: Exception) -> str:
     if isinstance(code, str) and code:
         return code
     text = str(exc).split(":", 1)[0]
-    return text if text in {"agent_backpressure", "generation_policy_conflict", "reverse_image_unavailable", "invalid_reverse_image_policy"} else "context_enqueue_failed"
+    return text if text in {"agent_backpressure", "agent_executor_not_configured", "agent_executor_unavailable", "agent_executor_unauthorized", "agent_runtime_unavailable", "generation_policy_conflict", "processing_options_conflict", "reverse_image_unavailable", "invalid_reverse_image_policy", "invalid_auto_name"} else "context_enqueue_failed"
 
 
 def _collection_payload(request: Request, environment, row) -> dict[str, object]:
@@ -1455,9 +1455,7 @@ async def config_status(request: Request) -> dict[str, object]:
         key: runtime[key]
         for key in (
             "mode",
-            "container_name",
-            "container_running",
-            "image_root_match",
+            "executor_running",
             "runtime_root_ready",
             "workspace_ready",
             "executable_ready",
@@ -1895,9 +1893,6 @@ async def cancel_task(request: Request, task_id: str) -> dict[str, object]:
         cancel = getattr(request.app.state.opencode, "cancel", None)
         if callable(cancel):
             cancel(task_id)
-        else:
-            # 兼容未升级的 runner 夹具；生产 Compose 路径始终使用 cancel() 的 executor 协议。
-            request.app.state.opencode._terminate_container_session(task_id)
     current = _service(request, "tasks").get(task_id)
     return _task_summary(request, current or record)
 

@@ -83,9 +83,6 @@ class Settings(BaseSettings):
     rate_limit_window: int = Field(default=60, ge=1, validation_alias=AliasChoices("MEMEMEOW_RATE_LIMIT_WINDOW", "rate_limit_window"))
     max_upload_size: int = Field(default=20 * 1024 * 1024, ge=1, validation_alias=AliasChoices("MEMEMEOW_MAX_UPLOAD_SIZE", "max_upload_size"))
     opencode_executable: str | None = Field(default="opencode", validation_alias=AliasChoices("MEMEMEOW_OPENCODE_EXECUTABLE", "opencode_executable"))
-    # 生产部署由 Compose 注入容器名称；留空仅用于不依赖 Docker 的离线单元夹具。
-    agent_container_name: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_AGENT_CONTAINER_NAME", "agent_container_name"))
-    agent_container_runtime: str = Field(default="docker", validation_alias=AliasChoices("MEMEMEOW_AGENT_CONTAINER_RUNTIME", "agent_container_runtime"))
     agent_runtime_mode: str = Field(default="auto", validation_alias=AliasChoices("MEMEMEOW_AGENT_RUNTIME_MODE", "agent_runtime_mode"))
     opencode_model: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_MODEL", "opencode_model"))
     opencode_base_url: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_BASE_URL", "opencode_base_url"))
@@ -142,8 +139,6 @@ class Settings(BaseSettings):
         "agent_executor_token_file",
         "llm_enhance_model",
         "opencode_executable",
-        "agent_container_name",
-        "agent_container_runtime",
         "agent_runtime_mode",
         "opencode_model",
         "opencode_base_url",
@@ -185,11 +180,23 @@ class Settings(BaseSettings):
             raise ValueError("visual_weights_sha256_invalid")
         if not self.database_url.startswith("postgresql"):
             raise ValueError("postgresql_required")
-        if self.agent_container_runtime not in {"docker"}:
-            raise ValueError("agent_container_runtime_unsupported")
-        if self.agent_runtime_mode not in {"auto", "executor", "docker", "host"}:
+        if self.agent_runtime_mode not in {"auto", "executor", "host"}:
             raise ValueError("agent_runtime_mode_invalid")
         return self
+
+    @property
+    def executor_configured(self) -> bool:
+        """返回 executor 地址和 token 是否同时可用，供运行模式选择调用。"""
+        return bool(str(self.agent_executor_url or "").strip() and str(self.agent_executor_token or "").strip())
+
+    @property
+    def selected_agent_runtime_mode(self) -> str:
+        """解析最终执行模式；auto 只有在 executor 凭据完整时才选择 executor。"""
+        if self.agent_runtime_mode == "executor":
+            return "executor"
+        if self.agent_runtime_mode == "auto" and self.executor_configured:
+            return "executor"
+        return "host"
 
     @property
     def expected_database_revision(self) -> str:
@@ -248,7 +255,6 @@ class Settings(BaseSettings):
             "visual_model_dimensions": self.visual_model_dimensions,
             "visual_preprocess_version": self.visual_preprocess_version,
             "opencode_model": self.opencode_model,
-            "agent_container_name": self.agent_container_name,
             "agent_runtime_mode": self.agent_runtime_mode,
             "agent_executor_configured": bool(self.agent_executor_url),
             "agent_executor_token_configured": bool(self.agent_executor_token),
@@ -322,7 +328,6 @@ class Settings(BaseSettings):
             "visual_preprocess_version": self.visual_preprocess_version,
             "visual_available": self.visual_available,
             "opencode_model": self.opencode_model,
-            "agent_container_name": self.agent_container_name,
             "agent_runtime_mode": self.agent_runtime_mode,
             "agent_executor_configured": bool(self.agent_executor_url),
             "agent_executor_token_configured": bool(self.agent_executor_token),

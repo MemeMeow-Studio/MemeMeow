@@ -9,8 +9,10 @@ OpenCode。这样把容器编排权限带入业务进程，且 `sleep infinity` 
 
 - 在常驻 Agent 容器内运行受限 executor HTTP 服务，固定监听 Compose 内部端口，提供健康、结构化任务提交、状态和取消接口。
 - 后端使用 Compose DNS 和非空 Bearer token 调用 executor，不再调用 Docker CLI、读取 Docker socket 或向 Agent 容器注入任意命令/环境变量。
+- **BREAKING** 删除 API 侧旧 `docker exec` 兼容路径、`docker` runtime mode、容器名称/运行时配置和相关历史夹具；保留 executor 生产模式、显式 host 回滚模式及兼容的 `auto` 选择，显式 executor 配置不完整时必须失败关闭。
 - executor 自己选择固定 OpenCode `run --auto --format json` 调用，限制图片相对路径、任务 ID、策略、超时、并发、结果大小和运行环境；后端继续读取并校验共享任务结果文件。
 - Compose 以 executor 健康检查作为 API 启动条件，API 只绑定 `127.0.0.1:8275`；视觉服务和 executor 端口均不发布到宿主机。
+- 删除 Agent 与 Visual 服务的固定 `container_name`，由 Compose project 生成实例名；内部 service key、DNS 和基于 service 名的运维诊断保持不变。
 - 用 named volume 共享持久 runtime，保留 session、缓存和结果产物，同时避免 bind mount 覆盖非 root 写权限。
 - Compose 为视觉状态注入内部健康 URL，API 不再用宿主模型权重相对路径判断视觉服务可用性。
 
@@ -29,6 +31,7 @@ OpenCode。这样把容器编排权限带入业务进程，且 `sleep infinity` 
 ## Impact
 
 影响 `backend/opencode.py`、`backend/agent_executor.py`、`backend/config.py`、
-`executor/server.py`、Agent Dockerfile、Compose、视觉健康客户端、测试及运行文档。
-现有 OpenCode 结果文件协议、数据库任务契约和宿主模式兼容夹具保留；生产 Compose
-路径不再依赖 Docker API 权限。
+`executor/server.py`、`scripts/open_opencode.py`、Agent Dockerfile、Compose、视觉健康
+客户端、测试及运行文档。现有 OpenCode 结果文件协议、数据库任务契约和显式 host
+模式保留；依赖 `docker` runtime mode、固定容器名或 API 侧 Docker 进程控制的配置与
+夹具被移除，生产 Compose 路径不再依赖 Docker API 权限。

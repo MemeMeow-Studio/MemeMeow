@@ -11,7 +11,6 @@ import io
 import json
 import os
 import re
-import shlex
 import shutil
 import signal
 import stat
@@ -106,10 +105,7 @@ STREAM_COPY_CHUNK_BYTES = 64 * 1024
 RESULT_FILE_NAME = "result.json.tmp"
 RESULT_DRAFT_NAME = "result.json.draft"
 RESULT_DEFAULT_MAX_BYTES = 1024 * 1024
-CONTAINER_RUNTIME_ROOT = Path("/runtime")
-CONTAINER_IMAGE_ROOT = Path("/images")
-CONTAINER_SKILL_ROOT = Path("/skills/research-meme-context")
-CONTAINER_NODE_MODULES = Path("/opt/mememeow/node_modules")
+EXECUTOR_IMAGE_ROOT = Path("/images")
 
 
 class OpenCodeError(RuntimeError):
@@ -147,7 +143,6 @@ class OpenCodeRunner:
         self._process_tasks: dict[subprocess.Popen[bytes], str | None] = {}
         self._active_task_ids: set[str] = set()
         self._active_executor_task_ids: set[str] = set()
-        self._docker_direct_access: bool | None = None
         self.executor = AgentExecutorClient(
             getattr(settings, "agent_executor_url", None),
             getattr(settings, "agent_executor_token", None),
@@ -156,29 +151,13 @@ class OpenCodeRunner:
 
     @property
     def executor_mode(self) -> bool:
-        """判断当前任务是否通过 Compose 内部 executor 执行。"""
-        configured = bool(getattr(self.settings, "agent_executor_url", None))
-        return configured and getattr(self.settings, "agent_runtime_mode", "auto") != "host"
-
-    @property
-    def docker_mode(self) -> bool:
-        """判断是否启用旧版 Docker exec 兼容模式。
-
-        Compose 生产配置始终使用 ``executor_mode``；该分支仅保留旧宿主诊断
-        和历史夹具的兼容，不会被新的 API 容器路径调用。
-        """
-        if self.executor_mode:
-            return False
-        return self.settings.agent_runtime_mode == "docker" or (
-            self.settings.agent_runtime_mode == "auto" and bool(self.settings.agent_container_name)
-        )
-
-    @property
-    def container_name(self) -> str:
-        """返回共享容器名称；Docker 模式缺失名称时以稳定错误阻断任务。"""
-        if not self.settings.agent_container_name:
-            raise OpenCodeError("agent_runtime_unavailable", "共享 Agent 容器未配置")
-        return self.settings.agent_container_name
+        """判断当前任务是否通过已选定的 executor 执行。"""
+        mode = getattr(self.settings, "agent_runtime_mode", "auto")
+        if mode not in {"auto", "executor", "host"}:
+            raise OpenCodeError("agent_runtime_mode_invalid", "Agent 运行模式不受支持")
+        if mode == "executor":
+            return True
+        return mode == "auto" and self.executor.configured
 
     def _configured_image_root(self) -> Path:
         """解析设置中的图片根目录，统一相对路径基准以匹配 Compose 挂载。"""
@@ -186,65 +165,6 @@ class OpenCodeRunner:
         if not configured.is_absolute():
             configured = self.project_root / configured
         return configured.resolve()
-
-    def _docker_image_root_matches_mount(self) -> bool:
-        """确认 Docker `/images` 的固定挂载来源与服务图片根目录一致。"""
-        return self._configured_image_root() == (self.project_root / "data" / "images").resolve()
-
-    def _docker(self, *arguments: str) -> list[str]:
-        """构造不经过 shell 的 Docker 命令，避免任务输入参与命令拼接。"""
-        return [self.settings.agent_container_runtime, *arguments]
-
-    def _docker_command_for_execution(self, command: list[str]) -> list[str]:
-        """为当前宿主用户选择直接 Docker 或安全的 ``sg docker`` 执行方式。"""
-        if self._docker_direct_access is None:
-            try:
-                probe = subprocess.run(
-                    [self.settings.agent_container_runtime, "info"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=3,
-                    check=False,
-                )
-                self._docker_direct_access = probe.returncode == 0
-            except (OSError, subprocess.TimeoutExpired):
-                self._docker_direct_access = False
-        if self._docker_direct_access:
-            return command
-        # sg 只接受一个命令字符串；逐参数 quote，避免 prompt 或密钥改变命令结构。
-        return ["sg", "docker", "-c", " ".join(shlex.quote(value) for value in command)]
-
-    def _container_exec(self, *arguments: str, environment: dict[str, str] | None = None, workdir: str | None = None) -> list[str]:
-        """构造共享容器 exec 命令，仅显式加入允许的运行环境变量。"""
-        command = self._docker("exec")
-        if workdir:
-            command.extend(("--workdir", workdir))
-        # 使用 `--env KEY` 从调用方白名单环境继承值，避免 API key 出现在宿主命令行。
-        for key in (environment or {}):
-            command.extend(("--env", key))
-        command.append(self.container_name)
-        command.extend(arguments)
-        return command
-
-    def _container_ready(self) -> tuple[bool, str]:
-        """检查 Docker daemon 和共享容器是否处于运行状态。"""
-        try:
-            command = self._docker_command_for_execution(self._docker("inspect", "--format", "{{.State.Running}}", self.container_name))
-            result = subprocess.run(command, capture_output=True, text=True, timeout=5, check=False)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return False, f"Docker runtime unavailable: {type(exc).__name__}"
-        if result.returncode != 0 or result.stdout.strip().lower() != "true":
-            return False, "共享 Agent 容器未运行"
-        return True, "ok"
-
-    def _container_exec_probe(self, arguments: list[str]) -> tuple[bool, str]:
-        """执行不修改状态的容器工具探针。"""
-        try:
-            command = self._docker_command_for_execution(self._container_exec(*arguments))
-            result = subprocess.run(command, capture_output=True, text=True, timeout=8, check=False)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return False, type(exc).__name__
-        return result.returncode == 0, (result.stdout.strip() or result.stderr.strip())[:200]
 
     def _link(self, target: Path, source: Path) -> None:
         """创建或核验相对链接，拒绝覆盖不属于 runtime 的真实目录。"""
@@ -283,10 +203,16 @@ class OpenCodeRunner:
             if self.executor_mode:
                 if not self.executor.configured:
                     raise OpenCodeError("agent_executor_not_configured", "Agent executor 地址或凭据 token 未配置")
-                health = self.executor.health()
+                try:
+                    health = self.executor.health()
+                except AgentExecutorError as exc:
+                    # 健康探针失败也必须进入任务稳定错误协议，不能把客户端异常
+                    # 直接交给长任务服务并退化成 task_failed。
+                    code = "agent_runtime_unavailable" if exc.code == "agent_timeout" else exc.code
+                    raise OpenCodeError(code, str(exc)[:500]) from exc
                 if not bool(health.get("ready")):
                     raise OpenCodeError("agent_runtime_unavailable", "Agent executor 健康检查未通过")
-            elif not self.docker_mode:
+            else:
                 executable = self.settings.opencode_executable
                 if not executable or (not Path(executable).is_file() and shutil.which(executable) is None):
                     raise OpenCodeError("opencode_not_configured", "未找到 OpenCode 可执行文件")
@@ -295,27 +221,13 @@ class OpenCodeRunner:
                 shared_modules = self.settings.opencode_node_modules or self.project_root / ".opencode" / "node_modules"
                 if not skills_source.is_dir() or not shared_modules.is_dir() or not (shared_modules / "@ai-sdk" / "openai").is_dir():
                     raise OpenCodeError("opencode_not_configured", "OpenCode skill、共享 node_modules 或 Responses provider 未预先安装")
-            elif self.docker_mode:
-                if not self._docker_image_root_matches_mount():
-                    raise OpenCodeError("agent_image_root_mismatch", "Docker Agent 图片挂载与图片根配置不一致")
-                ready, diagnostic = self._container_ready()
-                if not ready:
-                    raise OpenCodeError("agent_runtime_unavailable", diagnostic)
             self.runtime_root.mkdir(parents=True, exist_ok=True)
             (self.runtime_root / "home").mkdir(parents=True, exist_ok=True)
             self.workspace.mkdir(parents=True, exist_ok=True)
             self.slots_root.mkdir(parents=True, exist_ok=True)
             self.log_root.mkdir(parents=True, exist_ok=True)
             self._write_runtime_config()
-            if self.executor_mode:
-                # executor 直接挂载只读 skill 和镜像依赖，runtime volume 不保留符号链接，
-                # 这样初始化服务在重启时仍能严格拒绝所有链接节点。
-                pass
-            elif self.docker_mode:
-                # 旧版 Docker exec 兼容模式仍使用容器固定路径，避免暴露宿主绝对路径。
-                self._link(self.workspace / ".opencode" / "skills" / "research-meme-context", CONTAINER_SKILL_ROOT)
-                self._link(self.workspace / "node_modules", CONTAINER_NODE_MODULES)
-            else:
+            if not self.executor_mode:
                 self._link(self.workspace / ".opencode" / "skills" / "research-meme-context", skills_source)
                 self._link(self.workspace / "node_modules", shared_modules)
             self._runtime_ready = True
@@ -334,11 +246,10 @@ class OpenCodeRunner:
             executable_ready = bool(health.get("opencode"))
             socket_absent = bool(health.get("docker_socket_absent"))
             return {
-                "mode": "compose-agent-executor",
-                "container_name": getattr(self.settings, "agent_container_name", None),
+                "mode": "executor",
                 "executor_url_configured": bool(self.executor.url),
                 "executor_token_configured": bool(self.executor.token),
-                "container_running": ready,
+                "executor_running": ready,
                 "runtime_root_ready": self.runtime_root.is_dir(),
                 "workspace_ready": self.workspace.is_dir(),
                 "executable_ready": executable_ready,
@@ -353,40 +264,6 @@ class OpenCodeRunner:
                 "docker_socket_absent": socket_absent,
                 "concurrency": self.concurrency,
                 "verified": bool(ready and self.executor.configured and runtime_ready and images_ready and skills_ready and executable_ready and socket_absent),
-            }
-        if self.docker_mode:
-            running, running_detail = self._container_ready()
-            image_root_match = self._docker_image_root_matches_mount()
-            probes = {
-                "opencode": self._container_exec_probe(["opencode", "--version"]) if running else (False, "container_not_running"),
-                "runtime_read_write": self._container_exec_probe(["sh", "-lc", "test -r /runtime && test -w /runtime"]) if running else (False, "container_not_running"),
-                "images_read_only": self._container_exec_probe(["sh", "-lc", "test -r /images && test ! -w /images"]) if running else (False, "container_not_running"),
-                "skill_read_only": self._container_exec_probe(["sh", "-lc", "test -r /skills/research-meme-context && test ! -w /skills/research-meme-context"]) if running else (False, "container_not_running"),
-                "dependencies_read_only": self._container_exec_probe(["sh", "-lc", "test -r /opt/mememeow/node_modules && test ! -w /opt/mememeow/node_modules"]) if running else (False, "container_not_running"),
-                "non_root": self._container_exec_probe(["sh", "-lc", 'test "$(id -u)" != 0']) if running else (False, "container_not_running"),
-                "network": self._container_exec_probe(["sh", "-lc", "curl -fsS --max-time 3 https://example.com >/dev/null"]) if running else (False, "container_not_running"),
-                "docker_socket_absent": self._container_exec_probe(["sh", "-lc", "test ! -S /var/run/docker.sock"]) if running else (False, "container_not_running"),
-            }
-            tool_values = {key: value[0] for key, value in probes.items()}
-            return {
-                "mode": "shared-docker-container",
-                "container_name": self.settings.agent_container_name,
-                "container_running": running,
-                "container_diagnostic": running_detail,
-                "image_root_match": image_root_match,
-                "runtime_root_ready": self.runtime_root.is_dir(),
-                "workspace_ready": self.workspace.is_dir(),
-                "db_path": "opencode.db",
-                "executable_ready": tool_values["opencode"],
-                "skills_ready": tool_values["skill_read_only"],
-                "dependencies_ready": tool_values["opencode"] and tool_values["dependencies_read_only"],
-                "mounts_ready": tool_values["runtime_read_write"] and tool_values["images_read_only"] and tool_values["skill_read_only"],
-                "non_root": tool_values["non_root"],
-                "network_ready": tool_values["network"],
-                "docker_socket_absent": tool_values["docker_socket_absent"],
-                "tools": tool_values,
-                "concurrency": self.concurrency,
-                "verified": bool(running and image_root_match and all(tool_values.values()) and self.runtime_root.is_dir()),
             }
         executable = self.settings.opencode_executable
         executable_ready = bool(executable and (Path(executable).is_file() or shutil.which(executable)))
@@ -453,9 +330,9 @@ class OpenCodeRunner:
             if callback_token:
                 values["MEMEMEOW_AGENT_CALLBACK_TOKEN"] = callback_token
             return values
-        # host/dedicated 兼容模式也必须使用白名单；继承整个 API 环境会把 callback
+        # host 回滚模式也必须使用白名单；继承整个 API 环境会把 callback
         # 根 secret、executor token、数据库配置或其它 scope 配置带进 Agent 子进程。
-        runtime_root = CONTAINER_RUNTIME_ROOT if self.docker_mode else self.runtime_root
+        runtime_root = self.runtime_root
         workspace = runtime_root / "workspace"
         environment = {
             "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
@@ -472,10 +349,9 @@ class OpenCodeRunner:
             # 视觉 Skill 只接收 task-scoped 内部地址，不获得数据库或模型运行时权限。
             "MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL": self._agent_visual_search_url(),
         }
-        if not self.docker_mode:
-            environment["MEMEMEOW_OPENCODE_BASE_URL"] = str(self.settings.opencode_base_url or "")
-            environment["MEMEMEOW_OPENCODE_API_KEY"] = str(self.settings.opencode_api_key or "")
-            environment["NODE_PATH"] = str(self.workspace / "node_modules")
+        environment["MEMEMEOW_OPENCODE_BASE_URL"] = str(self.settings.opencode_base_url or "")
+        environment["MEMEMEOW_OPENCODE_API_KEY"] = str(self.settings.opencode_api_key or "")
+        environment["NODE_PATH"] = str(self.workspace / "node_modules")
         if slot_id is not None:
             environment["MEMEMEOW_OPENCODE_SLOT"] = str(slot_id)
         if task_id:
@@ -483,29 +359,6 @@ class OpenCodeRunner:
         if callback_token:
             environment["MEMEMEOW_AGENT_CALLBACK_TOKEN"] = callback_token
         return environment
-
-    def _allowed_container_environment(self, slot_id: int, task_id: str | None = None, callback_token: str | None = None) -> dict[str, str]:
-        """返回 Docker exec 白名单环境，禁止继承宿主其他环境变量。"""
-        values = {
-            "OPENCODE_DB": "/runtime/opencode.db",
-            "OPENCODE_CONFIG": "/runtime/workspace/opencode.json",
-            "OPENCODE_CONFIG_DIR": "/runtime/workspace/.opencode",
-            "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
-            "MEMEMEOW_OPENCODE_BASE_URL": str(self.settings.opencode_base_url or ""),
-            "MEMEMEOW_OPENCODE_API_KEY": str(self.settings.opencode_api_key or ""),
-            "MEMEMEOW_OPENCODE_SLOT": str(slot_id),
-            "MEMEMEOW_AGENT_CONTAINER": self.container_name,
-            # Skill 的可选反向图片检索只通过单一密钥和 runtime 缓存目录获得配置。
-            "MEMEMEOW_DATA_ROOT": "/runtime",
-            "MEMEMEOW_REVERSE_IMAGE_CACHE_ROOT": "/runtime/reverse_image_cache/serpapi_google_lens",
-            "MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL": self._agent_reverse_image_url(),
-            "MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL": self._agent_visual_search_url(),
-        }
-        if task_id:
-            values["MEMEMEOW_AGENT_TASK_ID"] = task_id
-        if callback_token:
-            values["MEMEMEOW_AGENT_CALLBACK_TOKEN"] = callback_token
-        return values
 
     def _acquire_slot(self) -> tuple[int, Any]:
         """获取进程内 semaphore 和跨进程 slot 文件锁。"""
@@ -731,54 +584,14 @@ class OpenCodeRunner:
             except OSError:
                 pass
 
-    def _terminate_container_session(self, task_id: str | None) -> None:
-        """终止指定 task 的容器进程，等待退出并以 KILL 兜底，不停止共享容器。"""
-        if not self.docker_mode or not task_id:
+    def _terminate_task(self, task_id: str | None) -> None:
+        """终止宿主模式下属于指定 task 的本地进程组，不影响其它任务。"""
+        if not task_id:
             return
-        # 每个任务的 OpenCode 命令带唯一 title；先 TERM，再确认匹配进程消失，最后 KILL。
-        pattern = f"mememeow-task-{re.escape(task_id)}"
-        try:
-            for signal_name, wait_seconds in (("TERM", 2.0), ("KILL", 1.0)):
-                self._container_signal_processes(pattern, signal_name)
-                deadline = time.monotonic() + wait_seconds
-                while time.monotonic() < deadline:
-                    if not self._container_has_task_processes(pattern):
-                        return
-                    time.sleep(0.05)
-            # KILL 后再发一次，覆盖进程在探针间隙重新出现的极端情况。
-            self._container_signal_processes(pattern, "KILL")
-        except (OpenCodeError, OSError, subprocess.TimeoutExpired):
-            pass
-
-    def _container_signal_processes(self, pattern: str, signal_name: str) -> None:
-        """按唯一任务标题向容器内匹配进程发送指定信号。"""
-        command = (
-            f"self=$$; for pid in $(pgrep -f -- {shlex.quote(pattern)} || true); do "
-            f"[ \"$pid\" = \"$self\" ] || kill -{signal_name} \"$pid\" 2>/dev/null || true; done"
-        )
-        subprocess.run(
-            self._docker_command_for_execution(self._container_exec("sh", "-lc", command)),
-            capture_output=True,
-            timeout=5,
-            check=False,
-        )
-
-    def _container_has_task_processes(self, pattern: str) -> bool:
-        """探测容器内是否仍有匹配任务进程。"""
-        command = (
-            f"self=$$; found=1; for pid in $(pgrep -f -- {shlex.quote(pattern)} || true); do "
-            f"[ \"$pid\" = \"$self\" ] || found=0; done; exit $found"
-        )
-        try:
-            result = subprocess.run(
-                self._docker_command_for_execution(self._container_exec("sh", "-lc", command)),
-                capture_output=True,
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return True
-        return result.returncode == 0
+        with self._process_lock:
+            processes = [process for process, active_task_id in self._process_tasks.items() if active_task_id == task_id]
+        for process in processes:
+            self._terminate(process)
 
     @staticmethod
     def _iter_json_array_values(source: BinaryIO) -> Iterator[object]:
@@ -933,8 +746,8 @@ class OpenCodeRunner:
     def map_image_path(self, image: Path) -> Path:
         """把后端图片路径映射到 executor 的只读 `/images`，拒绝根目录外文件。"""
         root = self._configured_image_root()
-        if (self.executor_mode or self.docker_mode) and root != (self.project_root / "data" / "images").resolve():
-            raise OpenCodeError("agent_image_root_mismatch", "Docker Agent 图片挂载与图片根配置不一致")
+        if self.executor_mode and root != (self.project_root / "data" / "images").resolve():
+            raise OpenCodeError("agent_image_root_mismatch", "executor 图片挂载与图片根配置不一致")
         raw_candidate = image.expanduser()
         # 先检查原始路径；若先 resolve，指向图片根目录内的符号链接会失去可识别性。
         if raw_candidate.is_symlink():
@@ -946,7 +759,7 @@ class OpenCodeRunner:
             raise OpenCodeError("agent_image_path_forbidden", "图片路径不在受控图片目录内") from exc
         if not candidate.is_file():
             raise OpenCodeError("agent_image_path_forbidden", "图片路径不可作为普通文件读取")
-        return CONTAINER_IMAGE_ROOT / Path(relative.as_posix()) if (self.executor_mode or self.docker_mode) else candidate
+        return EXECUTOR_IMAGE_ROOT / Path(relative.as_posix()) if self.executor_mode else candidate
 
     def map_host_image_path(self, image: Path) -> Path:
         """兼容诊断和测试入口，返回图片在当前运行时中的路径。"""
@@ -1075,10 +888,6 @@ class OpenCodeRunner:
         """读取并校验任务结果文件，供任务处理器和测试直接调用。"""
         return self._read_result_file(result_path)
 
-    def container_command(self, image: Path, prompt: str, *, slot_id: int = 0, task_id: str | None = None) -> list[str]:
-        """返回不经 shell 的共享容器 OpenCode 命令，便于启动诊断和参数审计。"""
-        return self._run_command(image, prompt, slot_id=slot_id, task_id=task_id)
-
     def cleanup_task_results(self, *, keep_task_id: str | None = None) -> int:
         """按保留天数和最大任务数清理旧产物，不删除当前任务目录。"""
         root = self.runtime_root / "task-results"
@@ -1118,19 +927,18 @@ class OpenCodeRunner:
             return removed
 
     def _run_command(self, image: Path, prompt: str, *, slot_id: int | None = None, task_id: str | None = None, result_path: Path | None = None, callback_token: str | None = None) -> list[str]:
-        """构造单图研究 CLI 参数，固定模型推理变体以保证结果质量一致。"""
-        image_path = self.map_image_path(image) if self.docker_mode else image.expanduser().resolve()
+        """构造宿主模式单图研究 CLI 参数，固定模型推理变体以保证结果质量一致。"""
+        # host 回滚支持开发者直接检查临时图片；业务 API 在提交前仍通过 map_image_path
+        # 验证受控图片根，executor 路径则单独执行同一边界校验。
+        image_path = image.expanduser().resolve()
         executable = str(self.settings.opencode_executable or "opencode")
-        if self.docker_mode and Path(executable).is_absolute() and not executable.startswith(("/runtime/", "/opt/", "/usr/", "/bin/", "/sbin/")):
-            # Docker 模式不能把宿主绝对路径交给容器；镜像内命令作为生产默认值。
-            executable = "opencode"
         command = [
             executable,
             "run",
-            # 非交互任务无法回答 OpenCode 的外部目录询问；容器挂载边界负责限制实际可见范围。
+            # 非交互任务无法回答 OpenCode 的外部目录询问；runtime 边界负责限制可见范围。
             "--auto",
             "--dir",
-            "/runtime/workspace" if self.docker_mode else str(self.workspace),
+            str(self.workspace),
             "--format",
             "json",
             "--file",
@@ -1143,11 +951,6 @@ class OpenCodeRunner:
             f"mememeow-task-{task_id or 'interactive'}",
             prompt,
         ]
-        if self.docker_mode:
-            if slot_id is None:
-                slot_id = 0
-            environment = self._allowed_container_environment(slot_id, task_id, callback_token)
-            return self._container_exec(*command, environment=environment, workdir="/runtime/workspace")
         return command
 
     def run(self, image: Path, progress: Callable[[float | None, str | None], None], *, task_id: str | None = None, reverse_image_policy: str = "forbid", callback_token: str | None = None) -> tuple[dict[str, Any], str]:
@@ -1162,11 +965,11 @@ class OpenCodeRunner:
                     self._active_executor_task_ids.add(task_id)
                 _draft_path, result_path = self.task_result_paths(task_id)
             self._reset_task_result_files(_draft_path, result_path)
-            result_runtime_root = CONTAINER_RUNTIME_ROOT if self.docker_mode else self.runtime_root
+            result_runtime_root = self.runtime_root
             if self.executor_mode:
                 mapped_image = self.map_image_path(image)
                 try:
-                    relative_image = mapped_image.relative_to(CONTAINER_IMAGE_ROOT).as_posix()
+                    relative_image = mapped_image.relative_to(EXECUTOR_IMAGE_ROOT).as_posix()
                 except ValueError as exc:
                     raise OpenCodeError("agent_image_path_forbidden", "图片路径不在 executor 受控目录内") from exc
                 progress(0.1, "正在提交 Agent executor 任务")
@@ -1185,8 +988,6 @@ class OpenCodeRunner:
                         except AgentExecutorError:
                             pass
                         raise OpenCodeError("agent_timeout", "OpenCode 执行超时") from exc
-                    if exc.code in {"agent_executor_unavailable", "agent_executor_not_configured", "agent_executor_unauthorized"}:
-                        raise OpenCodeError("agent_runtime_unavailable", "Agent executor 暂时不可用") from exc
                     raise OpenCodeError(exc.code, str(exc)) from exc
                 if response.status not in {"succeeded", "running", "queued"}:
                     raise OpenCodeError("agent_executor_invalid_response", "Agent executor 任务未返回成功状态")
@@ -1204,11 +1005,8 @@ class OpenCodeRunner:
                 "不要把业务 JSON 作为 assistant 文本交付，不要写入数据库；完成后简短说明即可。"
             )
             command = self._run_command(image, prompt, slot_id=slot_id, task_id=task_id, result_path=result_path, callback_token=callback_token)
-            execution_command = self._docker_command_for_execution(command) if self.docker_mode else command
-            environment = self.build_environment(slot_id, task_id, callback_token) if not self.docker_mode else {
-                "PATH": os.environ.get("PATH", ""),
-                **self._allowed_container_environment(slot_id, task_id, callback_token),
-            }
+            execution_command = command
+            environment = self.build_environment(slot_id, task_id, callback_token)
             progress(0.1, f"正在启动语境研究（slot {slot_id}）")
             # 由临时文件承接完整事件流，避免按总字节数拒绝合法的大输出，也避免管道缓存堆积在内存。
             with (
@@ -1217,7 +1015,7 @@ class OpenCodeRunner:
             ):
                 process = subprocess.Popen(
                     execution_command,
-                    cwd=self.workspace if not self.docker_mode else self.project_root,
+                    cwd=self.workspace,
                     env=environment,
                     stdin=subprocess.DEVNULL,
                     stdout=stdout_stream,
@@ -1230,7 +1028,6 @@ class OpenCodeRunner:
                     process.communicate(timeout=self.settings.opencode_timeout_seconds)
                 except subprocess.TimeoutExpired as exc:
                     self._terminate(process)
-                    self._terminate_container_session(task_id)
                     raise OpenCodeError("agent_timeout", "OpenCode 执行超时") from exc
                 finally:
                     self._untrack_process(process)
@@ -1256,9 +1053,7 @@ class OpenCodeRunner:
             try:
                 candidate = self._read_result_file(result_path)
             except OpenCodeError:
-                # 仅为旧宿主运行器和历史单元夹具保留会话读取兼容；Docker 模式绝不解析 assistant 文本。
-                if self.docker_mode:
-                    raise
+                # 显式 host 回滚继续兼容旧 session 结果读取；executor 任务在上方已直接失败。
                 data = self._session_messages(session_id, environment)
                 candidate = self.validate_candidate(self.extract_candidate(self._last_assistant_text(data)))
             progress(0.9, "正在校验并写入语境")
@@ -1299,11 +1094,9 @@ class OpenCodeRunner:
                 processes.append(self._process)
         for process in processes:
             self._terminate(process)
-            task_id = self._process_tasks.get(process)
-            self._terminate_container_session(task_id)
 
     def cancel(self, task_id: str) -> None:
-        """取消指定研究任务；Compose 模式请求 executor，宿主兼容模式终止本地进程。"""
+        """取消指定研究任务；executor 请求远端取消，host 终止对应本地进程组。"""
         if not task_id:
             return
         if self.executor_mode:
@@ -1313,4 +1106,4 @@ class OpenCodeRunner:
                 # 数据库任务已被取消时，executor 可能已经重启或忘记任务；不阻塞 API 收束。
                 return
             return
-        self._terminate_container_session(task_id)
+        self._terminate_task(task_id)

@@ -1,37 +1,35 @@
-"""共享 Agent 容器边界和任务结果文件协议测试。"""
+"""Agent 运行模式、executor 边界和任务结果文件协议测试。"""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-import shlex
-import shutil
-import subprocess
-import uuid
-import asyncio
-import stat
 import time
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 from starlette.requests import Request
 
 from api import config_status
+from backend.agent_executor import AgentExecutorError
 from backend.config import Settings
 from backend.opencode import OpenCodeError, OpenCodeRunner
 
 
 def make_settings(tmp_path: Path, **overrides: object) -> Settings:
-    """构造仅使用临时目录的 Docker runtime 配置。"""
+    """构造仅使用临时目录的 host/executor 测试配置。"""
     values: dict[str, object] = {
+        "_env_file": None,
         "data_root": tmp_path / "data",
         "image_root": tmp_path / "data" / "images",
         "opencode_model": "mememeow/gpt-5.6-luna",
         "opencode_base_url": "https://example.invalid/v1",
         "opencode_api_key": "test-key",
-        "agent_container_name": "mememeow-agent-runtime",
-        "agent_runtime_mode": "docker",
+        "opencode_executable": None,
+        "agent_runtime_mode": "host",
     }
     values.update(overrides)
     return Settings(**values)
@@ -53,102 +51,136 @@ def candidate() -> dict[str, object]:
     }
 
 
-def test_container_command_whitelists_environment_and_maps_image(tmp_path: Path):
-    """容器命令使用 /images 路径且不继承宿主密钥或数据库环境。"""
+def test_runtime_mode_selection_is_executor_or_host(tmp_path: Path) -> None:
+    """auto 只在 URL/token 均存在时选择 executor，显式 host 始终保留本地回滚。"""
+    assert OpenCodeRunner(make_settings(tmp_path)).executor_mode is False
+    assert OpenCodeRunner(make_settings(tmp_path, agent_runtime_mode="auto")).executor_mode is False
+    assert OpenCodeRunner(make_settings(tmp_path, agent_runtime_mode="auto", agent_executor_url="http://agent:8277")).executor_mode is False
+    assert OpenCodeRunner(make_settings(tmp_path, agent_runtime_mode="auto", agent_executor_url=" ", agent_executor_token=" ")).executor_mode is False
+    assert OpenCodeRunner(
+        make_settings(tmp_path, agent_runtime_mode="auto", agent_executor_url="http://agent:8277", agent_executor_token="token")
+    ).executor_mode is True
+    assert OpenCodeRunner(
+        make_settings(tmp_path, agent_runtime_mode="host", agent_executor_url="http://agent:8277", agent_executor_token="token")
+    ).executor_mode is False
+
+
+def test_explicit_executor_missing_configuration_fails_closed(tmp_path: Path) -> None:
+    """显式 executor 缺少 URL 或 token 时失败，不能静默启动 host OpenCode。"""
+    runner = OpenCodeRunner(make_settings(tmp_path, agent_runtime_mode="executor"))
+    assert runner.executor_mode is True
+    with pytest.raises(OpenCodeError) as error:
+        runner.prepare_runtime()
+    assert error.value.code == "agent_executor_not_configured"
+
+
+def test_legacy_docker_mode_and_fields_are_rejected(tmp_path: Path) -> None:
+    """旧 docker mode 被拒绝，旧容器字段不会成为 Settings 属性或执行开关。"""
+    with pytest.raises(ValidationError, match="agent_runtime_mode_invalid"):
+        make_settings(tmp_path, agent_runtime_mode="docker")
+    settings = make_settings(tmp_path, MEMEMEOW_AGENT_CONTAINER_NAME="legacy-name", MEMEMEOW_AGENT_CONTAINER_RUNTIME="docker")
+    assert not hasattr(settings, "agent_container_name")
+    assert not hasattr(settings, "agent_container_runtime")
+
+
+@pytest.mark.parametrize("executor_error", ["agent_executor_unavailable", "agent_executor_unauthorized"])
+def test_executor_failure_does_not_fallback_to_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, executor_error: str) -> None:
+    """executor 请求失败必须保留稳定错误码，不调用宿主 subprocess 回退。"""
+    data_root = tmp_path / "data"
+    image_root = data_root / "images"
+    image_root.mkdir(parents=True)
+    image = image_root / "sample.png"
+    image.write_bytes(b"image")
+    runner = OpenCodeRunner(
+        make_settings(
+            tmp_path,
+            agent_runtime_mode="executor",
+            agent_executor_url="http://agent:8277",
+            agent_executor_token="token",
+        ),
+        project_root=tmp_path,
+    )
+    monkeypatch.setattr(runner.executor, "health", lambda: {"ready": True})
+    monkeypatch.setattr(runner.executor, "run", lambda **_kwargs: (_ for _ in ()).throw(AgentExecutorError(executor_error)))
+    monkeypatch.setattr(runner, "_run_command", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("host fallback")))
+    with pytest.raises(OpenCodeError) as error:
+        runner.run(image, lambda *_args: None, task_id="executor-failure")
+    assert error.value.code == executor_error
+
+
+def test_executor_health_failure_is_stable_and_does_not_fallback_to_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """executor 健康探针异常必须转换为稳定错误，不能启动宿主 OpenCode。"""
+    runner = OpenCodeRunner(
+        make_settings(tmp_path, agent_runtime_mode="executor", agent_executor_url="http://agent:8277", agent_executor_token="token"),
+        project_root=tmp_path,
+    )
+    monkeypatch.setattr(runner.executor, "health", lambda: (_ for _ in ()).throw(AgentExecutorError("agent_executor_unauthorized")))
+    monkeypatch.setattr(runner, "_run_command", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("host fallback")))
+    image = tmp_path / "data" / "images" / "sample.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"image")
+    with pytest.raises(OpenCodeError) as error:
+        runner.run(image, lambda *_args: None, task_id="executor-health-failure")
+    assert error.value.code == "agent_executor_unauthorized"
+
+
+def test_executor_image_path_is_mapped_and_host_path_is_checked(tmp_path: Path) -> None:
+    """executor 图片只能映射到 /images，根目录外和符号链接均被拒绝。"""
     image_root = tmp_path / "data" / "images"
     image_root.mkdir(parents=True)
     image = image_root / "nested" / "meme.png"
     image.parent.mkdir()
     image.write_bytes(b"image")
-    runner = OpenCodeRunner(make_settings(tmp_path), project_root=tmp_path)
-    command = runner.container_command(image, "write result", task_id="task-1")
-    assert command[:3] == ["docker", "exec", "--workdir"]
-    assert "/images/nested/meme.png" in command
-    assert "--auto" in command
-    assert "--env" in command
-    assert "test-key" not in " ".join(command)
-    assert all("=" not in value for index, value in enumerate(command) if index and command[index - 1] == "--env")
-    assert not any("DATABASE_URL" in value or "HOME=" in value for value in command)
-    assert "SERPAPI_API_KEY" not in command
-
-
-def test_docker_environment_contains_claim_task_id(tmp_path: Path):
-    """Docker 白名单环境必须和 Host 一样传递当前 claim task id。"""
-    runner = OpenCodeRunner(make_settings(tmp_path), project_root=tmp_path)
-    environment = runner._allowed_container_environment(1, "claim-task-123")
-    assert environment["MEMEMEOW_AGENT_TASK_ID"] == "claim-task-123"
-    assert "SERPAPI_API_KEY" not in environment
-
-
-def test_docker_environment_uses_agent_callback_urls(tmp_path: Path):
-    """宿主后端与 Docker Agent 分离时，容器应使用专用 host-gateway 回调地址。"""
     runner = OpenCodeRunner(
-        make_settings(
-            tmp_path,
-            agent_reverse_image_internal_url="http://host.docker.internal:8275/internal/reverse-image/search",
-            agent_visual_search_internal_url="http://host.docker.internal:8275/internal/visual-search/match",
-        ),
+        make_settings(tmp_path, agent_runtime_mode="executor", agent_executor_url="http://agent:8277", agent_executor_token="token"),
         project_root=tmp_path,
     )
-    environment = runner._allowed_container_environment(0, "claim-task-urls")
-    assert environment["MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL"].startswith("http://host.docker.internal:")
-    assert environment["MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL"].startswith("http://host.docker.internal:")
-
-
-def test_image_path_outside_root_is_rejected(tmp_path: Path):
-    """图片根目录外的路径不能映射到 Agent。"""
+    assert runner.map_image_path(image).as_posix() == "/images/nested/meme.png"
     outside = tmp_path / "outside.png"
     outside.write_bytes(b"x")
-    runner = OpenCodeRunner(make_settings(tmp_path), project_root=tmp_path)
     with pytest.raises(OpenCodeError) as error:
-        runner.map_host_image_path(outside)
+        runner.map_image_path(outside)
     assert error.value.code == "agent_image_path_forbidden"
-
-
-def test_image_symlink_is_rejected_before_resolution(tmp_path: Path):
-    """图片根目录内的符号链接也不能借路径解析绕过只读边界。"""
-    image_root = tmp_path / "data" / "images"
-    image_root.mkdir(parents=True)
-    source = image_root / "source.png"
-    source.write_bytes(b"image")
     link = image_root / "link.png"
-    link.symlink_to(source)
-    runner = OpenCodeRunner(make_settings(tmp_path), project_root=tmp_path)
+    link.symlink_to(image)
     with pytest.raises(OpenCodeError) as error:
-        runner.map_host_image_path(link)
+        runner.map_image_path(link)
     assert error.value.code == "agent_image_path_forbidden"
 
 
-def test_docker_image_root_mismatch_is_rejected_before_container_exec(tmp_path: Path):
-    """Docker 固定 `/images` 挂载与自定义图片根不一致时稳定阻断任务。"""
-    custom_root = tmp_path / "custom-images"
-    custom_root.mkdir()
-    runner = OpenCodeRunner(make_settings(tmp_path, image_root=custom_root))
-    with pytest.raises(OpenCodeError) as error:
-        runner.prepare_runtime()
-    assert error.value.code == "agent_image_root_mismatch"
-
-
-def test_runtime_probe_strictly_checks_non_root_and_dependencies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """运行时探针必须把 UID 0 和可写依赖目录判为不安全。"""
-    runner = OpenCodeRunner(make_settings(tmp_path))
-    monkeypatch.setattr(runner, "_container_ready", lambda: (True, "ok"))
-    monkeypatch.setattr(runner, "_container_exec_probe", lambda arguments: (False, "uid=0") if arguments[:2] == ["sh", "-lc"] and "id -u" in arguments[-1] else (True, "ok"))
+def test_executor_runtime_probe_has_no_real_container_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """executor 探针只返回健康布尔值，不暴露 Compose 生成的真实实例名。"""
+    runner = OpenCodeRunner(
+        make_settings(tmp_path, agent_runtime_mode="executor", agent_executor_url="http://agent:8277", agent_executor_token="token"),
+    )
+    monkeypatch.setattr(
+        runner.executor,
+        "health",
+        lambda: {
+            "ready": True,
+            "runtime_read_write": True,
+            "images_read_only": True,
+            "skills_read_only": True,
+            "opencode": True,
+            "docker_socket_absent": True,
+        },
+    )
     result = runner.runtime_probe()
-    assert result["non_root"] is False
-    assert result["verified"] is False
+    assert result["mode"] == "executor"
+    assert result["executor_running"] is True
+    assert result["verified"] is True
+    assert "container_name" not in result
 
 
-def test_config_exposes_sanitized_agent_runtime_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """`/config` 只返回固定 runtime 标识和布尔状态，不泄露诊断或密钥。"""
-    runner = OpenCodeRunner(make_settings(tmp_path))
+def test_config_exposes_sanitized_agent_runtime_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`/config` 只返回固定 runtime 标识和布尔状态，不泄露诊断、名称或密钥。"""
+    runner = OpenCodeRunner(make_settings(tmp_path, agent_runtime_mode="host"))
     monkeypatch.setattr(
         runner,
         "runtime_probe",
         lambda: {
-            "mode": "shared-docker-container",
-            "container_name": "mememeow-agent-runtime",
-            "container_running": True,
+            "mode": "host-runtime-slot-lock",
+            "executor_running": False,
             "runtime_root_ready": True,
             "workspace_ready": True,
             "executable_ready": True,
@@ -159,113 +191,41 @@ def test_config_exposes_sanitized_agent_runtime_probe(tmp_path: Path, monkeypatc
             "network_ready": True,
             "docker_socket_absent": True,
             "verified": True,
-            "container_diagnostic": "宿主绝对路径不应返回",
+            "container_name": "must-not-leak",
+            "container_diagnostic": "must-not-leak",
         },
     )
-    app_stub = SimpleNamespace(
-        state=SimpleNamespace(
-            settings=runner.settings,
-            opencode=runner,
-            search_engine=SimpleNamespace(has_cache=lambda: False),
-        )
-    )
-    request = Request({
-        "type": "http",
-        "method": "GET",
-        "path": "/config",
-        "raw_path": b"/config",
-        "query_string": b"",
-        "headers": [],
-        "app": app_stub,
-    })
+    app_stub = SimpleNamespace(state=SimpleNamespace(settings=runner.settings, opencode=runner, search_engine=SimpleNamespace(has_cache=lambda: False)))
+    request = Request({"type": "http", "method": "GET", "path": "/config", "raw_path": b"/config", "query_string": b"", "headers": [], "app": app_stub})
     payload = asyncio.run(config_status(request))
     assert payload["runtime_ready"] is True
-    assert payload["agent_runtime"]["mode"] == "shared-docker-container"
+    assert payload["agent_runtime"]["mode"] == "host-runtime-slot-lock"
+    assert "container_name" not in payload["agent_runtime"]
     assert "container_diagnostic" not in payload["agent_runtime"]
     assert "opencode_api_key" not in payload
 
 
-def test_result_path_failure_releases_slot(tmp_path: Path):
+def test_result_path_failure_releases_slot(tmp_path: Path) -> None:
     """任务结果路径冲突时不能泄漏已获取的 slot。"""
     runner = OpenCodeRunner(make_settings(tmp_path))
     runner.prepare_runtime = lambda: None
     task_directory = runner.runtime_root / "task-results" / "slot-conflict"
     task_directory.mkdir(parents=True)
     (task_directory / "result.json.tmp").mkdir()
+    image = tmp_path / "image.png"
+    image.write_bytes(b"image")
     with pytest.raises(OpenCodeError) as error:
-        runner.run(tmp_path / "image.png", lambda *_: None, task_id="slot-conflict")
+        runner.run(image, lambda *_args: None, task_id="slot-conflict")
     assert error.value.code == "agent_result_path_invalid"
     assert runner._slot_semaphore.acquire(timeout=0.1)
     runner._slot_semaphore.release()
-
-
-def _run_container(runner: OpenCodeRunner, *arguments: str) -> subprocess.CompletedProcess[str]:
-    """通过与生产运行器相同的 Docker/sg 包装执行容器命令。"""
-    command = runner._docker_command_for_execution(runner._container_exec(*arguments))
-    return subprocess.run(command, capture_output=True, text=True, timeout=20, check=False)
-
-
-@pytest.mark.skipif(os.getenv("MEMEMEOW_AGENT_RUNTIME_E2E") != "1", reason="显式设置 MEMEMEOW_AGENT_RUNTIME_E2E=1 才运行 Docker 集成验收")
-def test_shared_container_runs_distinct_sessions_and_result_directories():
-    """两个真实 docker exec 任务共享容器，但使用不同 session 和结果目录。"""
-    project_root = Path(__file__).resolve().parent.parent
-    settings = Settings.from_env(project_root / ".env")
-    settings.agent_runtime_mode = "docker"
-    settings.agent_container_name = os.getenv("MEMEMEOW_AGENT_CONTAINER_NAME", "mememeow-agent-runtime")
-    runner = OpenCodeRunner(settings, project_root=project_root)
-    if not runner.runtime_probe().get("verified"):
-        pytest.skip("共享 Agent 容器未运行或探针未通过")
-    runner.prepare_runtime()
-    image = settings.image_root / "example_meme_1.jpg"
-    if not image.is_file():
-        pytest.skip("缺少 data/images/example_meme_1.jpg 集成图片")
-
-    suffix = uuid.uuid4().hex
-    task_ids = (f"integration-{suffix}-a", f"integration-{suffix}-b")
-    stub_path = f"/runtime/workspace/.mememeow-agent-stub-{suffix}"
-    stub = """#!/bin/sh
-set -eu
-task="${MEMEMEOW_AGENT_TASK_ID:?}"
-directory="/runtime/task-results/$task"
-mkdir -p "$directory"
-printf '%s\\n' '{"title":"集成验收","summary":"共享容器结果","subjects":["主体"],"visible_text":[],"references":[],"meaning":null,"keywords":["集成"],"search_queries":[],"uncertainties":[],"source_urls":[]}' > "$directory/result.json.draft"
-mv "$directory/result.json.draft" "$directory/result.json.tmp"
-printf '{"type":"session.created","session_id":"stub-%s"}\\n' "$task"
-"""
-    escaped_stub = shlex.quote(stub)
-    setup = _run_container(runner, "sh", "-lc", f"printf %s {escaped_stub} > {shlex.quote(stub_path)} && chmod 755 {shlex.quote(stub_path)}")
-    assert setup.returncode == 0, setup.stderr
-    original_executable = settings.opencode_executable
-    settings.opencode_executable = stub_path
-    try:
-        first, first_session = runner.run(image, lambda *_: None, task_id=task_ids[0])
-        second, second_session = runner.run(image, lambda *_: None, task_id=task_ids[1])
-        assert first["title"] == second["title"] == "集成验收"
-        assert first_session != second_session
-        assert (runner.runtime_root / "task-results" / task_ids[0] / "result.json.tmp").is_file()
-        assert (runner.runtime_root / "task-results" / task_ids[1] / "result.json.tmp").is_file()
-        boundary = _run_container(
-            runner,
-            "sh",
-            "-lc",
-            "test \"$(id -u)\" != 0 && test -r /images/example_meme_1.jpg && test ! -w /images && "
-            "test -r /skills/research-meme-context && test ! -w /skills/research-meme-context && "
-            "test -r /opt/mememeow/node_modules && test ! -w /opt/mememeow/node_modules && "
-            "test -r /runtime && test -w /runtime && test ! -e /.env && test ! -S /var/run/docker.sock",
-        )
-        assert boundary.returncode == 0, boundary.stderr
-    finally:
-        settings.opencode_executable = original_executable
-        _run_container(runner, "sh", "-lc", f"rm -f {shlex.quote(stub_path)}")
-        for task_id in task_ids:
-            shutil.rmtree(runner.runtime_root / "task-results" / task_id, ignore_errors=True)
 
 
 @pytest.mark.parametrize(
     ("kind", "expected"),
     [("missing", "agent_result_file_missing"), ("invalid", "agent_result_file_invalid_json"), ("schema", "agent_result_file_schema_invalid"), ("large", "agent_result_file_too_large")],
 )
-def test_result_file_failures_have_stable_codes(tmp_path: Path, kind: str, expected: str):
+def test_result_file_failures_have_stable_codes(tmp_path: Path, kind: str, expected: str) -> None:
     """结果文件缺失、JSON 截断、schema 错误和超限均不回退 assistant 文本。"""
     runner = OpenCodeRunner(make_settings(tmp_path, agent_result_max_bytes=1024))
     _draft, result_path = runner.create_task_result_paths("task-1")
@@ -280,7 +240,7 @@ def test_result_file_failures_have_stable_codes(tmp_path: Path, kind: str, expec
     assert error.value.code == expected
 
 
-def test_result_file_success_is_schema_validated_and_task_directories_are_independent(tmp_path: Path):
+def test_result_file_success_is_schema_validated_and_task_directories_are_independent(tmp_path: Path) -> None:
     """两个任务使用不同结果目录，成功结果只来自最终临时文件。"""
     runner = OpenCodeRunner(make_settings(tmp_path))
     first_draft, first_result = runner.create_task_result_paths("task-a")
@@ -293,7 +253,7 @@ def test_result_file_success_is_schema_validated_and_task_directories_are_indepe
     assert runner.read_result_file(second_result)["title"] == "测试标题"
 
 
-def test_retry_clears_previous_result_artifact(tmp_path: Path):
+def test_retry_clears_previous_result_artifact(tmp_path: Path) -> None:
     """同一任务重试前必须移除旧最终文件，防止失败尝试误读历史结果。"""
     runner = OpenCodeRunner(make_settings(tmp_path))
     draft, result = runner.create_task_result_paths("retry-task")
@@ -304,7 +264,7 @@ def test_retry_clears_previous_result_artifact(tmp_path: Path):
 
 
 @pytest.mark.parametrize("kind", ["result", "draft", "directory"])
-def test_result_paths_and_reads_reject_symlink_hijacking(tmp_path: Path, kind: str):
+def test_result_paths_and_reads_reject_symlink_hijacking(tmp_path: Path, kind: str) -> None:
     """结果最终文件、草稿和任务目录均不能通过符号链接逃逸。"""
     runner = OpenCodeRunner(make_settings(tmp_path))
     root = runner.runtime_root / "task-results"
@@ -330,7 +290,7 @@ def test_result_paths_and_reads_reject_symlink_hijacking(tmp_path: Path, kind: s
     assert error.value.code in {"agent_result_path_invalid", "agent_result_file_unreadable"}
 
 
-def test_result_parent_symlink_is_rejected(tmp_path: Path):
+def test_result_parent_symlink_is_rejected(tmp_path: Path) -> None:
     """task-results 本身被替换为符号链接时不能创建任务目录。"""
     runner = OpenCodeRunner(make_settings(tmp_path))
     runner.runtime_root.mkdir(parents=True)
@@ -342,7 +302,7 @@ def test_result_parent_symlink_is_rejected(tmp_path: Path):
     assert error.value.code == "agent_result_path_invalid"
 
 
-def test_cleanup_preserves_active_task_directories(tmp_path: Path):
+def test_cleanup_preserves_active_task_directories(tmp_path: Path) -> None:
     """清理旧产物时必须跳过其他仍在运行 task 的结果目录。"""
     runner = OpenCodeRunner(make_settings(tmp_path, agent_result_retention_days=1, agent_result_max_tasks=1))
     active = runner.runtime_root / "task-results" / "active-task"
@@ -361,23 +321,14 @@ def test_cleanup_preserves_active_task_directories(tmp_path: Path):
         runner._unmark_task_active("active-task")
 
 
-def test_terminate_container_session_waits_and_escalates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """容器任务终止应发送 TERM、等待确认，再发送 KILL 兜底。"""
+def test_host_cancel_only_terminates_matching_process_group(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """host 回滚取消只终止指定 task 的本地进程，不影响其它任务。"""
     runner = OpenCodeRunner(make_settings(tmp_path))
-    calls: list[str] = []
-    alive = {"value": True}
-    ignore_term = {"value": False}
-    def signal_processes(pattern: str, signal_name: str) -> None:
-        calls.append(signal_name)
-        if signal_name == "TERM" and not ignore_term["value"]:
-            alive["value"] = False
-    monkeypatch.setattr(runner, "_container_signal_processes", signal_processes)
-    monkeypatch.setattr(runner, "_container_has_task_processes", lambda pattern: alive["value"])
-    runner._terminate_container_session("task-1")
-    assert calls == ["TERM"]
-
-    calls.clear()
-    alive["value"] = True
-    ignore_term["value"] = True
-    runner._terminate_container_session("task-2")
-    assert calls[:2] == ["TERM", "KILL"]
+    first = object()
+    second = object()
+    runner._process_tasks[first] = "task-one"  # type: ignore[index]
+    runner._process_tasks[second] = "task-two"  # type: ignore[index]
+    terminated: list[object] = []
+    monkeypatch.setattr(runner, "_terminate", lambda process: terminated.append(process))
+    runner.cancel("task-one")
+    assert terminated == [first]

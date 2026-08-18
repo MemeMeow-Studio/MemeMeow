@@ -179,6 +179,18 @@ def test_compose_requires_explicit_identity_when_bypassing_start(tmp_path: Path)
     assert valid.returncode == 0, valid.stderr
 
 
+def test_compose_uses_project_generated_names_and_stable_service_dns() -> None:
+    """Agent/Visual 不固定真实容器名，多 project 仍通过 service key 保持内部 DNS。"""
+    compose = (Path(__file__).parent.parent / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "container_name:" not in compose
+    assert "mememeow-agent-runtime:" in compose
+    assert "mememeow-visual:" in compose
+    assert "http://mememeow-agent-runtime:8277" in compose
+    assert "http://mememeow-visual:8276" in compose
+    generated = [f"{project}-mememeow-agent-runtime-1" for project in ("project-a", "project-b")]
+    assert generated[0] != generated[1]
+
+
 @pytest.mark.skipif(os.getenv("MEMEMEOW_RUNTIME_IDENTITY_E2E") != "1", reason="显式设置 MEMEMEOW_RUNTIME_IDENTITY_E2E=1 才运行 Compose 身份验收")
 def test_compose_agent_reads_new_image_as_non_root_with_read_only_mount(tmp_path: Path) -> None:
     """Compose Agent 以非固定 UID 读取初始化后的图片且不能写入只读挂载。"""
@@ -196,7 +208,6 @@ def test_compose_agent_reads_new_image_as_non_root_with_read_only_mount(tmp_path
             "MEMEMEOW_RUNTIME_UID": "1501",
             "MEMEMEOW_RUNTIME_GID": "1502",
             "MEMEMEOW_IMAGE_ROOT_HOST": str(image_root),
-            "MEMEMEOW_AGENT_CONTAINER_NAME": f"{project_name}-agent",
         }
     )
     try:

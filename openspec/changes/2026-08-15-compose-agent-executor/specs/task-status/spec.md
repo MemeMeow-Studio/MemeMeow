@@ -14,4 +14,9 @@
 #### Scenario: executor 拒绝非法任务
 
 - **WHEN** executor 返回路径或协议校验错误
-- **THEN** 后端使用对应稳定错误码结束任务，不尝试本地 Docker exec 回退
+- **THEN** 后端使用对应稳定错误码结束任务，不尝试本地 Docker exec 或 host 执行回退
+
+#### Scenario: 显式 executor 缺少配置
+
+- **WHEN** 任务明确要求 executor，但 URL 或 token 配置不完整
+- **THEN** 后端以稳定配置错误结束任务，不启动本地 OpenCode 或探测 Docker

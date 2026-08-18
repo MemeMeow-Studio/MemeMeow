@@ -62,7 +62,6 @@ services:
     build:
       context: .
       dockerfile: docker/visual/Dockerfile
-    container_name: ${MEMEMEOW_VISUAL_CONTAINER_NAME:-mememeow-visual}
     restart: unless-stopped
     # 视觉端口只加入 Compose 网络，不发布到宿主机。
     expose:
@@ -103,7 +102,6 @@ services:
     build:
       context: .
       dockerfile: docker/agent/Dockerfile
-    container_name: ${MEMEMEOW_AGENT_CONTAINER_NAME:-mememeow-agent-runtime}
     depends_on:
       runtime-init:
         condition: service_completed_successfully
@@ -190,7 +188,6 @@ services:
       MEMEMEOW_IMAGE_ROOT: /app/data/images
       MEMEMEOW_OPENCODE_RUNTIME_ROOT: /app/data/opencode
       HOME: /app/data/opencode/home
-      MEMEMEOW_AGENT_CONTAINER_NAME: ${MEMEMEOW_AGENT_CONTAINER_NAME:-mememeow-agent-runtime}
       MEMEMEOW_AGENT_RUNTIME_MODE: executor
       MEMEMEOW_AGENT_EXECUTOR_URL: http://mememeow-agent-runtime:8277
       MEMEMEOW_AGENT_EXECUTOR_TOKEN_FILE: /run/agent-executor-secret/token
