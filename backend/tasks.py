@@ -49,6 +49,14 @@ STABLE_TASK_ERRORS = {
     "target_changed",
     "task_interrupted",
     "generation_policy_conflict",
+    "processing_options_conflict",
+    "invalid_auto_name",
+    "auto_rename_title_missing",
+    "auto_rename_invalid_filename",
+    "auto_rename_target_exists",
+    "auto_rename_target_changed",
+    "auto_rename_claim_expired",
+    "auto_rename_unknown_execution",
     "reverse_image_forbidden",
     "reverse_image_unavailable",
     "invalid_task",
@@ -99,12 +107,13 @@ STABLE_TASK_ERRORS = {
     "operation_grant_invalid",
     "blocked",
 }
-# 这三类任务由逐图图片处理 Worker 独占扫描、认领和执行；通用任务 Worker
+# 这四类任务由逐图图片处理 Worker 独占扫描、认领和执行；通用任务 Worker
 # 只能处理其它系统任务，避免旧调度器把图片链误判为缺少 handler。
 IMAGE_PROCESSING_TASK_TYPES = frozenset(
     {
         "visual_embedding_generation",
         "meme_context_generation",
+        "image_auto_rename",
         "text_embedding_generation",
     }
 )
@@ -183,7 +192,7 @@ class TaskRecord:
             task_id=task_id,
             task_type=task_type,
             submission_mode=value.get("submission_mode") if value.get("submission_mode") in {None, "pipeline", "standalone"} else None,
-            image_stage=value.get("image_stage") if value.get("image_stage") in {None, "visual", "agent", "text_embedding"} else None,
+            image_stage=value.get("image_stage") if value.get("image_stage") in {None, "visual", "agent", "auto_rename", "text_embedding"} else None,
             processing_job_id=(value.get("processing_job_id") or value.get("job_id")) if isinstance(value.get("processing_job_id") or value.get("job_id"), str) else None,
             payload=payload,
             status=str(value.get("status", "queued")),
@@ -290,8 +299,12 @@ class PersistentTaskService:
     @staticmethod
     def _payload_key(payload: dict[str, Any]) -> str:
         """将 payload 规范化为活动任务去重键。"""
-        # 批次标识只用于协调，不应让同一图片在不同批次重复启动 Agent。
-        comparable = {key: value for key, value in payload.items() if key not in {"batch_id", "batch_ids"}}
+        # 批次标识和并发提交 nonce 只用于协调，不应让同一图片阶段重复执行。
+        comparable = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"batch_id", "batch_ids", "standalone_submission_nonce"}
+        }
         return json.dumps(comparable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
     @staticmethod
@@ -326,8 +339,8 @@ class PersistentTaskService:
         for task_id in sorted(queued, key=lambda value: (self._records[value].created_at, value)):
             self._schedule(task_id)
 
-    def submit(self, task_type: str, payload: dict[str, Any] | None = None) -> TaskRecord:
-        """持久化新任务；相同类型和规范化 payload 的活动任务会被复用。"""
+    def submit(self, task_type: str, payload: dict[str, Any] | None = None, *, schedule: bool = True) -> TaskRecord:
+        """持久化新任务并按需调度；相同类型和规范化 payload 的活动任务会被复用。"""
         payload = dict(payload or {})
         key = self._payload_key(payload)
         with self._lock:
@@ -364,9 +377,13 @@ class PersistentTaskService:
             )
             self._records[record.task_id] = record
             self._write(record)
-        if self._started:
+        if schedule and self._started:
             self._schedule(record.task_id)
         return TaskRecord.from_dict(record.as_dict(include_payload=True))
+
+    def schedule(self, task_id: str) -> None:
+        """显式唤醒一个已持久化任务，与 PostgreSQL 任务服务保持相同入口。"""
+        self._schedule(task_id)
 
     def _schedule(self, task_id: str) -> None:
         """把已持久化的 queued 任务交给线程池，不重复提交运行记录。"""

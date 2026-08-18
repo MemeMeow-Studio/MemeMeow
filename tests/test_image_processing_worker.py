@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
-from backend.image_processing import ImageProcessingError, ImageProcessingWorker
+from backend.image_processing import ImageProcessingError, ImageProcessingOptions, ImageProcessingWorker, normalize_auto_name, normalize_reverse_image_policy
 from backend.operation_policy import AllowAllOperationPolicy, GrantAssociationStore, OperationPolicyGateway, PolicyDecision
 
 
@@ -143,3 +144,105 @@ def test_standalone_stage_aliases_are_canonical_and_mode_isolated() -> None:
         {"submission_mode": "standalone", "meme_id": "meme", "image_sha256": "a" * 64, "processing_config_hash": "b" * 64, "reverse_image_policy": "forbid"},
     )
     assert pipeline != standalone
+
+
+def test_processing_options_use_safe_defaults_but_reject_explicit_empty_values() -> None:
+    """缺失选项使用安全默认值，显式空字符串和非布尔值不能静默改写语义。"""
+    assert ImageProcessingOptions.normalize() == ImageProcessingOptions(reverse_image_policy="forbid", auto_name=False)
+    assert normalize_reverse_image_policy(None) == "forbid"
+    assert normalize_auto_name(None) is False
+    with pytest.raises(ImageProcessingError, match="invalid_reverse_image_policy"):
+        normalize_reverse_image_policy("")
+    with pytest.raises(ImageProcessingError, match="invalid_reverse_image_policy"):
+        normalize_reverse_image_policy([])
+    with pytest.raises(ImageProcessingError, match="invalid_reverse_image_policy"):
+        normalize_reverse_image_policy({"policy": "auto"})
+    with pytest.raises(ImageProcessingError, match="invalid_auto_name"):
+        normalize_auto_name("")
+    with pytest.raises(ImageProcessingError, match="invalid_auto_name"):
+        normalize_auto_name("false")
+
+
+class _AttachSession:
+    """按固定查询顺序返回 Job、阶段和叶子任务的绑定测试 session。"""
+
+    def __init__(self, values: list[object]) -> None:
+        self.values = iter(values)
+
+    def __enter__(self):
+        """返回可供 repository 使用的伪 session。"""
+        return self
+
+    def __exit__(self, *_args) -> bool:
+        """结束测试事务，不吞掉异常。"""
+        return False
+
+    def scalar(self, _statement):
+        """按 repository 的三次查询顺序返回固定实体。"""
+        return next(self.values)
+
+    def commit(self) -> None:
+        """记录事务提交边界；测试不需要持久化。"""
+        return None
+
+
+def test_pipeline_task_binding_requires_current_job_lease() -> None:
+    """过期 Worker 不能绑定叶子 Task，当前 claim 才能写入父阶段。"""
+    from backend.image_processing import ImageProcessingRepository
+
+    job_id = uuid4()
+    now = datetime.now(timezone.utc)
+    job = SimpleNamespace(
+        id=job_id,
+        status="running",
+        lease_owner="current-worker",
+        lease_expires_at=now + timedelta(minutes=1),
+        claim_generation=4,
+        meme_id=uuid4(),
+        image_sha256="a" * 64,
+    )
+    stage = SimpleNamespace(task_id=None, updated_at=None)
+    child = SimpleNamespace(
+        task_type="visual_embedding_generation",
+        submission_mode=None,
+        processing_job_id=None,
+        image_stage=None,
+        payload={},
+    )
+    repository = ImageProcessingRepository(object(), "local")
+    repository._session = lambda: _AttachSession([job, stage, child])
+
+    assert repository.attach_task(job_id, "visual", "task-1", owner="stale-worker", claim_generation=4) is False
+    assert stage.task_id is None
+
+    repository._session = lambda: _AttachSession([job, stage, child])
+    assert repository.attach_task(job_id, "visual", "task-1", owner="current-worker", claim_generation=4) is True
+    assert stage.task_id == "task-1"
+
+
+def test_unbound_pipeline_task_cleanup_checks_job_ownership() -> None:
+    """阶段绑定失败时只收束仍归属当前 Job 的 queued 叶子任务。"""
+    job_id = uuid4()
+    meme_id = uuid4()
+    job = SimpleNamespace(id=job_id, meme_id=meme_id, image_sha256="b" * 64)
+    task = SimpleNamespace(
+        task_type="visual_embedding_generation",
+        submission_mode="pipeline",
+        image_stage="visual",
+        processing_job_id=job_id,
+        status="queued",
+        payload={"job_id": str(job_id), "meme_id": str(meme_id), "image_sha256": job.image_sha256},
+        message=None,
+        error=None,
+        completed_at=None,
+        updated_at=None,
+    )
+    session = _AttachSession([task])
+    worker = ImageProcessingWorker(object(), scope_id="local", task_service=_TaskService())
+    worker.resources = SimpleNamespace(factory=lambda: session)
+    try:
+        assert worker._fail_unbound_pipeline_task("task-2", job, "visual", "stage_task_bind_failed") is True
+        assert task.status == "failed"
+        assert task.error == {"error": "stage_task_bind_failed"}
+    finally:
+        worker.shutdown()

@@ -14,11 +14,12 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from api import app
 from backend.collection_packages import CollectionManifest, CollectionManifestCollection, CollectionManifestMember, serialize_manifest, sha256_bytes
-from backend.database import create_engine_for_url
+from backend.database import EMBEDDING_DIMENSIONS, Meme, MemeTextEmbedding, Task, create_engine_for_url
+from backend.image_processing import ImageProcessingWorker
 
 
 def _clear_test_scope() -> None:
@@ -448,6 +449,7 @@ def test_cache_generation_returns_pollable_task(client):
 
 def test_parallel_context_batch_writes_independent_database_records_and_incremental_vectors(tmp_path, monkeypatch):
     """并发度为 2 时两张图片独立完成逐图文本向量，且不隐式创建全库缓存任务。"""
+    monkeypatch.setenv("MEMEMEOW_DATABASE_URL", os.getenv("MEMEMEOW_TEST_DATABASE_URL", ""))
     monkeypatch.setenv("MEMEMEOW_DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("MEMEMEOW_IMAGE_ROOT", str(tmp_path / "images"))
     monkeypatch.setenv("EMBEDDING_API_KEY", "")
@@ -530,6 +532,7 @@ def test_parallel_context_batch_writes_independent_database_records_and_incremen
 
 def test_pending_agent_ready_sidecar_and_v4_embedding_pipeline_is_backend_owned(tmp_path, monkeypatch):
     """测试图片从 pending 经 Agent 到 ready/v4 索引，canonical 写回始终由后端掌控。"""
+    monkeypatch.setenv("MEMEMEOW_DATABASE_URL", os.getenv("MEMEMEOW_TEST_DATABASE_URL", ""))
     monkeypatch.setenv("MEMEMEOW_DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("MEMEMEOW_IMAGE_ROOT", str(tmp_path / "images"))
     monkeypatch.setenv("EMBEDDING_API_KEY", "")
@@ -538,6 +541,8 @@ def test_pending_agent_ready_sidecar_and_v4_embedding_pipeline_is_backend_owned(
     monkeypatch.setenv("MEMEMEOW_AGENT_CALLBACK_SECRET", "test-agent-callback-secret-1234")
     monkeypatch.setenv("MEMEMEOW_OPENCODE_CONCURRENCY", "1")
     _clear_test_scope()
+
+
     application_file = Path(__file__).resolve().parent.parent / "api.py"
     application_before = application_file.read_bytes()
     with TestClient(app) as test_client:
@@ -606,8 +611,8 @@ def test_pending_agent_ready_sidecar_and_v4_embedding_pipeline_is_backend_owned(
                 break
             time.sleep(0.02)
         assert processing["status"] == "succeeded"
-        assert [stage["stage"] for stage in processing["stages"]] == ["visual", "agent", "text_embedding"]
-        assert all(stage["status"] == "succeeded" for stage in processing["stages"])
+        assert [stage["stage"] for stage in processing["stages"]] == ["visual", "agent", "auto_rename", "text_embedding"]
+        assert [stage["status"] for stage in processing["stages"]] == ["succeeded", "succeeded", "skipped", "succeeded"]
 
         metadata = test_client.get("/images/metadata", params={"meme_id": meme_id})
         assert metadata.status_code == 200
@@ -637,8 +642,348 @@ def test_pending_agent_ready_sidecar_and_v4_embedding_pipeline_is_backend_owned(
     _clear_test_scope()
 
 
+def test_auto_name_pipeline_renames_safely_and_freezes_final_metadata_hash(tmp_path, monkeypatch):
+    """自动命名四阶段必须按顺序完成，并让文本 Task 绑定重命名后的 metadata hash。"""
+    monkeypatch.setenv("MEMEMEOW_DATABASE_URL", os.getenv("MEMEMEOW_TEST_DATABASE_URL", ""))
+    monkeypatch.setenv("MEMEMEOW_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("MEMEMEOW_IMAGE_ROOT", str(tmp_path / "images"))
+    monkeypatch.setenv("EMBEDDING_API_KEY", "")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "")
+    monkeypatch.setenv("MEMEMEOW_OPENCODE_MODEL", "mememeow/gpt-5.6-luna")
+    monkeypatch.setenv("MEMEMEOW_AGENT_CALLBACK_SECRET", "test-agent-callback-secret-1234")
+    monkeypatch.setenv("MEMEMEOW_OPENCODE_CONCURRENCY", "1")
+    _clear_test_scope()
+    with TestClient(app) as test_client:
+        def fake_visual_embed(content, *, filename="image"):
+            """模拟视觉服务，确保测试只验证图片处理控制面。"""
+            del content, filename
+            settings = test_client.app.state.settings
+            return {
+                "model": settings.visual_model,
+                "dimensions": settings.visual_model_dimensions,
+                "preprocess_version": settings.visual_preprocess_version,
+                "embedding": [1.0] + [0.0] * (settings.visual_model_dimensions - 1),
+            }
+
+        def fake_text_embedding(text_value):
+            """模拟固定维度文本向量，避免访问外部 embedding 服务。"""
+            assert text_value
+            return [1.0] + [0.0] * 1023
+
+        def fake_agent_run(image, progress, *, task_id=None, callback_token=None, **kwargs):
+            """交付带非法路径字符的标题，验证服务端安全派生文件名。"""
+            del progress, callback_token, kwargs
+            assert task_id
+            runner = test_client.app.state.opencode
+            draft_path, result_path = runner.create_task_result_paths(task_id)
+            draft_path.write_text(
+                json.dumps(
+                    {
+                        "title": "Project Launch v2",
+                        "summary": "自动命名测试",
+                        "subjects": ["测试图片"],
+                        "visible_text": [],
+                        "references": [],
+                        "meaning": None,
+                        "keywords": ["测试"],
+                        "search_queries": [],
+                        "uncertainties": [],
+                        "source_urls": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            draft_path.replace(result_path)
+            return runner.read_result_file(result_path), f"session-{image.stem}"
+
+        monkeypatch.setattr(test_client.app.state.visual_inference, "embed", fake_visual_embed)
+        monkeypatch.setattr(test_client.app.state.search_engine, "_embedding", fake_text_embedding)
+        monkeypatch.setattr(test_client.app.state.opencode, "run", fake_agent_run)
+
+        uploaded = test_client.post(
+            "/images/upload",
+            data={"auto_name": "true", "reverse_image_policy": "forbid"},
+            files=[("files", ("original-name.png", png_bytes("purple"), "image/png"))],
+        )
+        assert uploaded.status_code == 200
+        result = uploaded.json()["results"][0]
+        assert result["ok"] is True
+        assert result["auto_name"] is True
+        assert result["saved_filename"] == "original-name.png"
+        job_id = result["processing_job_id"]
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            processing = test_client.get(f"/images/processing/{job_id}").json()
+            if processing.get("status") in {"succeeded", "failed", "blocked", "unknown_execution"}:
+                break
+            time.sleep(0.02)
+        assert processing["status"] == "succeeded"
+        assert processing["auto_name"] is True
+        assert [stage["stage"] for stage in processing["stages"]] == ["visual", "agent", "auto_rename", "text_embedding"]
+        assert [stage["status"] for stage in processing["stages"]] == ["succeeded", "succeeded", "succeeded", "succeeded"]
+        assert processing["has_warnings"] is False
+
+        metadata = test_client.get("/images/metadata", params={"meme_id": result["meme_id"]}).json()
+        assert metadata["image"]["relative_path"] == "Project Launch v2.png"
+        assert not (tmp_path / "images" / "original-name.png").exists()
+        assert (tmp_path / "images" / "Project Launch v2.png").exists()
+
+        with test_client.app.state.database.environment("local") as environment:
+            meme = environment.memes.get(result["meme_id"])
+            assert meme is not None
+            final_hash = ImageProcessingWorker._metadata_hash(meme)
+            assert final_hash is not None
+            rename_task = environment.tasks.get(
+                next(
+                    stage["task_id"]
+                    for stage in processing["stages"]
+                    if stage["stage"] == "auto_rename"
+                )
+            )
+            assert rename_task is not None
+            assert rename_task.status == "succeeded"
+            assert "auto_name" not in rename_task.payload
+            text_task = environment.uow.session.scalar(
+                select(Task).where(
+                    Task.scope_id == "local",
+                    Task.task_type == "text_embedding_generation",
+                    Task.processing_job_id == job_id,
+                )
+            )
+            assert text_task is not None
+            assert text_task.payload["metadata_hash"] == final_hash
+            old_hash_rows = list(
+                environment.uow.session.scalars(
+                    select(MemeTextEmbedding).where(
+                        MemeTextEmbedding.scope_id == "local",
+                        MemeTextEmbedding.meme_id == meme.id,
+                        MemeTextEmbedding.metadata_hash == final_hash,
+                        MemeTextEmbedding.status == "ready",
+                    )
+                )
+            )
+            assert len(old_hash_rows) == 1
+
+    _clear_test_scope()
+
+
+def test_auto_name_warning_keeps_leaf_failure_and_continues_text_stage(tmp_path, monkeypatch):
+    """缺少标题时叶子 Task 必须失败为事实，父 Job 以 warning 继续文本阶段。"""
+    monkeypatch.setenv("MEMEMEOW_DATABASE_URL", os.getenv("MEMEMEOW_TEST_DATABASE_URL", ""))
+    monkeypatch.setenv("MEMEMEOW_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("MEMEMEOW_IMAGE_ROOT", str(tmp_path / "images"))
+    monkeypatch.setenv("EMBEDDING_API_KEY", "")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "")
+    monkeypatch.setenv("MEMEMEOW_OPENCODE_MODEL", "mememeow/gpt-5.6-luna")
+    monkeypatch.setenv("MEMEMEOW_AGENT_CALLBACK_SECRET", "test-agent-callback-secret-1234")
+    _clear_test_scope()
+
+
+    with TestClient(app) as test_client:
+        def fake_visual_embed(content, *, filename="image"):
+            """模拟视觉向量服务。"""
+            del content, filename
+            settings = test_client.app.state.settings
+            return {
+                "model": settings.visual_model,
+                "dimensions": settings.visual_model_dimensions,
+                "preprocess_version": settings.visual_preprocess_version,
+                "embedding": [1.0] + [0.0] * (settings.visual_model_dimensions - 1),
+            }
+
+        def fake_text_embedding(text_value):
+            """模拟文本向量服务。"""
+            assert text_value
+            return [1.0] + [0.0] * 1023
+
+        def fake_agent_run(image, progress, *, task_id=None, callback_token=None, **kwargs):
+            """交付没有标题但其余字段有效的 Agent 语境。"""
+            del image, progress, callback_token, kwargs
+            assert task_id
+            runner = test_client.app.state.opencode
+            draft_path, result_path = runner.create_task_result_paths(task_id)
+            draft_path.write_text(
+                json.dumps(
+                    {
+                        "title": None,
+                        "summary": "保留原始文件名",
+                        "subjects": ["测试图片"],
+                        "visible_text": [],
+                        "references": [],
+                        "meaning": None,
+                        "keywords": ["测试"],
+                        "search_queries": [],
+                        "uncertainties": [],
+                        "source_urls": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            draft_path.replace(result_path)
+            return runner.read_result_file(result_path), "warning-session"
+
+        monkeypatch.setattr(test_client.app.state.visual_inference, "embed", fake_visual_embed)
+        monkeypatch.setattr(test_client.app.state.search_engine, "_embedding", fake_text_embedding)
+        monkeypatch.setattr(test_client.app.state.opencode, "run", fake_agent_run)
+        uploaded = test_client.post(
+            "/images/upload",
+            data={"auto_name": "true"},
+            files=[("files", ("keep-original.png", png_bytes("blue"), "image/png"))],
+        )
+        assert uploaded.status_code == 200
+        result = uploaded.json()["results"][0]
+        job_id = result["processing_job_id"]
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            processing = test_client.get(f"/images/processing/{job_id}").json()
+            if processing.get("status") in {"succeeded", "failed", "blocked", "unknown_execution"}:
+                break
+            time.sleep(0.02)
+        assert processing["status"] == "succeeded"
+        assert processing["has_warnings"] is True
+        assert processing["warnings"] == [
+            {
+                "stage": "auto_rename",
+                "error": "auto_rename_title_missing",
+                "message": "自动重命名未完成",
+                "recoverable": True,
+            }
+        ]
+        assert [stage["status"] for stage in processing["stages"]] == ["succeeded", "succeeded", "warning", "succeeded"]
+        assert test_client.get("/images/metadata", params={"meme_id": result["meme_id"]}).json()["image"]["relative_path"] == "keep-original.png"
+        rename_tasks = test_client.get("/tasks", params={"task_type": "image_auto_rename"}).json()["items"]
+        assert len(rename_tasks) == 1
+        assert rename_tasks[0]["status"] == "failed"
+        assert rename_tasks[0]["error"]["error"] == "auto_rename_title_missing"
+        assert rename_tasks[0]["image_stage_recoverable"] is True
+        text_tasks = test_client.get("/tasks", params={"task_type": "text_embedding_generation"}).json()["items"]
+        assert len(text_tasks) == 1 and text_tasks[0]["status"] == "succeeded"
+    _clear_test_scope()
+
+
+def test_scope_unready_processing_is_option_only_and_fail_closed(client, monkeypatch):
+    """scope 级未就绪入口不接受分页筛选，并在能力拒绝前不产生业务副作用。"""
+    test_client, _ = client
+    # 该测试必须稳定覆盖能力拒绝分支，不能受宿主环境中的 SerpAPI 凭据影响。
+    monkeypatch.setattr(test_client.app.state.reverse_image, "_provider_factory", None)
+    monkeypatch.setattr(test_client.app.state.reverse_image.settings, "serpapi_api_key", "")
+
+    unavailable = test_client.post(
+        "/images/processing/unready",
+        json={"reverse_image_policy": "auto", "auto_name": False},
+    )
+    assert unavailable.status_code == 503
+    assert unavailable.json()["error"] == "reverse_image_unavailable"
+    with test_client.app.state.database.environment("local") as environment:
+        assert environment.uow.session.scalar(select(Meme.id)) is None
+
+    first = test_client.post("/images/upload", files=[("files", ("scope-first.png", png_bytes("red"), "image/png"))]).json()["results"][0]
+    second = test_client.post("/images/upload", files=[("files", ("scope-second.png", png_bytes("blue"), "image/png"))]).json()["results"][0]
+    invalid_bool = test_client.post(
+        "/images/processing/unready",
+        json={"reverse_image_policy": "forbid", "auto_name": "true"},
+    )
+    assert invalid_bool.status_code == 400
+    assert invalid_bool.json()["error"] == "invalid_request"
+
+    response = test_client.post(
+        "/images/processing/unready",
+        json={"reverse_image_policy": "forbid", "auto_name": False},
+    )
+    assert response.status_code == 202
+    body = response.json()
+    assert body["target_count"] == 2
+    assert {item["meme_id"] for item in body["results"]} == {first["meme_id"], second["meme_id"]}
+    assert all(item.get("processing_job_id") or item.get("error") for item in body["results"])
+
+    filtered = test_client.post(
+        "/images/processing/unready?page=2",
+        json={"reverse_image_policy": "forbid", "auto_name": False},
+    )
+    assert filtered.status_code == 400
+    assert filtered.json()["error"] == "invalid_request"
+
+
+def test_standalone_auto_rename_invalidates_old_text_embedding_without_creating_job(tmp_path, monkeypatch):
+    """独立自动重命名成功后必须失效旧向量，且不能创建父 Job 或文本任务。"""
+    monkeypatch.setenv("MEMEMEOW_DATABASE_URL", os.getenv("MEMEMEOW_TEST_DATABASE_URL", ""))
+    monkeypatch.setenv("MEMEMEOW_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("MEMEMEOW_IMAGE_ROOT", str(tmp_path / "images"))
+    monkeypatch.setenv("EMBEDDING_API_KEY", "")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "")
+    monkeypatch.setenv("MEMEMEOW_OPENCODE_MODEL", "")
+    _clear_test_scope()
+    with TestClient(app) as test_client:
+        metadata_service = test_client.app.state.metadata
+        meme_id, image = metadata_service.upload_bytes(png_bytes("blue"), target_key="standalone-source.png")
+        metadata_service.update_context(
+            image,
+            {"title": "Standalone renamed", "summary": "独立阶段测试"},
+            producer="research",
+            model="test-model",
+            status="ready",
+        )
+        with test_client.app.state.database.environment("local") as environment:
+            record = environment.memes.get(meme_id)
+            assert record is not None
+            old_metadata_hash = ImageProcessingWorker._metadata_hash(record)
+            assert old_metadata_hash is not None
+            old_sha256 = record.sha256
+            environment.uow.session.add(
+                MemeTextEmbedding(
+                    scope_id="local",
+                    meme_id=record.id,
+                    image_sha256=old_sha256,
+                    metadata_hash=old_metadata_hash,
+                    embedding_model_version=test_client.app.state.settings.embedding_model,
+                    dimensions=EMBEDDING_DIMENSIONS,
+                    semantic_document="标题：Standalone renamed",
+                    embedding=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+                    status="ready",
+                )
+            )
+            environment.uow.session.commit()
+
+        submitted = test_client.post(
+            "/images/stages",
+            json={"meme_id": str(meme_id), "stage": "auto_rename"},
+        )
+        assert submitted.status_code == 202
+        task_id = submitted.json()["task_id"]
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            task = test_client.get(f"/tasks/{task_id}").json()
+            if task["status"] in {"succeeded", "failed"}:
+                break
+            time.sleep(0.02)
+        assert task["status"] == "succeeded"
+
+        with test_client.app.state.database.environment("local") as environment:
+            record = environment.memes.get(meme_id)
+            assert record is not None
+            assert record.storage_key == "Standalone renamed.png"
+            row = environment.uow.session.scalar(
+                select(MemeTextEmbedding).where(
+                    MemeTextEmbedding.scope_id == "local",
+                    MemeTextEmbedding.meme_id == record.id,
+                    MemeTextEmbedding.image_sha256 == old_sha256,
+                    MemeTextEmbedding.metadata_hash == old_metadata_hash,
+                )
+            )
+            assert row is not None
+            assert row.status == "failed"
+            assert environment.uow.session.scalar(select(Task).where(Task.task_type == "text_embedding_generation")) is None
+            assert environment.uow.session.scalar(select(Task).where(Task.processing_job_id.is_not(None))) is None
+    _clear_test_scope()
+
+
 def test_context_target_deleted_during_agent_is_reported_as_target_changed(tmp_path, monkeypatch):
     """Agent 运行期间图片被删除时，任务必须返回稳定的目标变化错误。"""
+    monkeypatch.setenv("MEMEMEOW_DATABASE_URL", os.getenv("MEMEMEOW_TEST_DATABASE_URL", ""))
     monkeypatch.setenv("MEMEMEOW_DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("MEMEMEOW_IMAGE_ROOT", str(tmp_path / "images"))
     monkeypatch.setenv("EMBEDDING_API_KEY", "")

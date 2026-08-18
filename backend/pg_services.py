@@ -827,7 +827,7 @@ class PostgresTaskWorkerManager:
             self.schedule(task_id)
 
     def shutdown(self) -> None:
-        """停止调度并以同一个 owner 收束本进程持有的所有 scope 任务。"""
+        """停止调度并等待本进程持有的任务退出后再释放线程池。"""
         self._stopped.set()
         now = utcnow()
         with self.resources.factory() as session:
@@ -843,7 +843,9 @@ class PostgresTaskWorkerManager:
                 self._release_slot(session, task.scope_id, task.id, owner=self.owner, claim_generation=task.claim_generation)
             session.commit()
         if self._owns_executor:
-            self._executor.shutdown(wait=False, cancel_futures=True)
+            # 任务线程可能仍在使用数据库连接；先等待其退出，避免应用释放连接池
+            # 后留下后台事务与下一次启动/测试清理互相死锁。
+            self._executor.shutdown(wait=True, cancel_futures=True)
 
 
 class PostgresTaskService:
@@ -915,6 +917,7 @@ class PostgresTaskService:
         stage = str(payload.get("stage") or {
             "visual_embedding_generation": "visual",
             "meme_context_generation": "agent",
+            "image_auto_rename": "auto_rename",
             "text_embedding_generation": "text_embedding",
         }.get(task_type) or "legacy")
         if task_type == "visual_embedding_generation":
@@ -935,6 +938,16 @@ class PostgresTaskService:
                 sha=payload.get("image_sha256"),
                 config=payload.get("processing_config_hash") or payload.get("skill_hash") or payload.get("model"),
                 policy=payload.get("reverse_image_policy") or "forbid",
+                revision=payload.get("job_revision") or "legacy",
+            )
+        if task_type == "image_auto_rename":
+            return "rename:{mode}:{stage}:{meme}:{sha}:{storage}:{title}:r{revision}".format(
+                mode=mode,
+                stage=stage,
+                meme=payload.get("meme_id"),
+                sha=payload.get("image_sha256"),
+                storage=payload.get("expected_storage_key"),
+                title=payload.get("title_fingerprint"),
                 revision=payload.get("job_revision") or "legacy",
             )
         if task_type == "text_embedding_generation":
@@ -1175,6 +1188,7 @@ class PostgresTaskService:
             stage_by_type = {
                 "visual_embedding_generation": "visual",
                 "meme_context_generation": "agent",
+                "image_auto_rename": "auto_rename",
                 "text_embedding_generation": "text_embedding",
             }
             expected_stage = stage_by_type[task_type]
@@ -1415,6 +1429,12 @@ class PostgresTaskService:
                     "query_embedding_not_ready",
                     "invalid_task",
                     "task_not_running",
+                    "auto_rename_title_missing",
+                    "auto_rename_invalid_filename",
+                    "auto_rename_target_exists",
+                    "auto_rename_target_changed",
+                    "auto_rename_claim_expired",
+                    "auto_rename_unknown_execution",
                     "task_scope_invalid",
                     "task_scope_mismatch",
                     "unknown_execution",

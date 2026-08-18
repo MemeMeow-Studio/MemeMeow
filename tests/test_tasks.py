@@ -154,3 +154,25 @@ def test_reused_context_task_finalizes_every_associated_batch(tmp_path):
         time.sleep(0.01)
     assert sorted(finalized) == ["one", "two"]
     manager.shutdown()
+
+
+def test_standalone_image_stage_dedupe_ignores_submission_nonce(tmp_path):
+    """独立图片阶段的并发 nonce 不应绕过去重并重复执行同一输入。"""
+    manager = PersistentTaskService(tmp_path / "tasks")
+    release = Event()
+    manager.register("image_auto_rename", lambda payload, progress: release.wait(1))
+    manager.start()
+    payload = {
+        "submission_mode": "standalone",
+        "stage": "auto_rename",
+        "meme_id": "meme-1",
+        "image_sha256": "a" * 64,
+        "expected_storage_key": "source.png",
+        "title_fingerprint": "b" * 64,
+    }
+    first = manager.submit("image_auto_rename", {**payload, "standalone_submission_nonce": "one"})
+    second = manager.submit("image_auto_rename", {**payload, "standalone_submission_nonce": "two"})
+    assert second.task_id == first.task_id
+    release.set()
+    assert wait_for_terminal(manager, first.task_id).status == "succeeded"
+    manager.shutdown()

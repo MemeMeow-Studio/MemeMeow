@@ -562,7 +562,7 @@ def test_nonlocal_resolver_with_default_factory_never_preloads_local(monkeypatch
             manager = doubles.worker_class.last_instance
             assert manager is not None
             assert manager.started is True
-            assert set(manager.registered) == {"cache_generation", "metadata_repair", "visual_embedding_generation", "meme_context_generation"}
+            assert set(manager.registered) == {"cache_generation", "metadata_repair", "visual_embedding_generation", "meme_context_generation", "image_auto_rename"}
             assert doubles.resources[0].require_local_scope is False
             assert doubles.resources[0].preflight_calls == []
             assert doubles.check_calls[0]["require_local_installation"] is False

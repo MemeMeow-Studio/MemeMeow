@@ -57,7 +57,7 @@ VISUAL_EMBEDDING_DIMENSIONS = 768
 SCOPE_LOCAL = "local"
 UTC = timezone.utc
 # 当前代码要求的 Alembic head；数据库初始化脚本会显式传入同一 revision。
-CURRENT_SCHEMA_REVISION = "0011_harden_operation_grant_association"
+CURRENT_SCHEMA_REVISION = "0012_image_processing_options_auto_rename"
 
 
 def utcnow() -> datetime:
@@ -195,6 +195,11 @@ class StorageOperation(Base):
     after_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     before_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     after_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    expected_revision: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    claim_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    attempt: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    task_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    expected_title_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="prepared")
     error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
@@ -206,6 +211,10 @@ class StorageOperation(Base):
         UniqueConstraint("scope_id", "meme_id", "operation_token", name="uq_storage_operation_token"),
         CheckConstraint("operation_type IN ('upload','rename','delete')", name="ck_storage_operation_type"),
         CheckConstraint("status IN ('prepared','file_applied','completed','compensated','blocked')", name="ck_storage_operation_status"),
+        CheckConstraint("expected_revision IS NULL OR expected_revision >= 1", name="ck_storage_operation_expected_revision"),
+        CheckConstraint("claim_generation IS NULL OR claim_generation > 0", name="ck_storage_operation_claim_generation"),
+        CheckConstraint("attempt IS NULL OR attempt > 0", name="ck_storage_operation_attempt"),
+        CheckConstraint("expected_title_fingerprint IS NULL OR length(expected_title_fingerprint) = 64", name="ck_storage_operation_title_fingerprint"),
     )
 
 
@@ -338,9 +347,9 @@ class Task(Base):
         CheckConstraint("status IN ('queued','running','succeeded','failed')", name="ck_task_status"),
         CheckConstraint("attempt_count >= 0 AND max_attempts > 0", name="ck_task_attempts"),
         CheckConstraint("submission_mode IS NULL OR submission_mode IN ('pipeline','standalone')", name="ck_task_submission_mode"),
-        CheckConstraint("image_stage IS NULL OR image_stage IN ('visual','agent','text_embedding')", name="ck_task_image_stage"),
+        CheckConstraint("image_stage IS NULL OR image_stage IN ('visual','agent','auto_rename','text_embedding')", name="ck_task_image_stage"),
         CheckConstraint("submission_mode IS NULL OR (submission_mode = 'standalone' AND processing_job_id IS NULL) OR (submission_mode = 'pipeline' AND processing_job_id IS NOT NULL)", name="ck_task_submission_job_exclusivity"),
-        CheckConstraint("task_type NOT IN ('visual_embedding_generation','meme_context_generation','text_embedding_generation') OR (submission_mode IS NULL OR (image_stage IS NOT NULL AND ((task_type = 'visual_embedding_generation' AND image_stage = 'visual') OR (task_type = 'meme_context_generation' AND image_stage = 'agent') OR (task_type = 'text_embedding_generation' AND image_stage = 'text_embedding'))))", name="ck_task_image_stage_type"),
+        CheckConstraint("task_type NOT IN ('visual_embedding_generation','meme_context_generation','image_auto_rename','text_embedding_generation') OR (submission_mode IS NULL OR (image_stage IS NOT NULL AND ((task_type = 'visual_embedding_generation' AND image_stage = 'visual') OR (task_type = 'meme_context_generation' AND image_stage = 'agent') OR (task_type = 'image_auto_rename' AND image_stage = 'auto_rename') OR (task_type = 'text_embedding_generation' AND image_stage = 'text_embedding'))))", name="ck_task_image_stage_type"),
         UniqueConstraint("scope_id", "id", name="uq_task_scope_id"),
         Index("ix_tasks_image_submission", "scope_id", "submission_mode", "image_stage", "processing_job_id", "created_at"),
     )
@@ -461,7 +470,7 @@ class OperationGrant(Base):
 
 
 class ImageProcessingJob(Base):
-    """一张图片一个 revision 的统一处理控制面。"""
+    """一张图片一个 revision 的统一处理控制面，冻结联网与自动命名选项。"""
 
     __tablename__ = "image_processing_jobs"
 
@@ -474,6 +483,7 @@ class ImageProcessingJob(Base):
     processing_config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     processing_config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     reverse_image_policy: Mapped[str] = mapped_column(String(16), nullable=False, default="forbid")
+    auto_name: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
     current_stage: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
@@ -498,7 +508,7 @@ class ImageProcessingJob(Base):
 
 
 class ImageProcessingStage(Base):
-    """图片处理 job 的视觉、Agent、文本 embedding 阶段状态。"""
+    """图片处理 job 的视觉、Agent、自动命名和文本 embedding 阶段状态。"""
 
     __tablename__ = "image_processing_stages"
 
@@ -517,8 +527,8 @@ class ImageProcessingStage(Base):
         # scope_id 是阶段主键，不能被复合外键的 SET NULL 一并置空；任务删除时
         # 由同 scope 处理阶段事实一起级联清理。
         ForeignKeyConstraint(["scope_id", "task_id"], ["tasks.scope_id", "tasks.id"], ondelete="CASCADE"),
-        CheckConstraint("stage IN ('visual','agent','text_embedding')", name="ck_image_processing_stage_name"),
-        CheckConstraint("status IN ('queued','running','succeeded','failed','blocked','unknown_execution')", name="ck_image_processing_stage_status"),
+        CheckConstraint("stage IN ('visual','agent','auto_rename','text_embedding')", name="ck_image_processing_stage_name"),
+        CheckConstraint("status IN ('queued','running','succeeded','failed','blocked','unknown_execution','skipped','warning')", name="ck_image_processing_stage_status"),
         Index("ix_image_processing_stages_task", "scope_id", "task_id"),
     )
 
@@ -702,7 +712,8 @@ def ensure_optional_control_schema(engine: Engine) -> None:
     """幂等创建图片处理与 operation grant 控制面表。
 
     该兼容保证只处理新增 ORM 表，既不推进也不回退 Alembic revision；生产部署仍
-    应先运行标准 migration，启动期只负责让 0009 之后新增的控制面安全可用。
+    应先运行标准 migration，启动期只负责让控制面安全可用；约束升级必须显式重建，
+    不能把旧的三阶段同名 CHECK 当作已经兼容。
     """
     try:
         with engine.begin() as connection:
@@ -711,35 +722,60 @@ def ensure_optional_control_schema(engine: Engine) -> None:
             connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS submission_mode VARCHAR(16)"))
             connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS image_stage VARCHAR(32)"))
             connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS processing_job_id UUID"))
+            connection.execute(text("ALTER TABLE image_processing_jobs ADD COLUMN IF NOT EXISTS auto_name BOOLEAN NOT NULL DEFAULT FALSE"))
+            # 旧兼容表可能已经有可空列；不能让 NULL 继续绕过 Job 选项契约。
+            connection.execute(text("UPDATE image_processing_jobs SET auto_name = FALSE WHERE auto_name IS NULL"))
+            connection.execute(text("ALTER TABLE image_processing_jobs ALTER COLUMN auto_name SET DEFAULT FALSE"))
+            connection.execute(text("ALTER TABLE image_processing_jobs ALTER COLUMN auto_name SET NOT NULL"))
+            connection.execute(text("ALTER TABLE storage_operations ADD COLUMN IF NOT EXISTS expected_revision BIGINT"))
+            connection.execute(text("ALTER TABLE storage_operations ADD COLUMN IF NOT EXISTS claim_generation BIGINT"))
+            connection.execute(text("ALTER TABLE storage_operations ADD COLUMN IF NOT EXISTS attempt INTEGER"))
+            connection.execute(text("ALTER TABLE storage_operations ADD COLUMN IF NOT EXISTS task_id VARCHAR(255)"))
+            connection.execute(text("ALTER TABLE storage_operations ADD COLUMN IF NOT EXISTS expected_title_fingerprint VARCHAR(64)"))
             Base.metadata.create_all(connection, tables=list(OPTIONAL_CONTROL_TABLES), checkfirst=True)
-            # 现有 0009 安装没有新列上的复合外键和约束；以幂等 DO 块补齐，避免
-            # 启动期因重复安装产生 DDL 冲突。
+            # 旧安装可能已经存在同名三阶段约束。先删后建，确保启动兼容路径和
+            # Alembic migration 对阶段/Task 映射使用完全相同的集合。
             connection.execute(text("""
-                DO $$ BEGIN
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_tasks_processing_job') THEN
-                        ALTER TABLE tasks ADD CONSTRAINT fk_tasks_processing_job
-                            FOREIGN KEY (scope_id, processing_job_id)
-                            REFERENCES image_processing_jobs(scope_id, id) ON DELETE CASCADE;
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_task_submission_mode') THEN
-                        ALTER TABLE tasks ADD CONSTRAINT ck_task_submission_mode
-                            CHECK (submission_mode IS NULL OR submission_mode IN ('pipeline','standalone'));
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_task_image_stage') THEN
-                        ALTER TABLE tasks ADD CONSTRAINT ck_task_image_stage
-                            CHECK (image_stage IS NULL OR image_stage IN ('visual','agent','text_embedding'));
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_task_submission_job_exclusivity') THEN
-                        ALTER TABLE tasks ADD CONSTRAINT ck_task_submission_job_exclusivity
-                            CHECK (submission_mode IS NULL OR (submission_mode = 'standalone' AND processing_job_id IS NULL) OR (submission_mode = 'pipeline' AND processing_job_id IS NOT NULL));
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_task_image_stage_type') THEN
-                        ALTER TABLE tasks ADD CONSTRAINT ck_task_image_stage_type
-                            CHECK (task_type NOT IN ('visual_embedding_generation','meme_context_generation','text_embedding_generation') OR submission_mode IS NULL OR (image_stage IS NOT NULL AND ((task_type = 'visual_embedding_generation' AND image_stage = 'visual') OR (task_type = 'meme_context_generation' AND image_stage = 'agent') OR (task_type = 'text_embedding_generation' AND image_stage = 'text_embedding'))));
-                    END IF;
-                END $$;
+                ALTER TABLE tasks DROP CONSTRAINT IF EXISTS fk_tasks_processing_job;
+                ALTER TABLE tasks DROP CONSTRAINT IF EXISTS ck_task_submission_mode;
+                ALTER TABLE tasks DROP CONSTRAINT IF EXISTS ck_task_image_stage;
+                ALTER TABLE tasks DROP CONSTRAINT IF EXISTS ck_task_submission_job_exclusivity;
+                ALTER TABLE tasks DROP CONSTRAINT IF EXISTS ck_task_image_stage_type;
+                ALTER TABLE tasks ADD CONSTRAINT fk_tasks_processing_job
+                    FOREIGN KEY (scope_id, processing_job_id)
+                    REFERENCES image_processing_jobs(scope_id, id) ON DELETE CASCADE;
+                ALTER TABLE tasks ADD CONSTRAINT ck_task_submission_mode
+                    CHECK (submission_mode IS NULL OR submission_mode IN ('pipeline','standalone'));
+                ALTER TABLE tasks ADD CONSTRAINT ck_task_image_stage
+                    CHECK (image_stage IS NULL OR image_stage IN ('visual','agent','auto_rename','text_embedding'));
+                ALTER TABLE tasks ADD CONSTRAINT ck_task_submission_job_exclusivity
+                    CHECK (submission_mode IS NULL OR (submission_mode = 'standalone' AND processing_job_id IS NULL) OR (submission_mode = 'pipeline' AND processing_job_id IS NOT NULL));
+                ALTER TABLE tasks ADD CONSTRAINT ck_task_image_stage_type
+                    CHECK (task_type NOT IN ('visual_embedding_generation','meme_context_generation','image_auto_rename','text_embedding_generation') OR submission_mode IS NULL OR (image_stage IS NOT NULL AND ((task_type = 'visual_embedding_generation' AND image_stage = 'visual') OR (task_type = 'meme_context_generation' AND image_stage = 'agent') OR (task_type = 'image_auto_rename' AND image_stage = 'auto_rename') OR (task_type = 'text_embedding_generation' AND image_stage = 'text_embedding'))));
+                ALTER TABLE image_processing_stages DROP CONSTRAINT IF EXISTS ck_image_processing_stage_name;
+                ALTER TABLE image_processing_stages DROP CONSTRAINT IF EXISTS ck_image_processing_stage_status;
+                ALTER TABLE image_processing_stages ADD CONSTRAINT ck_image_processing_stage_name
+                    CHECK (stage IN ('visual','agent','auto_rename','text_embedding'));
+                ALTER TABLE image_processing_stages ADD CONSTRAINT ck_image_processing_stage_status
+                    CHECK (status IN ('queued','running','succeeded','failed','blocked','unknown_execution','skipped','warning'));
+                ALTER TABLE image_processing_jobs DROP CONSTRAINT IF EXISTS ck_image_processing_policy;
+                ALTER TABLE image_processing_jobs ADD CONSTRAINT ck_image_processing_policy
+                    CHECK (reverse_image_policy IN ('forbid','auto'));
+                ALTER TABLE storage_operations DROP CONSTRAINT IF EXISTS ck_storage_operation_expected_revision;
+                ALTER TABLE storage_operations DROP CONSTRAINT IF EXISTS ck_storage_operation_claim_generation;
+                ALTER TABLE storage_operations DROP CONSTRAINT IF EXISTS ck_storage_operation_attempt;
+                ALTER TABLE storage_operations DROP CONSTRAINT IF EXISTS ck_storage_operation_title_fingerprint;
+                ALTER TABLE storage_operations ADD CONSTRAINT ck_storage_operation_expected_revision
+                    CHECK (expected_revision IS NULL OR expected_revision >= 1);
+                ALTER TABLE storage_operations ADD CONSTRAINT ck_storage_operation_claim_generation
+                    CHECK (claim_generation IS NULL OR claim_generation > 0);
+                ALTER TABLE storage_operations ADD CONSTRAINT ck_storage_operation_attempt
+                    CHECK (attempt IS NULL OR attempt > 0);
+                ALTER TABLE storage_operations ADD CONSTRAINT ck_storage_operation_title_fingerprint
+                    CHECK (expected_title_fingerprint IS NULL OR length(expected_title_fingerprint) = 64);
             """))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_image_submission ON tasks(scope_id, submission_mode, image_stage, processing_job_id, created_at)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_storage_operations_task ON storage_operations(scope_id, task_id, updated_at)"))
             connection.execute(text("ALTER TABLE image_processing_jobs ADD COLUMN IF NOT EXISTS processing_config JSONB NOT NULL DEFAULT '{}'::jsonb"))
             connection.execute(text("ALTER TABLE reverse_image_usage_events ADD COLUMN IF NOT EXISTS claim_generation BIGINT"))
             connection.execute(text("ALTER TABLE reverse_image_usage_events ADD COLUMN IF NOT EXISTS attempt INTEGER"))
@@ -1777,6 +1813,7 @@ class TaskRepository:
         image_task_stages = {
             "visual_embedding_generation": "visual",
             "meme_context_generation": "agent",
+            "image_auto_rename": "auto_rename",
             "text_embedding_generation": "text_embedding",
         }
         expected_stage = image_task_stages.get(task_type)
@@ -2767,6 +2804,14 @@ class StorageCoordinator:
         operation.updated_at = utcnow()
         (session or self._session).flush()
 
+    @staticmethod
+    def _title_fingerprint(record: Meme) -> str:
+        """按自动命名 handler 的规则计算当前语境标题指纹。"""
+        context = record.meme_context if isinstance(record.meme_context, dict) else {}
+        raw_title = context.get("title") if isinstance(context, dict) else None
+        title = raw_title.strip() if isinstance(raw_title, str) else ""
+        return hashlib.sha256(title.encode("utf-8")).hexdigest()
+
     @contextmanager
     def _transaction(self) -> Iterator[Session]:
         """创建当前 scope 的短数据库事务，并在退出时提交或回滚。"""
@@ -2802,7 +2847,14 @@ class StorageCoordinator:
                 session.flush()
             self.blob_store.link_move(staging_key, target_key)
             with self._transaction() as session:
-                operation = session.scalar(select(StorageOperation).where(StorageOperation.operation_token == token).with_for_update())
+                operation = session.scalar(
+                    select(StorageOperation)
+                    .where(
+                        StorageOperation.scope_id == self.scope.scope_id,
+                        StorageOperation.operation_token == token,
+                    )
+                    .with_for_update()
+                )
                 if operation is None:
                     raise DatabaseError("storage_operation_missing")
                 self._session = session
@@ -2842,7 +2894,14 @@ class StorageCoordinator:
         except Exception:
             raise
         with self._transaction() as session:
-            operation = session.scalar(select(StorageOperation).where(StorageOperation.operation_token == token).with_for_update())
+            operation = session.scalar(
+                select(StorageOperation)
+                .where(
+                    StorageOperation.scope_id == self.scope.scope_id,
+                    StorageOperation.operation_token == token,
+                )
+                .with_for_update()
+            )
             record = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == UUID(str(meme_id))).with_for_update())
             if operation is None or record is None:
                 raise DatabaseError("storage_operation_missing")
@@ -2854,6 +2913,355 @@ class StorageCoordinator:
             self._set_status(operation, "completed", session=session)
             session.flush()
             return record
+
+    def rename_if_current(
+        self,
+        meme_id: UUID | str,
+        *,
+        target_key: str,
+        expected_source_key: str,
+        expected_sha256: str,
+        expected_revision: int,
+        task_id: str,
+        claim_generation: int,
+        attempt: int,
+        claim_owner: str,
+        expected_title_fingerprint: str | None = None,
+    ) -> Meme:
+        """在任务 claim 与 Meme 事实仍匹配时执行一次 CAS 重命名。
+
+        第一段事务锁定 Meme/Task 并记录 ``StorageOperation``，文件移动完成后第二段
+        事务再次复核所有 fencing 输入。任一复核失败都会阻断操作恢复，避免未知文件
+        副作用被当作普通命名警告；实际 claim owner 必须与当前 Task lease owner 完全
+        一致，不能只依赖 generation 和 attempt。
+
+        ``storage_key_changed`` 只表示同一 SHA 的 Meme 已经被人工改名，调用方可将其
+        降级为 warning；SHA、revision、语境指纹、claim 或文件副作用无法确认时必须
+        保持 blocked/unknown_execution。
+        """
+        try:
+            validate_business_storage_key(target_key)
+            validate_business_storage_key(expected_source_key)
+        except ValueError as exc:
+            raise DatabaseError("invalid_filename") from exc
+        if (
+            not isinstance(expected_sha256, str)
+            or len(expected_sha256) != 64
+            or any(char not in "0123456789abcdefABCDEF" for char in expected_sha256)
+            or not isinstance(task_id, str)
+            or not task_id
+            or not isinstance(claim_owner, str)
+            or not claim_owner
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+            or not isinstance(claim_generation, int)
+            or claim_generation < 1
+            or not isinstance(attempt, int)
+            or attempt < 1
+        ):
+            raise DatabaseError("target_changed")
+
+        def current_title_fingerprint(record: Meme) -> str:
+            """从数据库中的当前标题计算与 handler 一致的输入指纹。"""
+            return self._title_fingerprint(record)
+
+        def mark_blocked(error: str) -> None:
+            """在文件副作用已发生但 finalize 不确定时持久化 blocked。"""
+            try:
+                with self._transaction() as session:
+                    operation = session.scalar(
+                        select(StorageOperation)
+                        .where(
+                            StorageOperation.scope_id == self.scope.scope_id,
+                            StorageOperation.operation_token == token,
+                        )
+                        .with_for_update()
+                    )
+                    if operation is not None and operation.status in self._ACTIVE:
+                        # finalize 失败时不再复用可能已抛错的状态转移 helper，直接
+                        # 持久化 blocked 事实，确保恢复器不会把副作用当作可重放。
+                        operation.status = "blocked"
+                        operation.error = {"error": error}
+                        operation.updated_at = utcnow()
+                        session.flush()
+            except Exception:  # noqa: BLE001 - 数据库本身不可用时保留原始异常
+                return
+
+        def compensate_manual_replacement() -> bool:
+            """识别文件移动前同图手动改名，并安全结束未执行的操作。"""
+            try:
+                with self._transaction() as session:
+                    operation = session.scalar(
+                        select(StorageOperation)
+                        .where(
+                            StorageOperation.scope_id == self.scope.scope_id,
+                            StorageOperation.operation_token == token,
+                        )
+                        .with_for_update()
+                    )
+                    record = session.scalar(
+                        select(Meme)
+                        .where(Meme.scope_id == self.scope.scope_id, Meme.id == UUID(str(meme_id)))
+                        .with_for_update()
+                    )
+                    if operation is None or operation.status != "prepared" or record is None:
+                        return False
+                    title_matches = expected_title_fingerprint is None or current_title_fingerprint(record) == expected_title_fingerprint
+                    same_image = record.sha256.lower() == expected_sha256.lower()
+                    current_is_target = (
+                        record.storage_key == target_key
+                        and record.revision == expected_revision + 1
+                        and self.blob_store.exists_with_identity(target_key, sha256=expected_sha256, size_bytes=record.size_bytes)
+                    )
+                    current_is_replacement = record.storage_key != source_key and not current_is_target
+                    target_path = self.blob_store._key_path(target_key, must_exist=False)
+                    target_absent = not target_path.exists() and not target_path.is_symlink()
+                    if not (same_image and title_matches and current_is_replacement and target_absent):
+                        if not (same_image and title_matches and current_is_target):
+                            return False
+                    self._set_status(operation, "compensated", error={"error": "storage_key_changed"}, session=session)
+                    return True
+            except Exception:  # noqa: BLE001 - 无法确认时必须保留 unknown 语义
+                return False
+
+        def compensate_unapplied_target_conflict() -> bool:
+            """在目标文件于预检后被占用时补偿尚未发生的文件动作。"""
+            try:
+                with self._transaction() as session:
+                    operation = session.scalar(
+                        select(StorageOperation)
+                        .where(
+                            StorageOperation.scope_id == self.scope.scope_id,
+                            StorageOperation.operation_token == token,
+                        )
+                        .with_for_update()
+                    )
+                    record = session.scalar(
+                        select(Meme)
+                        .where(
+                            Meme.scope_id == self.scope.scope_id,
+                            Meme.id == UUID(str(meme_id)),
+                        )
+                        .with_for_update()
+                    )
+                    if operation is None or operation.status != "prepared" or record is None:
+                        return False
+                    if (
+                        record.storage_key != source_key
+                        or record.revision != expected_revision
+                        or record.sha256.lower() != expected_sha256.lower()
+                        or (expected_title_fingerprint is not None and current_title_fingerprint(record) != expected_title_fingerprint)
+                    ):
+                        return False
+                    source_ok = self.blob_store.exists_with_identity(
+                        source_key,
+                        sha256=expected_sha256,
+                        size_bytes=record.size_bytes,
+                    )
+                    target_path = self.blob_store._key_path(target_key, must_exist=False)
+                    if not source_ok or not target_path.exists() or target_path.is_symlink():
+                        return False
+                    self._set_status(operation, "compensated", error={"error": "target_exists"}, session=session)
+                    return True
+            except Exception:  # noqa: BLE001 - 无法证明未发生副作用时保留未知语义
+                return False
+
+        token = uuid.uuid4()
+        source_key = expected_source_key
+        expected_size: int | None = None
+        try:
+            with self._transaction() as session:
+                record = session.scalar(
+                    select(Meme).where(
+                        Meme.scope_id == self.scope.scope_id,
+                        Meme.id == UUID(str(meme_id)),
+                    ).with_for_update()
+                )
+                task = session.scalar(
+                    select(Task).where(
+                        Task.scope_id == self.scope.scope_id,
+                        Task.id == task_id,
+                    ).with_for_update()
+                )
+                now = utcnow()
+                if (
+                    task is None
+                    or task.task_type != "image_auto_rename"
+                    or task.image_stage != "auto_rename"
+                    or task.status != "running"
+                    or task.claim_generation != claim_generation
+                    or task.attempt_count != attempt
+                    or task.lease_expires_at is None
+                    or task.lease_expires_at <= now
+                    or task.lease_owner != claim_owner
+                ):
+                    raise DatabaseError("claim_expired")
+                if record is None or record.sha256.lower() != expected_sha256.lower():
+                    raise DatabaseError("target_changed")
+                if expected_title_fingerprint is not None and current_title_fingerprint(record) != expected_title_fingerprint:
+                    raise DatabaseError("target_changed")
+                if record.storage_key != expected_source_key:
+                    raise DatabaseError("storage_key_changed")
+                if record.revision != expected_revision:
+                    raise DatabaseError("target_changed")
+                # 同一 Meme 的既有存储操作可能仍有未确认副作用；即使本次派生结果
+                # 与当前文件同名，也不能绕过 blocked/活动操作的 fail-closed 边界。
+                unsettled_operation = session.scalar(
+                    select(StorageOperation)
+                    .where(
+                        StorageOperation.scope_id == self.scope.scope_id,
+                        StorageOperation.meme_id == record.id,
+                        StorageOperation.status.in_(("prepared", "file_applied", "blocked")),
+                    )
+                    .order_by(StorageOperation.updated_at.desc(), StorageOperation.id.desc())
+                    .with_for_update()
+                )
+                if unsettled_operation is not None:
+                    raise DatabaseError("storage_operation_unknown")
+                if target_key == record.storage_key:
+                    # 目标名已经符合派生结果时仍需经过上面的 Task claim/CAS
+                    # 校验和文件身份复核；文件被外部替换时不能把旧路径当作成功。
+                    if not self.blob_store.exists_with_identity(
+                        record.storage_key,
+                        sha256=expected_sha256,
+                        size_bytes=record.size_bytes,
+                    ):
+                        raise DatabaseError("target_changed")
+                    # 复核通过后避免无意义地创建 storage operation。
+                    return record
+                if session.scalar(
+                    select(Meme.id).where(
+                        Meme.scope_id == self.scope.scope_id,
+                        Meme.storage_key == target_key,
+                        Meme.id != record.id,
+                    )
+                ) is not None:
+                    raise DatabaseError("target_exists")
+                target_path = self.blob_store._key_path(target_key)
+                if target_path.exists() or target_path.is_symlink():
+                    raise DatabaseError("target_exists")
+                expected_size = record.size_bytes
+                operation = StorageOperation(
+                    scope_id=self.scope.scope_id,
+                    meme_id=record.id,
+                    operation_type="rename",
+                    operation_token=token,
+                    source_key=record.storage_key,
+                    target_key=target_key,
+                    before_sha256=record.sha256,
+                    after_sha256=record.sha256,
+                    before_size=record.size_bytes,
+                    after_size=record.size_bytes,
+                    expected_revision=expected_revision,
+                    claim_generation=claim_generation,
+                    attempt=attempt,
+                    task_id=task_id,
+                    expected_title_fingerprint=expected_title_fingerprint,
+                    status="prepared",
+                )
+                session.add(operation)
+                session.flush()
+            # 数据库锁不能阻止外部进程替换文件；移动前复核源对象身份，避免把
+            # 同名但不同字节的文件绑定到当前 Meme。
+            if not self.blob_store.exists_with_identity(
+                source_key,
+                sha256=expected_sha256,
+                size_bytes=expected_size,
+            ):
+                mark_blocked("source_identity_changed")
+                raise DatabaseError("target_changed")
+            try:
+                self.blob_store.link_move(source_key, target_key)
+            except (DatabaseError, OSError) as exc:
+                if compensate_manual_replacement():
+                    raise DatabaseError("storage_key_changed") from exc
+                if isinstance(exc, DatabaseError) and exc.code == "target_exists" and compensate_unapplied_target_conflict():
+                    raise DatabaseError("target_exists") from exc
+                # 预检通过后文件动作仍可能在 link/unlink 边界失败；此时不能把
+                # 未知副作用当作普通目标冲突，必须留下 blocked 事实交给恢复器。
+                mark_blocked("rename_file_move_unknown")
+                raise DatabaseError("storage_operation_unknown") from exc
+            try:
+                target_verified = self.blob_store.exists_with_identity(
+                    target_key,
+                    sha256=expected_sha256,
+                    size_bytes=expected_size,
+                )
+                source_path = self.blob_store._key_path(source_key, must_exist=False)
+                source_absent = not source_path.exists() and not source_path.is_symlink()
+            except (DatabaseError, OSError) as exc:
+                mark_blocked("rename_file_identity_unknown")
+                raise DatabaseError("storage_operation_unknown") from exc
+            if not target_verified or not source_absent:
+                mark_blocked("rename_file_identity_mismatch")
+                raise DatabaseError("storage_operation_unknown")
+        except Exception:
+            # ``prepared`` 操作必须交给恢复器判断；不要删除可能已完成的文件移动。
+            raise
+
+        blocked_error: str | None = None
+        try:
+            with self._transaction() as session:
+                operation = session.scalar(
+                    select(StorageOperation)
+                    .where(
+                        StorageOperation.scope_id == self.scope.scope_id,
+                        StorageOperation.operation_token == token,
+                    )
+                    .with_for_update()
+                )
+                record = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == UUID(str(meme_id))).with_for_update())
+                task = session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.id == task_id).with_for_update())
+                now = utcnow()
+                if operation is None or record is None:
+                    blocked_error = "storage_operation_missing"
+                elif (
+                    task is None
+                    or task.task_type != "image_auto_rename"
+                    or task.image_stage != "auto_rename"
+                    or task.status != "running"
+                    or task.claim_generation != claim_generation
+                    or task.attempt_count != attempt
+                    or task.lease_expires_at is None
+                    or task.lease_expires_at <= now
+                    or task.lease_owner != claim_owner
+                ):
+                    blocked_error = "claim_expired"
+                elif record.sha256.lower() != expected_sha256.lower():
+                    blocked_error = "target_changed"
+                elif expected_title_fingerprint is not None and current_title_fingerprint(record) != expected_title_fingerprint:
+                    blocked_error = "target_changed"
+                elif record.storage_key != expected_source_key:
+                    blocked_error = "storage_key_changed" if record.sha256.lower() == expected_sha256.lower() else "target_changed"
+                elif record.revision != expected_revision:
+                    blocked_error = "target_changed"
+                else:
+                    target_verified = self.blob_store.exists_with_identity(
+                        target_key,
+                        sha256=expected_sha256,
+                        size_bytes=expected_size,
+                    )
+                    source_path = self.blob_store._key_path(source_key, must_exist=False)
+                    if not target_verified or source_path.exists() or source_path.is_symlink():
+                        blocked_error = "rename_file_identity_mismatch"
+                    else:
+                        self._session = session
+                        self._set_status(operation, "file_applied", session=session)
+                        record.storage_key = target_key
+                        record.revision += 1
+                        record.updated_at = utcnow()
+                        self._set_status(operation, "completed", session=session)
+                        session.flush()
+        except Exception as exc:  # noqa: BLE001 - 文件已移动，finalize 异常必须留痕
+            mark_blocked("unknown_execution")
+            raise DatabaseError("storage_operation_unknown") from exc
+        if blocked_error is not None:
+            # 文件已移动但数据库事实无法安全收束，operation 保持 blocked，由恢复/人工
+            # 处置路径保留未知执行证据，调用方不能把它降级为 warning。
+            mark_blocked(blocked_error)
+            raise DatabaseError("storage_operation_unknown")
+        with self.resources.factory() as session:
+            return session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == UUID(str(meme_id))))
 
     def delete(self, meme_id: UUID | str) -> None:
         """先将文件移入隔离区，再删除 Meme 记录并清理隔离对象。"""
@@ -2868,7 +3276,14 @@ class StorageCoordinator:
             source_key = record.storage_key
         self.blob_store.quarantine(source_key, token=token)
         with self._transaction() as session:
-            operation = session.scalar(select(StorageOperation).where(StorageOperation.operation_token == token).with_for_update())
+            operation = session.scalar(
+                select(StorageOperation)
+                .where(
+                    StorageOperation.scope_id == self.scope.scope_id,
+                    StorageOperation.operation_token == token,
+                )
+                .with_for_update()
+            )
             record = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == UUID(str(meme_id))).with_for_update())
             if operation is None or record is None:
                 raise DatabaseError("storage_operation_missing")
@@ -2899,6 +3314,11 @@ class StorageCoordinator:
                         self._recover_rename(session, operation, counts)
                     elif operation.operation_type == "delete":
                         self._recover_delete(session, operation, counts)
+                    else:
+                        # 数据库 CHECK 已禁止新值，但旧安装或人工修复可能留下
+                        # 未知类型；恢复器必须停在 blocked，不能静默丢掉副作用事实。
+                        self._set_status(operation, "blocked", error={"error": "storage_operation_unknown_type"}, session=session)
+                        counts["blocked"] += 1
                 except DatabaseError as exc:
                     self._set_status(operation, "blocked", error={"error": exc.code, "message": str(exc)}, session=session)
                     counts["blocked"] += 1
@@ -2934,23 +3354,94 @@ class StorageCoordinator:
         assert operation.source_key and operation.target_key
         source_ok = self.blob_store.exists_with_identity(operation.source_key, sha256=operation.before_sha256, size_bytes=operation.before_size)
         target_ok = self.blob_store.exists_with_identity(operation.target_key, sha256=operation.after_sha256, size_bytes=operation.after_size)
+        record = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == operation.meme_id).with_for_update())
+        if record is None:
+            raise DatabaseError("meme_not_found")
+        if operation.task_id is not None:
+            # 自动重命名的恢复必须仍属于创建 operation 时的叶子 claim。任务被
+            # 重新认领、完成或租约过期后，不能让恢复器继续移动或 finalize 文件。
+            task = session.scalar(
+                select(Task)
+                .where(Task.scope_id == self.scope.scope_id, Task.id == operation.task_id)
+                .with_for_update()
+            )
+            now = utcnow()
+            if (
+                task is None
+                or task.task_type != "image_auto_rename"
+                or task.image_stage != "auto_rename"
+                or task.status != "running"
+                or operation.claim_generation is None
+                or task.claim_generation != operation.claim_generation
+                or operation.attempt is None
+                or task.attempt_count != operation.attempt
+                or task.lease_expires_at is None
+                or task.lease_expires_at <= now
+            ):
+                raise DatabaseError("rename_claim_expired")
+        if (
+            not isinstance(operation.before_sha256, str)
+            or len(operation.before_sha256) != 64
+            or not isinstance(operation.after_sha256, str)
+            or len(operation.after_sha256) != 64
+        ):
+            raise DatabaseError("rename_operation_invalid")
+        same_image = record.sha256.lower() == operation.before_sha256.lower()
+        title_matches = operation.expected_title_fingerprint is None or self._title_fingerprint(record) == operation.expected_title_fingerprint
+        already_finalized = (
+            record.storage_key == operation.target_key
+            and operation.expected_revision is not None
+            and record.revision == operation.expected_revision + 1
+        )
+        source_binding = (
+            record.storage_key == operation.source_key
+            and (operation.expected_revision is None or record.revision == operation.expected_revision)
+        )
+        if operation.status == "prepared":
+            if not same_image or not title_matches:
+                raise DatabaseError("rename_target_changed")
+            if not source_binding and not already_finalized:
+                # 文件动作尚未被本 operation 可靠确认，同图手动改名已经替换了
+                # source key 时可以补偿操作；其它组合必须停在 blocked。
+                if not source_ok and not target_ok:
+                    self._set_status(operation, "compensated", error={"error": "storage_key_changed"}, session=session)
+                    counts["compensated"] += 1
+                    return
+                raise DatabaseError("rename_target_changed")
         if operation.status == "prepared" and source_ok and not target_ok:
             self.blob_store.link_move(operation.source_key, operation.target_key)
             source_ok, target_ok = False, True
             counts["retried"] += 1
         if target_ok and not source_ok:
-            record = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == operation.meme_id).with_for_update())
-            if record is None:
-                raise DatabaseError("meme_not_found")
-            self._set_status(operation, "file_applied", session=session)
-            record.storage_key = operation.target_key
-            record.revision += 1
-            record.updated_at = utcnow()
+            # 只有数据库仍保留 operation 记录的 CAS 输入时才能补交 Meme；若
+            # finalize 已经成功但连接在提交后断开，则识别已完成事实而不重复递增
+            # revision；人工改名或 SHA 变化必须阻断，不能覆盖用户结果。
+            if (
+                record.storage_key == operation.target_key
+                and operation.expected_revision is not None
+                and record.revision == operation.expected_revision + 1
+                and same_image
+                and title_matches
+            ):
+                self._set_status(operation, "file_applied", session=session)
+            elif (
+                record.storage_key == operation.source_key
+                and (operation.expected_revision is None or record.revision == operation.expected_revision)
+                and same_image
+                and title_matches
+            ):
+                self._set_status(operation, "file_applied", session=session)
+                record.storage_key = operation.target_key
+                record.revision += 1
+                record.updated_at = utcnow()
+            else:
+                raise DatabaseError("rename_target_changed")
             self._set_status(operation, "completed", session=session)
             counts["completed"] += 1
         elif source_ok and not target_ok and operation.status == "file_applied":
-            self._set_status(operation, "compensated", session=session)
-            counts["compensated"] += 1
+            # ``file_applied`` 已经声明发生过文件副作用；源文件重新出现且目标
+            # 消失无法证明是回滚还是外部修改，不能把这条事实静默标成 compensated。
+            raise DatabaseError("rename_recovery_ambiguous")
         else:
             raise DatabaseError("rename_recovery_ambiguous")
 

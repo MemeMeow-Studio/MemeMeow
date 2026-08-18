@@ -29,7 +29,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, StrictInt
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, StrictBool, StrictInt
 from sqlalchemy import select
 
 from backend.config import Settings, update_dotenv_concurrency
@@ -71,7 +71,7 @@ from backend.callbacks import (
     validate_request_id,
     verify_content_length,
 )
-from backend.image_processing import ImageProcessingError, ImageProcessingRepository, ImageProcessingSnapshot, ImageProcessingWorker, SingleImageEmbeddingService
+from backend.image_processing import AUTO_RENAME_WARNING_ERRORS, ImageProcessingError, ImageProcessingOptions, ImageProcessingRepository, ImageProcessingSnapshot, ImageProcessingWorker, SingleImageEmbeddingService, image_file_matches, processing_config_hash, stable_input_digest
 from backend.app_extensions import ApplicationExtension, extension_paths, path_is_exempt
 
 
@@ -184,6 +184,7 @@ class ProcessingRetryRequest(StrictRequestModel):
 
     model_config = ConfigDict(extra="forbid")
     reverse_image_policy: str | None = Field(default=None, pattern="^(forbid|auto)$")
+    auto_name: StrictBool | None = None
 
 
 class ImageStageSubmissionRequest(StrictRequestModel):
@@ -200,6 +201,7 @@ class ProcessingBatchRequest(StrictRequestModel):
 
     model_config = ConfigDict(extra="forbid")
     reverse_image_policy: str = Field(default="forbid", pattern="^(forbid|auto)$")
+    auto_name: StrictBool = False
 
 
 class VisualMatchRequest(StrictRequestModel):
@@ -343,6 +345,38 @@ def _filename_from_title(title: str, suffix: str) -> str:
     return f"{stem}{suffix}"
 
 
+def _parse_multipart_bool(value: object, *, default: bool = False) -> bool:
+    """严格解析 multipart 布尔字段，未知文本不再静默变成 False。"""
+    if value is None:
+        return default
+    if type(value) is bool:
+        return value
+    if not isinstance(value, str):
+        raise ImageProcessingError("invalid_auto_name")
+    normalized = value.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ImageProcessingError("invalid_auto_name")
+
+
+def _normalize_processing_options(request: Request, *, reverse_image_policy: object = None, auto_name: object = None, check_availability: bool = True) -> ImageProcessingOptions:
+    """统一规范化图片选项，并在产生 Job 前校验联网能力。"""
+    try:
+        options = ImageProcessingOptions.normalize(reverse_image_policy=reverse_image_policy, auto_name=auto_name)
+    except ImageProcessingError:
+        raise
+    if check_availability and options.reverse_image_policy == "auto":
+        try:
+            available = bool(_service(request, "reverse_image").available)
+        except Exception:  # noqa: BLE001 - 能力探测异常必须按不可用处理
+            available = False
+        if not available:
+            raise ImageProcessingError("reverse_image_unavailable")
+    return options
+
+
 def _media_for_meme(request: Request, meme_id: str) -> str | None:
     """将当前 scope 的稳定 meme_id 映射为受控媒体 URL。"""
     try:
@@ -357,6 +391,37 @@ def _invalidate_search(request: Request) -> None:
     invalidate = getattr(_service(request, "search"), "invalidate_cache", None)
     if invalidate:
         invalidate()
+
+
+def _invalidate_stale_text_embeddings(
+    database: DatabaseResources,
+    *,
+    scope_id: str,
+    meme_id: str | UUID,
+    image_sha256: str,
+    metadata_hash: str,
+) -> None:
+    """把指定图片旧 metadata hash 的 ready 文本向量标记为失效。
+
+    standalone 图片阶段只负责当前叶子任务的事实收束，不能创建新的文本任务；
+    其成功改变图片语境或路径后，由该辅助函数让旧向量退出检索候选。
+    """
+    with database.factory() as session:
+        stale_rows = list(
+            session.scalars(
+                select(MemeTextEmbedding).where(
+                    MemeTextEmbedding.scope_id == scope_id,
+                    MemeTextEmbedding.meme_id == UUID(str(meme_id)),
+                    MemeTextEmbedding.image_sha256 == image_sha256,
+                    MemeTextEmbedding.metadata_hash != metadata_hash,
+                    MemeTextEmbedding.status == "ready",
+                ).with_for_update()
+            )
+        )
+        for stale in stale_rows:
+            stale.status = "failed"
+            stale.updated_at = utcnow()
+        session.commit()
 
 
 def _context_payload(request: Request, image: Path, *, auto_name: bool = False, batch_id: str | None = None, expected_sha256: str | None = None, reverse_image_policy: str = "forbid") -> dict[str, object]:
@@ -374,7 +439,6 @@ def _context_payload(request: Request, image: Path, *, auto_name: bool = False, 
         "meme_id": meme_id,
         "image_relative_path": relative,
         "image_sha256": expected_sha256 or metadata_service.image_sha256(image),
-        "auto_name": auto_name,
         "model": settings.opencode_model,
         "skill_hash": skill_hash,
         "settings_version": settings.settings_version,
@@ -405,7 +469,7 @@ def _submit_context_task(request: Request, image: Path, *, auto_name: bool = Fal
     return _service(request, "tasks").submit("meme_context_generation", _context_payload(request, image, auto_name=auto_name, batch_id=batch_id, expected_sha256=expected_sha256, reverse_image_policy=reverse_image_policy), schedule=schedule)
 
 
-def _visual_payload(request: Request, image: Path, *, batch_id: str | None = None, expected_sha256: str | None = None, auto_name: bool = False, reverse_image_policy: str = "forbid") -> dict[str, object]:
+def _visual_payload(request: Request, image: Path, *, batch_id: str | None = None, expected_sha256: str | None = None, reverse_image_policy: str = "forbid") -> dict[str, object]:
     """构造视觉任务可序列化 payload，模型身份始终来自服务端配置。"""
     settings: Settings = request.app.state.settings
     identity = identity_from_settings(settings)
@@ -420,7 +484,6 @@ def _visual_payload(request: Request, image: Path, *, batch_id: str | None = Non
         "visual_dimensions": identity.dimensions,
         "preprocess_version": identity.preprocess_version,
         "settings_version": settings.settings_version,
-        "auto_name": auto_name,
         "reverse_image_policy": reverse_image_policy if reverse_image_policy in {"forbid", "auto"} else "forbid",
     }
     if batch_id:
@@ -428,9 +491,9 @@ def _visual_payload(request: Request, image: Path, *, batch_id: str | None = Non
     return payload
 
 
-def _submit_visual_task(request: Request, image: Path, *, batch_id: str | None = None, expected_sha256: str | None = None, auto_name: bool = False, reverse_image_policy: str = "forbid", schedule: bool = True) -> TaskRecord:
+def _submit_visual_task(request: Request, image: Path, *, batch_id: str | None = None, expected_sha256: str | None = None, reverse_image_policy: str = "forbid", schedule: bool = True) -> TaskRecord:
     """在图片 durable upload 提交后创建或复用异步视觉任务。"""
-    return _service(request, "tasks").submit("visual_embedding_generation", _visual_payload(request, image, batch_id=batch_id, expected_sha256=expected_sha256, auto_name=auto_name, reverse_image_policy=reverse_image_policy), schedule=schedule)
+    return _service(request, "tasks").submit("visual_embedding_generation", _visual_payload(request, image, batch_id=batch_id, expected_sha256=expected_sha256, reverse_image_policy=reverse_image_policy), schedule=schedule)
 
 
 def _context_enqueue_error(exc: Exception) -> str:
@@ -908,48 +971,129 @@ async def lifespan(app: FastAPI):
             "meme_id": meme_id,
             "session_id": session_id,
             "result_artifact": f"task-results/{payload.get('_claim_task_id', '')}/result.json.tmp",
-            "auto_named": False,
             "reverse_image_policy": payload["reverse_image_policy"],
         }
         metadata_hash = service.metadata.embedding_record(image)["metadata_hash"]
         if mode == "standalone":
             # 独立 Agent 只使旧文本向量失效；这里不创建文本 Task，也不触碰
             # image_processing_jobs 的 reconcile 状态。
-            with app.state.database.factory() as session:
-                stale_rows = list(
-                    session.scalars(
-                        select(MemeTextEmbedding).where(
-                            MemeTextEmbedding.scope_id == service.scope.scope_id,
-                            MemeTextEmbedding.meme_id == UUID(meme_id),
-                            MemeTextEmbedding.image_sha256 == expected_sha,
-                            MemeTextEmbedding.metadata_hash != metadata_hash,
-                            MemeTextEmbedding.status == "ready",
-                        ).with_for_update()
-                    )
-                )
-                for stale in stale_rows:
-                    stale.status = "failed"
-                    stale.updated_at = utcnow()
-                session.commit()
-        if payload.get("auto_name") and metadata.meme_context.title:
-            try:
-                target = image.parent / _filename_from_title(metadata.meme_context.title, image.suffix)
-                if target != image:
-                    service.metadata.rename_by_id(meme_id, target)
-                    result["auto_named"] = True
-                    result["saved_filename"] = target.name
-                    result["image_relative_path"] = service.metadata.blob_store.relative(target)
-            except (MetadataError, ValueError, OSError):
-                result["auto_name_error"] = "auto_name_failed"
-        # 自动命名可能改变 storage_key，最终哈希必须从实际提交路径读取。
-        final_image = image
-        if isinstance(result.get("saved_filename"), str):
-            final_image = image.with_name(str(result["saved_filename"]))
+            if not isinstance(metadata_hash, str) or not metadata_hash:
+                raise RuntimeError("target_changed")
+            _invalidate_stale_text_embeddings(
+                app.state.database,
+                scope_id=service.scope.scope_id,
+                meme_id=meme_id,
+                image_sha256=expected_sha,
+                metadata_hash=metadata_hash,
+            )
         try:
-            result["metadata_hash"] = service.metadata.embedding_record(final_image)["metadata_hash"]
+            result["metadata_hash"] = service.metadata.embedding_record(image)["metadata_hash"]
         except MetadataError:
             result["metadata_hash"] = metadata_hash
         return result
+
+    def auto_rename_handler(payload: dict[str, object], progress):
+        """在当前图片 Task claim 内校验并执行服务端派生的安全重命名。"""
+        service = services_for_task(payload)
+        meme_id = payload.get("meme_id")
+        expected_sha = payload.get("image_sha256")
+        expected_storage_key = payload.get("expected_storage_key")
+        expected_revision = payload.get("expected_meme_revision")
+        expected_title_fingerprint = payload.get("title_fingerprint")
+        claim_task_id = payload.get("_claim_task_id")
+        claim_generation = payload.get("_claim_generation")
+        claim_attempt = payload.get("_claim_attempt")
+        claim_owner = payload.get("_claim_owner")
+        if not all(isinstance(value, str) and value for value in (meme_id, expected_sha, expected_storage_key, expected_title_fingerprint, claim_task_id, claim_owner)) or not isinstance(expected_revision, int) or not isinstance(claim_generation, int) or not isinstance(claim_attempt, int):
+            raise RuntimeError("auto_rename_claim_expired")
+        try:
+            record, image = service.metadata.image_for_meme(meme_id)
+            current_sha = service.metadata.image_sha256(image)
+        except MetadataError as exc:
+            raise RuntimeError("target_changed") from exc
+        if current_sha != expected_sha or record.sha256 != expected_sha:
+            raise RuntimeError("target_changed")
+        try:
+            raw_context = record.meme_context if isinstance(record.meme_context, Mapping) else {}
+            raw_title = raw_context.get("title") if isinstance(raw_context, Mapping) else None
+            title = raw_title.strip() if isinstance(raw_title, str) else ""
+        except (AttributeError, TypeError, ValueError) as exc:
+            # 语境结构损坏只影响候选命名，不代表图片身份或执行权失效。
+            raise RuntimeError("auto_rename_title_missing") from exc
+        if not title:
+            raise RuntimeError("auto_rename_title_missing")
+        title_fingerprint = stable_input_digest(title)
+        if title_fingerprint != expected_title_fingerprint:
+            raise RuntimeError("target_changed")
+        # 同一 SHA 的 storage key 已被用户手动改名时仅产生 warning；revision
+        # 或语境单独漂移仍必须停止 Job，不能把 CAS race 统称为可恢复命名失败。
+        if record.storage_key != expected_storage_key:
+            if record.sha256.lower() == expected_sha.lower() and title_fingerprint == expected_title_fingerprint:
+                raise RuntimeError("auto_rename_target_changed")
+            raise RuntimeError("target_changed")
+        if record.revision != expected_revision:
+            raise RuntimeError("target_changed")
+        try:
+            target_name = _filename_from_title(title, image.suffix or record.extension)
+        except ValueError as exc:
+            raise RuntimeError("auto_rename_invalid_filename") from exc
+        target = image.with_name(target_name)
+        same_name = target == image
+        try:
+            renamed = service.metadata.storage.rename_if_current(
+                record.id,
+                target_key=service.metadata.blob_store.relative(target),
+                expected_source_key=expected_storage_key,
+                expected_sha256=expected_sha,
+                expected_revision=expected_revision,
+                task_id=claim_task_id,
+                claim_generation=claim_generation,
+                attempt=claim_attempt,
+                claim_owner=claim_owner,
+                expected_title_fingerprint=expected_title_fingerprint,
+            )
+        except DatabaseError as exc:
+            if exc.code == "target_exists":
+                raise RuntimeError("auto_rename_target_exists") from exc
+            if exc.code == "target_changed":
+                # CAS 同时检测 revision/语境/SHA；这些漂移不是同图人工改名，
+                # 必须停止 Job，不能伪装成可恢复 warning。
+                raise RuntimeError("target_changed") from exc
+            if exc.code == "storage_key_changed":
+                raise RuntimeError("auto_rename_target_changed") from exc
+            if exc.code == "claim_expired":
+                raise RuntimeError("auto_rename_claim_expired") from exc
+            if exc.code in {"storage_operation_unknown", "storage_operation_missing"}:
+                raise RuntimeError("auto_rename_unknown_execution") from exc
+            if exc.code == "invalid_filename":
+                raise RuntimeError("auto_rename_invalid_filename") from exc
+            raise RuntimeError("auto_rename_unknown_execution") from exc
+        except OSError as exc:
+            raise RuntimeError("auto_rename_unknown_execution") from exc
+        if renamed is None:
+            # 文件移动后无法重新读取 Meme 记录时，副作用结果无法证明，不能把
+            # ``None`` 当作普通命名失败或让任务服务退化成 task_failed。
+            raise RuntimeError("auto_rename_unknown_execution")
+        if payload.get("submission_mode") == "standalone":
+            # 重命名改变 sidecar image.relative_path，独立阶段不创建文本 Task，
+            # 但必须让重命名前绑定旧路径的 ready 向量退出检索候选。
+            metadata_hash = ImageProcessingWorker._metadata_hash(renamed)
+            if metadata_hash is None:
+                raise RuntimeError("auto_rename_unknown_execution")
+            _invalidate_stale_text_embeddings(
+                app.state.database,
+                scope_id=service.scope.scope_id,
+                meme_id=meme_id,
+                image_sha256=expected_sha,
+                metadata_hash=metadata_hash,
+            )
+        if progress:
+            progress(1.0, "文件名已经符合标题" if same_name else "自动重命名已完成")
+        if not same_name:
+            # 独立重命名改变了 storage_key，当前 scope 的检索缓存不能继续
+            # 使用旧 metadata hash；任务 handler 只能通过已解析的 service 失效缓存。
+            service.search.invalidate_cache()
+        return {"meme_id": meme_id, "saved_filename": renamed.storage_key.rsplit("/", 1)[-1], "auto_named": not same_name}
 
     def text_embedding_handler(payload: dict[str, object], progress):
         """为统一图片处理 job 的当前语境生成单图文本向量。"""
@@ -963,8 +1107,21 @@ async def lifespan(app: FastAPI):
             embedding_record = service.metadata.embedding_record(image)
         except MetadataError as exc:
             raise RuntimeError("target_changed") from exc
+        frozen_metadata_hash = payload.get("metadata_hash")
+        if frozen_metadata_hash is not None and (
+            not isinstance(frozen_metadata_hash, str)
+            or len(frozen_metadata_hash) != 64
+            or any(char not in "0123456789abcdefABCDEF" for char in frozen_metadata_hash)
+        ):
+            raise RuntimeError("target_changed")
+        current_metadata_hash = embedding_record.get("metadata_hash")
         if embedding_record.get("image_sha256") != expected_sha:
             raise RuntimeError("target_changed")
+        if frozen_metadata_hash is not None and current_metadata_hash != frozen_metadata_hash:
+            raise RuntimeError("target_changed")
+        if not isinstance(current_metadata_hash, str) or not current_metadata_hash:
+            raise RuntimeError("target_changed")
+        frozen_metadata_hash = frozen_metadata_hash or current_metadata_hash
         if not embedding_record.get("indexable"):
             raise RuntimeError("query_embedding_not_ready")
         if progress:
@@ -982,12 +1139,21 @@ async def lifespan(app: FastAPI):
         embedding_service.upsert(
             meme_id,
             image_sha256=expected_sha,
-            metadata_hash=str(embedding_record.get("metadata_hash") or ""),
+            metadata_hash=frozen_metadata_hash,
             semantic_document=str(embedding_record.get("text") or ""),
         )
+        # upsert 已在写事务内校验一次；写回后再次读取当前 Meme，确保并发语境或
+        # storage key 变化不会被当作本次冻结 hash 的成功结果。
+        try:
+            _current_record, current_image = service.metadata.image_for_meme(meme_id)
+            after_record = service.metadata.embedding_record(current_image)
+        except MetadataError as exc:
+            raise RuntimeError("target_changed") from exc
+        if after_record.get("image_sha256") != expected_sha or after_record.get("metadata_hash") != frozen_metadata_hash:
+            raise RuntimeError("target_changed")
         if progress:
             progress(1.0, "单图文本向量已保存")
-        return {"meme_id": meme_id, "metadata_hash": embedding_record.get("metadata_hash"), "embedding_model": app.state.settings.embedding_model}
+        return {"meme_id": meme_id, "metadata_hash": frozen_metadata_hash, "embedding_model": app.state.settings.embedding_model}
 
     def register_handlers(services: ScopeServices | None = None) -> None:
         """向进程级 manager 注册处理器，并为 scope facade 安装批次收束回调。"""
@@ -998,9 +1164,10 @@ async def lifespan(app: FastAPI):
         register("metadata_repair", repair_handler)
         register("visual_embedding_generation", visual_handler)
         register("meme_context_generation", context_handler)
+        register("image_auto_rename", auto_rename_handler)
         if services is not None:
             register("text_embedding_generation", text_embedding_handler)
-        # 图片处理三阶段由 ImageProcessingWorker 的 job 状态推进；不再把视觉或
+        # 图片处理阶段由 ImageProcessingWorker 的 job 状态推进；不再把视觉或
         # Agent 批次终态隐式转换成全库 cache_generation。显式 /generate-cache
         # 仍通过普通任务入口保留维护能力。
 
@@ -1044,6 +1211,7 @@ async def lifespan(app: FastAPI):
     app.state.image_processing_task_handlers = {
         "visual_embedding_generation": visual_handler,
         "meme_context_generation": context_handler,
+        "image_auto_rename": auto_rename_handler,
         "text_embedding_generation": text_embedding_handler,
     }
     app.state.image_processing_workers = {}
@@ -1060,6 +1228,7 @@ async def lifespan(app: FastAPI):
             task_handlers={
                 "visual_embedding_generation": visual_handler,
                 "meme_context_generation": context_handler,
+                "image_auto_rename": auto_rename_handler,
                 "text_embedding_generation": text_embedding_handler,
             },
         )
@@ -1089,7 +1258,8 @@ async def lifespan(app: FastAPI):
             # 默认工厂绑定本轮 engine；不能在下次 lifespan 中被误当作宿主注入对象复用。
             delattr(app.state, "service_factory")
         if shared_worker_executor is not None:
-            shared_worker_executor.shutdown(wait=False, cancel_futures=True)
+            # 共享任务线程仍可能持有数据库 session，连接池必须最后释放。
+            shared_worker_executor.shutdown(wait=True, cancel_futures=True)
         engine.dispose()
 
 
@@ -1161,20 +1331,20 @@ def _processing_repository(request: Request) -> ImageProcessingRepository:
     return ImageProcessingRepository(request.app.state.database, _request_scope(request))
 
 
-def _submit_processing_job_for_image(request: Request, record: Meme, image: Path, *, reverse_image_policy: str, explicit_retry: bool = False, schedule: bool = True) -> ImageProcessingSnapshot:
+def _submit_processing_job_for_image(request: Request, record: Meme, image: Path, *, reverse_image_policy: object = None, auto_name: object = None, explicit_retry: bool = False, schedule: bool = True) -> ImageProcessingSnapshot:
     """把旧单阶段入口收敛到当前 scope 的统一图片处理 job。"""
     worker = _processing_worker(request)
     if worker is None:
         raise ImageProcessingError("image_processing_unavailable")
-    if reverse_image_policy == "auto" and not _service(request, "reverse_image").available:
-        raise ImageProcessingError("reverse_image_unavailable")
+    options = _normalize_processing_options(request, reverse_image_policy=reverse_image_policy, auto_name=auto_name)
     embedding_record = _service(request, "metadata").embedding_record(image)
     return worker.submit(
         record.id,
         record.sha256,
         metadata_hash=embedding_record.get("metadata_hash") if isinstance(embedding_record, Mapping) else None,
         config=_processing_config(request),
-        reverse_image_policy=reverse_image_policy,
+        reverse_image_policy=options.reverse_image_policy,
+        auto_name=options.auto_name,
         # 上传/普通单图提交只创建或复用当前 revision；终态失败只能通过显式
         # retry 接口或图片库批量入口创建新 revision，避免请求重试隐式重放外部执行。
         explicit_retry=explicit_retry,
@@ -1811,7 +1981,7 @@ def _task_summary(request: Request, record: TaskRecord, activities: Mapping[str,
         activities = _read_agent_activity(request, [record])
     data = record.as_dict(include_payload=False)
     payload = record.payload
-    if record.task_type in {"visual_embedding_generation", "meme_context_generation", "text_embedding_generation"}:
+    if record.task_type in {"visual_embedding_generation", "meme_context_generation", "image_auto_rename", "text_embedding_generation"}:
         # NULL 来源只代表旧历史无法可靠归类，不能被前端解释为 standalone。
         data["historical_unclassified"] = record.submission_mode is None
         data["read_only"] = record.submission_mode is None
@@ -1819,8 +1989,29 @@ def _task_summary(request: Request, record: TaskRecord, activities: Mapping[str,
         data["image_stage"] = record.image_stage or {
             "visual_embedding_generation": "visual",
             "meme_context_generation": "agent",
+            "image_auto_rename": "auto_rename",
             "text_embedding_generation": "text_embedding",
         }.get(record.task_type)
+        if record.task_type == "image_auto_rename":
+            # pipeline 自动命名只有 warning 才能从专用阶段入口恢复；不可降级
+            # failure/blocked/unknown_execution 必须保持停止状态。standalone
+            # 终态失败则允许按当前 Meme 输入重新提交独立 Task。
+            recoverable_errors = {
+                "auto_rename_title_missing",
+                "auto_rename_invalid_filename",
+                "auto_rename_target_exists",
+                "auto_rename_target_changed",
+            }
+            recoverable = record.submission_mode == "standalone" and record.status == "failed" and (record.error or {}).get("error") in recoverable_errors
+            if record.submission_mode == "pipeline" and record.processing_job_id:
+                try:
+                    processing = _processing_repository(request).snapshot(record.processing_job_id)
+                    stage = next((item for item in processing.stages if item.get("stage") == "auto_rename"), None) if processing else None
+                    recoverable = bool(stage and stage.get("status") == "warning")
+                    data["image_stage_status"] = stage.get("status") if stage else None
+                except (DatabaseError, TypeError, ValueError):
+                    recoverable = False
+            data["image_stage_recoverable"] = recoverable
     if record.task_type == "meme_context_generation":
         # 只暴露可观察策略；完整 payload 仍留在后端数据库和 Worker 边界内。
         data["reverse_image_policy"] = str(payload.get("reverse_image_policy") or "forbid")
@@ -1870,7 +2061,7 @@ async def get_task(request: Request, task_id: str) -> dict[str, object]:
             snapshot = None
         if snapshot is not None:
             # 上传/合集旧客户端把父 Job 当作视觉任务轮询；新客户端使用
-            # /images/processing/{job_id} 获取完整三阶段 DTO。这里只保留
+            # /images/processing/{job_id} 获取完整四阶段 DTO。这里只保留
             # 旧轮询所需的任务类型兼容值，不改变父 Job 的真实状态。
             data = snapshot.as_dict()
             data["task_type"] = "visual_embedding_generation"
@@ -1919,6 +2110,12 @@ async def retry_task(request: Request, task_id: str) -> dict[str, object]:
     return _task_summary(request, record)
 
 
+@app.post("/images/processing/unready", status_code=202, tags=["images", "tasks"])
+async def process_unready_image_library_route(request: Request, payload: ProcessingBatchRequest) -> dict[str, object]:
+    """将静态未就绪路由放在动态 job 路由之前，避免被 job_id 捕获。"""
+    return await process_unready_image_library(request, payload)
+
+
 @app.get("/images/processing/{job_id}", tags=["images", "tasks"])
 @app.get("/image-processing/{job_id}", tags=["images", "tasks"], include_in_schema=False)
 async def get_image_processing_job(request: Request, job_id: str) -> dict[str, object]:
@@ -1941,15 +2138,163 @@ async def list_image_processing_jobs(request: Request, limit: int = Query(defaul
     return {"items": [snapshot.as_dict() for snapshot in snapshots], "next_cursor": None}
 
 
+def _core_image_ready(request: Request, record: Meme, image: Path, policy: str) -> bool:
+    """按当前图片、Agent 策略和文本模型判断三个核心产物是否有效。"""
+    del image  # 物理身份由共享判定按当前 storage_key 重新解析并复核。
+    latest = _processing_repository(request).latest_for_target(record.id, record.sha256)
+    if latest is not None:
+        if latest.reverse_image_policy != policy:
+            return False
+        # 产物可能仍然存在，但最新 Job/核心阶段已明确失败、阻止或执行状态
+        # 未知；完整重试必须把这种目标重新纳入，而不是只看三张产物表。
+        if latest.status in {"failed", "blocked", "unknown_execution"}:
+            return False
+        if any(
+            stage.get("stage") in {"visual", "agent", "text_embedding"}
+            and stage.get("status") in {"failed", "blocked", "unknown_execution"}
+            for stage in latest.stages
+        ):
+            return False
+        # 自动重命名 warning 是可选阶段的非阻塞结果，但目标/执行身份失效
+        # 仍会停止 Job；即使异常历史行的顶层状态没有同步，也不能把它当作
+        # 核心产物已经可以安全复用。
+        auto_rename_stage = next((stage for stage in latest.stages if stage.get("stage") == "auto_rename"), None)
+        if auto_rename_stage and auto_rename_stage.get("status") in {"failed", "blocked", "unknown_execution"}:
+            return False
+        if auto_rename_stage and auto_rename_stage.get("status") == "warning":
+            warning_code = (auto_rename_stage.get("error") or {}).get("error") if isinstance(auto_rename_stage.get("error"), Mapping) else None
+            if warning_code not in AUTO_RENAME_WARNING_ERRORS:
+                return False
+        if any(
+            next((stage.get("status") for stage in latest.stages if stage.get("stage") == required), None) != "succeeded"
+            for required in ("visual", "agent", "text_embedding")
+        ):
+            return False
+    config = _processing_config(request)
+    if not image_file_matches(request.app.state.database, _request_scope(request), record):
+        return False
+    metadata_hash = ImageProcessingWorker._metadata_hash(record)
+    if metadata_hash is None or record.context_status != "ready":
+        return False
+    summary = (record.provenance or {}).get("agent_context")
+    expected_config_hash = processing_config_hash(config)
+    if (
+        not isinstance(summary, Mapping)
+        or summary.get("image_sha256") != record.sha256
+        or summary.get("model") != config.get("agent_model")
+        or summary.get("reverse_image_policy") != policy
+        or summary.get("processing_config_hash") != expected_config_hash
+        or ("skill_hash" in config and summary.get("skill_hash") != config.get("skill_hash"))
+        or not summary.get("task_id")
+        or not summary.get("completed_at")
+    ):
+        return False
+    visual_identity = identity_from_settings(request.app.state.settings)
+    try:
+        with _environment(request) as environment:
+            visual = environment.visual.get(record.id, model=visual_identity.model, preprocess_version=visual_identity.preprocess_version, dimensions=visual_identity.dimensions, image_sha256=record.sha256)
+            if visual is None or visual.embedding is None:
+                return False
+            text_row = environment.uow.session.scalar(
+                select(MemeTextEmbedding).where(
+                    MemeTextEmbedding.scope_id == _request_scope(request).scope_id,
+                    MemeTextEmbedding.meme_id == record.id,
+                    MemeTextEmbedding.image_sha256 == record.sha256,
+                    MemeTextEmbedding.metadata_hash == metadata_hash,
+                    MemeTextEmbedding.embedding_model_version == config.get("embedding_model"),
+                    MemeTextEmbedding.dimensions == EMBEDDING_DIMENSIONS,
+                    MemeTextEmbedding.status == "ready",
+                    MemeTextEmbedding.embedding.is_not(None),
+                )
+            )
+            return text_row is not None
+    except Exception:  # noqa: BLE001 - 就绪判断是安全边界，任一异常都必须 fail-closed
+        return False
+
+
+async def process_unready_image_library(request: Request, payload: ProcessingBatchRequest) -> dict[str, object]:
+    """在当前 scope 内以游标枚举全部核心未就绪图片并逐图提交 Job。"""
+    unknown = set(request.query_params)
+    if unknown:
+        raise _error(400, "invalid_request", "未就绪处理不接受分页、筛选或 scope 参数")
+    try:
+        options = _normalize_processing_options(request, reverse_image_policy=payload.reverse_image_policy, auto_name=payload.auto_name)
+    except ImageProcessingError as exc:
+        raise _error(503 if exc.code == "reverse_image_unavailable" else 400, exc.code, "图片处理选项无效或服务不可用") from exc
+    worker = _processing_worker(request)
+    if worker is None:
+        raise _error(503, "image_processing_unavailable", "图片处理服务当前不可用")
+    repository = _processing_repository(request)
+    results: list[dict[str, object]] = []
+    last_id: UUID | None = None
+    while True:
+        with _environment(request) as environment:
+            statement = select(Meme).where(Meme.scope_id == _request_scope(request).scope_id)
+            if last_id is not None:
+                # storage_key 会被自动重命名阶段异步改变，不能作为分页游标；
+                # Meme ID 不可变，才能保证一次请求不会重复或漏扫目标。
+                statement = statement.where(Meme.id > last_id)
+            rows = list(environment.uow.session.scalars(statement.order_by(Meme.id.asc()).limit(100)))
+        if not rows:
+            break
+        for meme in rows:
+            last_id = meme.id
+            try:
+                image = _service(request, "metadata").blob_store.resolve(meme.storage_key)
+                if _core_image_ready(request, meme, image, options.reverse_image_policy):
+                    continue
+                latest = repository.latest_for_target(meme.id, meme.sha256)
+                snapshot = worker.submit(
+                    meme.id,
+                    meme.sha256,
+                    metadata_hash=ImageProcessingWorker._metadata_hash(meme),
+                    config=_processing_config(request),
+                    reverse_image_policy=options.reverse_image_policy,
+                    auto_name=options.auto_name,
+                    explicit_retry=latest is not None,
+                    schedule=True,
+                )
+                reused = latest is not None and latest.job_id == snapshot.job_id
+                results.append(
+                    {
+                        "meme_id": str(meme.id),
+                        "processing_job_id": snapshot.job_id,
+                        "status": snapshot.status,
+                        "reused": reused,
+                        "category": "reused" if reused else "submitted",
+                    }
+                )
+            except ImageProcessingError as exc:
+                category = "conflict" if exc.code in {"generation_policy_conflict", "processing_options_conflict"} else "failed"
+                results.append({"meme_id": str(meme.id), "error": exc.code, "category": category})
+            except Exception:  # noqa: BLE001 - 单图提交必须隔离异常并继续枚举其它图片
+                results.append({"meme_id": str(meme.id), "error": "image_processing_failed", "category": "failed"})
+    submitted = sum(1 for item in results if item.get("processing_job_id") and not item.get("reused"))
+    reused = sum(1 for item in results if item.get("reused"))
+    conflicts = sum(1 for item in results if item.get("category") == "conflict")
+    failed = sum(1 for item in results if item.get("category") == "failed")
+    return {"target_count": len(results), "submitted_count": submitted, "reused_count": reused, "conflict_count": conflicts, "failed_count": failed, "results": results}
+
+
 @app.post("/images/processing/{job_id}/retry", status_code=202, tags=["images", "tasks"])
 @app.post("/image-processing/{job_id}/retry", status_code=202, tags=["images", "tasks"], include_in_schema=False)
 async def retry_image_processing_job(request: Request, job_id: str, payload: ProcessingRetryRequest | None = None) -> dict[str, object]:
     """显式创建新的图片处理 job revision，不重新激活旧 job。"""
     try:
         repository = _processing_repository(request)
-        job = repository.retry(job_id, policy=payload.reverse_image_policy if payload else None, config=_processing_config(request))
+        old_job = repository.get(job_id)
+        if old_job is None:
+            raise ImageProcessingError("job_not_found")
+        # retry 请求中的省略字段继承旧 revision 的冻结选项；显式字段仍经过
+        # 与上传/scope 请求相同的严格规范化和联网能力校验。
+        options = _normalize_processing_options(
+            request,
+            reverse_image_policy=(payload.reverse_image_policy if payload and payload.reverse_image_policy is not None else old_job.reverse_image_policy),
+            auto_name=(payload.auto_name if payload and payload.auto_name is not None else old_job.auto_name),
+        )
+        job = repository.retry(job_id, policy=options.reverse_image_policy, auto_name=options.auto_name, config=_processing_config(request))
     except ImageProcessingError as exc:
-        status = 404 if exc.code == "job_not_found" else 409
+        status = 404 if exc.code == "job_not_found" else 503 if exc.code == "reverse_image_unavailable" else 422 if exc.code in {"invalid_auto_name", "invalid_reverse_image_policy"} else 409
         raise _error(status, exc.code, "图片处理任务当前不可重试") from exc
     worker = _processing_worker(request)
     if worker is not None:
@@ -1964,7 +2309,7 @@ async def retry_image_processing_job(request: Request, job_id: str, payload: Pro
 @app.post("/images/processing/stages", status_code=202, tags=["images", "tasks"], include_in_schema=False)
 @app.post("/image-processing/stages", status_code=202, tags=["images", "tasks"], include_in_schema=False)
 async def submit_image_stage(request: Request, payload: ImageStageSubmissionRequest) -> dict[str, object]:
-    """提交一个无父 Job 的视觉、Agent 或文本 embedding 阶段。"""
+    """提交一个无父 Job 的视觉、Agent、自动重命名或文本 embedding 阶段。"""
     try:
         canonical = ImageProcessingWorker._canonical_stage(payload.stage)
     except ImageProcessingError as exc:
@@ -1975,8 +2320,11 @@ async def submit_image_stage(request: Request, payload: ImageStageSubmissionRequ
         status = 404 if exc.code in {"metadata_missing", "image_unreadable"} else 409
         code = "meme_not_found" if status == 404 else exc.code
         raise _error(status, code, "图片不存在或内容已变化") from exc
-    if payload.reverse_image_policy == "auto" and not _service(request, "reverse_image").available:
-        raise _error(503, "reverse_image_unavailable", "反向图片服务尚未配置")
+    try:
+        options = _normalize_processing_options(request, reverse_image_policy=payload.reverse_image_policy)
+    except ImageProcessingError as exc:
+        status = 503 if exc.code == "reverse_image_unavailable" else 400
+        raise _error(status, exc.code, "图片处理选项无效或服务不可用") from exc
     worker = _processing_worker(request)
     if worker is None:
         raise _error(503, "image_processing_unavailable", "图片处理服务当前不可用")
@@ -1985,7 +2333,7 @@ async def submit_image_stage(request: Request, payload: ImageStageSubmissionRequ
             record.id,
             canonical,
             config=_processing_config(request),
-            reverse_image_policy=payload.reverse_image_policy,
+            reverse_image_policy=options.reverse_image_policy,
             schedule=True,
         )
     except ImageProcessingError as exc:
@@ -2032,7 +2380,11 @@ async def list_images(
         metadata_status = services.metadata.status(image)
         with _environment(request) as environment:
             visual_row = environment.visual.get(record.id, model=visual_identity.model, preprocess_version=visual_identity.preprocess_version, dimensions=visual_identity.dimensions, image_sha256=record.sha256)
-        items.append({"meme_id": str(record.id), "filename": record.storage_key, "extension": record.extension, "size": identity["size_bytes"], "media_url": f"/media/{record.id}", "metadata": metadata_status, "embedding_status": "ready" if services.search.has_cache() and metadata_status.get("status") in {"partial", "ready"} else "blocked" if metadata_status.get("status") == "repair_required" else "pending", "visual_embedding_status": "ready" if visual_row is not None else "pending"})
+        item = {"meme_id": str(record.id), "filename": record.storage_key, "extension": record.extension, "size": identity["size_bytes"], "media_url": f"/media/{record.id}", "metadata": metadata_status, "embedding_status": "ready" if services.search.has_cache() and metadata_status.get("status") in {"partial", "ready"} else "blocked" if metadata_status.get("status") == "repair_required" else "pending", "visual_embedding_status": "ready" if visual_row is not None else "pending"}
+        latest_processing = _processing_repository(request).latest_for_target(record.id, record.sha256)
+        if latest_processing is not None:
+            item.update({"processing_job_id": latest_processing.job_id, "processing_status": latest_processing.status, "processing_auto_name": latest_processing.auto_name, "processing_has_warnings": latest_processing.has_warnings, "processing_stages": list(latest_processing.stages)})
+        items.append(item)
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
@@ -2047,6 +2399,10 @@ async def process_image_library(
     worker = _processing_worker(request)
     if worker is None:
         raise _error(503, "image_processing_unavailable", "图片处理服务当前不可用")
+    try:
+        options = _normalize_processing_options(request, reverse_image_policy=payload.reverse_image_policy, auto_name=payload.auto_name)
+    except ImageProcessingError as exc:
+        raise _error(503 if exc.code == "reverse_image_unavailable" else 400, exc.code, "图片处理选项无效或服务不可用") from exc
     repository = _processing_repository(request)
     results: list[dict[str, object]] = []
     with _environment(request) as environment:
@@ -2062,7 +2418,8 @@ async def process_image_library(
                 meme.sha256,
                 metadata_hash=embedding_record.get("metadata_hash") if isinstance(embedding_record, Mapping) else None,
                 config=_processing_config(request),
-                reverse_image_policy=payload.reverse_image_policy,
+                reverse_image_policy=options.reverse_image_policy,
+                auto_name=options.auto_name,
                 explicit_retry=latest is not None and latest.status in {"failed", "blocked", "unknown_execution"},
             )
             results.append({"meme_id": str(meme.id), "job_id": snapshot.job_id, "processing_job_id": snapshot.job_id, "submission_mode": "pipeline", "status": snapshot.status, "reused": latest is not None and snapshot.job_id == latest.job_id})
@@ -2433,12 +2790,14 @@ async def upload_images(
     unknown = set(form.keys()) - {"auto_name", "files", "reverse_image_policy"}
     if unknown:
         raise _error(400, "invalid_request", "上传不接受已废弃的目标目录字段")
-    auto_name = str(form.get("auto_name", "false")).lower() in {"1", "true", "yes", "on"}
-    reverse_image_policy = str(form.get("reverse_image_policy", "forbid"))
-    if reverse_image_policy not in {"forbid", "auto"}:
-        raise _error(400, "invalid_reverse_image_policy", "反向图片策略只能是 forbid 或 auto")
-    if reverse_image_policy == "auto" and not _service(request, "reverse_image").available:
-        raise _error(503, "reverse_image_unavailable", "反向图片服务尚未配置")
+    try:
+        auto_name = _parse_multipart_bool(form.get("auto_name"), default=False)
+        options = _normalize_processing_options(request, reverse_image_policy=form.get("reverse_image_policy"), auto_name=auto_name)
+    except ImageProcessingError as exc:
+        status = 503 if exc.code == "reverse_image_unavailable" else 400
+        raise _error(status, exc.code, "图片处理选项无效或服务不可用") from exc
+    reverse_image_policy = options.reverse_image_policy
+    auto_name = options.auto_name
     files = [item for item in form.getlist("files") if hasattr(item, "filename") and hasattr(item, "read")]
     if not files:
         raise _error(400, "files_required", "必须上传图片文件")
@@ -2516,7 +2875,7 @@ async def upload_images(
             if processing_worker is None:
                 # 没有统一图片控制面时保留旧视觉入口；生产 PostgreSQL 路径
                 # 会先建立完整 Job，再由 pipeline Worker 创建 visual 叶子。
-                task = _submit_visual_task(request, target, batch_id=upload_batch_id, auto_name=auto_name, reverse_image_policy=reverse_image_policy, schedule=upload_batch_id is None)
+                task = _submit_visual_task(request, target, batch_id=upload_batch_id, reverse_image_policy=reverse_image_policy, schedule=upload_batch_id is None)
                 result["visual_task_id"] = task.task_id
                 result["visual_job_id"] = task.task_id
                 result["metadata_job_id"] = task.task_id
@@ -2528,6 +2887,8 @@ async def upload_images(
             result["visual_task_error"] = _context_enqueue_error(exc) if isinstance(exc, RuntimeError) else "visual_enqueue_failed"
             result["metadata_job_error"] = result["visual_task_error"]
         result["metadata_status"] = metadata_service.status(target)["status"]
+        result["auto_name"] = auto_name
+        result["reverse_image_policy"] = reverse_image_policy
         try:
             worker = processing_worker
             if worker is not None:
@@ -2538,6 +2899,7 @@ async def upload_images(
                     metadata_hash=embedding_record.get("metadata_hash") if isinstance(embedding_record, Mapping) else None,
                     config=_processing_config(request),
                     reverse_image_policy=reverse_image_policy,
+                    auto_name=auto_name,
                     schedule=False,
                 )
                 worker.schedule(processing.job_id)
@@ -2548,6 +2910,8 @@ async def upload_images(
                         "processing_job_id": processing.job_id,
                         "submission_mode": "pipeline",
                         "processing_status": processing.status,
+                        "auto_name": processing.auto_name,
+                        "reverse_image_policy": processing.reverse_image_policy,
                         "visual_task_id": processing.job_id,
                         "visual_job_id": processing.job_id,
                         "metadata_job_id": processing.job_id,
