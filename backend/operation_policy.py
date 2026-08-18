@@ -554,15 +554,7 @@ class PersistentGrantAssociationStore:
         return PersistentGrantRepository(resources, scope)
 
     def get(self, request: OperationRequest) -> GrantAssociation | None:
-        """先查进程缓存，再查持久事实；跨 scope 不共享关联。"""
-        try:
-            cached = self._memory.get(request)
-        except OperationPolicyError:
-            # 另一个进程可能刚完成 task 绑定；持久事实可确认时允许刷新缓存，
-            # 但真正的请求冲突仍会由 repository 再次 fail-closed。
-            cached = None
-        if cached is not None:
-            return cached
+        """每次读取持久事实后刷新缓存，避免跨进程终态被旧缓存遮蔽。"""
         value = self._repository(self.resources, request.scope).get(request)
         if value is not None:
             self._memory._refresh(value)
@@ -574,14 +566,8 @@ class PersistentGrantAssociationStore:
         return self._memory._refresh(value)
 
     def acquire(self, request: OperationRequest, gateway: OperationPolicyGateway) -> GrantAssociation:
-        """在数据库 advisory lock 下完成跨进程幂等 acquire。"""
+        """先由持久 repository 校验当前状态，再在数据库锁下完成幂等 acquire。"""
         with self._lock:
-            try:
-                cached = self._memory.get(request)
-            except OperationPolicyError:
-                cached = None
-            if cached is not None:
-                return _validate_association(request, cached, executable=True)
             value = self._repository(self.resources, request.scope).acquire(request, gateway)
             return self._memory._refresh(value)
 

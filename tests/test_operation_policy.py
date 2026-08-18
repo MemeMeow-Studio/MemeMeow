@@ -9,6 +9,7 @@ import pytest
 from backend.database import ScopeContext
 from backend.operation_policy import (
     AllowAllOperationPolicy,
+    GrantAssociation,
     GrantResult,
     GrantRef,
     GrantAssociationStore,
@@ -17,6 +18,7 @@ from backend.operation_policy import (
     OperationRequest,
     Operations,
     PolicyDecision,
+    PersistentGrantAssociationStore,
     require_allowed,
     validate_grant,
 )
@@ -237,6 +239,59 @@ def test_commit_and_release_are_idempotent_without_refunding_committed_grant() -
     assert store.transition(association.grant, "committed") is True
     assert store.transition(association.grant, "committed") is True
     assert store.transition(association.grant, "released") is False
+
+
+class _MutablePersistentGrantRepository:
+    """用可变持久事实模拟另一个进程收束 grant 的最小 repository。"""
+
+    def __init__(self, association: GrantAssociation) -> None:
+        """保存当前持久状态，并让每次读取返回新的关联对象。"""
+        self.association = association
+        self.get_calls = 0
+        self.acquire_calls = 0
+
+    def get(self, request: OperationRequest) -> GrantAssociation:
+        """返回当前持久状态，避免测试意外共享进程缓存对象。"""
+        self.get_calls += 1
+        current = self.association
+        return GrantAssociation(request, current.grant, current.state, current.metadata)
+
+    def put(self, association: GrantAssociation) -> GrantAssociation:
+        """写入测试用的持久关联。"""
+        self.association = association
+        return association
+
+    def acquire(self, request: OperationRequest, gateway: OperationPolicyGateway) -> GrantAssociation:
+        """模拟持久层拒绝已收束关联，证明 acquire 不使用旧缓存旁路。"""
+        self.acquire_calls += 1
+        current = self.get(request)
+        if current.state != "acquired":
+            raise OperationPolicyError("operation_policy_unavailable")
+        return current
+
+
+def test_persistent_store_never_uses_stale_terminal_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """跨进程将 grant 收束后，持久 store 必须读取新终态而非返回旧 acquired 缓存。"""
+    gateway = OperationPolicyGateway(AllowAllOperationPolicy(), allow_all=True)
+    request = gateway.request("tenant-cache", Operations.IMAGE_UPLOAD, "upload:cache", source="test")
+    grant = gateway.acquire(request).grant
+    assert grant is not None
+    acquired = GrantAssociation(request, grant)
+    repository = _MutablePersistentGrantRepository(acquired)
+    store = PersistentGrantAssociationStore(object())
+    monkeypatch.setattr(store, "_repository", lambda _resources, _scope: repository)
+    store.put(acquired)
+
+    # 模拟另一个进程在数据库中将相同 reservation 标记为 released。
+    repository.association = GrantAssociation(request, grant, "released")
+    observed = store.get(request)
+    assert observed is not None and observed.state == "released"
+    assert repository.get_calls == 1
+
+    with pytest.raises(OperationPolicyError) as error:
+        store.acquire(request, gateway)
+    assert error.value.code == "operation_policy_unavailable"
+    assert repository.acquire_calls == 1
 
 
 def test_gateway_rejects_client_grant_and_scope_overrides() -> None:
