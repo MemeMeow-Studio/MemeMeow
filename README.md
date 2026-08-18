@@ -107,7 +107,8 @@ Compose 插值校验失败。完整迁移、排障和回滚顺序见
 [`docs/runtime-identity.md`](docs/runtime-identity.md)。
 
 每次启动先运行一次性的 `runtime-init` 容器。它只挂载图片根、Agent runtime volume
-和 executor token volume，拒绝符号链接、特殊节点和多链接普通文件，并把受控目录设为
+和 executor token volume，拒绝符号链接、特殊节点和多链接普通文件；仅兼容留在同一
+`node_modules` 树内、目标为普通文件的 npm `.bin` 相对链接，并把受控目录设为
 `0700`、普通文件设为 `0600` 后归属目标 UID/GID。历史图片只改变所有权和权限，不改变
 文件字节；初始化失败时 API 与 Agent 不会启动。回滚前应停止新版本并保留 volume 备份，
 旧版本若再次以 root 写入新图片会重新产生权限冲突，不能把回滚当作长期部署方案。
@@ -146,7 +147,7 @@ API 只绑定 `127.0.0.1:8275`；Agent executor `8277` 和视觉服务 `8276` �
 ./db-viewer.sh start
 ```
 
-然后访问 `http://127.0.0.1:8080`。连接时选择 `PostgreSQL`，服务器填写 `postgres`（容器内默认端口 5432），数据库、用户名和密码使用 `.env` 中的 `POSTGRES_*` 配置（默认均为 `mememeow`）。查看器只绑定 `127.0.0.1`，停止服务使用 `./db-viewer.sh stop`。可通过 `MEMEMEOW_DB_VIEWER_PORT=8081 ./db-viewer.sh start` 修改宿主端口。
+然后访问 `http://127.0.0.1:8080`。连接时选择 `PostgreSQL`，服务器填写 `postgres`（容器内默认端口 5432），数据库、用户名和密码使用 `.env` 中的 `POSTGRES_*` 配置（默认均为 `mememeow`）。查看器只绑定 `127.0.0.1`，停止服务使用 `./db-viewer.sh stop`。可通过 `MEMEMEOW_DB_VIEWER_PORT=8081 ./db-viewer.sh start` 修改宿主端口。若 Docker Hub 不可达，启动脚本会自动尝试备用镜像；主镜像可在 `.env` 中通过 `MEMEMEOW_DB_VIEWER_IMAGE` 覆盖，备用镜像可在启动命令中通过 `MEMEMEOW_DB_VIEWER_FALLBACK_IMAGE` 覆盖或设为空禁用。
 
 镜像位于 `docker/agent/Dockerfile`，预装 OpenCode、Node、Python、Bash、curl、jq、file、ImageMagick、ffmpeg、Tesseract 中英文 OCR 和常见文本工具。镜像默认用户本身是非 root；Compose 会以部署提供的 UID/GID 覆盖运行身份，入口是固定的 `executor.server` HTTP 服务。只读挂载 `data/images` 和 `skills/research-meme-context`，读写挂载 named volume `mememeow-agent-runtime-data:/runtime`，并在独立的 `mememeow-agent-executor-secret` named volume 中以 0600 权限持久化首次生成的随机 executor token。Agent 的 HOME、workspace 和任务结果都在初始化过的 runtime volume 中，不依赖镜像内固定用户的 home 所有权。API 以只读方式读取同一 token 文件，不会把 token 写入 checkout、`.env`、日志、结果文件或 OpenCode 子进程环境。容器不会挂载项目根目录、数据库凭据、用户目录或 Docker socket。后端只向 `http://mememeow-agent-runtime:8277` 发送带 token 的结构化任务；每个任务仍使用独立 OpenCode session 和 `task-results/<task_id>/` 结果目录。反向图片能力由后端内部接口统一代理，Agent 不持有 `SERPAPI_API_KEY`。callback 根 secret、密钥轮换和禁用式回滚按 [`docs/agent-callback-migration.md`](docs/agent-callback-migration.md) 执行。
 
@@ -202,11 +203,11 @@ sha256sum data/models/dinov2_vitb14_pretrain.pth
 3. 可选：启用“处理完成后按标题自动命名”；图片上传立即返回，Agent 完成并成功写入数据库语境后才会异步重命名图片
 
 > [!NOTE]
-> 上传成功后会自动创建或复用逐图处理任务，按“视觉向量 → Agent 语境 → 文本 embedding”
+> 上传成功后会自动创建或复用逐图处理任务，按“视觉向量 → Agent 语境 → 可选自动重命名 → 文本 embedding”
 > 异步推进；通常不需要每次上传后手动重建缓存。只有切换 embedding 模型、迁移存量图片或
 > 进行显式全量维护时，才需要按处理任务中的提示执行回填或 v4 缓存生成。
 
-图片库中的“选择图片”可勾选指定的 `pending` 或 `repair_required` 图片并点击“重试选中”；“重试所有未就绪”会批量提交所有尚未完成处理的图片。每行同时显示元数据处理状态、文本 embedding 索引状态和图片视觉向量状态，顶栏显示当前文本 embedding 来源状态。
+图片库中的“选择图片”可勾选指定的 `pending` 或 `repair_required` 图片并点击“重试选中”；“完整重试所有未就绪”会先确认联网策略和是否自动命名，再由服务端枚举当前 scope 的全部核心未就绪图片，不受当前筛选或分页影响。每行同时显示元数据处理状态、文本 embedding 索引状态和图片视觉向量状态，顶栏显示当前文本 embedding 来源状态。
 
 #### 处理任务
 

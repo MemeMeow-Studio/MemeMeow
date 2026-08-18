@@ -67,6 +67,55 @@ def test_runtime_init_normalizes_permissions_and_preserves_image_digest(tmp_path
         assert directory.stat().st_gid == os.getgid()
 
 
+def test_runtime_init_preserves_safe_npm_bin_symlinks(tmp_path: Path) -> None:
+    """初始化应保留依赖树内的 npm bin 链接，同时继续归一化真实文件。"""
+    image_root, runtime_root, token_root = _roots(tmp_path)
+    package_root = runtime_root / "node_modules" / "demo-package"
+    package_root.mkdir(parents=True)
+    target = package_root / "bin.js"
+    target.write_bytes(b"#!/usr/bin/env node\n")
+    bin_root = runtime_root / "node_modules" / ".bin"
+    bin_root.mkdir()
+    link = bin_root / "demo"
+    link.symlink_to("../demo-package/bin.js")
+
+    _initialize(image_root, runtime_root, token_root)
+
+    assert link.is_symlink()
+    assert os.readlink(link) == "../demo-package/bin.js"
+    assert target.read_bytes() == b"#!/usr/bin/env node\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("target_kind", ["escape", "absolute", "missing", "special"])
+def test_runtime_init_rejects_unsafe_npm_bin_symlinks(tmp_path: Path, target_kind: str) -> None:
+    """npm bin 例外不能放行越界、缺失或特殊文件目标。"""
+    image_root, runtime_root, token_root = _roots(tmp_path)
+    package_root = runtime_root / "node_modules" / "demo-package"
+    package_root.mkdir(parents=True)
+    bin_root = runtime_root / "node_modules" / ".bin"
+    bin_root.mkdir()
+    link = bin_root / "demo"
+
+    if target_kind == "escape":
+        outside = tmp_path / "outside.bin"
+        outside.write_bytes(b"outside bytes")
+        link.symlink_to("../../../outside.bin")
+    elif target_kind == "absolute":
+        outside = tmp_path / "outside.bin"
+        outside.write_bytes(b"outside bytes")
+        link.symlink_to(outside)
+    elif target_kind == "missing":
+        link.symlink_to("../demo-package/missing.js")
+    else:
+        fifo = package_root / "unsafe"
+        os.mkfifo(fifo)
+        link.symlink_to("../demo-package/unsafe")
+
+    with pytest.raises(RuntimeInitError, match="runtime_storage_symlink_forbidden"):
+        initialize_storage(image_root, runtime_root, token_root, os.getuid(), os.getgid())
+
+
 @pytest.mark.parametrize("kind", ["symlink", "special", "hardlink"])
 def test_runtime_init_rejects_unsafe_nodes_without_changing_outside_bytes(tmp_path: Path, kind: str) -> None:
     """初始化必须拒绝链接、特殊节点和多链接文件，不能触及根外对象。"""

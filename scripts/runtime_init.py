@@ -50,10 +50,38 @@ def parse_runtime_identity(uid: str | int | None, gid: str | int | None) -> tupl
     return values[0], values[1]
 
 
+def _is_safe_npm_bin_symlink(path: Path) -> bool:
+    """校验 npm ``node_modules/.bin`` 内的相对链接是否仍留在同一依赖树。"""
+    if path.parent.name != ".bin" or path.parent.parent.name != "node_modules":
+        return False
+    try:
+        target = os.readlink(path)
+        if not target or os.path.isabs(target):
+            return False
+        node_modules_root = path.parent.parent.absolute()
+        target_path = Path(os.path.normpath(os.path.join(str(path.parent), target)))
+        if not target_path.is_absolute() or not target_path.is_relative_to(node_modules_root):
+            return False
+
+        # 不跟随目标路径中的任何链接，避免通过中间节点绕出受控依赖树。
+        current = node_modules_root
+        for part in target_path.relative_to(node_modules_root).parts:
+            current /= part
+            target_metadata = current.lstat()
+            if stat.S_ISLNK(target_metadata.st_mode):
+                return False
+        target_metadata = target_path.lstat()
+    except (OSError, ValueError):
+        return False
+    return stat.S_ISREG(target_metadata.st_mode) and target_metadata.st_nlink == 1
+
+
 def _reject_unsafe_node(path: Path, metadata: os.stat_result, *, root: bool = False) -> None:
     """拒绝符号链接、特殊节点和不安全的多链接普通文件。"""
     mode = metadata.st_mode
     if stat.S_ISLNK(mode):
+        if _is_safe_npm_bin_symlink(path):
+            return
         raise RuntimeInitError("runtime_storage_symlink_forbidden")
     if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
         raise RuntimeInitError("runtime_storage_special_node_forbidden")
@@ -104,6 +132,9 @@ def _normalize_tree(root: Path, uid: int, gid: int) -> None:
     except OSError as exc:
         raise RuntimeInitError("runtime_storage_unreadable") from exc
     _reject_unsafe_node(root, metadata)
+    if stat.S_ISLNK(metadata.st_mode):
+        # 合法 npm bin 链接只做完整性校验，不能对链接本身执行 chmod/chown。
+        return
     if stat.S_ISDIR(metadata.st_mode):
         try:
             with os.scandir(root) as iterator:

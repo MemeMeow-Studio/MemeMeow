@@ -32,3 +32,10 @@ context: |
 #     archive:
 #       guidance:
 #         - Summarize the archive outcome before finishing
+operations:
+  apply:
+    guidance:
+      - 实现完成后必须交给 luna_max 做严格代码 review，重点检查安全、权限、事务、并发、迁移、回滚和测试覆盖风险。
+      - 根据 review findings 决定修复范围；P1/P2 finding 必须修复，或明确记录可接受的残余风险与理由。
+      - 完成修复后必须再次交给 luna_max review，并持续执行“review、决策、修复、复审”循环，直到没有未处理的 P1/P2 finding，或每项残余风险均已明确记录并获认可。
+      - 循环结束后必须运行与改动风险相称的最终测试、静态检查和必要的迁移或环境门禁，并在交付结果中报告通过项与无法运行的门禁。

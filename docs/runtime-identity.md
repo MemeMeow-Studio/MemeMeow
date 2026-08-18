@@ -19,7 +19,8 @@ MEMEMEOW_RUNTIME_UID=1500 MEMEMEOW_RUNTIME_GID=1500 docker compose --profile app
 
 `runtime-init` 是唯一需要 root 的短生命周期服务。它只接收显式挂载的图片根、Agent
 runtime named volume 和 executor token named volume，不连接网络、数据库或 Docker
-socket。初始化会拒绝符号链接、特殊节点和具有多个硬链接的普通文件，再把受控目录设为
+socket。初始化会拒绝符号链接、特殊节点和具有多个硬链接的普通文件；仅兼容留在同一
+`node_modules` 树内、目标为普通文件的 npm `.bin` 相对链接，再把受控目录设为
 `0700`、普通文件设为 `0600` 并归属目标 UID/GID。API 与 Agent 依赖它以成功退出后才启动。
 
 初始化可以归一化旧版本 root 创建的图片和 sidecar；操作只改变所有权与 mode，不读写图片

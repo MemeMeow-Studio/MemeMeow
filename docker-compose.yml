@@ -49,7 +49,7 @@ services:
 
   db-viewer:
     profiles: ["db-viewer"]
-    image: adminer:4
+    image: ${MEMEMEOW_DB_VIEWER_IMAGE:-adminer:4}
     depends_on:
       postgres:
         condition: service_healthy
