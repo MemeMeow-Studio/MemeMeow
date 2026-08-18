@@ -2,14 +2,17 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { tasks, task, context } = vi.hoisted(() => ({
+const { tasks, task, context, processingJobs, retryProcessingJob, submitImageStage } = vi.hoisted(() => ({
   tasks: vi.fn(),
   task: vi.fn(),
   context: vi.fn(),
+  processingJobs: vi.fn(),
+  retryProcessingJob: vi.fn(),
+  submitImageStage: vi.fn(),
 }))
 
 vi.mock('../api', () => ({
-  api: { tasks, task, context },
+  api: { tasks, task, context, processingJobs, retryProcessingJob, submitImageStage },
 }))
 
 import TasksWorkspace from './TasksWorkspace.vue'
@@ -20,6 +23,9 @@ describe('TasksWorkspace', () => {
     tasks.mockReset()
     task.mockReset()
     context.mockReset()
+    processingJobs.mockReset().mockResolvedValue({ items: [] })
+    retryProcessingJob.mockReset().mockResolvedValue({ task_id: 'retry-task' })
+    submitImageStage.mockReset().mockResolvedValue({ task_id: 'rename-retry' })
   })
 
   afterEach(() => {
@@ -55,5 +61,83 @@ describe('TasksWorkspace', () => {
     document.dispatchEvent(new Event('visibilitychange'))
     await vi.advanceTimersByTimeAsync(5000)
     expect(tasks).toHaveBeenCalledTimes(1)
+  })
+
+  it('展示历史三阶段 Job、skipped、running 和 warning 阶段事实', async () => {
+    tasks.mockResolvedValue({ items: [], next_cursor: null })
+    processingJobs.mockResolvedValue({ items: [{
+      task_id: 'job-task',
+      task_type: 'image_processing',
+      job_id: 'job-1',
+      meme_id: 'meme-1',
+      processing_job_id: 'job-1',
+      revision: 1,
+      image_sha256: 'sha',
+      reverse_image_policy: 'forbid',
+      auto_name: false,
+      status: 'succeeded',
+      has_warnings: false,
+      warnings: [],
+      stages: [
+        { stage: 'visual', status: 'succeeded', task_id: 'visual-1' },
+        { stage: 'agent', status: 'running', task_id: 'agent-1' },
+        { stage: 'auto_rename', status: 'skipped' },
+        { stage: 'text_embedding', status: 'succeeded', task_id: 'text-1' },
+      ],
+    }] })
+    const wrapper = mount(TasksWorkspace)
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('四阶段流水线')
+    expect(wrapper.text()).toContain('Agent 语境处理中')
+    expect(wrapper.text()).toContain('自动重命名未启用')
+    expect(wrapper.text()).toContain('未启用')
+    wrapper.unmount()
+  })
+
+  it('warning 自动重命名从阶段详情走 submitImageStage，不调用通用重试', async () => {
+    tasks.mockResolvedValue({ items: [], next_cursor: null })
+    processingJobs.mockResolvedValue({ items: [{
+      task_id: 'job-task',
+      task_type: 'image_processing',
+      job_id: 'job-1',
+      meme_id: 'meme-1',
+      processing_job_id: 'job-1',
+      revision: 2,
+      image_sha256: 'sha',
+      reverse_image_policy: 'forbid',
+      auto_name: true,
+      status: 'succeeded',
+      has_warnings: true,
+      warnings: [{ stage: 'auto_rename', error: 'name_conflict', recoverable: true }],
+      stages: [{ stage: 'auto_rename', status: 'warning', task_id: 'rename-1' }],
+    }] })
+    task.mockResolvedValue({
+      task_id: 'rename-1',
+      task_type: 'image_auto_rename',
+      submission_mode: 'pipeline',
+      image_stage: 'auto_rename',
+      image_stage_status: 'warning',
+      image_stage_recoverable: true,
+      processing_job_id: 'job-1',
+      status: 'failed',
+      image: { meme_id: 'meme-1', filename: 'sample.png' },
+    })
+    const wrapper = mount(TasksWorkspace)
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('处理完成，自动重命名未完成')
+    await wrapper.get('.task-stage-row').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.task-drawer').text()).toContain('恢复自动命名')
+    const retryButton = wrapper.findAll('.task-drawer > .quiet').find((button) => button.text().includes('恢复自动命名'))
+    expect(retryButton).toBeDefined()
+    await retryButton.trigger('click')
+    await flushPromises()
+
+    expect(submitImageStage).toHaveBeenCalledWith({ meme_id: 'meme-1', stage: 'auto_rename', reverse_image_policy: 'forbid' })
+    expect(retryProcessingJob).not.toHaveBeenCalled()
+    expect(context).not.toHaveBeenCalled()
+    wrapper.unmount()
   })
 })

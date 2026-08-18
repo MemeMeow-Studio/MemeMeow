@@ -1,6 +1,14 @@
 /** 统一封装后端请求、错误结构和任务轮询。 */
 const API_BASE = import.meta.env.VITE_API_BASE ?? (import.meta.env.DEV ? '/api' : '')
 
+/** 将客户端处理选项收束为服务端接受的安全形状，避免旧调用方传入非法值。 */
+function normalizeImageProcessingOptions(options = {}) {
+  return {
+    reverse_image_policy: options?.reverse_image_policy === 'auto' ? 'auto' : 'forbid',
+    auto_name: options?.auto_name === true,
+  }
+}
+
 export async function request(path, options = {}) {
   const response = await fetch(`${API_BASE}${path}`, {
     ...options,
@@ -34,15 +42,20 @@ export const api = {
     return request(`/images/metadata?meme_id=${encodeURIComponent(memeId)}`, { cache: 'no-store' })
   },
   rename: (payload) => request('/images/rename', { method: 'POST', body: JSON.stringify(payload) }),
-  upload: (files, autoName) => {
+  upload: (files, options = {}) => {
+    const normalized = typeof options === 'boolean'
+      ? { reverse_image_policy: 'forbid', auto_name: options }
+      : normalizeImageProcessingOptions(options)
     const body = new FormData()
-    body.append('auto_name', autoName)
+    body.append('reverse_image_policy', normalized.reverse_image_policy)
+    body.append('auto_name', String(normalized.auto_name))
     files.forEach((file) => body.append('files', file))
     return request('/images/upload', { method: 'POST', body })
   },
   context: (payload) => request('/images/context', { method: 'POST', body: JSON.stringify(payload) }),
   contextBatch: (payload = {}) => request('/images/context/batch', { method: 'POST', body: JSON.stringify(payload) }),
   processingJobs: (params = {}) => request(`/images/processing?${new URLSearchParams(params)}`),
+  unreadyProcessing: (options = {}) => request('/images/processing/unready', { method: 'POST', body: JSON.stringify(normalizeImageProcessingOptions(options)) }),
   processingJob: (id) => request(`/images/processing/${encodeURIComponent(id)}`),
   retryProcessingJob: (id, payload = {}) => request(`/images/processing/${encodeURIComponent(id)}/retry`, { method: 'POST', body: JSON.stringify(payload) }),
   submitImageStage: (payload) => request('/images/stages', { method: 'POST', body: JSON.stringify(payload) }),
@@ -62,10 +75,11 @@ export const api = {
 }
 
 export async function pollTask(id, onUpdate, interval = 700) {
+  const terminalStatuses = new Set(['succeeded', 'failed', 'blocked', 'unknown_execution', 'warning', 'skipped'])
   while (true) {
     const task = await api.task(id)
     onUpdate(task)
-    if (task.status === 'succeeded' || task.status === 'failed') return task
+    if (terminalStatuses.has(task.status)) return task
     await new Promise((resolve) => setTimeout(resolve, interval))
   }
 }

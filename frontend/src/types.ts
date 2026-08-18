@@ -12,6 +12,12 @@ export interface NavigationItem {
 export interface ServiceConfig {
   embedding_model?: string
   embedding_cache_ready?: boolean
+  reverse_image_available?: boolean
+}
+
+export interface ImageProcessingOptions {
+  reverse_image_policy: 'forbid' | 'auto'
+  auto_name: boolean
 }
 
 export interface ImageMetadataSummary {
@@ -27,6 +33,11 @@ export interface MemeImage {
   metadata?: ImageMetadataSummary
   embedding_status?: string
   visual_embedding_status?: string
+  processing_job_id?: string
+  processing_status?: string
+  processing_auto_name?: boolean
+  processing_has_warnings?: boolean
+  processing_stages?: ImageProcessingStage[]
 }
 
 export interface CollectionSummary {
@@ -47,11 +58,13 @@ export interface TaskItem {
   task_id: string
   task_type: string
   submission_mode?: 'pipeline' | 'standalone' | null
-  image_stage?: 'visual' | 'agent' | 'text_embedding' | null
+  image_stage?: 'visual' | 'agent' | 'auto_rename' | 'text_embedding' | null
   processing_job_id?: string | null
   historical_unclassified?: boolean
   read_only?: boolean
   retry_allowed?: boolean
+  image_stage_recoverable?: boolean
+  image_stage_status?: string | null
   status: string
   progress?: number | null
   message?: string
@@ -71,8 +84,8 @@ export interface TaskItem {
 }
 
 export interface ImageProcessingStage {
-  stage: 'visual' | 'agent' | 'text_embedding'
-  status: string
+  stage: 'visual' | 'agent' | 'auto_rename' | 'text_embedding'
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'blocked' | 'unknown_execution' | 'skipped' | 'warning'
   task_id?: string | null
   attempt?: number
   error?: { error?: string; message?: string } | null
@@ -92,7 +105,10 @@ export interface ImageProcessingJob {
   revision: number
   image_sha256: string
   reverse_image_policy: string
+  auto_name?: boolean
   status: string
+  has_warnings?: boolean
+  warnings?: Array<{ stage?: string; error?: string; message?: string; recoverable?: boolean }>
   current_stage?: string | null
   stages: ImageProcessingStage[]
   error?: { error?: string; message?: string } | null
@@ -110,6 +126,18 @@ export interface UploadResult {
   metadata_job_id?: string
   saved_filename?: string
   error?: string
+  processing_job_id?: string
+  auto_name?: boolean
+  reverse_image_policy?: 'forbid' | 'auto'
+}
+
+export interface UnreadyProcessingResponse {
+  target_count: number
+  submitted_count: number
+  reused_count: number
+  conflict_count: number
+  failed_count: number
+  results: Array<{ meme_id: string; processing_job_id?: string; status?: string; reused?: boolean; error?: string; category?: 'submitted' | 'reused' | 'conflict' | 'failed' }>
 }
 
 export interface ClipboardNotice {

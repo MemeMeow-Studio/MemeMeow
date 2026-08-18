@@ -5,7 +5,7 @@ test.beforeEach(async ({ page }) => {
   await page.route('**/api/config', (route) => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ embedding_model: 'test-model', embedding_cache_ready: true }),
+    body: JSON.stringify({ embedding_model: 'test-model', embedding_cache_ready: true, reverse_image_available: true }),
   }))
   await page.route('**/api/images?**', (route) => route.fulfill({
     status: 200,
@@ -17,6 +17,75 @@ test.beforeEach(async ({ page }) => {
     contentType: 'application/json',
     body: JSON.stringify({ items: [], next_cursor: null }),
   }))
+})
+
+test('上传选项先取消再确认，并发送两项处理选项', async ({ page }) => {
+  const uploadRequests = []
+  await page.route('**/api/images/upload', async (route) => {
+    uploadRequests.push(route.request())
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ results: [{ meme_id: 'meme-upload', filename: 'sample.png', ok: true, saved_filename: 'sample.png' }] }),
+    })
+  })
+
+  await page.goto('/')
+  await page.getByRole('button', { name: '上传' }).click()
+  await page.setInputFiles('input[type="file"]', { name: 'sample.png', mimeType: 'image/png', buffer: Buffer.from([1, 2, 3]) })
+  await page.getByRole('button', { name: '上传所选图片' }).click()
+  const dialog = page.getByRole('dialog', { name: '图片处理选项' })
+  await expect(dialog).toBeVisible()
+  expect(uploadRequests).toHaveLength(0)
+
+  await page.keyboard.press('Escape')
+  await expect(dialog).toBeHidden()
+  expect(uploadRequests).toHaveLength(0)
+
+  await page.getByRole('button', { name: '上传所选图片' }).click()
+  await dialog.getByRole('radio', { name: /按需允许联网/ }).check()
+  await dialog.getByRole('checkbox', { name: '按标题自动命名' }).check()
+  await dialog.getByRole('button', { name: '确认并提交' }).click()
+  await expect.poll(() => uploadRequests.length).toBe(1)
+  const body = uploadRequests[0].postData() || ''
+  expect(body).toContain('name="reverse_image_policy"')
+  expect(body).toContain('name="auto_name"')
+  expect(body).toContain('auto')
+  expect(body).toContain('true')
+})
+
+test('完整重试使用 scope 端点，取消不请求且 320px 弹层不越界', async ({ page }) => {
+  const retryRequests = []
+  await page.route('**/api/images/processing/unready', async (route) => {
+    retryRequests.push(route.request())
+    await route.fulfill({
+      status: 202,
+      contentType: 'application/json',
+      body: JSON.stringify({ target_count: 1, submitted_count: 1, reused_count: 0, conflict_count: 0, failed_count: 0, results: [{ meme_id: 'meme-1', processing_job_id: 'job-1', status: 'queued' }] }),
+    })
+  })
+
+  await page.goto('/')
+  await page.setViewportSize({ width: 320, height: 844 })
+  await page.getByRole('button', { name: '图片库' }).click()
+  await page.getByRole('button', { name: '完整重试所有未就绪' }).click()
+  const dialog = page.getByRole('dialog', { name: '图片处理选项' })
+  await expect(dialog).toBeVisible()
+  expect(retryRequests).toHaveLength(0)
+  const box = await dialog.boundingBox()
+  expect(box).not.toBeNull()
+  expect(box.x + box.width).toBeLessThanOrEqual(320)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
+
+  await page.keyboard.press('Escape')
+  await expect(dialog).toBeHidden()
+  expect(retryRequests).toHaveLength(0)
+
+  await page.getByRole('button', { name: '完整重试所有未就绪' }).click()
+  await dialog.getByRole('button', { name: '确认并提交' }).click()
+  await expect.poll(() => retryRequests.length).toBe(1)
+  expect(retryRequests[0].postDataJSON()).toEqual({ reverse_image_policy: 'forbid', auto_name: false })
+  await expect(page.locator('.inline-notice')).toContainText('完整重试：目标 1，提交 1')
 })
 
 test('首页可加载并切换核心工作区', async ({ page }) => {

@@ -121,6 +121,7 @@ onMounted(async () => {
         <CollectionsWorkspace v-else-if="page === 'collections'" @error="showError" />
         <UploadWorkspace
           v-else-if="page === 'upload'"
+          :config="config"
           @error="showError"
           @clear-error="clearError"
           @open-task="openUploadTask"

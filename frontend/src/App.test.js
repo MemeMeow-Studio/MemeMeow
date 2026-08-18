@@ -2,7 +2,7 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { search, images, imageMetadata, contextBatch, generateCache, pollTask, tasks, task } = vi.hoisted(() => ({ search: vi.fn(), images: vi.fn(), imageMetadata: vi.fn(), contextBatch: vi.fn(), generateCache: vi.fn(), pollTask: vi.fn(), tasks: vi.fn(), task: vi.fn() }))
+const { search, images, imageMetadata, contextBatch, unreadyProcessing, generateCache, pollTask, tasks, task } = vi.hoisted(() => ({ search: vi.fn(), images: vi.fn(), imageMetadata: vi.fn(), contextBatch: vi.fn(), unreadyProcessing: vi.fn(), generateCache: vi.fn(), pollTask: vi.fn(), tasks: vi.fn(), task: vi.fn() }))
 vi.mock('./api', () => ({
   api: {
     config: vi.fn(async () => ({ embedding_model: 'test-model', embedding_cache_ready: false })),
@@ -10,6 +10,7 @@ vi.mock('./api', () => ({
     images,
     imageMetadata,
     contextBatch,
+    unreadyProcessing,
     tasks,
     task,
     generateCache,
@@ -26,6 +27,7 @@ describe('App', () => {
     images.mockReset().mockResolvedValue({ items: [] })
     imageMetadata.mockReset().mockResolvedValue({})
     contextBatch.mockReset().mockResolvedValue({ results: [] })
+    unreadyProcessing.mockReset().mockResolvedValue({ target_count: 0, submitted_count: 0, reused_count: 0, conflict_count: 0, failed_count: 0, results: [] })
     tasks.mockReset().mockResolvedValue({ items: [], next_cursor: null })
     task.mockReset().mockResolvedValue(null)
     generateCache.mockReset()
@@ -256,7 +258,9 @@ describe('App', () => {
     expect(checkboxes).toHaveLength(2)
     expect(checkboxes[1].element.disabled).toBe(false)
     await checkboxes[0].setValue(true)
-    await wrapper.get('.toolbar button:nth-last-child(2)').trigger('click')
+    const retrySelectedButton = wrapper.findAll('.toolbar button').find((button) => button.text().includes('完整重试选中'))
+    expect(retrySelectedButton).toBeDefined()
+    await retrySelectedButton.trigger('click')
     await flushPromises()
     expect(contextBatch).toHaveBeenCalledWith({ items: [{ meme_id: '33333333-3333-4333-8333-333333333333' }], include_unready: true })
     expect(wrapper.text()).toContain('文本索引已就绪')

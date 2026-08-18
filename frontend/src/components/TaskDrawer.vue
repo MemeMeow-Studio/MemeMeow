@@ -3,7 +3,7 @@
 import { computed, shallowRef } from 'vue'
 import { useModalDialog } from '../composables/useModalDialog'
 import type { TaskItem } from '../types'
-import { formatTaskTime, taskActivity, taskStatusLabel, taskTypeLabel } from '../utils/presentation'
+import { formatTaskTime, imageStageLabel, imageStageStatusLabel, taskActivity, taskStatusLabel, taskTypeLabel } from '../utils/presentation'
 
 const props = defineProps<{
   task: TaskItem
@@ -21,9 +21,19 @@ const emit = defineEmits<{
 const drawer = shallowRef<HTMLElement | null>(null)
 const closeButton = shallowRef<HTMLElement | null>(null)
 const activity = computed(() => taskActivity(props.task))
-const isImageStage = computed(() => ['visual_embedding_generation', 'meme_context_generation', 'text_embedding_generation'].includes(props.task.task_type))
-const canRetryStage = computed(() => isImageStage.value && props.task.status === 'failed' && !props.task.read_only && props.task.submission_mode === 'standalone')
-const canRetryFull = computed(() => props.task.submission_mode === 'pipeline' && !!props.task.processing_job_id && props.task.status === 'failed')
+const isImageStage = computed(() => ['visual_embedding_generation', 'meme_context_generation', 'image_auto_rename', 'text_embedding_generation'].includes(props.task.task_type))
+const taskStage = computed(() => props.task.image_stage || (props.task.task_type === 'image_auto_rename' ? 'auto_rename' : null))
+const autoRenameRetryable = computed(() => {
+  if (taskStage.value !== 'auto_rename' || props.task.status !== 'failed' || props.task.read_only) return false
+  if (props.task.image_stage_recoverable === false) return false
+  return props.task.image_stage_recoverable === true || props.task.image_stage_status === 'warning'
+})
+const canRetryStage = computed(() => {
+  if (!isImageStage.value || props.task.status !== 'failed' || props.task.read_only) return false
+  if (props.task.task_type === 'image_auto_rename' || taskStage.value === 'auto_rename') return autoRenameRetryable.value
+  return props.task.submission_mode === 'standalone'
+})
+const canRetryFull = computed(() => props.task.submission_mode === 'pipeline' && props.task.task_type !== 'image_auto_rename' && taskStage.value !== 'auto_rename' && !!props.task.processing_job_id && ['failed', 'blocked', 'unknown_execution'].includes(props.task.status))
 const canRetryLegacy = computed(() => props.task.task_type === 'meme_context_generation' && props.task.status === 'failed' && props.task.submission_mode == null && !props.task.read_only)
 
 useModalDialog({
@@ -44,7 +54,7 @@ useModalDialog({
       <dl>
         <div><dt>状态</dt><dd>{{ taskStatusLabel(task.status) }}</dd></div>
         <div><dt>类型</dt><dd>{{ taskTypeLabel(task.task_type) }}</dd></div>
-        <div><dt>阶段</dt><dd>{{ task.message || '—' }}</dd></div>
+        <div><dt>阶段</dt><dd>{{ taskStage ? `${imageStageLabel(taskStage)}：${imageStageStatusLabel(task.image_stage_status || (autoRenameRetryable ? 'warning' : task.status))}` : task.message || '—' }}</dd></div>
         <div v-if="activity" class="task-activity-detail">
           <dt>Agent 工作回合</dt>
           <dd>
@@ -77,7 +87,7 @@ useModalDialog({
         :disabled="retrying"
         @click="emit('retry-stage')"
       >
-        {{ retrying ? '提交中...' : '仅重试本阶段' }}
+        {{ retrying ? '提交中...' : taskStage === 'auto_rename' ? '恢复自动命名' : '仅重试本阶段' }}
       </button>
       <button
         v-if="canRetryLegacy"

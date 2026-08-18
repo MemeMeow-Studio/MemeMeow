@@ -33,10 +33,20 @@ export function useModalDialog(options: ModalDialogOptions): void {
       return
     }
     if (event.key !== 'Tab') return
-    const focusable = [...(options.dialog.value?.querySelectorAll<HTMLElement>(focusableSelector) || [])]
-    if (!focusable.length) return
+    const dialogElement = options.dialog.value
+    const focusable = [...(dialogElement?.querySelectorAll<HTMLElement>(focusableSelector) || [])]
+    if (!focusable.length) {
+      event.preventDefault()
+      dialogElement?.focus()
+      return
+    }
     const first = focusable[0]
     const last = focusable[focusable.length - 1]
+    if (!options.dialog.value?.contains(document.activeElement)) {
+      event.preventDefault()
+      first.focus()
+      return
+    }
     if (event.shiftKey && document.activeElement === first) {
       event.preventDefault()
       last.focus()

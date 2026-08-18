@@ -48,7 +48,16 @@ export function visualEmbeddingLabel(status?: string): string {
 
 /** 将后端任务状态转换为用户可读标签。 */
 export function taskStatusLabel(status?: string): string {
-  return { queued: '排队中', running: '处理中', succeeded: '已完成', failed: '失败' }[status || ''] || '未知状态'
+  return {
+    queued: '排队中',
+    running: '处理中',
+    succeeded: '已完成',
+    failed: '失败',
+    blocked: '已阻止',
+    unknown_execution: '执行状态未知',
+    skipped: '未启用',
+    warning: '处理完成，自动重命名未完成',
+  }[status || ''] || '未知状态'
 }
 
 /** 将后端任务类型转换为可扫描的中文名称。 */
@@ -58,6 +67,7 @@ export function taskTypeLabel(type?: string): string {
     cache_generation: '检索缓存',
     metadata_repair: '元数据修复',
     visual_embedding_generation: '图片向量生成',
+    image_auto_rename: '自动重命名',
     text_embedding_generation: '文本 embedding',
     image_processing: '完整图片处理',
   }[type || ''] || type || '未知任务'
@@ -70,12 +80,18 @@ export function submissionModeLabel(mode?: string | null): string {
 
 /** 将图片阶段转换为工作台标签。 */
 export function imageStageLabel(stage?: string | null): string {
-  return { visual: '视觉向量', agent: 'Agent 语境', text_embedding: '文本 embedding' }[stage || ''] || '图片阶段'
+  return { visual: '视觉向量', agent: 'Agent 语境', auto_rename: '自动重命名', text_embedding: '文本 embedding' }[stage || ''] || '图片阶段'
 }
 
 /** 将图片处理 Job 阶段状态转换为短标签。 */
 export function imageStageStatusLabel(status?: string): string {
-  return taskStatusLabel(status)
+  return {
+    skipped: '未启用',
+    warning: '处理完成，自动重命名未完成',
+    failed: '失败，处理已停止',
+    blocked: '已阻止，等待恢复',
+    unknown_execution: '执行状态未知，需人工确认',
+  }[status || ''] || taskStatusLabel(status)
 }
 
 /** 将任务时间压缩为桌面和移动端都能容纳的本地格式。 */

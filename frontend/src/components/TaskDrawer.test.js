@@ -51,4 +51,74 @@ describe('TaskDrawer', () => {
     expect(document.activeElement).toBe(trigger)
     trigger.remove()
   })
+
+  it('核心图片阶段 blocked 时仍提供完整重试入口', async () => {
+    wrapper = mount(TaskDrawer, {
+      props: {
+        task: {
+          task_id: 'task-blocked',
+          task_type: 'visual_embedding_generation',
+          submission_mode: 'pipeline',
+          image_stage: 'visual',
+          processing_job_id: 'job-1',
+          status: 'blocked',
+          image: { meme_id: 'meme-1', filename: 'sample.png' },
+        },
+      },
+    })
+    await nextTick()
+
+    const retryButton = wrapper.get('.task-drawer > .primary')
+    await retryButton.trigger('click')
+    expect(wrapper.emitted('retry-full')).toHaveLength(1)
+  })
+
+  it('warning 自动重命名叶子 Task 显示阶段警告和独立恢复动作', async () => {
+    wrapper = mount(TaskDrawer, {
+      props: {
+        task: {
+          task_id: 'rename-task',
+          task_type: 'image_auto_rename',
+          submission_mode: 'pipeline',
+          image_stage: 'auto_rename',
+          image_stage_status: 'warning',
+          image_stage_recoverable: true,
+          processing_job_id: 'job-1',
+          status: 'failed',
+          image: { meme_id: 'meme-1', filename: 'sample.png' },
+        },
+      },
+    })
+    await nextTick()
+
+    expect(wrapper.text()).toContain('自动重命名：处理完成，自动重命名未完成')
+    const retryButton = wrapper.findAll('.task-drawer > .quiet').find((button) => button.text().includes('恢复自动命名'))
+    expect(retryButton).toBeDefined()
+    expect(retryButton.text()).toBe('恢复自动命名')
+    await retryButton.trigger('click')
+    expect(wrapper.emitted('retry-stage')).toHaveLength(1)
+    expect(wrapper.emitted('retry-full')).toBeUndefined()
+    expect(wrapper.emitted('retry')).toBeUndefined()
+  })
+
+  it('自动重命名 running 时不提供恢复按钮', async () => {
+    wrapper = mount(TaskDrawer, {
+      props: {
+        task: {
+          task_id: 'rename-running',
+          task_type: 'image_auto_rename',
+          submission_mode: 'pipeline',
+          image_stage: 'auto_rename',
+          image_stage_status: 'running',
+          status: 'running',
+          image: { meme_id: 'meme-1', filename: 'sample.png' },
+        },
+      },
+    })
+    await nextTick()
+
+    expect(wrapper.text()).toContain('自动重命名：处理中')
+    expect(wrapper.findAll('.task-drawer > .quiet').some((button) => !button.attributes('aria-label'))).toBe(false)
+    expect(wrapper.find('.task-drawer > .primary').exists()).toBe(false)
+  })
 })

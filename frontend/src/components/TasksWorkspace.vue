@@ -11,6 +11,7 @@ import {
   taskStatusLabel,
   taskTypeLabel,
   imageStageLabel,
+  imageStageStatusLabel,
   submissionModeLabel,
 } from '../utils/presentation'
 import TaskDrawer from './TaskDrawer.vue'
@@ -41,12 +42,31 @@ const visibleTaskItems = computed(() => taskItems.value.filter((item) => !(item.
 const hasActiveTasks = computed(() => taskItems.value.some((item) => item.status === 'queued' || item.status === 'running') || processingJobs.value.some((item) => ['queued', 'running'].includes(item.status)))
 const activityById = computed(() => new Map(taskItems.value.map((item) => [item.task_id, taskActivity(item)])))
 
+/** 判断自动重命名叶子 Task 是否属于可降级 warning，兼容新旧响应字段。 */
+function canRetryAutoRename(task: TaskItem): boolean {
+  const stage = task.image_stage || (task.task_type === 'image_auto_rename' ? 'auto_rename' : null)
+  if (stage !== 'auto_rename' || task.status !== 'failed' || task.read_only) return false
+  if (task.image_stage_recoverable === false) return false
+  return task.image_stage_recoverable === true || task.image_stage_status === 'warning'
+}
+
+/** 根据 Job 是否公开自动重命名阶段，保留历史三阶段 Job 的准确文案。 */
+function processingPipelineLabel(job: ImageProcessingJob): string {
+  const hasAutoRenameStage = job.auto_name === true || job.stages?.some((stage) => stage.stage === 'auto_rename')
+  return hasAutoRenameStage ? '四阶段流水线' : '三阶段流水线'
+}
+
 /** 加载完整图片处理 Job；旧测试夹具没有该 API 时保持任务列表兼容。 */
 async function loadProcessingJobs(): Promise<void> {
   if (typeof api.processingJobs !== 'function') return
   try {
     const response = await api.processingJobs({ limit: 100 })
-    if (!disposed) processingJobs.value = response.items || []
+    if (!disposed) {
+      processingJobs.value = response.items || []
+      // 父 Job 可能没有可见叶子 Task；列表首次加载后仍要依据最新 Job
+      // 状态启动轮询，否则用户只能手动刷新才能看到阶段推进。
+      syncPolling()
+    }
   } catch (reason) {
     if (!disposed) emit('error', errorMessage(reason))
   }
@@ -99,18 +119,24 @@ function closeTask(): void {
 
 /** 为失败的语境任务重新创建任务，并打开新任务详情。 */
 async function retryTask(): Promise<void> {
-  const image = selectedTask.value?.image
+  const selected = selectedTask.value
+  const image = selected?.image
   if (!image?.meme_id || retrying.value) return
+  if (selected?.task_type === 'image_auto_rename' && !canRetryAutoRename(selected)) return
   retrying.value = true
   try {
     let response
-    if (selectedTask.value?.submission_mode === 'pipeline' && selectedTask.value.processing_job_id && typeof api.retryProcessingJob === 'function') {
-      response = await api.retryProcessingJob(selectedTask.value.processing_job_id)
-    } else if (selectedTask.value?.submission_mode === 'standalone' && selectedTask.value.image_stage && typeof api.submitImageStage === 'function') {
-      response = await api.submitImageStage({ meme_id: image.meme_id, stage: selectedTask.value.image_stage, reverse_image_policy: 'forbid' })
-    } else {
+    if (selected && canRetryAutoRename(selected) && typeof api.submitImageStage === 'function') {
+      response = await api.submitImageStage({ meme_id: image.meme_id, stage: 'auto_rename', reverse_image_policy: 'forbid' })
+    } else if (selected?.task_type !== 'image_auto_rename' && selected?.submission_mode === 'pipeline' && selected.image_stage !== 'auto_rename' && selected.processing_job_id && typeof api.retryProcessingJob === 'function') {
+      response = await api.retryProcessingJob(selected.processing_job_id)
+    } else if (selected?.task_type !== 'image_auto_rename' && selected?.submission_mode === 'standalone' && selected.image_stage && typeof api.submitImageStage === 'function') {
+      response = await api.submitImageStage({ meme_id: image.meme_id, stage: selected.image_stage, reverse_image_policy: 'forbid' })
+    } else if (selected?.task_type === 'meme_context_generation' && selected.submission_mode == null) {
       // 未归类历史只保留旧诊断兼容，不把新的图片任务送入通用 retry。
       response = await api.context({ meme_id: image.meme_id })
+    } else {
+      return
     }
     await loadTasks()
     if (response?.task_id) await openTask(response.task_id)
@@ -165,8 +191,8 @@ onBeforeUnmount(() => {
       <button class="quiet" type="button" :disabled="loading" @click="loadTasks()">刷新</button>
     </div>
     <div class="task-toolbar">
-      <label>状态<select v-model="status" aria-label="按状态筛选" @change="loadTasks()"><option value="">全部</option><option value="queued">排队中</option><option value="running">处理中</option><option value="succeeded">已完成</option><option value="failed">失败</option></select></label>
-      <label>类型<select v-model="type" aria-label="按类型筛选" @change="loadTasks()"><option value="">全部</option><option value="meme_context_generation">语境生成</option><option value="visual_embedding_generation">图片向量</option><option value="text_embedding_generation">文本 embedding</option><option value="cache_generation">检索缓存</option><option value="metadata_repair">元数据修复</option></select></label>
+      <label>状态<select v-model="status" aria-label="按状态筛选" @change="loadTasks()"><option value="">全部</option><option value="queued">排队中</option><option value="running">处理中</option><option value="succeeded">已完成</option><option value="failed">失败</option><option value="blocked">已阻止</option><option value="unknown_execution">执行状态未知</option></select></label>
+      <label>类型<select v-model="type" aria-label="按类型筛选" @change="loadTasks()"><option value="">全部</option><option value="meme_context_generation">语境生成</option><option value="visual_embedding_generation">图片向量</option><option value="image_auto_rename">自动重命名</option><option value="text_embedding_generation">文本 embedding</option><option value="cache_generation">检索缓存</option><option value="metadata_repair">元数据修复</option></select></label>
     </div>
     <div class="task-table" :class="{ loading }" role="table" aria-label="处理任务列表">
       <div class="task-head" role="row"><span role="columnheader">状态</span><span role="columnheader">类型</span><span role="columnheader">来源</span><span role="columnheader">关联图片</span><span role="columnheader">进度</span><span role="columnheader">最近更新</span></div>
@@ -175,16 +201,18 @@ onBeforeUnmount(() => {
           <span class="task-status-cell"><i :class="`status-dot ${job.status}`" aria-hidden="true"></i>{{ taskStatusLabel(job.status) }}</span>
           <span><strong>完整图片处理</strong><small> Job #{{ job.revision }} · {{ job.meme_id }}</small></span>
           <span class="task-source">{{ submissionModeLabel('pipeline') }}</span>
-          <span>{{ job.current_stage ? imageStageLabel(job.current_stage) : '三阶段流水线' }}</span>
+          <span>{{ job.current_stage ? imageStageLabel(job.current_stage) : processingPipelineLabel(job) }}</span>
           <span>{{ job.progress == null ? '—' : `${Math.round(job.progress * 100)}%` }}</span>
           <time>{{ formatTaskTime(job.updated_at) }}</time>
         </summary>
+        <p v-if="job.has_warnings" class="inline-notice warning" role="status">处理已完成，自动重命名未完成</p>
         <div class="processing-job-stages">
           <button v-for="stage in job.stages" :key="`${job.job_id}:${stage.stage}`" class="task-stage-row" type="button" :disabled="!stage.task_id" @click="stage.task_id && openTask(stage.task_id)">
             <span><i :class="`status-dot ${stage.status}`" aria-hidden="true"></i>{{ imageStageLabel(stage.stage) }}</span>
-            <span>{{ taskStatusLabel(stage.status) }}</span>
-            <span>{{ stage.task_id || '等待创建叶子任务' }}</span>
+            <span>{{ imageStageStatusLabel(stage.status) }}</span>
+            <span>{{ stage.task_id || (stage.status === 'skipped' ? '未启用' : '等待创建叶子任务') }}</span>
             <span v-if="stage.error" class="task-error">{{ stage.error.error || '阶段失败' }}</span>
+            <span v-if="stage.status === 'warning'" class="task-error warning">处理完成，自动重命名未完成</span>
           </button>
         </div>
       </details>
@@ -205,12 +233,14 @@ onBeforeUnmount(() => {
             <b>{{ activityById.get(item.task_id)?.turns }}</b><time>{{ activityById.get(item.task_id)?.lastActivity }}</time>
           </span>
         </span>
-        <span class="task-source" role="cell" data-label="来源">{{ submissionModeLabel(item.historical_unclassified ? 'unclassified' : item.submission_mode) }}<small v-if="item.image_stage"> · {{ imageStageLabel(item.image_stage) }}</small></span>
+        <span class="task-source" role="cell" data-label="来源">{{ submissionModeLabel(item.historical_unclassified ? 'unclassified' : item.submission_mode) }}<small v-if="item.image_stage || item.task_type === 'image_auto_rename'"> · {{ imageStageLabel(item.image_stage || 'auto_rename') }}</small></span>
         <span class="task-image" role="cell" data-label="图片">{{ item.image?.filename || '—' }}</span>
         <span class="task-progress" role="cell" data-label="进度">{{ item.progress == null ? '—' : `${Math.round(item.progress * 100)}%` }}</span>
         <time role="cell">{{ formatTaskTime(item.updated_at) }}</time>
       </button>
-      <div v-for="n in 5" v-if="loading && !taskItems.length" :key="n" class="task-skeleton"></div>
+      <template v-if="loading && !taskItems.length">
+        <div v-for="n in 5" :key="n" class="task-skeleton"></div>
+      </template>
       <div v-if="!loading && !taskItems.length" class="empty-state compact"><h2>没有匹配的任务</h2><p>调整筛选条件后再试。</p></div>
     </div>
     <button v-if="cursor" class="quiet load-more" type="button" @click="loadTasks({ append: true })">加载更多</button>
