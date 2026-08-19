@@ -1,10 +1,10 @@
 <script setup lang="ts">
 /** 上传工作区：管理文件选择、选项确认与逐文件结果。 */
-import { shallowRef } from 'vue'
-import { api } from '../api'
-import type { ImageProcessingOptions, ServiceConfig, UploadResult } from '../types'
+import { computed, shallowRef } from 'vue'
+import type { ImageProcessingOptions, ServiceConfig } from '../types'
 import { errorMessage } from '../utils/presentation'
 import ImageProcessingOptionsDialog from './ImageProcessingOptionsDialog.vue'
+import { useUploadBatch, type UploadBatchItem } from '../composables/useUploadBatch'
 
 const props = defineProps<{
   config: ServiceConfig | null
@@ -17,26 +17,30 @@ const emit = defineEmits<{
 }>()
 
 const files = shallowRef<File[]>([])
-const uploadResults = shallowRef<UploadResult[]>([])
-const busy = shallowRef(false)
 const dialogOpen = shallowRef(false)
 const dialogTrigger = shallowRef<HTMLElement | null>(null)
 const retryOptions = shallowRef<ImageProcessingOptions>({ reverse_image_policy: 'forbid', auto_name: false })
 const preserveRetryOptions = shallowRef(false)
+const batch = useUploadBatch()
+const batchItems = batch.items
+const batchSummary = batch.summary
+const busy = batch.busy
+const canRetryFailed = computed(() => !busy.value && batchItems.value.some((item) => item.status === 'failed' && item.retryable))
 
 /** 读取原生文件输入，并以不可变数组保存用户选择。 */
 function onFiles(event: Event): void {
   const input = event.target as HTMLInputElement
   files.value = [...(input.files || [])]
+  batch.setFiles(files.value)
   preserveRetryOptions.value = false
   retryOptions.value = { reverse_image_policy: 'forbid', auto_name: false }
 }
 
 /** 打开共享选项对话框；请求尚未发生时保留文件选择。 */
-function openOptions(event: MouseEvent): void {
+function openOptions(event?: MouseEvent): void {
   if (busy.value || !files.value.length) return
   if (!preserveRetryOptions.value) retryOptions.value = { reverse_image_policy: 'forbid', auto_name: false }
-  dialogTrigger.value = event.currentTarget instanceof HTMLElement ? event.currentTarget : null
+  dialogTrigger.value = event?.currentTarget instanceof HTMLElement ? event.currentTarget : null
   dialogOpen.value = true
 }
 
@@ -55,24 +59,35 @@ async function confirmOptions(options: ImageProcessingOptions): Promise<void> {
   emit('clearError')
   retryOptions.value = options
   preserveRetryOptions.value = true
-  busy.value = true
-  try {
-    const selectedFiles = files.value
-    const response = await api.upload(selectedFiles, options)
-    uploadResults.value = response.results
-    // 逐文件接口可能部分成功；只移除已成功的输入，失败项仍可安全重试。
-    files.value = selectedFiles.filter((_file, index) => response.results[index]?.ok !== true)
-    dialogOpen.value = false
-    // 本次请求已经收束；下一次重新打开必须重新使用安全默认值。网络异常
-    // 则不会进入这里，对话框仍保持打开并保留当前选择供用户重试。
-    preserveRetryOptions.value = false
-    retryOptions.value = { reverse_image_policy: 'forbid', auto_name: false }
-  } catch (reason) {
-    emit('error', errorMessage(reason))
+  const selectedFiles = files.value
+  const outcome = await batch.start(selectedFiles, options, props.config)
+  // 逐文件接口可能部分成功；仅保留仍可重试的失败项作为下一次输入。
+  files.value = batchItems.value
+    .filter((item) => item.status === 'failed' && item.retryable)
+    .map((item) => item.file)
+  if (outcome.transportError) {
+    emit('error', errorMessage(outcome.transportError))
     // 网络或服务错误时保持对话框和选择，用户可以直接再次确认。
-  } finally {
-    busy.value = false
+    return
   }
+  dialogOpen.value = false
+  preserveRetryOptions.value = false
+  retryOptions.value = { reverse_image_policy: 'forbid', auto_name: false }
+}
+
+/** 返回不依赖后端枚举原文的逐项状态文案。 */
+function statusLabel(item: UploadBatchItem): string {
+  if (item.status === 'succeeded') return '完成'
+  if (item.status === 'uploading') return '上传中'
+  if (item.status === 'pending') return '等待中'
+  if (item.status === 'cancelled') return '已取消'
+  return item.error === 'rate_limited' ? '等待重试' : '失败'
+}
+
+/** 展示服务端成功摘要或稳定错误码，避免把原始异常对象渲染到页面。 */
+function itemDetail(item: UploadBatchItem): string {
+  if (item.error) return item.error
+  return item.result?.saved_filename || item.result?.processing_status || ''
 }
 </script>
 
@@ -90,13 +105,22 @@ async function confirmOptions(options: ImageProcessingOptions): Promise<void> {
       <button class="primary wide" type="button" :disabled="busy || !files.length" @click="openOptions">
         {{ busy ? '上传中...' : '上传所选图片' }}
       </button>
+      <div v-if="batchSummary.total" class="upload-summary" aria-live="polite">
+        <strong>已处理 {{ batchSummary.succeeded + batchSummary.failed + batchSummary.cancelled }} / {{ batchSummary.total }}</strong>
+        <span>成功 {{ batchSummary.succeeded }}，失败 {{ batchSummary.failed }}，取消 {{ batchSummary.cancelled }}</span>
+        <span v-if="batchSummary.pending" class="summary-muted">等待 {{ batchSummary.pending }}</span>
+        <button v-if="busy && !batch.paused" class="quiet" type="button" @click="batch.pause">暂停</button>
+        <button v-if="busy && batch.paused" class="quiet" type="button" @click="batch.resume">继续</button>
+        <button v-if="busy" class="quiet" type="button" aria-label="取消未发送图片" @click="batch.cancel">取消未发送</button>
+        <button v-if="canRetryFailed" class="quiet" type="button" @click="openOptions">重试失败项</button>
+      </div>
     </div>
-    <div v-if="uploadResults.length" class="upload-results" aria-live="polite">
-      <div v-for="(item, index) in uploadResults" :key="item.meme_id || `${item.filename}-${index}`" class="upload-result" :class="{ fail: !item.ok }">
-        <span>{{ item.ok ? '完成' : '失败' }}</span>
-        <strong :title="item.filename">{{ item.filename }}</strong>
-        <button v-if="item.processing_job_id || item.metadata_job_id" class="quiet" type="button" @click="emit('openTask', item.processing_job_id || item.metadata_job_id || '')">查看任务</button>
-        <small v-else>{{ item.ok ? item.saved_filename : item.error }}</small>
+    <div v-if="batchItems.length" class="upload-results" aria-live="polite">
+      <div v-for="item in batchItems" :key="item.id" v-memo="[item.status, item.error, item.result?.meme_id, item.result?.processing_status]" class="upload-result" :class="{ fail: item.status === 'failed' || item.status === 'cancelled' }">
+        <span>{{ statusLabel(item) }}</span>
+        <strong :title="item.file.name">{{ item.file.name }}</strong>
+        <button v-if="item.result?.processing_job_id || item.result?.metadata_job_id" class="quiet" type="button" @click="emit('openTask', item.result?.processing_job_id || item.result?.metadata_job_id || '')">查看任务</button>
+        <small>{{ itemDetail(item) }}</small>
       </div>
     </div>
   </section>

@@ -21,6 +21,13 @@ export async function request(path, options = {}) {
     const error = new Error(detail.message || (typeof data.detail === 'string' ? data.detail : '请求失败'))
     error.code = detail.error || 'request_failed'
     error.status = response.status
+    const retryAfter = response.headers?.get?.('retry-after')
+    if (retryAfter) {
+      const seconds = Number.parseFloat(retryAfter)
+      error.retryAfter = Number.isFinite(seconds)
+        ? Math.max(0, seconds)
+        : Math.max(0, (Date.parse(retryAfter) - Date.now()) / 1000)
+    }
     throw error
   }
   return data
@@ -42,7 +49,7 @@ export const api = {
     return request(`/images/metadata?meme_id=${encodeURIComponent(memeId)}`, { cache: 'no-store' })
   },
   rename: (payload) => request('/images/rename', { method: 'POST', body: JSON.stringify(payload) }),
-  upload: (files, options = {}) => {
+  upload: (files, options = {}, requestOptions = {}) => {
     const normalized = typeof options === 'boolean'
       ? { reverse_image_policy: 'forbid', auto_name: options }
       : normalizeImageProcessingOptions(options)
@@ -50,7 +57,7 @@ export const api = {
     body.append('reverse_image_policy', normalized.reverse_image_policy)
     body.append('auto_name', String(normalized.auto_name))
     files.forEach((file) => body.append('files', file))
-    return request('/images/upload', { method: 'POST', body })
+    return request('/images/upload', { method: 'POST', body, signal: requestOptions.signal })
   },
   context: (payload) => request('/images/context', { method: 'POST', body: JSON.stringify(payload) }),
   contextBatch: (payload = {}) => request('/images/context/batch', { method: 'POST', body: JSON.stringify(payload) }),

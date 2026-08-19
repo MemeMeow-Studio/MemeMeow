@@ -29,6 +29,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
+from starlette.formparsers import MultiPartException, MultiPartParser
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, StrictBool, StrictInt
 from sqlalchemy import select
 
@@ -81,6 +82,49 @@ STORAGE_PREFLIGHT_BLOCKING_KEYS = ("non_flat_keys", "nested_images", "missing_fi
 INTERNAL_SCOPE_CALLBACK_PATHS = frozenset({"/internal/reverse-image/search", "/internal/visual-search/match"})
 OPERATION_POLICY_PATH = "/operations/availability"
 SCOPE_SELECTOR_FIELDS = frozenset({"scope_id", "scope-id", "user_id", "user-id"})
+MAX_UPLOAD_FILES_PER_REQUEST = 20
+UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
+
+
+class _BoundedUploadMultipartParser(MultiPartParser):
+    """在 Starlette multipart parser 写入临时文件前统计上传文件字节。"""
+
+    def __init__(self, *args: Any, max_request_bytes: int | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._max_request_bytes = max_request_bytes
+        self._request_file_bytes = 0
+
+    def on_part_data(self, data: bytes, start: int, end: int) -> None:
+        """只累计文件 part 的实际字节，拒绝超预算数据而不信任请求头。"""
+        if self._current_part.file is not None:
+            self._request_file_bytes += end - start
+            if self._max_request_bytes is not None and self._request_file_bytes > self._max_request_bytes:
+                raise MultiPartException("Upload request exceeded configured byte budget.")
+        super().on_part_data(data, start, end)
+
+
+async def _parse_upload_form(request: Request, *, max_files: int, max_request_bytes: int | None):
+    """解析上传 multipart，并在文件写入 SpooledTemporaryFile 前执行总预算。"""
+    content_type = request.headers.get("content-type", "").lower()
+    if not content_type.startswith("multipart/form-data"):
+        return await request.form(max_files=max_files, max_fields=8)
+    parser = _BoundedUploadMultipartParser(
+        request.headers,
+        request.stream(),
+        max_files=max_files,
+        max_fields=8,
+        max_part_size=1024 * 1024,
+        max_request_bytes=max_request_bytes,
+    )
+    try:
+        return await parser.parse()
+    except MultiPartException as exc:
+        message = str(exc)
+        if "Too many files" in message:
+            raise _error(413, "too_many_files", "单个上传请求最多包含 20 个文件") from exc
+        if "byte budget" in message:
+            raise _error(413, "request_too_large", "上传请求超过服务端总字节预算") from exc
+        raise _error(400, "invalid_request", "上传 multipart 请求无效") from exc
 
 
 class StrictRequestModel(BaseModel):
@@ -297,15 +341,19 @@ def _commit_operation(request: Request, grant) -> None:
 
 
 def _release_operation(request: Request, grant) -> None:
-    """仅供调用方确认未发生 durable 副作用后释放 reservation。"""
+    """确认本请求未发生 durable 副作用后释放 reservation，并保留并发 committed 事实。"""
     gateway = _operation_gateway(request)
     store = getattr(request.app.state, "operation_grants", None)
     try:
         result = gateway.release(grant)
-        if not result.ok or result.state not in {"released", "already_released"}:
+        if not result.ok or result.state not in {"released", "already_released", "committed", "already_committed"}:
             raise OperationPolicyError(result.reason or "operation_policy_unavailable", retry_at=result.retry_at)
-        if callable(getattr(store, "transition", None)) and not store.transition(grant, "released"):
-            raise OperationPolicyError("operation_grant_invalid")
+        if callable(getattr(store, "transition", None)):
+            # 并发幂等请求可能已经由另一执行者提交同一 grant；此时 release 是
+            # no-op，必须保留 committed 事实，不能把已计量操作改写为 released。
+            state = "committed" if result.state in {"committed", "already_committed"} else "released"
+            if not store.transition(grant, state):
+                raise OperationPolicyError("operation_grant_invalid")
     except OperationPolicyError:
         if callable(getattr(store, "transition", None)):
             try:
@@ -2964,12 +3012,73 @@ async def delete_image(request: Request, payload: DeleteRequest) -> dict[str, ob
     return {"meme_id": payload.meme_id, "deleted": True}
 
 
+def _idempotent_upload_result(
+    request: Request,
+    metadata_service: PostgresMetadataService,
+    record: Meme,
+    image: Path,
+    *,
+    original: str,
+    reverse_image_policy: str,
+    auto_name: bool,
+) -> dict[str, object]:
+    """构造已存在 durable 图片的幂等成功结果并复用当前处理状态。"""
+    result: dict[str, object] = {
+        "meme_id": str(record.id),
+        "filename": original,
+        "ok": True,
+        "saved_filename": Path(record.storage_key).name,
+        "media_url": f"/media/{record.id}",
+        "metadata_status": metadata_service.status(image)["status"],
+        "idempotent": True,
+        "auto_name": auto_name,
+        "reverse_image_policy": reverse_image_policy,
+    }
+    worker = _processing_worker(request)
+    snapshot = worker.jobs.latest_for_target(record.id, record.sha256) if worker is not None else None
+    if snapshot is None:
+        try:
+            snapshot = _submit_processing_job_for_image(
+                request,
+                record,
+                image,
+                reverse_image_policy=reverse_image_policy,
+                auto_name=auto_name,
+            )
+        except (ImageProcessingError, MetadataError, RuntimeError, DatabaseError) as exc:
+            result["processing_job_error"] = getattr(exc, "code", "image_processing_unavailable")
+    if snapshot is not None:
+        result.update(
+            {
+                "processing_job_id": snapshot.job_id,
+                "processing_status": snapshot.status,
+                "processing_progress": snapshot.progress,
+                "processing_message": snapshot.message,
+                "metadata_job_id": snapshot.job_id,
+            }
+        )
+    return result
+
+
 @app.post("/images/upload", tags=["images"])
 async def upload_images(
     request: Request,
 ) -> dict[str, object]:
     """解析扁平上传表单并逐文件校验保存，批量中的失败不会回滚成功文件。"""
-    form = await request.form()
+    settings: Settings = request.app.state.settings
+    configured_file_limit = int(getattr(settings, "max_files_per_request", MAX_UPLOAD_FILES_PER_REQUEST))
+    file_limit = max(1, min(configured_file_limit, MAX_UPLOAD_FILES_PER_REQUEST))
+    max_request_bytes = getattr(settings, "max_request_bytes", None)
+    if max_request_bytes is not None:
+        max_request_bytes = int(max_request_bytes)
+    try:
+        # 多解析一个文件是为了把恰好越过业务上限的请求映射为稳定错误；更大的
+        # 请求仍由框架 parser 在读取过量文件时拒绝，不进入任何 durable 写入路径。
+        form = await _parse_upload_form(request, max_files=file_limit + 1, max_request_bytes=max_request_bytes)
+    except HTTPException as exc:
+        if exc.status_code == 400 and "Too many files" in str(exc.detail):
+            raise _error(413, "too_many_files", "单个上传请求最多包含 20 个文件") from exc
+        raise
     unknown = set(form.keys()) - {"auto_name", "files", "reverse_image_policy"}
     if unknown:
         raise _error(400, "invalid_request", "上传不接受已废弃的目标目录字段")
@@ -2984,20 +3093,34 @@ async def upload_images(
     files = [item for item in form.getlist("files") if hasattr(item, "filename") and hasattr(item, "read")]
     if not files:
         raise _error(400, "files_required", "必须上传图片文件")
+    if len(files) > file_limit:
+        raise _error(413, "too_many_files", "单个上传请求最多包含 20 个文件")
     metadata_service = _service(request, "metadata")
-    settings: Settings = request.app.state.settings
+    preloaded: list[tuple[bytes, bool]] = []
+    request_bytes = 0
+    for upload in files:
+        content = bytearray()
+        while len(content) <= settings.max_upload_size:
+            chunk = await upload.read(min(UPLOAD_READ_CHUNK_BYTES, settings.max_upload_size + 1 - len(content)))
+            if not chunk:
+                break
+            content.extend(chunk)
+        too_large = len(content) > settings.max_upload_size
+        request_bytes += len(content)
+        preloaded.append((bytes(content), too_large))
+        if max_request_bytes is not None and request_bytes > max_request_bytes:
+            raise _error(413, "request_too_large", "上传请求超过服务端总字节预算")
     results = []
     upload_batch_id = uuid4().hex if len(files) > 1 else None
     upload_task_ids: list[str] = []
     unified_processing_worker_used = False
-    for upload in files:
+    for upload, (content, too_large) in zip(files, preloaded, strict=True):
         original = upload.filename or "image"
         clean = _safe_filename(original)
         if Path(clean).suffix.lower() not in SUPPORTED_EXTENSIONS:
             results.append({"filename": original, "ok": False, "error": "unsupported_format"})
             continue
-        content = await upload.read()
-        if len(content) > settings.max_upload_size:
+        if too_large:
             results.append({"filename": original, "ok": False, "error": "file_too_large"})
             continue
         try:
@@ -3005,10 +3128,20 @@ async def upload_images(
         except ValueError:
             results.append({"filename": original, "ok": False, "error": "invalid_filename"})
             continue
-        target = metadata_service.blob_store.resolve(clean, must_exist=False)
-        if target.exists():
+        content_digest = sha256_bytes(content)
+        try:
+            existing = metadata_service.find_existing_upload(clean, sha256=content_digest, size_bytes=len(content))
+        except MetadataError as exc:
+            if exc.code == "upload_reconciliation_required":
+                results.append({"filename": original, "ok": False, "error": exc.code})
+                continue
             results.append({"filename": original, "ok": False, "error": "file_exists"})
             continue
+        if existing is not None:
+            existing_record, existing_path = existing
+            results.append(_idempotent_upload_result(request, metadata_service, existing_record, existing_path, original=original, reverse_image_policy=reverse_image_policy, auto_name=auto_name))
+            continue
+        target = metadata_service.blob_store.resolve(clean, must_exist=False)
         try:
             from io import BytesIO
             from PIL import Image
@@ -3022,7 +3155,6 @@ async def upload_images(
             continue
         grant = None
         try:
-            content_digest = sha256_bytes(content)
             upload_key = f"upload:{content_digest}:{clean}"
             grant = _acquire_operation(request, Operations.IMAGE_UPLOAD, upload_key, resource_id=clean, source="upload", input_digest=content_digest)
         except OperationPolicyError as exc:
@@ -3031,6 +3163,23 @@ async def upload_images(
         try:
             meme_id, saved_path = metadata_service.upload_bytes(content, target_key=clean)
         except (OSError, MetadataError) as exc:
+            if isinstance(exc, MetadataError) and exc.code == "target_exists":
+                # 并发首个提交可能已经完成 durable 落位；重新验证三方事实后
+                # 将竞争请求收束为幂等成功，不重复 acquire operation 或创建 Meme。
+                try:
+                    existing = metadata_service.find_existing_upload(clean, sha256=content_digest, size_bytes=len(content))
+                except MetadataError:
+                    existing = None
+                if existing is not None:
+                    existing_record, existing_path = existing
+                    try:
+                        _release_operation(request, grant)
+                    except OperationPolicyError:
+                        # 竞争请求可能已经由另一执行者提交同一 grant；此时
+                        # durable 事实优先，保留 policy 的未知状态供恢复器处理。
+                        pass
+                    results.append(_idempotent_upload_result(request, metadata_service, existing_record, existing_path, original=original, reverse_image_policy=reverse_image_policy, auto_name=auto_name))
+                    continue
             # 只有明确知道 durable 写入未开始时才能 release；普通 I/O 异常保留
             # reservation，避免把未知副作用错误地返还给宿主额度。
             if isinstance(exc, MetadataError) and exc.code in {"target_exists", "invalid_filename", "invalid_image", "staging_conflict", "staging_write_failed"} and grant is not None:

@@ -25,6 +25,21 @@ describe('请求封装', () => {
     })
   })
 
+  it('保留 429 Retry-After 供上传调度器退避', async () => {
+    fetch.mockResolvedValue({
+      ok: false,
+      status: 429,
+      headers: { get: (name) => name === 'retry-after' ? '3' : null },
+      json: async () => ({ detail: { error: 'rate_limited', message: '稍后重试' } }),
+    })
+
+    await expect(request('/images/upload', { method: 'POST', body: new FormData() })).rejects.toMatchObject({
+      code: 'rate_limited',
+      status: 429,
+      retryAfter: 3,
+    })
+  })
+
   it('图片元数据查询只使用稳定 meme_id', async () => {
     await api.imageMetadata('meme-1')
 

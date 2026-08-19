@@ -88,6 +88,10 @@ class Settings(BaseSettings):
     rate_limit_requests: int = Field(default=60, ge=1, validation_alias=AliasChoices("MEMEMEOW_RATE_LIMIT_REQUESTS", "rate_limit_requests"))
     rate_limit_window: int = Field(default=60, ge=1, validation_alias=AliasChoices("MEMEMEOW_RATE_LIMIT_WINDOW", "rate_limit_window"))
     max_upload_size: int = Field(default=20 * 1024 * 1024, ge=1, validation_alias=AliasChoices("MEMEMEOW_MAX_UPLOAD_SIZE", "max_upload_size"))
+    # 上传请求边界是服务端权威；客户端只把 /config 中的值用于调度提示。
+    max_files_per_request: int = Field(default=20, ge=1, le=20, validation_alias=AliasChoices("MEMEMEOW_MAX_FILES_PER_REQUEST", "max_files_per_request"))
+    max_concurrent_upload_requests: int = Field(default=2, ge=1, le=2, validation_alias=AliasChoices("MEMEMEOW_MAX_CONCURRENT_UPLOAD_REQUESTS", "max_concurrent_upload_requests"))
+    max_request_bytes: int | None = Field(default=None, ge=1, le=4 * 1024 * 1024 * 1024, validation_alias=AliasChoices("MEMEMEOW_MAX_REQUEST_BYTES", "max_request_bytes"))
     opencode_executable: str | None = Field(default="opencode", validation_alias=AliasChoices("MEMEMEOW_OPENCODE_EXECUTABLE", "opencode_executable"))
     agent_runtime_mode: str = Field(default="auto", validation_alias=AliasChoices("MEMEMEOW_AGENT_RUNTIME_MODE", "agent_runtime_mode"))
     opencode_model: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_MODEL", "opencode_model"))
@@ -156,6 +160,7 @@ class Settings(BaseSettings):
         "settings_admin_token",
         "agent_callback_verification_keys",
         "database_url",
+        "max_request_bytes",
         mode="before",
     )
     @classmethod
@@ -325,6 +330,9 @@ class Settings(BaseSettings):
             "database_configured": bool(self.database_url),
             "worker_lease_seconds": self.worker_lease_seconds,
             "worker_heartbeat_seconds": self.worker_heartbeat_seconds,
+            "max_files_per_request": self.max_files_per_request,
+            "max_concurrent_upload_requests": self.max_concurrent_upload_requests,
+            "max_request_bytes": self.max_request_bytes,
         }
 
     def backend_status(self, *, cache_ready: bool = False, runtime_ready: bool = False) -> dict[str, object]:

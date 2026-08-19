@@ -51,7 +51,7 @@ app = create_app(scope_resolver=LocalScopeResolver("local"))
 - `GET /images/metadata?meme_id=`：读取当前 scope 指定 Meme 的完整数据库语境；不接受路径式资源标识。
 - `POST /images/rename`：请求 `{ "meme_id": "...", "new_name": "new" }`，保留原扩展名且拒绝覆盖。
 - `POST /images/delete`：请求 `{ "meme_id": "..." }`，隔离并删除图片及数据库 Meme。
-- `POST /images/upload`：multipart 字段 `reverse_image_policy=forbid|auto`、`auto_name=true|false` 和多个 `files`，逐文件返回成功或失败，图片直接写入当前请求 scope 的受控图片根；成功入库后自动创建或复用逐图处理 job；不接受目标目录、`scope_id` 或 `user_id`。
+- `POST /images/upload`：multipart 字段 `reverse_image_policy=forbid|auto`、`auto_name=true|false` 和多个 `files`，单请求最多 20 个文件，逐文件返回成功或失败，图片直接写入当前请求 scope 的受控图片根；成功入库后自动创建或复用逐图处理 job；不接受目标目录、`scope_id` 或 `user_id`。部署可通过 `MEMEMEOW_MAX_REQUEST_BYTES` 启用总请求字节预算，未配置时不启用总量限制；响应丢失后的同名、同 SHA、同大小提交会返回既有 `meme_id` 和当前处理状态。
 - 上传成功会在 PostgreSQL 创建稳定 `meme_id` 和 `pending` 元数据记录；`meme_context.title` 初始为 `null`。数据库是唯一结构化事实，运行时不读取或写入 sidecar。
 - `GET /media/{meme_id}`：按当前请求 scope 稳定 Meme ID 受控读取 PNG/JPG/JPEG/GIF；跨 scope ID 返回 `404 meme_not_found`。
 
@@ -114,7 +114,7 @@ Agent 只获得当前任务 token、内部地址和 executor token，不获得 c
 
 ## 配置与访问策略
 
-- `GET /config`：只返回模型名、provider 是否配置和 `*_api_key_configured` 布尔状态；完整 URL、路径和密钥不返回。
+- `GET /config`：只返回模型名、provider 是否配置和 `*_api_key_configured` 布尔状态；完整 URL、路径和密钥不返回。上传能力字段包含 `max_files_per_request: 20`、`max_concurrent_upload_requests: 2` 和可选 `max_request_bytes: null|正整数`，供客户端调度使用，服务端仍是最终边界。
 - 本地视觉活动模型固定为 `dinov2_vitb14`、768 维和 `dinov2_vitb14-rgb224-first-frame-v1`；Compose API 从 `mememeow-visual:8276/health` 读取真实模型状态，权重只在视觉容器内只读挂载并按 `MEMEMEOW_VISUAL_WEIGHTS_SHA256` 校验，未配置时任务返回 `visual_model_not_configured`。历史 DINOv3 向量表保留但不会参与活动匹配。
 - 视觉源码目录由 `MEMEMEOW_VISUAL_MODEL_REPO` 配置，仅服务端读取；源码提交和权重许可要求见 [`docs/visual-model-baseline.md`](docs/visual-model-baseline.md)。
 - Agent 通过内部 `POST /internal/visual-search/match` 发送 `{ "task_id": "...", "top_k": 20, "exclude_self": true }`。scope、查询图片和向量空间均从运行中的 Agent 任务推导；候选必须同 scope、当前 SHA 有效并有成功 research provenance。

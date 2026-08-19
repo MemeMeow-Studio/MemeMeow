@@ -13,6 +13,9 @@ export interface ServiceConfig {
   embedding_model?: string
   embedding_cache_ready?: boolean
   reverse_image_available?: boolean
+  max_files_per_request?: number
+  max_concurrent_upload_requests?: number
+  max_request_bytes?: number | null
 }
 
 export interface ImageProcessingOptions {
@@ -141,6 +144,11 @@ export interface UploadResult {
   processing_job_id?: string
   auto_name?: boolean
   reverse_image_policy?: 'forbid' | 'auto'
+  idempotent?: boolean
+  processing_status?: string
+  processing_progress?: number | null
+  processing_message?: string | null
+  metadata_status?: string
 }
 
 export interface UnreadyProcessingResponse {

@@ -22,6 +22,31 @@ def test_visual_defaults_pin_dinov2_vitb14_identity() -> None:
     assert settings.visual_preprocess_version == VISUAL_PREPROCESS_VERSION
 
 
+def test_upload_limits_default_to_public_two_lane_contract() -> None:
+    """上传边界默认公开 20 文件、2 并发，并关闭可选总字节预算。"""
+    settings = Settings(_env_file=None)
+    assert settings.max_files_per_request == 20
+    assert settings.max_concurrent_upload_requests == 2
+    assert settings.max_request_bytes is None
+    assert settings.status()["max_request_bytes"] is None
+
+
+def test_upload_limits_validate_deployment_bounds() -> None:
+    """上传文件数、并发数和总预算拒绝越过服务端边界的配置。"""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, max_files_per_request=21)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, max_concurrent_upload_requests=3)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, max_request_bytes=0)
+
+
+def test_upload_limits_accept_optional_total_budget() -> None:
+    """部署配置有效总请求预算后可被状态接口安全返回。"""
+    settings = Settings(_env_file=None, max_request_bytes=128)
+    assert settings.status()["max_request_bytes"] == 128
+
+
 def test_visual_known_previous_model_requires_schema_migration() -> None:
     """已归档的 DINOv3 模型不能仅靠环境变量重新启用。"""
     with pytest.raises(ValidationError, match="visual_model_migration_required"):

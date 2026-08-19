@@ -42,7 +42,7 @@ describe('UploadWorkspace', () => {
     await flushPromises()
 
     expect(upload).toHaveBeenCalledTimes(1)
-    expect(upload).toHaveBeenCalledWith(files, { reverse_image_policy: 'auto', auto_name: true })
+    expect(upload).toHaveBeenCalledWith(files, { reverse_image_policy: 'auto', auto_name: true }, expect.objectContaining({ signal: expect.any(AbortSignal) }))
   })
 
   it('联网能力不可用时保持 forbid 可选并禁用 auto', async () => {
@@ -104,6 +104,6 @@ describe('UploadWorkspace', () => {
     expect(wrapper.get('.processing-options-dialog input[type="checkbox"]').element.checked).toBe(false)
     await wrapper.get('.processing-options-dialog form').trigger('submit')
     await flushPromises()
-    expect(upload).toHaveBeenNthCalledWith(2, [files[1]], { reverse_image_policy: 'forbid', auto_name: false })
+    expect(upload).toHaveBeenNthCalledWith(2, [files[1]], { reverse_image_policy: 'forbid', auto_name: false }, expect.objectContaining({ signal: expect.any(AbortSignal) }))
   })
 })

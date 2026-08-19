@@ -195,6 +195,10 @@ button, input, select, textarea { border-radius: var(--radius-control); }
 .upload-result.fail > span { color: var(--error); }
 .upload-result strong { min-width: 0; overflow-wrap: anywhere; }
 .upload-result small { margin-left: auto; color: var(--muted); font-size: 14px; }
+.upload-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 14px; color: var(--ink-soft); font-size: 15px; }
+.upload-summary strong { color: var(--ink); }
+.upload-summary .quiet { min-height: 40px; margin-left: auto; }
+.summary-muted { color: var(--muted); }
 
 .settings-workspace { max-width: 920px; }
 .settings-section { border-top: 1px solid var(--line); padding: 24px 0 28px; }

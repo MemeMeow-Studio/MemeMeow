@@ -214,6 +214,35 @@ class PostgresMetadataService:
                 raise MetadataError("metadata_image_mismatch")
             return record, image
 
+    def find_existing_upload(self, target_key: str, *, sha256: str, size_bytes: int) -> tuple[Meme, Path] | None:
+        """按当前 scope 验证可幂等认领的 durable 上传事实。
+
+        返回值为数据库 Meme 与受控图片路径；目标不存在时返回 ``None``。只要目标
+        文件或数据库记录存在但任一指纹不一致，就返回 reconciliation 错误，避免
+        把孤立文件或损坏记录误认成上传成功。
+        """
+        with self.resources.environment(self.scope.scope_id) as environment:
+            record = environment.memes.by_storage_key(target_key)
+        try:
+            image = self.blob_store.resolve(target_key, must_exist=True)
+        except DatabaseError as exc:
+            if record is None and exc.code == "file_not_found":
+                return None
+            raise MetadataError("upload_reconciliation_required") from exc
+        if record is None:
+            raise MetadataError("upload_reconciliation_required")
+        try:
+            identity = self._identity(image)
+        except MetadataError as exc:
+            raise MetadataError("upload_reconciliation_required") from exc
+        # 先验证数据库与存储彼此一致；两者一致但与本次上传不同只是正常同名冲突，
+        # 不应被误报为 reconciliation。只有 durable 事实自身不一致才进入修复路径。
+        if record.size_bytes != identity["size_bytes"] or record.sha256.lower() != str(identity["sha256"]).lower():
+            raise MetadataError("upload_reconciliation_required")
+        if record.size_bytes != size_bytes or record.sha256.lower() != sha256.lower():
+            raise MetadataError("file_exists")
+        return record, image
+
     def create_pending(self, image: Path, *, status: str = "pending", meme_id: UUID | None = None) -> SidecarMetadata:
         """为合法图片幂等创建数据库 Meme 和 pending 语境。"""
         if status not in CONTEXT_STATUSES:

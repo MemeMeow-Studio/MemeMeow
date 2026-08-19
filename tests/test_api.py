@@ -19,7 +19,7 @@ from sqlalchemy import select, text
 
 from api import app
 from backend.collection_packages import CollectionManifest, CollectionManifestCollection, CollectionManifestMember, serialize_manifest, sha256_bytes
-from backend.database import EMBEDDING_DIMENSIONS, Meme, MemeTextEmbedding, Task, create_engine_for_url
+from backend.database import EMBEDDING_DIMENSIONS, ImageProcessingJob, Meme, MemeTextEmbedding, StorageOperation, Task, create_engine_for_url
 from backend.image_processing import ImageProcessingWorker
 
 
@@ -217,6 +217,96 @@ def test_upload_lists_and_serves_image(client):
     assert listed["media_url"] == f"/media/{meme_id}"
     assert listed["metadata"]["status"] == "pending"
     assert listed["embedding_status"] == "pending"
+
+
+def test_upload_rejects_more_than_twenty_files_before_durable_write(client):
+    """超过每请求文件数边界时在任何 Meme 或 operation 写入前拒绝。"""
+    test_client, _ = client
+    response = test_client.post(
+        "/images/upload",
+        files=[("files", (f"too-many-{index}.png", png_bytes(), "image/png")) for index in range(21)],
+    )
+    assert response.status_code == 413
+    assert response.json()["error"] == "too_many_files"
+    assert test_client.get("/images").json()["total"] == 0
+
+
+def test_upload_accepts_twenty_files_and_exposes_default_limits(client):
+    """恰好 20 个文件可以逐项入库，配置响应保持默认 20/2/disabled。"""
+    test_client, _ = client
+    response = test_client.post(
+        "/images/upload",
+        files=[("files", (f"limit-{index}.png", png_bytes(), "image/png")) for index in range(20)],
+    )
+    assert response.status_code == 200
+    assert len(response.json()["results"]) == 20
+    assert all(item["ok"] for item in response.json()["results"])
+    config = test_client.get("/config").json()
+    assert config["max_files_per_request"] == 20
+    assert config["max_concurrent_upload_requests"] == 2
+    assert config["max_request_bytes"] is None
+
+
+def test_upload_optional_total_budget_is_enforced_without_content_length_dependency(client):
+    """启用总预算后按实际读取字节拒绝超限请求，而不是信任 Content-Length。"""
+    test_client, _ = client
+    settings = test_client.app.state.settings
+    previous = settings.max_request_bytes
+    settings.max_request_bytes = len(png_bytes())
+    try:
+        response = test_client.post(
+            "/images/upload",
+            files=[
+                ("files", ("budget-a.png", png_bytes("red"), "image/png")),
+                ("files", ("budget-b.png", png_bytes("blue"), "image/png")),
+            ],
+        )
+    finally:
+        settings.max_request_bytes = previous
+    assert response.status_code == 413
+    assert response.json()["error"] == "request_too_large"
+    assert test_client.get("/images").json()["total"] == 0
+
+
+def test_upload_retry_reuses_durable_meme_operation_and_processing_job(client):
+    """响应丢失后的同内容重试只返回原 Meme 和处理 job，不重复 durable 事实。"""
+    test_client, _ = client
+    content = png_bytes("red")
+    first = test_client.post("/images/upload", files=[("files", ("idempotent.png", content, "image/png"))])
+    assert first.status_code == 200
+    first_item = first.json()["results"][0]
+    engine = test_client.app.state.database.engine
+    with engine.connect() as connection:
+        before = (
+            connection.execute(select(Meme).where(Meme.scope_id == "local")).all(),
+            connection.execute(select(StorageOperation).where(StorageOperation.scope_id == "local")).all(),
+            connection.execute(select(ImageProcessingJob).where(ImageProcessingJob.scope_id == "local")).all(),
+        )
+    second = test_client.post("/images/upload", files=[("files", ("idempotent.png", content, "image/png"))])
+    assert second.status_code == 200
+    second_item = second.json()["results"][0]
+    assert second_item["ok"] is True
+    assert second_item["idempotent"] is True
+    assert second_item["meme_id"] == first_item["meme_id"]
+    with engine.connect() as connection:
+        after = (
+            connection.execute(select(Meme).where(Meme.scope_id == "local")).all(),
+            connection.execute(select(StorageOperation).where(StorageOperation.scope_id == "local")).all(),
+            connection.execute(select(ImageProcessingJob).where(ImageProcessingJob.scope_id == "local")).all(),
+        )
+    assert tuple(len(items) for items in after) == tuple(len(items) for items in before)
+
+
+def test_upload_retry_reports_reconciliation_when_file_fact_changes(client):
+    """数据库记录与实际文件指纹不一致时不盲目认领上传。"""
+    test_client, tmp_path = client
+    content = png_bytes("red")
+    first = test_client.post("/images/upload", files=[("files", ("reconcile.png", content, "image/png"))])
+    assert first.status_code == 200
+    (tmp_path / "images" / "reconcile.png").write_bytes(png_bytes("blue"))
+    response = test_client.post("/images/upload", files=[("files", ("reconcile.png", content, "image/png"))])
+    assert response.status_code == 200
+    assert response.json()["results"][0]["error"] == "upload_reconciliation_required"
 
 
 def test_multi_upload_seals_visual_batch(client):
