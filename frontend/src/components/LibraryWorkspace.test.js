@@ -15,6 +15,7 @@ vi.mock('../api', () => ({
   api: { images, imageMetadata, contextBatch, retryImageStagesBatch, unreadyProcessing, submitImageStage },
 }))
 
+import { api } from '../api'
 import LibraryWorkspace from './LibraryWorkspace.vue'
 
 const image = {
@@ -121,6 +122,50 @@ describe('LibraryWorkspace', () => {
     expect(unreadyProcessing.mock.calls[0][0]).not.toHaveProperty('items')
     expect(unreadyProcessing.mock.calls[0][0]).not.toHaveProperty('search')
     expect(unreadyProcessing.mock.calls[0][0]).not.toHaveProperty('cursor')
+  })
+
+  it('即使完整重试能力尚未注入，点击主按钮也先显示图片处理选项且不请求', async () => {
+    const submitUnreadyProcessing = api.unreadyProcessing
+    delete api.unreadyProcessing
+    try {
+      const wrapper = mount(LibraryWorkspace, {
+        props: { config: null, cacheTask: null, cacheBusy: false, refreshToken: 0 },
+      })
+      await flushPromises()
+
+      await fullRetryButton(wrapper).trigger('click')
+
+      expect(wrapper.get('[role="dialog"][aria-labelledby="processing-options-title"]').text()).toContain('图片处理选项')
+      expect(unreadyProcessing).not.toHaveBeenCalled()
+      await wrapper.get('[aria-label="取消图片处理"]').trigger('click')
+      expect(unreadyProcessing).not.toHaveBeenCalled()
+      wrapper.unmount()
+    } finally {
+      api.unreadyProcessing = submitUnreadyProcessing
+    }
+  })
+
+  it('提交失败时保留已选处理选项，允许用户再次确认', async () => {
+    unreadyProcessing.mockRejectedValueOnce(new Error('network_failed'))
+    const wrapper = mount(LibraryWorkspace, {
+      props: { config: { reverse_image_available: true }, cacheTask: null, cacheBusy: false, refreshToken: 0 },
+    })
+    await flushPromises()
+
+    await fullRetryButton(wrapper).trigger('click')
+    await wrapper.get('.processing-options-dialog input[value="auto"]').setValue(true)
+    await wrapper.get('.processing-options-dialog input[type="checkbox"]').setValue(true)
+    await wrapper.get('.processing-options-dialog form').trigger('submit')
+    await flushPromises()
+
+    expect(wrapper.get('.processing-options-dialog input[value="auto"]').element.checked).toBe(true)
+    expect(wrapper.get('.processing-options-dialog input[type="checkbox"]').element.checked).toBe(true)
+    expect(unreadyProcessing).toHaveBeenCalledTimes(1)
+
+    await wrapper.get('.processing-options-dialog form').trigger('submit')
+    await flushPromises()
+    expect(unreadyProcessing).toHaveBeenCalledTimes(2)
+    wrapper.unmount()
   })
 
   it('按提交、复用、冲突和失败分类展示 scope 级摘要及逐图结果', async () => {

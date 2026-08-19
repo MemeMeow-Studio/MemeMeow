@@ -258,10 +258,6 @@ async function confirmRetrySelected(payload: { mode: SelectedImageRetryMode; sta
 /** 打开 scope 级完整重试的共享选项对话框。 */
 function openUnreadyOptions(event: MouseEvent): void {
   if (retryBusy.value) return
-  if (typeof api.unreadyProcessing !== 'function') {
-    emit('error', '完整重试服务不可用')
-    return
-  }
   if (!preserveRetryOptions.value) retryOptions.value = { reverse_image_policy: 'forbid', auto_name: false }
   retryDetails.value = []
   processingOptionsTrigger.value = event.currentTarget instanceof HTMLElement ? event.currentTarget : null
@@ -284,9 +280,15 @@ async function confirmUnreadyOptions(options: ImageProcessingOptions): Promise<v
   retryNotice.value = ''
   retryOptions.value = options
   preserveRetryOptions.value = true
+  const submitUnreadyProcessing = api.unreadyProcessing
+  if (typeof submitUnreadyProcessing !== 'function') {
+    // API 能力尚未注入时也先保留选项弹层，避免点击主按钮变成无反馈操作。
+    emit('error', '完整重试服务不可用')
+    return
+  }
   retryBusy.value = true
   try {
-    const response = await api.unreadyProcessing(options) as UnreadyProcessingResponse
+    const response = await submitUnreadyProcessing(options) as UnreadyProcessingResponse
     retryDetails.value = response.results || []
     retryNotice.value = `完整重试：目标 ${response.target_count ?? 0}，提交 ${response.submitted_count ?? 0}，复用 ${response.reused_count ?? 0}，冲突 ${response.conflict_count ?? 0}，失败 ${response.failed_count ?? 0}`
     processingOptionsOpen.value = false

@@ -91,13 +91,17 @@ test('完整重试使用 scope 端点，取消不请求且 320px 弹层不越界
 /** 使用真实浏览器核对默认选择、指定阶段多选和桌面/移动弹层布局。 */
 test('重试选中默认可选择并按指定阶段提交', async ({ page }) => {
   const stageRequests = []
+  const fullRetryRequests = []
+  const consoleErrors = []
+  page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()) })
+  page.on('pageerror', (error) => { consoleErrors.push(error.message) })
   await page.route('**/api/images?**', (route) => route.fulfill({
     status: 200,
     contentType: 'application/json',
     body: JSON.stringify({
       items: [
-        { meme_id: '55555555-5555-4555-8555-555555555555', filename: 'pending.png', size: 1024, extension: '.png', media_url: '/media/pending', metadata: { status: 'pending' }, embedding_status: 'pending', visual_embedding_status: 'pending' },
-        { meme_id: '66666666-6666-4666-8666-666666666666', filename: 'ready.png', size: 2048, extension: '.png', media_url: '/media/ready', metadata: { status: 'ready' }, embedding_status: 'ready', visual_embedding_status: 'ready' },
+        { meme_id: '55555555-5555-4555-8555-555555555555', filename: 'pending.png', size: 1024, extension: '.png', media_url: 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=', metadata: { status: 'pending' }, embedding_status: 'pending', visual_embedding_status: 'pending' },
+        { meme_id: '66666666-6666-4666-8666-666666666666', filename: 'ready.png', size: 2048, extension: '.png', media_url: 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=', metadata: { status: 'ready' }, embedding_status: 'ready', visual_embedding_status: 'ready' },
       ],
       total: 2,
       page: 1,
@@ -112,6 +116,14 @@ test('重试选中默认可选择并按指定阶段提交', async ({ page }) => 
       body: JSON.stringify({ target_count: 2, submitted_count: 2, failed_count: 0, results: [] }),
     })
   })
+  await page.route('**/api/images/context/batch', async (route) => {
+    fullRetryRequests.push(route.request())
+    await route.fulfill({
+      status: 202,
+      contentType: 'application/json',
+      body: JSON.stringify({ results: [{ meme_id: '55555555-5555-4555-8555-555555555555', task_id: 'job-1' }] }),
+    })
+  })
 
   await page.goto('/')
   await page.setViewportSize({ width: 1440, height: 1000 })
@@ -121,8 +133,23 @@ test('重试选中默认可选择并按指定阶段提交', async ({ page }) => 
   await expect(page.getByRole('button', { name: /^重试选中/ })).toBeDisabled()
 
   await page.locator('.image-check input').first().check()
-  await page.getByRole('button', { name: /^重试选中/ }).click()
+  const retryButton = page.getByRole('button', { name: /^重试选中/ })
+  expect(stageRequests).toHaveLength(0)
+  expect(fullRetryRequests).toHaveLength(0)
+  await retryButton.click()
   const dialog = page.getByRole('dialog', { name: '重试选中' })
+  await expect(dialog).toBeVisible()
+  await expect(dialog).toContainText('已选 1 张图片，选择本次要重新处理的范围。')
+  await expect(dialog.getByRole('button', { name: '完整重试' })).toBeEnabled()
+  expect(stageRequests).toHaveLength(0)
+  expect(fullRetryRequests).toHaveLength(0)
+  await page.keyboard.press('Escape')
+  await expect(dialog).toBeHidden()
+  await expect(retryButton).toBeFocused()
+  expect(stageRequests).toHaveLength(0)
+  expect(fullRetryRequests).toHaveLength(0)
+
+  await retryButton.click()
   await expect(dialog).toBeVisible()
   await page.screenshot({ path: '/home/infstellar/vscode/MemeMeow/frontend/test-results/retry-selected-desktop.png', fullPage: true })
 
@@ -138,6 +165,7 @@ test('重试选中默认可选择并按指定阶段提交', async ({ page }) => 
     items: [{ meme_id: '55555555-5555-4555-8555-555555555555' }],
     stages: ['agent', 'text_embedding'],
   })
+  expect(consoleErrors).toEqual([])
 })
 
 test('首页可加载并切换核心工作区', async ({ page }) => {

@@ -85,9 +85,12 @@ cd MemeMeow
 
 2. 创建 Compose 配置
 ```bash
-cp .env.example .env
+uv run python -m scripts.sync_env
 # 编辑 .env，填写需要的模型凭据和可选视觉权重配置
 ```
+
+重复运行同步命令时，`.env.example` 继续提供字段顺序、分组注释和默认值；已有
+`.env` 的同名字段值会被保留，模板中没有的本地字段会追加到文件末尾。
 
 3. 启动 Compose 全栈
 ```bash
