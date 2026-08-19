@@ -57,6 +57,12 @@ _KNOWN_TASK_ERRORS = frozenset(
         "agent_connection_interrupted",
         "session_binding_mismatch",
         "session_not_resumable",
+        "opencode_workspace_invalid",
+        "opencode_workspace_mismatch",
+        "opencode_workspace_capability_invalid",
+        "opencode_workspace_capability_expired",
+        "opencode_workspace_capability_unavailable",
+        "opencode_workspace_provider_missing",
     }
 )
 
@@ -249,7 +255,21 @@ class AgentExecutorClient:
         """返回当前业务任务最近一次提交的 executor attempt 标识。"""
         return self._attempt_ids.get(task_id)
 
-    def run(self, *, task_id: str, image_relative_path: str, reverse_image_policy: str, timeout_seconds: int, callback_token: str | None = None, executor_attempt_id: str | None = None, session_id: str | None = None, resume_of_attempt_id: str | None = None, processing_config_hash: str | None = None) -> ExecutorTaskResponse:
+    def run(
+        self,
+        *,
+        task_id: str,
+        image_relative_path: str,
+        reverse_image_policy: str,
+        timeout_seconds: int,
+        callback_token: str | None = None,
+        executor_attempt_id: str | None = None,
+        session_id: str | None = None,
+        resume_of_attempt_id: str | None = None,
+        processing_config_hash: str | None = None,
+        workspace_selector: str | None = None,
+        workspace_capability: str | None = None,
+    ) -> ExecutorTaskResponse:
         """提交业务任务的独立 executor attempt，并可按明确 session 续跑。"""
         timeout_value = int(timeout_seconds)
         attempt_id = executor_attempt_id or f"attempt-{uuid4().hex}"
@@ -272,6 +292,8 @@ class AgentExecutorClient:
                     **({"session_id": session_id} if session_id else {}),
                     **({"resume_of_attempt_id": resume_of_attempt_id} if resume_of_attempt_id else {}),
                     **({"processing_config_hash": processing_config_hash} if processing_config_hash else {}),
+                    **({"workspace_selector": workspace_selector} if workspace_selector else {}),
+                    **({"workspace_capability": workspace_capability} if workspace_capability else {}),
                     **({"callback_token": callback_token} if callback_token else {}),
                 },
                 timeout=max(self.timeout, timeout_value + 10),

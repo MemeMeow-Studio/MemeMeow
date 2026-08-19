@@ -101,6 +101,10 @@ class Settings(BaseSettings):
     reverse_image_cache_root: Path | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_REVERSE_IMAGE_CACHE_ROOT", "reverse_image_cache_root"))
     reverse_image_internal_url: str = Field(default="http://127.0.0.1:8275/internal/reverse-image/search", validation_alias=AliasChoices("MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL", "reverse_image_internal_url"))
     opencode_runtime_root: Path | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_RUNTIME_ROOT", "opencode_runtime_root"))
+    # 外部 scope workspace 由宿主预装配；selector capability 使用独立签名材料。
+    opencode_workspace_root: Path | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_WORKSPACE_ROOT", "MEMEMEOW_AGENT_WORKSPACE_ROOT", "opencode_workspace_root"))
+    opencode_workspace_capability_key: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_WORKSPACE_CAPABILITY_KEY", "MEMEMEOW_AGENT_WORKSPACE_CAPABILITY_KEY", "opencode_workspace_capability_key"), repr=False)
+    opencode_workspace_capability_ttl_seconds: int = Field(default=300, ge=1, le=3600, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_WORKSPACE_CAPABILITY_TTL_SECONDS", "opencode_workspace_capability_ttl_seconds"))
     opencode_timeout_seconds: int = Field(default=300, ge=1, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_TIMEOUT_SECONDS", "opencode_timeout_seconds"))
     # 保留旧配置字段供部署和外部调用方读取；OpenCode 输出现在通过临时文件流式承接，不再按该值截断。
     opencode_max_output_bytes: int = Field(default=2 * 1024 * 1024, ge=1024, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_MAX_OUTPUT_BYTES", "opencode_max_output_bytes"))
@@ -277,6 +281,7 @@ class Settings(BaseSettings):
             "opencode_concurrency": self.opencode_concurrency,
             "agent_backpressure": self.agent_backpressure,
             "protected_mode": self.protected_mode,
+            "opencode_workspace_root_configured": bool(self.opencode_workspace_root),
         }
         return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
@@ -317,6 +322,8 @@ class Settings(BaseSettings):
             "opencode_configured": bool(self.opencode_executable and self.opencode_model and self.opencode_base_url and self.opencode_api_key),
             "agent_executor_configured": bool(self.agent_executor_url),
             "agent_executor_token_configured": bool(self.agent_executor_token),
+            "opencode_workspace_root_configured": bool(self.opencode_workspace_root),
+            "opencode_workspace_capability_configured": bool(self.opencode_workspace_capability_key),
             "agent_runtime_mode": self.agent_runtime_mode,
             "data_root_configured": True,
             "opencode_concurrency": self.opencode_concurrency,
@@ -374,6 +381,7 @@ class Settings(BaseSettings):
         deployment = {
             "opencode_executable": {"configured": bool(self.opencode_executable)},
             "runtime_root": {"configured": bool(self.opencode_runtime_root)},
+            "workspace_root": {"configured": bool(self.opencode_workspace_root)},
             "data_root": {"configured": bool(self.data_root)},
             "provider_url": {"configured": bool(self.opencode_base_url or self.embedding_base_url)},
             "api_key": {"configured": bool(self.opencode_api_key or self.embedding_api_key)},

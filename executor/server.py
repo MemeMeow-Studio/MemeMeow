@@ -21,14 +21,21 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from backend.opencode import RUNTIME_OPENCODE_CONFIG
+from backend.opencode_workspace import (
+    SELECTOR_RE,
+    WorkspaceCapabilityError,
+    WorkspaceCapabilitySigner,
+    build_edit_permission_rules,
+    validate_directory_path,
+    validate_file_path,
+)
 from executor.token import ExecutorTokenError, ensure_token_file, read_token_file
-
 
 TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,254}\Z")
@@ -42,6 +49,7 @@ WORKSPACE = RUNTIME_ROOT / "workspace"
 RESULT_ROOT = RUNTIME_ROOT / "task-results"
 LOG_ROOT = RUNTIME_ROOT / "logs"
 SKILL_ROOT = Path(os.getenv("MEMEMEOW_EXECUTOR_SKILL_ROOT", "/skills/research-meme-context"))
+WORKSPACE_ROOT = Path(os.getenv("MEMEMEOW_EXECUTOR_WORKSPACE_ROOT", str(RUNTIME_ROOT / "workspaces")))
 DEFAULT_MAX_RESULT_BYTES = 1024 * 1024
 ALLOWED_REQUEST_FIELDS = frozenset(
     {
@@ -56,6 +64,8 @@ ALLOWED_REQUEST_FIELDS = frozenset(
         "timeout_seconds",
         "wait",
         "callback_token",
+        "workspace_selector",
+        "workspace_capability",
     }
 )
 REQUIRED_RESULT_FIELDS = frozenset(
@@ -88,6 +98,11 @@ _EXECUTOR_ERROR_CODES = frozenset(
         "agent_connection_interrupted",
         "session_binding_mismatch",
         "session_not_resumable",
+        "opencode_workspace_invalid",
+        "opencode_workspace_mismatch",
+        "opencode_workspace_capability_invalid",
+        "opencode_workspace_capability_expired",
+        "opencode_workspace_capability_unavailable",
     }
 )
 _SECRET_PATTERNS = (
@@ -197,10 +212,13 @@ def _stream_sample(stream: Any, limit: int) -> bytes:
 
 def _relative_image_path(value: object) -> Path:
     """验证图片相对路径，拒绝绝对路径、父级跳转和符号链接入口。"""
-    if not isinstance(value, str) or not value or len(value) > 512 or "\\" in value:
+    if not isinstance(value, str) or not value or len(value) > 512 or "\\" in value or re.match(r"^[A-Za-z]:", value):
+        raise ValueError("agent_image_path_forbidden")
+    raw_parts = value.split("/")
+    if any(not part or part in {".", ".."} for part in raw_parts) or any(ord(character) < 0x20 for character in value):
         raise ValueError("agent_image_path_forbidden")
     normalized = PurePosixPath(value)
-    if normalized.is_absolute() or not normalized.parts or any(part in {"", ".", ".."} for part in normalized.parts):
+    if normalized.is_absolute() or not normalized.parts:
         raise ValueError("agent_image_path_forbidden")
     return Path(*normalized.parts)
 
@@ -220,6 +238,15 @@ class TaskState:
     resume_of_attempt_id: str | None = None
     is_resume: bool = False
     callback_token: str | None = field(default=None, repr=False)
+    workspace_selector: str = "local"
+    workspace_capability: str | None = field(default=None, repr=False)
+    workspace_directory: Path | None = field(default=None, repr=False)
+    images_root: Path | None = field(default=None, repr=False)
+    metadata_root: Path | None = field(default=None, repr=False)
+    skill_root: Path | None = field(default=None, repr=False)
+    task_scratch_root: Path | None = field(default=None, repr=False)
+    config_file: Path | None = field(default=None, repr=False)
+    config_dir: Path | None = field(default=None, repr=False)
     status: str = "queued"
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -250,7 +277,23 @@ class TaskState:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "process_reaped": self.process_reaped,
+            "workspace_selector": self.workspace_selector,
         }
+
+
+@dataclass(frozen=True)
+class WorkspaceLayout:
+    """executor 内部已验证的 selector 目录布局。"""
+
+    selector: str
+    directory: Path
+    images_root: Path
+    metadata_root: Path
+    skill_root: Path
+    task_scratch_root: Path
+    config_file: Path
+    config_dir: Path
+    local: bool = False
 
 
 class Executor:
@@ -277,6 +320,11 @@ class Executor:
         self.backpressure = _env_int("MEMEMEOW_AGENT_BACKPRESSURE", 32, 1, 500)
         self.max_timeout = _env_int("MEMEMEOW_AGENT_EXECUTOR_MAX_TIMEOUT_SECONDS", 1800, 1, 7200)
         self.max_result_bytes = _env_int("MEMEMEOW_AGENT_RESULT_MAX_BYTES", DEFAULT_MAX_RESULT_BYTES, 1024, 16 * 1024 * 1024)
+        capability_key = os.getenv("MEMEMEOW_WORKSPACE_CAPABILITY_KEY", os.getenv("MEMEMEOW_AGENT_WORKSPACE_CAPABILITY_KEY", ""))
+        self.capability_signer = WorkspaceCapabilitySigner(capability_key)
+        # workspace root 只允许由部署预装配；executor 不因请求 selector 创建新的
+        # scope 目录。未配置时仍保留旧 local 请求兼容路径。
+        self.workspace_root = Path(os.getenv("MEMEMEOW_EXECUTOR_WORKSPACE_ROOT", str(WORKSPACE_ROOT)))
         self.lock = threading.RLock()
         self.tasks: dict[str, TaskState] = {}
         self.pool = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="mememeow-opencode")
@@ -338,6 +386,119 @@ class Executor:
         """返回尚未开始的任务数量，调用方可在锁外使用。"""
         with self.lock:
             return sum(1 for task in self.tasks.values() if task.status == "queued")
+
+    @staticmethod
+    def _checked_directory(path: Path, *, create: bool = False, missing_code: str = "opencode_workspace_invalid") -> Path:
+        """在 executor 边界逐级拒绝符号链接、文件和越界目录。"""
+        try:
+            return validate_directory_path(path, create=create, code=missing_code)
+        except Exception as exc:  # noqa: BLE001 - executor 对外只返回稳定错误码
+            raise ValueError(missing_code) from exc
+
+    def _workspace_layout(self, *, selector: str | None, business_task_id: str) -> WorkspaceLayout:
+        """把 selector 解析到固定布局；未知 selector 不创建任何 scope 目录。"""
+        if selector is None:
+            directory = self._checked_directory(WORKSPACE)
+            images_root = self._checked_directory(IMAGE_ROOT)
+            metadata_root = images_root
+            skill_root = self._checked_directory(SKILL_ROOT)
+            base = directory
+            local = True
+        else:
+            if not isinstance(selector, str) or not SELECTOR_RE.fullmatch(selector):
+                raise ValueError("opencode_workspace_invalid")
+            if selector == "local":
+                directory = self._checked_directory(WORKSPACE)
+                images_root = self._checked_directory(IMAGE_ROOT)
+                metadata_root = images_root
+                skill_root = self._checked_directory(SKILL_ROOT)
+                local = True
+                task_scratch = directory / "tasks" / business_task_id
+                return WorkspaceLayout(
+                    selector="local",
+                    directory=directory,
+                    images_root=images_root,
+                    metadata_root=metadata_root,
+                    skill_root=skill_root,
+                    task_scratch_root=task_scratch,
+                    config_file=task_scratch / "opencode.json",
+                    config_dir=task_scratch / ".opencode",
+                    local=True,
+                )
+            root = self._checked_directory(self.workspace_root, missing_code="opencode_workspace_invalid")
+            base = root / selector
+            self._checked_directory(base, missing_code="opencode_workspace_invalid")
+            directory = self._checked_directory(base / "workspace")
+            images_root = self._checked_directory(base / "images")
+            metadata_root = self._checked_directory(base / "metadata")
+            skill_root = self._checked_directory(base / "skills")
+            local = False
+        task_scratch = directory / "tasks" / business_task_id
+        # 只检查祖先；创建由 _run 在锁定任务后完成，校验失败不会留下目录。
+        tasks_root = directory / "tasks"
+        try:
+            tasks_root.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            self._checked_directory(tasks_root)
+        config_dir = task_scratch / ".opencode"
+        return WorkspaceLayout(
+            selector=selector or "local",
+            directory=directory,
+            images_root=images_root,
+            metadata_root=metadata_root,
+            skill_root=skill_root,
+            task_scratch_root=task_scratch,
+            config_file=task_scratch / "opencode.json",
+            config_dir=config_dir,
+            local=local,
+        )
+
+    def _verify_workspace_capability(self, values: dict[str, object]) -> None:
+        """校验 selector capability 的签名、受众、期限和 attempt 绑定。"""
+        selector = values.get("workspace_selector")
+        capability = values.get("workspace_capability")
+        if selector is None:
+            if capability is not None:
+                raise ValueError("opencode_workspace_mismatch")
+            return
+        if selector == "local" and capability is None:
+            # 显式 local 仍兼容旧单用户调用；非 local selector 永远需要签名材料。
+            return
+        if not isinstance(capability, str) or not capability:
+            raise ValueError("opencode_workspace_capability_unavailable")
+        if not self.capability_signer.configured:
+            raise ValueError("opencode_workspace_capability_unavailable")
+        try:
+            self.capability_signer.verify(
+                capability,
+                task_id=str(values["business_task_id"]),
+                attempt_id=str(values["executor_attempt_id"]),
+                selector=str(selector),
+                session_id=str(values["session_id"]) if isinstance(values.get("session_id"), str) else None,
+                resume_of_attempt_id=str(values["resume_of_attempt_id"]) if isinstance(values.get("resume_of_attempt_id"), str) else None,
+            )
+        except WorkspaceCapabilityError as exc:
+            raise ValueError(exc.code) from exc
+
+    def _verify_task_workspace_capability(self, task: TaskState) -> None:
+        """在排队任务真正启动前再次验证 capability，避免长队列越过有效期。"""
+        if task.workspace_selector == "local":
+            return
+        if not task.workspace_capability or not self.capability_signer.configured:
+            raise RuntimeError("opencode_workspace_capability_unavailable")
+        try:
+            self.capability_signer.verify(
+                task.workspace_capability,
+                task_id=task.business_task_id,
+                attempt_id=task.executor_attempt_id,
+                selector=task.workspace_selector,
+                session_id=task.session_id,
+                resume_of_attempt_id=task.resume_of_attempt_id,
+            )
+        except WorkspaceCapabilityError as exc:
+            raise RuntimeError(exc.code) from exc
 
     def _prune_history_locked(self) -> None:
         """限制内存中的终态历史，避免长期运行的 executor 被任务标识耗尽内存。"""
@@ -411,6 +572,7 @@ class Executor:
             "image_relative_path": task.image_relative_path,
             "reverse_image_policy": task.reverse_image_policy,
             "processing_config_hash": task.processing_config_hash,
+            "workspace_selector": task.workspace_selector,
             "session_id": task.session_id,
             "resume_of_attempt_id": task.resume_of_attempt_id,
             "status": task.status,
@@ -450,6 +612,7 @@ class Executor:
                 or entry.get("image_relative_path") != values.get("image_relative_path")
                 or entry.get("reverse_image_policy") != values.get("reverse_image_policy")
                 or entry.get("processing_config_hash") != values.get("processing_config_hash")
+                or entry.get("workspace_selector", "local") != (values.get("workspace_selector") or "local")
                 or (resume_of is not None and entry.get("executor_attempt_id") != resume_of)
             ):
                 continue
@@ -472,6 +635,7 @@ class Executor:
                 timeout_seconds=int(values["timeout_seconds"]),
                 processing_config_hash=values.get("processing_config_hash") if isinstance(values.get("processing_config_hash"), str) else None,
                 session_id=session_id,
+                workspace_selector=str(values.get("workspace_selector") or "local"),
                 status="failed",
                 error={str(key): value for key, value in error.items()},
                 created_at=float(entry.get("created_at")) if isinstance(entry.get("created_at"), (int, float)) else time.time(),
@@ -515,22 +679,24 @@ class Executor:
         ):
             raise ValueError("invalid_task")
         relative = _relative_image_path(payload.get("image_relative_path"))
-        image = IMAGE_ROOT / relative
-        try:
-            current = IMAGE_ROOT
-            for part in relative.parts:
-                current = current / part
-                if current.is_symlink():
+        raw_selector = payload.get("workspace_selector")
+        if raw_selector is None or raw_selector == "local":
+            image = IMAGE_ROOT / relative
+            try:
+                current = IMAGE_ROOT
+                for part in relative.parts:
+                    current = current / part
+                    if current.is_symlink():
+                        raise ValueError("agent_image_path_forbidden")
+                root = IMAGE_ROOT.resolve()
+                candidate = image.resolve(strict=True)
+                candidate.relative_to(root)
+                if not candidate.is_file():
                     raise ValueError("agent_image_path_forbidden")
-            root = IMAGE_ROOT.resolve()
-            candidate = image.resolve(strict=True)
-            candidate.relative_to(root)
-            if not candidate.is_file():
-                raise ValueError("agent_image_path_forbidden")
-        except (OSError, RuntimeError, ValueError) as exc:
-            if isinstance(exc, ValueError) and str(exc) == "agent_image_path_forbidden":
-                raise
-            raise ValueError("agent_image_path_forbidden") from exc
+            except (OSError, RuntimeError, ValueError) as exc:
+                if isinstance(exc, ValueError) and str(exc) == "agent_image_path_forbidden":
+                    raise
+                raise ValueError("agent_image_path_forbidden") from exc
         policy = payload.get("reverse_image_policy", "forbid")
         if policy not in {"forbid", "auto"}:
             raise ValueError("invalid_reverse_image_policy")
@@ -553,7 +719,13 @@ class Executor:
             or any(character.isspace() or ord(character) < 0x20 for character in callback_token)
         ):
             raise ValueError("invalid_task")
-        return {
+        workspace_selector = raw_selector
+        if workspace_selector is not None and (not isinstance(workspace_selector, str) or not SELECTOR_RE.fullmatch(workspace_selector)):
+            raise ValueError("opencode_workspace_invalid")
+        workspace_capability = payload.get("workspace_capability")
+        if workspace_capability is not None and (not isinstance(workspace_capability, str) or not workspace_capability or len(workspace_capability) > 4096):
+            raise ValueError("opencode_workspace_capability_invalid")
+        values = {
             "task_id": business_task_id,
             "business_task_id": business_task_id,
             "executor_attempt_id": executor_attempt_id,
@@ -565,7 +737,28 @@ class Executor:
             "timeout_seconds": timeout,
             "wait": wait,
             "callback_token": callback_token,
+            "workspace_selector": workspace_selector,
+            "workspace_capability": workspace_capability,
         }
+        self._verify_workspace_capability(values)
+        layout = self._workspace_layout(selector=workspace_selector if isinstance(workspace_selector, str) else None, business_task_id=business_task_id)
+        image = layout.images_root / relative
+        try:
+            current = layout.images_root
+            for part in relative.parts:
+                current = current / part
+                info = current.lstat()
+                if stat.S_ISLNK(info.st_mode):
+                    raise ValueError("agent_image_path_forbidden")
+            info = image.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("agent_image_path_forbidden")
+        except (OSError, ValueError) as exc:
+            if isinstance(exc, ValueError) and str(exc) == "agent_image_path_forbidden":
+                raise
+            raise ValueError("agent_image_path_forbidden") from exc
+        values["workspace_layout"] = layout
+        return values
 
     def _resume_source(self, values: dict[str, object]) -> TaskState | None:
         """查找与续跑 session 完全绑定的失败 attempt，拒绝跨任务猜测。"""
@@ -582,6 +775,7 @@ class Executor:
             and task.image_relative_path == values["image_relative_path"]
             and task.reverse_image_policy == values["reverse_image_policy"]
             and task.processing_config_hash == values.get("processing_config_hash")
+            and task.workspace_selector == (values.get("workspace_selector") or "local")
             and (resume_of is None or task.executor_attempt_id == resume_of)
         ]
         if not matches:
@@ -645,6 +839,15 @@ class Executor:
                 timeout_seconds=int(values["timeout_seconds"]),
                 processing_config_hash=values.get("processing_config_hash") if isinstance(values.get("processing_config_hash"), str) else None,
                 session_id=values.get("session_id") if isinstance(values.get("session_id"), str) else None,
+                workspace_selector=str(values.get("workspace_selector") or "local"),
+                workspace_capability=values.get("workspace_capability") if isinstance(values.get("workspace_capability"), str) else None,
+                workspace_directory=(values.get("workspace_layout").directory if isinstance(values.get("workspace_layout"), WorkspaceLayout) else None),
+                images_root=(values.get("workspace_layout").images_root if isinstance(values.get("workspace_layout"), WorkspaceLayout) else None),
+                metadata_root=(values.get("workspace_layout").metadata_root if isinstance(values.get("workspace_layout"), WorkspaceLayout) else None),
+                skill_root=(values.get("workspace_layout").skill_root if isinstance(values.get("workspace_layout"), WorkspaceLayout) else None),
+                task_scratch_root=(values.get("workspace_layout").task_scratch_root if isinstance(values.get("workspace_layout"), WorkspaceLayout) else None),
+                config_file=(values.get("workspace_layout").config_file if isinstance(values.get("workspace_layout"), WorkspaceLayout) else None),
+                config_dir=(values.get("workspace_layout").config_dir if isinstance(values.get("workspace_layout"), WorkspaceLayout) else None),
                 resume_of_attempt_id=source.executor_attempt_id if source else None,
                 is_resume=source is not None,
                 callback_token=values.get("callback_token") if isinstance(values.get("callback_token"), str) else None,
@@ -654,14 +857,89 @@ class Executor:
             self.futures[task.executor_attempt_id] = self.pool.submit(self._run, task)
             return task, bool(values["wait"])
 
+    @staticmethod
+    def _workspace_permission_rules(task: TaskState) -> dict[str, str]:
+        """生成 OpenCode 外部目录的最后匹配优先规则。"""
+        images = task.images_root or IMAGE_ROOT
+        metadata = task.metadata_root or IMAGE_ROOT
+        skills = task.skill_root or SKILL_ROOT
+        scratch = task.task_scratch_root or (WORKSPACE / "tasks" / task.business_task_id)
+        result_dir = RESULT_ROOT / task.business_task_id
+        subtree = lambda path: f"{Path(os.path.abspath(path)).as_posix()}/**"
+        return {
+            "*": "deny",
+            subtree(skills): "allow",
+            subtree(images): "allow",
+            subtree(metadata): "allow",
+            subtree(scratch): "allow",
+            # 外部文件工具先检查结果目录的 ``<dir>/*`` 父级模式；写入范围
+            # 由同一配置中的 ``edit`` 规则收窄到两个固定结果文件。
+            str(result_dir.absolute()) + "/*": "allow",
+            str((result_dir / RESULT_DRAFT_NAME).absolute()): "allow",
+            str((result_dir / RESULT_FILE_NAME).absolute()): "allow",
+        }
+
+    @staticmethod
+    def _workspace_edit_permission_rules(task: TaskState) -> dict[str, str]:
+        """生成只允许 Task 临时数据和两个结果文件的编辑规则。"""
+        scratch = task.task_scratch_root or (WORKSPACE / "tasks" / task.business_task_id)
+        config_file = task.config_file or scratch / "opencode.json"
+        config_dir = task.config_dir or scratch / ".opencode"
+        result_dir = RESULT_ROOT / task.business_task_id
+        return dict(
+            build_edit_permission_rules(
+                task_scratch_root=scratch,
+                config_file=config_file,
+                config_dir=config_dir,
+                draft_path=result_dir / RESULT_DRAFT_NAME,
+                result_path=result_dir / RESULT_FILE_NAME,
+            )
+        )
+
+    def _prepare_task_workspace(self, task: TaskState) -> None:
+        """创建当前 Task 临时目录并原子写入不含密钥的 workspace 配置。"""
+        scratch = task.task_scratch_root or (WORKSPACE / "tasks" / task.business_task_id)
+        config_file = task.config_file or scratch / "opencode.json"
+        config_dir = task.config_dir or scratch / ".opencode"
+        self._checked_directory(scratch.parent, create=True)
+        self._checked_directory(scratch, create=True)
+        self._checked_directory(config_dir, create=True)
+        try:
+            validate_file_path(config_file, allow_missing=True, code="opencode_workspace_invalid")
+        except Exception as exc:  # noqa: BLE001 - 配置路径是 executor 安全边界
+            raise RuntimeError("opencode_workspace_invalid") from exc
+        config = json.loads(json.dumps(RUNTIME_OPENCODE_CONFIG, ensure_ascii=False))
+        config["permission"] = {
+            "external_directory": self._workspace_permission_rules(task),
+            "edit": self._workspace_edit_permission_rules(task),
+        }
+        content = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+        temporary = config_file.with_name(f".{config_file.name}.tmp.{os.getpid()}.{id(task)}")
+        try:
+            validate_file_path(temporary, allow_missing=True, code="opencode_workspace_invalid")
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), stat.S_IRUSR | stat.S_IWUSR)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    descriptor = -1
+                    handle.write(content)
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("opencode_workspace_invalid") from exc
+        try:
+            os.replace(temporary, config_file)
+        except OSError as exc:
+            raise RuntimeError("opencode_workspace_invalid") from exc
+
     def _task_environment(self, task: TaskState) -> dict[str, str]:
         """构造 OpenCode 最小环境白名单，不继承 executor 容器中的无关变量。"""
         values = {
             "PATH": os.getenv("PATH", "/usr/local/bin:/usr/bin:/bin"),
             "HOME": os.getenv("HOME", "/runtime/home"),
             "OPENCODE_DB": str(RUNTIME_ROOT / "opencode.db"),
-            "OPENCODE_CONFIG": str(WORKSPACE / "opencode.json"),
-            "OPENCODE_CONFIG_DIR": str(WORKSPACE / ".opencode"),
+            "OPENCODE_CONFIG": str(task.config_file or (task.task_scratch_root or (WORKSPACE / "tasks" / task.business_task_id)) / "opencode.json"),
+            "OPENCODE_CONFIG_DIR": str(task.config_dir or (task.task_scratch_root or (WORKSPACE / "tasks" / task.business_task_id)) / ".opencode"),
             "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
             "MEMEMEOW_OPENCODE_BASE_URL": self.base_url,
             "MEMEMEOW_OPENCODE_API_KEY": self.api_key,
@@ -709,8 +987,10 @@ class Executor:
                     task.completed_at = time.time()
                     task.done.set()
                     return
+                self._verify_task_workspace_capability(task)
                 task.status = "running"
                 task.started_at = time.time()
+                self._prepare_task_workspace(task)
                 result_dir = RESULT_ROOT / task.task_id
                 if result_dir.is_symlink() or (result_dir.exists() and not result_dir.is_dir()):
                     raise RuntimeError("agent_result_path_invalid")
@@ -723,13 +1003,29 @@ class Executor:
                         if path.exists() or path.is_symlink():
                             path.unlink()
             env = self._task_environment(task)
-            image = IMAGE_ROOT / _relative_image_path(task.image_relative_path)
+            image_root = task.images_root or IMAGE_ROOT
+            image = image_root / _relative_image_path(task.image_relative_path)
+            try:
+                self._checked_directory(image_root)
+                current = image_root
+                for part in _relative_image_path(task.image_relative_path).parts:
+                    current = current / part
+                    info = current.lstat()
+                    if stat.S_ISLNK(info.st_mode):
+                        raise ValueError("agent_image_path_forbidden")
+                info = image.lstat()
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError("agent_image_path_forbidden")
+            except (OSError, ValueError) as exc:
+                if isinstance(exc, ValueError) and str(exc) == "agent_image_path_forbidden":
+                    raise
+                raise ValueError("agent_image_path_forbidden") from exc
             command = [
                 self.opencode_executable,
                 "run",
                 "--auto",
                 "--dir",
-                str(WORKSPACE),
+                str(task.workspace_directory or WORKSPACE),
                 "--format",
                 "json",
                 "--file",
@@ -745,7 +1041,7 @@ class Executor:
                 command.extend(("--session", task.session_id))
             command.append(self._prompt(task))
             with tempfile.TemporaryFile(dir=LOG_ROOT, prefix=f"{task.task_id}-", mode="w+b") as out, tempfile.TemporaryFile(dir=LOG_ROOT, prefix=f"{task.task_id}-", mode="w+b") as err:
-                process = subprocess.Popen(command, cwd=WORKSPACE, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+                process = subprocess.Popen(command, cwd=task.workspace_directory or WORKSPACE, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
                 with self.lock:
                     task.process = process
                     # 进程启动后，只有父进程确认 waitpid 收束才允许该 attempt 作为续跑源。
@@ -1113,6 +1409,11 @@ class Handler(BaseHTTPRequestHandler):
                 "invalid_reverse_image_policy": "反向图片策略无效",
                 "agent_timeout_limit_exceeded": "任务超时超过 executor 上限",
                 "session_binding_mismatch": "续跑 session 与任务事实不匹配",
+                "opencode_workspace_invalid": "workspace selector 或目录无效",
+                "opencode_workspace_mismatch": "workspace capability 与任务事实不匹配",
+                "opencode_workspace_capability_invalid": "workspace capability 无效",
+                "opencode_workspace_capability_expired": "workspace capability 已过期",
+                "opencode_workspace_capability_unavailable": "workspace capability 未配置",
             }
             if code not in messages and code not in {"invalid_task"}:
                 code = "invalid_task"
@@ -1128,6 +1429,11 @@ class Handler(BaseHTTPRequestHandler):
                 "session_binding_mismatch",
                 "session_not_resumable",
                 "unknown_execution",
+                "opencode_workspace_invalid",
+                "opencode_workspace_mismatch",
+                "opencode_workspace_capability_invalid",
+                "opencode_workspace_capability_expired",
+                "opencode_workspace_capability_unavailable",
             }:
                 code = "agent_runtime_unavailable"
             status = {

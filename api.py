@@ -51,6 +51,7 @@ from backend.pg_services import PostgresMetadataService, PostgresSearchService, 
 from backend.paths import PathResolver, SUPPORTED_EXTENSIONS, validate_business_storage_key
 from backend.rate_limiter import RateLimiter
 from backend.opencode import OpenCodeError, OpenCodeRunner
+from backend.opencode_workspace import LocalWorkspaceProvider, MissingWorkspaceProvider, TrustedWorkspaceContext, WorkspaceResolutionError
 from backend.opencode_activity import AgentActivity, OpenCodeActivityReader
 from backend.reverse_image import ReverseImageError, ReverseImageRequest, ReverseImageService, derive_controlled_crop
 from backend.tasks import TaskRecord
@@ -576,7 +577,7 @@ def _context_enqueue_error(exc: Exception) -> str:
     if isinstance(code, str) and code:
         return code
     text = str(exc).split(":", 1)[0]
-    return text if text in {"agent_backpressure", "agent_executor_not_configured", "agent_executor_unavailable", "agent_executor_unauthorized", "agent_runtime_unavailable", "generation_policy_conflict", "processing_options_conflict", "reverse_image_unavailable", "invalid_reverse_image_policy", "invalid_auto_name"} else "context_enqueue_failed"
+    return text if text in {"agent_backpressure", "agent_executor_not_configured", "agent_executor_unavailable", "agent_executor_unauthorized", "agent_runtime_unavailable", "generation_policy_conflict", "processing_options_conflict", "reverse_image_unavailable", "invalid_reverse_image_policy", "invalid_auto_name", "opencode_workspace_provider_missing", "opencode_workspace_invalid", "opencode_workspace_mismatch"} else "context_enqueue_failed"
 
 
 def _collection_payload(request: Request, environment, row) -> dict[str, object]:
@@ -683,6 +684,21 @@ async def lifespan(app: FastAPI):
     if configured_agent_input_provider is None and configured_factory is not None:
         configured_agent_input_provider = getattr(configured_factory, "agent_input_provider", None)
     settings.ensure_directories()
+    configured_workspace_provider = getattr(app.state, "workspace_provider", None)
+    if configured_workspace_provider is None and configured_factory is not None:
+        configured_workspace_provider = getattr(configured_factory, "workspace_provider", None)
+    if local_mode:
+        if configured_workspace_provider is None:
+            configured_workspace_provider = LocalWorkspaceProvider(
+                settings.opencode_runtime_root,
+                image_root=settings.image_root,
+                skill_root=Path(__file__).resolve().parent / "skills" / "research-meme-context",
+            )
+    elif configured_workspace_provider is None:
+        # 先允许 non-local 应用完成无业务副作用的生命周期装配；真正任务执行时
+        # 由占位 provider 稳定拒绝，绝不静默回退 local。
+        configured_workspace_provider = MissingWorkspaceProvider()
+    app.state.workspace_provider = configured_workspace_provider
     try:
         engine = create_engine_for_settings(settings)
         expected_revision = getattr(app.state, "expected_schema_revision", settings.expected_database_revision)
@@ -711,7 +727,9 @@ async def lifespan(app: FastAPI):
     else:
         # 适配宿主由自己的 resolver/factory 管理 scope，不探测或创建 local namespace。
         app.state.storage_preflight = None
+    # 先按旧构造方式创建 runner，再安装 provider，兼容宿主测试夹具和旧扩展工厂。
     app.state.opencode = OpenCodeRunner(settings)
+    app.state.opencode.workspace_provider = configured_workspace_provider
     try:
         app.state.agent_activity = OpenCodeActivityReader(settings.opencode_runtime_root)
     except Exception:  # noqa: BLE001
@@ -879,9 +897,6 @@ async def lifespan(app: FastAPI):
         expected_sha = payload.get("image_sha256")
         if not isinstance(meme_id, str) or not isinstance(expected_sha, str):
             raise RuntimeError("target_changed")
-        if service.scope.scope_id != "local" and not callable(getattr(app.state, "agent_input_provider", None)):
-            # 适配宿主未提供受控输入时拒绝任务，不能把其他 scope 的物理根目录交给 Agent。
-            raise RuntimeError("agent_input_provider_unavailable")
         try:
             _record, image = service.metadata.image_for_meme(meme_id)
             relative = service.metadata.blob_store.relative(image)
@@ -986,8 +1001,8 @@ async def lifespan(app: FastAPI):
             if callable(mark_attempt) and claimed_task is not None:
                 mark_attempt(claimed_task, payload, "grant_committed")
         agent_image = image
-        if service.scope.scope_id != "local":
-            provider = app.state.agent_input_provider
+        provider = getattr(app.state, "agent_input_provider", None)
+        if service.scope.scope_id != "local" and callable(provider):
             try:
                 try:
                     provided = provider(service.scope, image)
@@ -1001,14 +1016,30 @@ async def lifespan(app: FastAPI):
                 # 适配层替换成另一 scope 的内容或把任意文件交给 Runner。
                 if service.metadata.image_sha256(agent_image) != expected_sha:
                     raise ValueError("agent_input_sha256_mismatch")
-                map_image_path = getattr(app.state.opencode, "map_image_path", None)
-                if callable(map_image_path):
-                    map_image_path(agent_image)
+                # non-local provider 会在 runner 内按当前 selector 的 images_root
+                # 重新解析 image_relative_path；不能用 local 的全局 /images 映射
+                # 把宿主提供的 scope 视图误判成越界路径。
+                if service.scope.scope_id == "local":
+                    map_image_path = getattr(app.state.opencode, "map_image_path", None)
+                    if callable(map_image_path):
+                        map_image_path(agent_image)
             except (MetadataError, OSError, OpenCodeError, TypeError, ValueError) as exc:
                 raise RuntimeError("agent_input_provider_unavailable") from exc
         # callback token 是 Agent 内部接口的授权凭据，Runner 不支持显式传递时必须
         # 让任务失败，不能以兼容调用的名义退回无凭据执行。
         try:
+            try:
+                workspace_context = TrustedWorkspaceContext(
+                    task_id=claim_task_id,
+                    attempt_id=f"claim-{claim_attempt}",
+                    scope_id=service.scope.scope_id,
+                    selector=str(payload.get("_workspace_selector")) if isinstance(payload.get("_workspace_selector"), str) else None,
+                    session_id=payload.get("_resume_session_id") if isinstance(payload.get("_resume_session_id"), str) else None,
+                    resume_of_attempt_id=payload.get("_resume_of_attempt_id") if isinstance(payload.get("_resume_of_attempt_id"), str) else None,
+                    image_relative_path=relative if isinstance(relative, str) else None,
+                )
+            except WorkspaceResolutionError as exc:
+                raise OpenCodeError(exc.code, str(exc)) from exc
             candidate, session_id = app.state.opencode.run(
                 agent_image,
                 progress,
@@ -1018,6 +1049,7 @@ async def lifespan(app: FastAPI):
                 resume_session_id=payload.get("_resume_session_id") if isinstance(payload.get("_resume_session_id"), str) else None,
                 resume_of_attempt_id=payload.get("_resume_of_attempt_id") if isinstance(payload.get("_resume_of_attempt_id"), str) else None,
                 processing_config_hash=config_hash,
+                workspace_context=workspace_context,
             )
         except OpenCodeError as exc:
             # 续跑候选已由 Worker 按持久 session、scope、输入摘要和配置 hash
@@ -1055,6 +1087,11 @@ async def lifespan(app: FastAPI):
                 payload["_resume_session_id"] = failure_session_id
             if getattr(exc, "executor_attempt_id", None):
                 payload["_executor_attempt_id"] = exc.executor_attempt_id
+            selector_reader = getattr(app.state.opencode, "workspace_for_task", None)
+            if callable(selector_reader):
+                selector = selector_reader(claim_task_id)
+                if isinstance(selector, str):
+                    payload["_workspace_selector"] = selector
             record_attempt = getattr(service.tasks, "record_agent_attempt", None)
             try:
                 if callable(record_attempt):
@@ -1063,6 +1100,7 @@ async def lifespan(app: FastAPI):
                         error={"error": exc.code, "message": str(exc), **({"http_status": exc.http_status} if getattr(exc, "http_status", None) else {})},
                         session_id=failure_session_id,
                         executor_attempt_id=getattr(exc, "executor_attempt_id", None),
+                        workspace_selector=payload.get("_workspace_selector") if isinstance(payload.get("_workspace_selector"), str) else None,
                         resume_available=decision.available,
                         resume_reason=decision.reason,
                     )
@@ -1089,6 +1127,11 @@ async def lifespan(app: FastAPI):
         executor_attempt_id = attempt_reader(claim_task_id) if callable(attempt_reader) else getattr(app.state.opencode, "last_executor_attempt_id", None)
         if isinstance(executor_attempt_id, str):
             payload["_executor_attempt_id"] = executor_attempt_id
+        selector_reader = getattr(app.state.opencode, "workspace_for_task", None)
+        if callable(selector_reader):
+            selector = selector_reader(claim_task_id)
+            if isinstance(selector, str):
+                payload["_workspace_selector"] = selector
         record_attempt = getattr(service.tasks, "record_agent_attempt", None)
         try:
             if callable(record_attempt):
@@ -1096,6 +1139,7 @@ async def lifespan(app: FastAPI):
                     payload,
                     session_id=session_id,
                     executor_attempt_id=executor_attempt_id,
+                    workspace_selector=payload.get("_workspace_selector") if isinstance(payload.get("_workspace_selector"), str) else None,
                     resume_available=False,
                 )
                 if recorded is False:
@@ -3389,7 +3433,7 @@ async def repair_metadata(request: Request) -> dict[str, object]:
     return {"task_id": record.task_id, "task_type": record.task_type, "status": record.status}
 
 
-def create_app(*, scope_resolver, service_factory: ScopeServiceFactory | None = None, operation_policy=None, callback_issuer=None, callback_verifier=None, agent_input_provider: Callable[[ScopeContext, Path], str | Path] | None = None, extensions: Sequence[ApplicationExtension] | None = None) -> FastAPI:
+def create_app(*, scope_resolver, service_factory: ScopeServiceFactory | None = None, operation_policy=None, callback_issuer=None, callback_verifier=None, agent_input_provider: Callable[[ScopeContext, Path], str | Path] | None = None, workspace_provider=None, extensions: Sequence[ApplicationExtension] | None = None) -> FastAPI:
     """创建显式绑定 scope resolver 的 FastAPI 应用。
 
     ``scope_resolver`` 是必填参数；适配宿主可注入自己的可信 resolver、兼容的
@@ -3434,6 +3478,8 @@ def create_app(*, scope_resolver, service_factory: ScopeServiceFactory | None = 
         created.state._scope_factory_managed = False
     if agent_input_provider is not None:
         created.state.agent_input_provider = agent_input_provider
+    if workspace_provider is not None:
+        created.state.workspace_provider = workspace_provider
     return created
 
 

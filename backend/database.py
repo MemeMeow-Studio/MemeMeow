@@ -58,7 +58,7 @@ VISUAL_EMBEDDING_DIMENSIONS = 768
 SCOPE_LOCAL = "local"
 UTC = timezone.utc
 # 当前代码要求的 Alembic head；数据库初始化脚本会显式传入同一 revision。
-CURRENT_SCHEMA_REVISION = "0013_resume_opencode_session_after_failure"
+CURRENT_SCHEMA_REVISION = "0014_scope_aware_opencode_workspace"
 
 
 def utcnow() -> datetime:
@@ -337,6 +337,7 @@ class Task(Base):
     resume_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     resume_session_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     executor_attempt_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    workspace_selector: Mapped[str | None] = mapped_column(String(128), nullable=True)
     resume_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     resume_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     first_error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
@@ -564,6 +565,7 @@ class ImageProcessingAttempt(Base):
     session_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     executor_attempt_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     resume_of_attempt_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    workspace_selector: Mapped[str | None] = mapped_column(String(128), nullable=True)
     processing_config_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     resume_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     resume_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -755,6 +757,7 @@ def ensure_optional_control_schema(engine: Engine) -> None:
             connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_reason VARCHAR(64)"))
             connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_session_id VARCHAR(255)"))
             connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS executor_attempt_id VARCHAR(255)"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS workspace_selector VARCHAR(128)"))
             connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_attempt_count INTEGER NOT NULL DEFAULT 0"))
             connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_started_at TIMESTAMPTZ"))
             connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS first_error JSONB"))
@@ -763,6 +766,7 @@ def ensure_optional_control_schema(engine: Engine) -> None:
             connection.execute(text("ALTER TABLE tasks ALTER COLUMN resume_available SET DEFAULT FALSE, ALTER COLUMN resume_available SET NOT NULL, ALTER COLUMN resume_attempt_count SET DEFAULT 0, ALTER COLUMN resume_attempt_count SET NOT NULL, ALTER COLUMN error_history SET DEFAULT '[]'::jsonb, ALTER COLUMN error_history SET NOT NULL"))
             connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS executor_attempt_id VARCHAR(255)"))
             connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS resume_of_attempt_id VARCHAR(255)"))
+            connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS workspace_selector VARCHAR(128)"))
             connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS processing_config_hash VARCHAR(64)"))
             connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS resume_available BOOLEAN NOT NULL DEFAULT FALSE"))
             connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS resume_reason VARCHAR(64)"))

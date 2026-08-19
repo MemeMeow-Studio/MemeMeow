@@ -8,6 +8,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from backend.agent_executor import AgentExecutorClient, AgentExecutorError
 from backend.agent_executor import ExecutorTaskResponse
 from backend.config import Settings
 from backend.opencode import OpenCodeError, OpenCodeRunner
+from backend.opencode_workspace import WorkspaceCapabilitySigner
 from executor import server as executor_server
 from executor.token import ExecutorTokenError, ensure_token_file, read_token_file
 
@@ -95,24 +97,40 @@ def executor_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     fake = tmp_path / "fake-opencode"
     fake.write_text(
         "#!/usr/bin/env python3\n"
-        "import json, os, sys, time\n"
-        "if os.getenv('FAKE_SLEEP'):\n"
-        "    time.sleep(float(os.environ['FAKE_SLEEP']))\n"
+        "import json, os, signal, sys, time\n"
+        "from pathlib import Path\n"
         "task = os.environ['MEMEMEOW_AGENT_TASK_ID']\n"
-        "directory = os.path.dirname(os.environ['OPENCODE_DB']) + '/task-results/' + task\n"
-        "os.makedirs(directory, exist_ok=True)\n"
-        "candidate = {'title':'executor 测试','summary':'受控任务结果','subjects':['主体'],'visible_text':[],'references':[],'meaning':None,'keywords':['测试'],'search_queries':[],'uncertainties':[],'source_urls':[]}\n"
-        "if os.getenv('FAKE_MODE') == 'provider429':\n"
-        "    with open(directory + '/result.json.draft', 'w', encoding='utf-8') as handle: json.dump({'partial': True}, handle)\n"
+        "runtime = Path(os.environ['OPENCODE_DB']).parent\n"
+        "active = runtime / 'active'\n"
+        "active.mkdir(parents=True, exist_ok=True)\n"
+        "marker = active / task\n"
+        "marker.write_text(str(os.getpid()), encoding='ascii')\n"
+        "def handle_sigterm(_signum, _frame):\n"
+        "    marker.unlink(missing_ok=True)\n"
+        "    raise SystemExit(143)\n"
+        "signal.signal(signal.SIGTERM, handle_sigterm)\n"
+        "try:\n"
+        "    if os.getenv('FAKE_SLEEP'):\n"
+        "        time.sleep(float(os.environ['FAKE_SLEEP']))\n"
+        "    directory = runtime / 'task-results' / task\n"
+        "    directory.mkdir(parents=True, exist_ok=True)\n"
+        "    image_arg = sys.argv[sys.argv.index('--file') + 1]\n"
+        "    observation = {'cwd': os.getcwd(), 'db': os.environ['OPENCODE_DB'], 'config': os.environ['OPENCODE_CONFIG'], 'config_dir': os.environ['OPENCODE_CONFIG_DIR'], 'image': Path(image_arg).read_bytes().decode('utf-8')}\n"
+        "    Path(os.environ['OPENCODE_CONFIG']).with_name('observation.json').write_text(json.dumps(observation), encoding='utf-8')\n"
+        "    candidate = {'title':'executor 测试','summary':'受控任务结果','subjects':['主体'],'visible_text':[],'references':[],'meaning':None,'keywords':['测试'],'search_queries':[],'uncertainties':[],'source_urls':[]}\n"
+        "    if os.getenv('FAKE_MODE') == 'provider429':\n"
+        "        with open(directory / 'result.json.draft', 'w', encoding='utf-8') as handle: json.dump({'partial': True}, handle)\n"
+        "        print(json.dumps({'type':'session.created','session_id':'session-' + task}), flush=True)\n"
+        "        print(json.dumps({'type':'error','error':{'data':{'message':'provider status 429'}}}), flush=True)\n"
+        "        sys.exit(7)\n"
+        "    if os.getenv('FAKE_MODE') == 'resume' and ('--session' not in sys.argv or 'session-' + task not in sys.argv):\n"
+        "        print(json.dumps({'type':'error','error':{'data':{'message':'session missing'}}}), flush=True)\n"
+        "        sys.exit(8)\n"
+        "    with open(directory / 'result.json.draft', 'w', encoding='utf-8') as handle: json.dump(candidate, handle, ensure_ascii=False)\n"
+        "    os.replace(directory / 'result.json.draft', directory / 'result.json.tmp')\n"
         "    print(json.dumps({'type':'session.created','session_id':'session-' + task}), flush=True)\n"
-        "    print(json.dumps({'type':'error','error':{'data':{'message':'provider status 429'}}}), flush=True)\n"
-        "    sys.exit(7)\n"
-        "if os.getenv('FAKE_MODE') == 'resume' and ('--session' not in sys.argv or 'session-' + task not in sys.argv):\n"
-        "    print(json.dumps({'type':'error','error':{'data':{'message':'session missing'}}}), flush=True)\n"
-        "    sys.exit(8)\n"
-        "with open(directory + '/result.json.draft', 'w', encoding='utf-8') as handle: json.dump(candidate, handle, ensure_ascii=False)\n"
-        "os.replace(directory + '/result.json.draft', directory + '/result.json.tmp')\n"
-        "print(json.dumps({'type':'session.created','session_id':'session-' + task}), flush=True)\n",
+        "finally:\n"
+        "    marker.unlink(missing_ok=True)\n",
         encoding="utf-8",
     )
     fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
@@ -352,6 +370,113 @@ def test_executor_queue_backpressure_returns_stable_429(executor_fixture, monkey
             {"task_id": "task-overflow", "image_relative_path": "sample.png", "timeout_seconds": 5, "wait": False},
         )
     assert error.value.code == "agent_backpressure"
+
+
+def test_executor_concurrent_workspaces_share_runtime_and_isolate_execution(executor_fixture, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """不同 workspace 并发时共享 DB 但隔离 cwd、配置、图片、结果，并验证取消/超时只影响自身。"""
+    executor, _client, runtime = executor_fixture
+    executor.pool.shutdown(wait=True)
+    executor.max_workers = 2
+    executor.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mememeow-opencode-concurrency")
+    workspace_root = tmp_path / "workspaces"
+    for selector, marker in (("scope-a", "image-a"), ("scope-b", "image-b")):
+        base = workspace_root / selector
+        for directory in ("workspace", "images", "metadata", "skills"):
+            (base / directory).mkdir(parents=True)
+        (base / "images" / "sample.png").write_text(marker, encoding="utf-8")
+    executor.workspace_root = workspace_root
+    signer = WorkspaceCapabilitySigner("workspace-test-key")
+    executor.capability_signer = signer
+    original_environment = executor._task_environment
+    sleep_by_task = {
+        "task-a": "0.5",
+        "task-b": "0.5",
+        "cancel-a": "5",
+        "cancel-b": "0.2",
+        "timeout-a": "2",
+        "timeout-b": "0.2",
+    }
+    monkeypatch.setattr(
+        executor,
+        "_task_environment",
+        lambda task: {
+            **original_environment(task),
+            **({"FAKE_SLEEP": sleep_by_task[task.business_task_id]} if task.business_task_id in sleep_by_task else {}),
+        },
+    )
+
+    def submit(task_id: str, attempt_id: str, selector: str, *, timeout_seconds: int = 5):
+        """提交带 selector capability 的异步测试任务。"""
+        task, _wait = executor.submit(
+            {
+                "task_id": task_id,
+                "business_task_id": task_id,
+                "executor_attempt_id": attempt_id,
+                "image_relative_path": "sample.png",
+                "reverse_image_policy": "forbid",
+                "timeout_seconds": timeout_seconds,
+                "wait": False,
+                "workspace_selector": selector,
+                "workspace_capability": signer.issue(task_id=task_id, attempt_id=attempt_id, selector=selector),
+            }
+        )
+        return task
+
+    active = runtime / "active"
+    first = submit("task-a", "attempt-a", "scope-a")
+    second = submit("task-b", "attempt-b", "scope-b")
+    deadline = time.monotonic() + 3
+    max_active = 0
+    while time.monotonic() < deadline and not ({"task-a", "task-b"} <= {path.name for path in active.glob("*")}):
+        max_active = max(max_active, len(list(active.glob("*"))))
+        time.sleep(0.01)
+    max_active = max(max_active, len(list(active.glob("*"))))
+    assert max_active == 2
+    assert first.done.wait(3)
+    assert second.done.wait(3)
+    assert first.status == "succeeded"
+    assert second.status == "succeeded"
+    assert executor.pool._max_workers == 2
+    assert len(list(active.glob("*"))) == 0
+
+    observations = []
+    for task_id, selector, marker in (("task-a", "scope-a", "image-a"), ("task-b", "scope-b", "image-b")):
+        scratch = workspace_root / selector / "workspace" / "tasks" / task_id
+        observation = json.loads((scratch / "observation.json").read_text(encoding="utf-8"))
+        assert observation["cwd"] == str(scratch.parent.parent)
+        assert observation["config"] == str(scratch / "opencode.json")
+        assert observation["config_dir"] == str(scratch / ".opencode")
+        assert observation["db"] == str(runtime / "opencode.db")
+        assert observation["image"] == marker
+        config = json.loads((scratch / "opencode.json").read_text(encoding="utf-8"))
+        assert config["permission"]["external_directory"][f"{(runtime / 'task-results' / task_id).absolute()}/*"] == "allow"
+        assert config["permission"]["edit"]["*"] == "deny"
+        assert config["permission"]["edit"][f"**/{(scratch / 'opencode.json').as_posix().lstrip('/')}"] == "deny"
+        result_path = runtime / "task-results" / task_id / "result.json.tmp"
+        assert result_path.is_file()
+        observations.append(observation)
+    assert {item["db"] for item in observations} == {str(runtime / "opencode.db")}
+
+    cancelled = submit("cancel-a", "attempt-cancel-a", "scope-a")
+    unaffected_by_cancel = submit("cancel-b", "attempt-cancel-b", "scope-b")
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and cancelled.status != "running":
+        time.sleep(0.01)
+    executor.cancel(cancelled.executor_attempt_id)
+    assert cancelled.done.wait(3)
+    assert unaffected_by_cancel.done.wait(3)
+    assert cancelled.status == "cancelled"
+    assert unaffected_by_cancel.status == "succeeded"
+
+    timed_out = submit("timeout-a", "attempt-timeout-a", "scope-a", timeout_seconds=1)
+    unaffected_by_timeout = submit("timeout-b", "attempt-timeout-b", "scope-b")
+    assert timed_out.done.wait(4)
+    assert unaffected_by_timeout.done.wait(4)
+    assert timed_out.status == "failed"
+    assert timed_out.error == {"error": "agent_timeout", "message": "OpenCode 执行超时"}
+    assert unaffected_by_timeout.status == "succeeded"
+    assert len(list(active.glob("*"))) == 0
+    assert executor._queued_count() == 0
 
 
 def test_executor_captures_failed_session_and_resumes_with_new_attempt(executor_fixture, monkeypatch: pytest.MonkeyPatch) -> None:

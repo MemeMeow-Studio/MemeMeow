@@ -13,24 +13,38 @@ import os
 import re
 import shutil
 import signal
-import stat
 import socket
+import stat
 import subprocess
 import tempfile
 import time
 import uuid
+from dataclasses import replace
 from io import BytesIO
-from queue import Empty, Queue
-from urllib.error import URLError
-from urllib.request import urlopen
 from pathlib import Path
+from queue import Empty, Queue
 from threading import Event, Lock, RLock, Semaphore
 from typing import Any, BinaryIO, Callable, Iterator
+from urllib.error import URLError
+from urllib.request import urlopen
 
-from backend.config import Settings
 from backend.agent_executor import AgentExecutorClient, AgentExecutorError
 from backend.agent_resume import classify_resume_error, normalize_identifier
+from backend.config import Settings
 from backend.metadata import MemeContext
+from backend.opencode_workspace import (
+    LocalWorkspaceProvider,
+    ResolvedWorkspace,
+    TrustedWorkspaceContext,
+    WorkspaceCapabilityError,
+    WorkspaceProvider,
+    WorkspaceResolutionError,
+    build_edit_permission_rules,
+    build_external_directory_rules,
+    capability_for_provider,
+    validate_directory_path,
+    validate_file_path,
+)
 
 try:
     from jsonschema import Draft202012Validator, FormatChecker
@@ -156,10 +170,30 @@ class OpenCodeError(RuntimeError):
         self.http_status = http_status
 
 
+def _workspace_opencode_config(workspace: ResolvedWorkspace) -> dict[str, Any]:
+    """生成当前 workspace 的无密钥 OpenCode 配置和文件工具权限规则。"""
+    config = json.loads(json.dumps(RUNTIME_OPENCODE_CONFIG, ensure_ascii=False))
+    config["permission"] = {
+        "external_directory": {path: decision for path, decision in workspace.permission_rules},
+        "edit": {
+            path: decision
+            for path, decision in build_edit_permission_rules(
+                task_scratch_root=workspace.task_scratch_root,
+                config_file=workspace.config_file,
+                config_dir=workspace.config_dir,
+                draft_path=workspace.draft_path,
+                result_path=workspace.result_path,
+            )
+        },
+    }
+    return config
+
+
 class OpenCodeRunner:
     """在固定 runtime 中按 slot 受控并行执行 OpenCode，并返回已校验研究结果。"""
 
-    def __init__(self, settings: Settings, project_root: Path | None = None):
+    def __init__(self, settings: Settings, project_root: Path | None = None, *, workspace_provider: WorkspaceProvider | None = None):
+        """初始化 runner；应用装配应显式传入 provider，旧直接夹具兼容 local。"""
         self.settings = settings
         self.project_root = (project_root or Path(__file__).resolve().parent.parent).resolve()
         self.runtime_root = (settings.opencode_runtime_root or settings.data_root / "opencode").expanduser().resolve()
@@ -185,11 +219,107 @@ class OpenCodeRunner:
         self._active_executor_task_ids: set[str] = set()
         self._last_executor_attempt_ids: dict[str, str] = {}
         self._cancelled_task_ids: set[str] = set()
+        # 未显式传入 provider 只为既有开源直接构造调用保留 local 兼容；应用工厂
+        # 对 non-local scope 必须显式装配 provider，不能在这里猜测路径。
+        self.workspace_provider: WorkspaceProvider = workspace_provider or LocalWorkspaceProvider(
+            self.runtime_root,
+            image_root=self._configured_image_root(),
+            skill_root=self.project_root / "skills" / "research-meme-context",
+        )
+        self._workspace_by_task: dict[str, ResolvedWorkspace] = {}
+        self._workspace_selectors: dict[str, str] = {}
+        self._workspace_capabilities: dict[str, str] = {}
         self.executor = AgentExecutorClient(
             getattr(settings, "agent_executor_url", None),
             getattr(settings, "agent_executor_token", None),
             timeout=int(getattr(settings, "agent_executor_request_timeout_seconds", 1810)),
         )
+
+    def resolve_workspace(self, context: TrustedWorkspaceContext) -> ResolvedWorkspace:
+        """从可信任务上下文解析并缓存一次 workspace 描述。"""
+        try:
+            resolved = self.workspace_provider.resolve(context)
+        except (WorkspaceResolutionError, WorkspaceCapabilityError) as exc:
+            raise OpenCodeError(exc.code, str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - provider 是安全边界，异常统一失败关闭
+            raise OpenCodeError("opencode_workspace_invalid", "workspace provider 无法解析任务") from exc
+        if not isinstance(resolved, ResolvedWorkspace):
+            raise OpenCodeError("opencode_workspace_invalid", "workspace provider 返回值无效")
+        if context.selector is not None and context.selector != resolved.selector:
+            raise OpenCodeError("opencode_workspace_mismatch", "workspace selector 与可信任务事实不一致")
+        try:
+            return self._validate_resolved_workspace(context, resolved)
+        except WorkspaceResolutionError as exc:
+            raise OpenCodeError(exc.code, str(exc)) from exc
+        except (OSError, TypeError, ValueError) as exc:
+            raise OpenCodeError("opencode_workspace_invalid", "workspace provider 返回值无法校验") from exc
+
+    def _validate_resolved_workspace(self, context: TrustedWorkspaceContext, resolved: ResolvedWorkspace) -> ResolvedWorkspace:
+        """固定 provider 输出的结果/DB 布局，并重建服务端权限规则。
+
+        provider 可以把图片、metadata 和 Skill 放在容器外部受控挂载，但配置、Task
+        临时目录和结果路径不能变成新的任意文件写入接口。这里的检查只验证已存在
+        的输入视图；Task 目录和结果目录在 capability 校验后才创建。
+        """
+        def absolute(path: Path) -> Path:
+            """规范化路径而不跟随最终符号链接。"""
+            return Path(os.path.abspath(Path(path).expanduser()))
+
+        directory = absolute(resolved.directory)
+        scratch = absolute(resolved.task_scratch_root)
+        config_file = absolute(resolved.config_file)
+        config_dir = absolute(resolved.config_dir)
+        images_root = absolute(resolved.images_root)
+        metadata_root = absolute(resolved.metadata_root)
+        skill_root = absolute(resolved.skill_root)
+        task_results = absolute(resolved.task_results_root)
+        expected_results = absolute(self.runtime_root / "task-results" / context.task_id)
+        expected_db = absolute(self.db_path)
+        if not isinstance(resolved.selector, str) or resolved.selector != resolved.selector.strip() or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", resolved.selector):
+            raise WorkspaceResolutionError("opencode_workspace_invalid", "workspace selector 无效")
+        if absolute(resolved.db_path) != expected_db:
+            raise WorkspaceResolutionError("opencode_workspace_invalid", "workspace DB 路径不受支持")
+        validate_file_path(resolved.db_path, allow_missing=True, code="opencode_workspace_invalid")
+        if task_results != expected_results:
+            raise WorkspaceResolutionError("opencode_workspace_invalid", "workspace 结果路径不受支持")
+        if scratch != directory / "tasks" / context.task_id:
+            raise WorkspaceResolutionError("opencode_workspace_invalid", "workspace 临时路径不受支持")
+        if config_file != scratch / "opencode.json" or config_dir != scratch / ".opencode":
+            raise WorkspaceResolutionError("opencode_workspace_invalid", "workspace 配置路径不受支持")
+        if resolved.local and context.scope_id != "local":
+            raise WorkspaceResolutionError("opencode_workspace_mismatch", "non-local 任务不能使用 local workspace")
+        if resolved.local and resolved.selector != "local":
+            raise WorkspaceResolutionError("opencode_workspace_invalid", "local workspace selector 无效")
+        if not resolved.local and resolved.selector == "local":
+            raise WorkspaceResolutionError("opencode_workspace_invalid", "external workspace selector 保留字无效")
+        for path in (directory, images_root, metadata_root):
+            validate_directory_path(path, code="opencode_workspace_invalid")
+        if resolved.local and skill_root.is_symlink():
+            # local provider 为既有 checkout 保留相对 Skill 链接；链接目标仍须是普通目录。
+            validate_directory_path(skill_root.resolve(strict=True), code="opencode_workspace_invalid")
+        else:
+            validate_directory_path(skill_root, code="opencode_workspace_invalid")
+        for path in (scratch, config_dir, task_results):
+            if path.exists() or path.is_symlink():
+                validate_directory_path(path, code="opencode_workspace_invalid")
+        validated = replace(
+            resolved,
+            directory=directory,
+            config_file=config_file,
+            config_dir=config_dir,
+            images_root=images_root,
+            metadata_root=metadata_root,
+            skill_root=skill_root,
+            task_scratch_root=scratch,
+            task_results_root=task_results,
+            db_path=expected_db,
+        )
+        return replace(validated, _permission_rules=build_external_directory_rules(validated))
+
+    def workspace_for_task(self, task_id: str) -> str | None:
+        """返回任务最近解析的 opaque selector，供诊断写回。"""
+        with self._process_lock:
+            return self._workspace_selectors.get(task_id)
 
     @property
     def executor_mode(self) -> bool:
@@ -256,6 +386,12 @@ class OpenCodeRunner:
             "agent_executor_unavailable",
             "agent_executor_unauthorized",
             "agent_executor_invalid_response",
+            "opencode_workspace_invalid",
+            "opencode_workspace_mismatch",
+            "opencode_workspace_capability_invalid",
+            "opencode_workspace_capability_expired",
+            "opencode_workspace_capability_unavailable",
+            "opencode_workspace_provider_missing",
         }
         return code if code in known else "agent_executor_invalid_response"
 
@@ -277,8 +413,32 @@ class OpenCodeRunner:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.symlink_to(os.path.relpath(source, target.parent), target_is_directory=True)
 
+    def _write_workspace_config(self, workspace: ResolvedWorkspace) -> None:
+        """原子写入当前 workspace 的无密钥配置和外部目录权限。"""
+        target = workspace.config_file
+        validate_directory_path(target.parent, create=True, code="opencode_workspace_invalid")
+        validate_file_path(target, allow_missing=True, code="opencode_workspace_invalid")
+        content = json.dumps(_workspace_opencode_config(workspace), ensure_ascii=False, indent=2) + "\n"
+        try:
+            if target.read_text(encoding="utf-8") == content:
+                os.chmod(target, 0o600)
+                return
+        except FileNotFoundError:
+            pass
+        temporary = target.with_name(f".{target.name}.tmp.{os.getpid()}.{id(self)}")
+        validate_file_path(temporary, allow_missing=True, code="opencode_workspace_invalid")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                descriptor = -1
+                handle.write(content)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        os.replace(temporary, target)
+
     def _write_runtime_config(self) -> None:
-        """原子写入 workspace 共享的无密钥 OpenCode 配置。"""
+        """兼容旧诊断入口，写入既有 local workspace 基础配置。"""
         target = self.workspace / "opencode.json"
         content = json.dumps(RUNTIME_OPENCODE_CONFIG, ensure_ascii=False, indent=2) + "\n"
         try:
@@ -317,17 +477,24 @@ class OpenCodeRunner:
                 if not executable or (not Path(executable).is_file() and shutil.which(executable) is None):
                     raise OpenCodeError("opencode_not_configured", "未找到 OpenCode 可执行文件")
                 skills_source = self.project_root / "skills" / "research-meme-context"
+                if not isinstance(self.workspace_provider, LocalWorkspaceProvider):
+                    # 外部 provider 已在 resolve 阶段验证自己的只读 Skill 视图，
+                    # host 模式不应再要求项目根存在同一份副本。
+                    skills_source = None
                 # 项目自己的 OpenCode 插件依赖与前端依赖隔离；环境变量可覆盖这一默认共享目录。
                 shared_modules = self.settings.opencode_node_modules or self.project_root / ".opencode" / "node_modules"
-                if not skills_source.is_dir() or not shared_modules.is_dir() or not (shared_modules / "@ai-sdk" / "openai").is_dir():
+                if (skills_source is not None and not skills_source.is_dir()) or not shared_modules.is_dir() or not (shared_modules / "@ai-sdk" / "openai").is_dir():
                     raise OpenCodeError("opencode_not_configured", "OpenCode skill、共享 node_modules 或 Responses provider 未预先安装")
             self.runtime_root.mkdir(parents=True, exist_ok=True)
             (self.runtime_root / "home").mkdir(parents=True, exist_ok=True)
-            self.workspace.mkdir(parents=True, exist_ok=True)
+            if isinstance(self.workspace_provider, LocalWorkspaceProvider):
+                self.workspace.mkdir(parents=True, exist_ok=True)
             self.slots_root.mkdir(parents=True, exist_ok=True)
             self.log_root.mkdir(parents=True, exist_ok=True)
-            self._write_runtime_config()
-            if not self.executor_mode:
+            if isinstance(self.workspace_provider, LocalWorkspaceProvider):
+                self._write_runtime_config()
+            if not self.executor_mode and isinstance(self.workspace_provider, LocalWorkspaceProvider):
+                skills_source = self.project_root / "skills" / "research-meme-context"
                 self._link(self.workspace / ".opencode" / "skills" / "research-meme-context", skills_source)
                 self._link(self.workspace / "node_modules", shared_modules)
             self._runtime_ready = True
@@ -412,15 +579,35 @@ class OpenCodeRunner:
             return str(visual_search)
         return str(self.settings.visual_internal_url).replace("/visual-embedding", "/visual-search/match")
 
-    def build_environment(self, slot_id: int | None = None, task_id: str | None = None, callback_token: str | None = None) -> dict[str, str]:
+    def build_environment(
+        self,
+        slot_id: int | None = None,
+        task_id: str | None = None,
+        callback_token: str | None = None,
+        *,
+        workspace: ResolvedWorkspace | None = None,
+    ) -> dict[str, str]:
         """构造隔离的 OpenCode 进程环境，供后台任务和交互检查入口共同使用。"""
+        active_workspace = workspace or ResolvedWorkspace(
+            selector="local",
+            directory=self.workspace,
+            config_file=self.workspace / "opencode.json",
+            config_dir=self.workspace / ".opencode",
+            images_root=self._configured_image_root(),
+            metadata_root=self._configured_image_root(),
+            skill_root=self.project_root / "skills" / "research-meme-context",
+            task_scratch_root=self.workspace / "tasks" / (task_id or "interactive"),
+            task_results_root=self.runtime_root / "task-results" / (task_id or "interactive"),
+            db_path=self.db_path,
+            local=True,
+        )
         if self.executor_mode:
             # API 不启动 OpenCode 子进程；该快照仅供诊断，绝不把 executor token
             # 或宿主环境传给 Agent。模型密钥由 executor 自身从 Compose 环境读取。
             values = {
                 "OPENCODE_DB": "/runtime/opencode.db",
-                "OPENCODE_CONFIG": "/runtime/workspace/opencode.json",
-                "OPENCODE_CONFIG_DIR": "/runtime/workspace/.opencode",
+                "OPENCODE_CONFIG": str(active_workspace.config_file),
+                "OPENCODE_CONFIG_DIR": str(active_workspace.config_dir),
                 "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
                 "MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL": self._agent_reverse_image_url(),
                 "MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL": self._agent_visual_search_url(),
@@ -436,14 +623,13 @@ class OpenCodeRunner:
         # host 回滚模式也必须使用白名单；继承整个 API 环境会把 callback
         # 根 secret、executor token、数据库配置或其它 scope 配置带进 Agent 子进程。
         runtime_root = self.runtime_root
-        workspace = runtime_root / "workspace"
         environment = {
             "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
             # 使用 runtime 专属 HOME，避免 host 兼容模式读取调用用户的凭据目录。
             "HOME": str(self.runtime_root / "home"),
             "OPENCODE_DB": str(runtime_root / "opencode.db"),
-            "OPENCODE_CONFIG": str(workspace / "opencode.json"),
-            "OPENCODE_CONFIG_DIR": str(workspace / ".opencode"),
+            "OPENCODE_CONFIG": str(active_workspace.config_file),
+            "OPENCODE_CONFIG_DIR": str(active_workspace.config_dir),
             # 禁止向上合并项目根配置，避免任务意外使用其他 provider 或本地凭据。
             "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
             "MEMEMEOW_DATA_ROOT": str(runtime_root),
@@ -454,7 +640,8 @@ class OpenCodeRunner:
         }
         environment["MEMEMEOW_OPENCODE_BASE_URL"] = str(self.settings.opencode_base_url or "")
         environment["MEMEMEOW_OPENCODE_API_KEY"] = str(self.settings.opencode_api_key or "")
-        environment["NODE_PATH"] = str(self.workspace / "node_modules")
+        shared_modules = self.settings.opencode_node_modules or self.project_root / ".opencode" / "node_modules"
+        environment["NODE_PATH"] = str(shared_modules)
         if slot_id is not None:
             environment["MEMEMEOW_OPENCODE_SLOT"] = str(slot_id)
         if task_id:
@@ -838,9 +1025,17 @@ class OpenCodeRunner:
                 continue
             raise json.JSONDecodeError("JSON 数组缺少分隔符", buffer, position)
 
-    def _session_messages(self, session_id: str, environment: dict[str, str], task_id: str | None = None) -> object:
+    def _session_messages(
+        self,
+        session_id: str,
+        environment: dict[str, str],
+        task_id: str | None = None,
+        *,
+        workspace: ResolvedWorkspace | None = None,
+    ) -> object:
         """经临时 loopback server 读取完整 session，规避 export 内联附件的 CLI 截断。"""
         self.log_root.mkdir(parents=True, exist_ok=True)
+        workspace_directory = workspace.directory if workspace is not None else self.workspace
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
@@ -853,7 +1048,7 @@ class OpenCodeRunner:
                 "--port",
                 str(port),
             ],
-            cwd=self.workspace,
+            cwd=workspace_directory,
             env=environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -920,12 +1115,12 @@ class OpenCodeRunner:
         """兼容诊断和测试入口，返回图片在当前运行时中的路径。"""
         return self.map_image_path(image)
 
-    def task_result_paths(self, task_id: str) -> tuple[Path, Path]:
+    def task_result_paths(self, task_id: str, *, workspace: ResolvedWorkspace | None = None) -> tuple[Path, Path]:
         """创建任务专属结果目录并返回草稿、最终临时 JSON 路径。"""
         with self._process_lock:
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", task_id or ""):
                 raise OpenCodeError("agent_result_path_invalid", "任务结果标识非法")
-            root = self.runtime_root / "task-results"
+            root = workspace.task_results_root.parent if workspace is not None else self.runtime_root / "task-results"
             self._ensure_no_symlink_path(self.runtime_root.parent, create=True)
             self._ensure_no_symlink_path(self.runtime_root, create=True)
             self._ensure_no_symlink_path(root, create=True)
@@ -987,15 +1182,15 @@ class OpenCodeRunner:
             except OSError as exc:
                 raise OpenCodeError("agent_result_file_unreadable", "无法准备 Agent 结果文件路径") from exc
 
-    def create_task_result_paths(self, task_id: str) -> tuple[Path, Path]:
+    def create_task_result_paths(self, task_id: str, *, workspace: ResolvedWorkspace | None = None) -> tuple[Path, Path]:
         """兼容调用方名称，创建并返回任务专属结果文件路径。"""
-        return self.task_result_paths(task_id)
+        return self.task_result_paths(task_id, workspace=workspace)
 
-    def _read_result_file(self, result_path: Path) -> dict[str, Any]:
+    def _read_result_file(self, result_path: Path, *, workspace: ResolvedWorkspace | None = None) -> dict[str, Any]:
         """读取有限大小的 Agent 结果文件并执行 JSON/schema/业务字段校验。"""
         # 结果读取只允许任务目录内的固定最终文件，避免该通用入口被拿来读取 runtime 外文件。
         result_path = Path(os.path.abspath(Path(result_path).expanduser()))
-        result_root = Path(os.path.abspath(self.runtime_root / "task-results"))
+        result_root = Path(os.path.abspath((workspace.task_results_root.parent if workspace is not None else self.runtime_root / "task-results")))
         try:
             relative = result_path.relative_to(result_root)
         except ValueError as exc:
@@ -1039,9 +1234,9 @@ class OpenCodeRunner:
         except OpenCodeError as exc:
             raise OpenCodeError("agent_result_file_schema_invalid", str(exc)) from exc
 
-    def read_result_file(self, result_path: Path) -> dict[str, Any]:
+    def read_result_file(self, result_path: Path, *, workspace: ResolvedWorkspace | None = None) -> dict[str, Any]:
         """读取并校验任务结果文件，供任务处理器和测试直接调用。"""
-        return self._read_result_file(result_path)
+        return self._read_result_file(result_path, workspace=workspace)
 
     def cleanup_task_results(self, *, keep_task_id: str | None = None) -> int:
         """按保留天数和最大任务数清理旧产物，不删除当前任务目录。"""
@@ -1081,11 +1276,35 @@ class OpenCodeRunner:
                     removed += 1
             return removed
 
-    def _run_command(self, image: Path, prompt: str, *, slot_id: int | None = None, task_id: str | None = None, result_path: Path | None = None, callback_token: str | None = None, resume_session_id: str | None = None) -> list[str]:
+    def _run_command(
+        self,
+        image: Path,
+        prompt: str,
+        *,
+        slot_id: int | None = None,
+        task_id: str | None = None,
+        result_path: Path | None = None,
+        callback_token: str | None = None,
+        resume_session_id: str | None = None,
+        workspace: ResolvedWorkspace | None = None,
+    ) -> list[str]:
         """构造宿主模式单图研究 CLI 参数；续跑只能显式传入 session。"""
         # host 回滚支持开发者直接检查临时图片；业务 API 在提交前仍通过 map_image_path
         # 验证受控图片根，executor 路径则单独执行同一边界校验。
         image_path = image.expanduser().resolve()
+        active_workspace = workspace or ResolvedWorkspace(
+            selector="local",
+            directory=self.workspace,
+            config_file=self.workspace / "opencode.json",
+            config_dir=self.workspace / ".opencode",
+            images_root=self._configured_image_root(),
+            metadata_root=self._configured_image_root(),
+            skill_root=self.project_root / "skills" / "research-meme-context",
+            task_scratch_root=self.workspace / "tasks" / (task_id or "interactive"),
+            task_results_root=self.runtime_root / "task-results" / (task_id or "interactive"),
+            db_path=self.db_path,
+            local=True,
+        )
         executable = str(self.settings.opencode_executable or "opencode")
         command = [
             executable,
@@ -1093,7 +1312,7 @@ class OpenCodeRunner:
             # 非交互任务无法回答 OpenCode 的外部目录询问；runtime 边界负责限制可见范围。
             "--auto",
             "--dir",
-            str(self.workspace),
+            str(active_workspace.directory),
             "--format",
             "json",
             "--file",
@@ -1110,7 +1329,19 @@ class OpenCodeRunner:
         command.append(prompt)
         return command
 
-    def run(self, image: Path, progress: Callable[[float | None, str | None], None], *, task_id: str | None = None, reverse_image_policy: str = "forbid", callback_token: str | None = None, resume_session_id: str | None = None, resume_of_attempt_id: str | None = None, processing_config_hash: str | None = None) -> tuple[dict[str, Any], str]:
+    def run(
+        self,
+        image: Path,
+        progress: Callable[[float | None, str | None], None],
+        *,
+        task_id: str | None = None,
+        reverse_image_policy: str = "forbid",
+        callback_token: str | None = None,
+        resume_session_id: str | None = None,
+        resume_of_attempt_id: str | None = None,
+        processing_config_hash: str | None = None,
+        workspace_context: TrustedWorkspaceContext | None = None,
+    ) -> tuple[dict[str, Any], str]:
         """执行单张图片研究；失败也尽力返回可验证 session 诊断。"""
         task_id = task_id or uuid.uuid4().hex
         # host 回滚模式也需要 attempt 级诊断标识；executor 模式提交后会以
@@ -1119,26 +1350,79 @@ class OpenCodeRunner:
         self._remember_executor_attempt(task_id, local_executor_attempt_id)
         if self._take_pre_cancelled(task_id) or self._closing.is_set():
             raise OpenCodeError("task_interrupted", "OpenCode runner 正在关闭或任务已取消", executor_attempt_id=local_executor_attempt_id)
-        self.prepare_runtime()
-        slot_id, lock_handle = self._acquire_slot()
+        context = workspace_context or TrustedWorkspaceContext(
+            task_id=task_id,
+            attempt_id=local_executor_attempt_id,
+            scope_id="local",
+            selector="local",
+            session_id=resume_session_id,
+            resume_of_attempt_id=resume_of_attempt_id,
+        )
+        if workspace_context is not None:
+            if workspace_context.task_id != task_id:
+                raise OpenCodeError("opencode_workspace_mismatch", "workspace 上下文与任务不一致", executor_attempt_id=local_executor_attempt_id)
+            # capability 的 attempt_id 必须与本次 executor 请求使用的独立 attempt
+            # 完全相同；scope/selector/session 等业务事实仍来自调用方 claim。
+            context = replace(context, task_id=task_id, attempt_id=local_executor_attempt_id)
+        if context.task_id != task_id:
+            raise OpenCodeError("opencode_workspace_mismatch", "workspace 上下文与任务不一致", executor_attempt_id=local_executor_attempt_id)
+        resolved_workspace = self.resolve_workspace(context)
+        with self._process_lock:
+            # 即使 capability 签发失败，也保留已解析的 opaque selector 供失败诊断和
+            # claim fencing 写回；目录与 OpenCode 进程仍不会在此处创建。
+            self._workspace_selectors[task_id] = resolved_workspace.selector
+            while len(self._workspace_selectors) > 5000:
+                self._workspace_selectors.pop(next(iter(self._workspace_selectors)))
+        capability = capability_for_provider(self.workspace_provider, context, resolved_workspace)
+        if self.executor_mode and not resolved_workspace.local and not capability:
+            raise OpenCodeError("opencode_workspace_capability_unavailable", "非 local executor workspace 缺少 capability", executor_attempt_id=local_executor_attempt_id)
+        with self._process_lock:
+            self._workspace_by_task[task_id] = resolved_workspace
+            if capability:
+                self._workspace_capabilities[task_id] = capability
+        # provider 解析在任何 OpenCode 子进程和结果文件副作用前完成；此时才准备
+        # runtime 和当前 workspace 配置。
+        try:
+            self.prepare_runtime()
+            if not self.executor_mode:
+                # 外部 provider 的 Task 临时目录和配置只在 capability 已经验证后
+                # 创建；解析失败不能留下可写任务目录或结果目录。
+                validate_directory_path(resolved_workspace.task_scratch_root, create=True, code="opencode_workspace_invalid")
+                validate_directory_path(resolved_workspace.config_dir, create=True, code="opencode_workspace_invalid")
+                self._write_workspace_config(resolved_workspace)
+            slot_id, lock_handle = self._acquire_slot()
+        except Exception:
+            with self._process_lock:
+                self._workspace_by_task.pop(task_id, None)
+                self._workspace_capabilities.pop(task_id, None)
+            raise
         try:
             with self._process_lock:
                 self._active_task_ids.add(task_id)
                 if self.executor_mode:
                     self._active_executor_task_ids.add(task_id)
-                _draft_path, result_path = self.task_result_paths(task_id)
+                _draft_path, result_path = self.task_result_paths(task_id, workspace=resolved_workspace)
             if resume_session_id and not normalize_identifier(resume_session_id, kind="session"):
                 raise OpenCodeError("session_binding_mismatch", "续跑 session 标识无效", executor_attempt_id=local_executor_attempt_id)
             # 续跑必须保留既有 draft/中间产物；新业务 attempt 才初始化结果文件。
             if not resume_session_id:
                 self._reset_task_result_files(_draft_path, result_path)
             result_runtime_root = self.runtime_root
-            if self.executor_mode:
-                mapped_image = self.map_image_path(image)
+            active_image = Path(image)
+            if context.image_relative_path:
                 try:
-                    relative_image = mapped_image.relative_to(EXECUTOR_IMAGE_ROOT).as_posix()
-                except ValueError as exc:
-                    raise OpenCodeError("agent_image_path_forbidden", "图片路径不在 executor 受控目录内") from exc
+                    active_image = resolved_workspace.image_path(context.image_relative_path)
+                except WorkspaceResolutionError as exc:
+                    raise OpenCodeError(exc.code, str(exc), executor_attempt_id=local_executor_attempt_id) from exc
+            if self.executor_mode:
+                if context.image_relative_path:
+                    relative_image = context.image_relative_path.replace("\\", "/")
+                else:
+                    mapped_image = self.map_image_path(active_image)
+                    try:
+                        relative_image = mapped_image.relative_to(EXECUTOR_IMAGE_ROOT).as_posix()
+                    except ValueError as exc:
+                        raise OpenCodeError("agent_image_path_forbidden", "图片路径不在 executor 受控目录内") from exc
                 if self._take_pre_cancelled(task_id):
                     raise OpenCodeError("task_interrupted", "Agent 任务已取消", executor_attempt_id=local_executor_attempt_id)
                 progress(0.1, "正在提交 Agent executor 任务")
@@ -1152,6 +1436,9 @@ class OpenCodeRunner:
                         session_id=resume_session_id,
                         resume_of_attempt_id=resume_of_attempt_id,
                         processing_config_hash=processing_config_hash,
+                        executor_attempt_id=local_executor_attempt_id,
+                        workspace_selector=None if resolved_workspace.local else resolved_workspace.selector,
+                        workspace_capability=capability,
                     )
                     if response.executor_attempt_id:
                         self._remember_executor_attempt(task_id, response.executor_attempt_id)
@@ -1183,7 +1470,7 @@ class OpenCodeRunner:
                         executor_attempt_id=response.executor_attempt_id or local_executor_attempt_id,
                     )
                 progress(0.65, "正在读取研究结果文件")
-                candidate = self._read_result_file(result_path)
+                candidate = self._read_result_file(result_path, workspace=resolved_workspace)
                 progress(0.9, "正在校验并写入语境")
                 return candidate, response.session_id
             resume_instruction = (
@@ -1196,14 +1483,14 @@ class OpenCodeRunner:
                 "遇到错误时自行尝试可行的替代方案；确认无法解决时，简短说明原因并退出。"
                 f"本任务 reverse_image_policy={reverse_image_policy if reverse_image_policy in {'forbid', 'auto'} else 'forbid'}；只能通过项目内部反向图片接口使用能力，绝不读取或请求供应商密钥。"
                 f"{resume_instruction}"
-                f"结果必须写入 {result_runtime_root / 'task-results' / task_id / RESULT_FILE_NAME}。"
-                f"先在同目录写入 {result_runtime_root / 'task-results' / task_id / RESULT_DRAFT_NAME}，"
+                f"结果必须写入 {resolved_workspace.result_path}。"
+                f"先在同目录写入 {resolved_workspace.draft_path}，"
                 "使用 output-schema.json 校验完整 JSON 对象后，使用同一文件系统的原子 rename/mv 将草稿替换为最终文件。"
                 "不要把业务 JSON 作为 assistant 文本交付，不要写入数据库；完成后简短说明即可。"
             )
-            command = self._run_command(image, prompt, slot_id=slot_id, task_id=task_id, result_path=result_path, callback_token=callback_token, resume_session_id=resume_session_id)
+            command = self._run_command(active_image, prompt, slot_id=slot_id, task_id=task_id, result_path=result_path, callback_token=callback_token, resume_session_id=resume_session_id, workspace=resolved_workspace)
             execution_command = command
-            environment = self.build_environment(slot_id, task_id, callback_token)
+            environment = self.build_environment(slot_id, task_id, callback_token, workspace=resolved_workspace)
             progress(0.1, f"正在启动语境研究（slot {slot_id}）")
             # 由临时文件承接完整事件流，避免按总字节数拒绝合法的大输出，也避免管道缓存堆积在内存。
             with (
@@ -1212,7 +1499,7 @@ class OpenCodeRunner:
             ):
                 process = subprocess.Popen(
                     execution_command,
-                    cwd=self.workspace,
+                    cwd=resolved_workspace.directory,
                     env=environment,
                     stdin=subprocess.DEVNULL,
                     stdout=stdout_stream,
@@ -1284,14 +1571,18 @@ class OpenCodeRunner:
                 raise OpenCodeError("agent_output_invalid_json", "OpenCode 未返回 session 标识", executor_attempt_id=local_executor_attempt_id)
             progress(0.65, "正在读取研究结果文件")
             try:
-                candidate = self._read_result_file(result_path)
+                candidate = self._read_result_file(result_path, workspace=resolved_workspace)
             except OpenCodeError:
                 if resume_session_id:
                     # 续跑必须以受控结果文件为边界；已有 draft/result 损坏时
                     # 不能退回 transcript 解析，否则会绕过副作用和产物完整性判定。
                     raise
                 # 显式 host 回滚继续兼容旧 session 结果读取；executor 任务在上方已直接失败。
-                data = self._session_messages(session_id, environment, task_id)
+                try:
+                    data = self._session_messages(session_id, environment, task_id, workspace=resolved_workspace)
+                except TypeError:
+                    # 保持旧测试/扩展覆写三参数 session reader 的兼容。
+                    data = self._session_messages(session_id, environment, task_id)
                 candidate = self.validate_candidate(self.extract_candidate(self._last_assistant_text(data)))
             progress(0.9, "正在校验并写入语境")
             return candidate, session_id
@@ -1301,6 +1592,8 @@ class OpenCodeRunner:
             with self._process_lock:
                 self._active_executor_task_ids.discard(task_id)
                 self._cancelled_task_ids.discard(task_id)
+                self._workspace_by_task.pop(task_id, None)
+                self._workspace_capabilities.pop(task_id, None)
             self._release_slot(slot_id, lock_handle)
 
     @staticmethod

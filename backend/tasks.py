@@ -18,6 +18,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from backend.agent_resume import normalize_identifier, sanitize_error, sanitize_error_history
+from backend.opencode_workspace import SELECTOR_RE
 
 TERMINAL = {"succeeded", "failed"}
 STABLE_TASK_ERRORS = {
@@ -114,6 +115,12 @@ STABLE_TASK_ERRORS = {
     "session_not_resumable",
     "resume_disabled",
     "resume_budget_exhausted",
+    "opencode_workspace_invalid",
+    "opencode_workspace_mismatch",
+    "opencode_workspace_provider_missing",
+    "opencode_workspace_capability_invalid",
+    "opencode_workspace_capability_expired",
+    "opencode_workspace_capability_unavailable",
 }
 # 这四类任务由逐图图片处理 Worker 独占扫描、认领和执行；通用任务 Worker
 # 只能处理其它系统任务，避免旧调度器把图片链误判为缺少 handler。
@@ -160,6 +167,8 @@ class TaskRecord:
     resume_reason: str | None = None
     session_id: str | None = None
     executor_attempt_id: str | None = None
+    # 公开任务摘要最多携带 opaque selector，不暴露 workspace 物理路径。
+    workspace_selector: str | None = None
     resume_attempts: int = 0
     resume_started_at: str | None = None
     first_error: dict[str, Any] | None = None
@@ -175,8 +184,12 @@ class TaskRecord:
         """返回稳定 API 结构；列表调用方可排除内部 payload。"""
         session_id = normalize_identifier(self.session_id, kind="session")
         executor_attempt_id = normalize_identifier(self.executor_attempt_id, kind="attempt")
+        workspace_selector = self.workspace_selector if isinstance(self.workspace_selector, str) and SELECTOR_RE.fullmatch(self.workspace_selector) else None
         resume_available = bool(self.resume_available and session_id and executor_attempt_id)
         resume_reason = self.resume_reason
+        if self.workspace_selector is not None and workspace_selector is None:
+            resume_available = False
+            resume_reason = "opencode_workspace_mismatch"
         if self.resume_available and not resume_available:
             # 旧磁盘记录可能携带损坏的恢复标识；公开摘要必须 fail-closed，不能
             # 让客户端把一条无法绑定的 session 当成可续跑目标。
@@ -200,6 +213,7 @@ class TaskRecord:
             "resume_reason": resume_reason,
             "session_id": session_id,
             "executor_attempt_id": executor_attempt_id,
+            "workspace_selector": workspace_selector,
             "resume_attempts": self.resume_attempts,
             "resume_started_at": self.resume_started_at,
             "first_error": sanitize_error(self.first_error) if isinstance(self.first_error, dict) else None,
@@ -223,8 +237,14 @@ class TaskRecord:
             raise ValueError("task_record_invalid")
         session_id = normalize_identifier(value.get("session_id"), kind="session")
         executor_attempt_id = normalize_identifier(value.get("executor_attempt_id"), kind="attempt")
+        raw_workspace_selector = value.get("workspace_selector")
+        workspace_selector = raw_workspace_selector if isinstance(raw_workspace_selector, str) and SELECTOR_RE.fullmatch(raw_workspace_selector) else None
         stored_resume_available = bool(value.get("resume_available", False))
         resume_reason = value.get("resume_reason") if isinstance(value.get("resume_reason"), str) else None
+        if raw_workspace_selector is not None and workspace_selector is None:
+            # 保留损坏 selector 的事实，避免清洗成 None 后把旧 session 误报为可恢复。
+            stored_resume_available = False
+            resume_reason = "opencode_workspace_mismatch"
         if stored_resume_available and not (session_id and executor_attempt_id):
             resume_reason = "session_not_resumable"
         return cls(
@@ -246,6 +266,7 @@ class TaskRecord:
             resume_reason=resume_reason,
             session_id=session_id,
             executor_attempt_id=executor_attempt_id,
+            workspace_selector=workspace_selector,
             resume_attempts=max(0, int(value.get("resume_attempts", 0))),
             resume_started_at=value.get("resume_started_at") if isinstance(value.get("resume_started_at"), str) else None,
             first_error=sanitize_error(value.get("first_error")) if isinstance(value.get("first_error"), dict) else None,

@@ -68,6 +68,7 @@ from backend.metadata import (
     semantic_document,
 )
 from backend.operation_policy import GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations
+from backend.opencode_workspace import SELECTOR_RE
 from backend.paths import SUPPORTED_EXTENSIONS
 from backend.tasks import IMAGE_PROCESSING_TASK_TYPES, TaskRecord, TERMINAL, STABLE_TASK_ERRORS
 from backend.scope import validate_scope_services
@@ -1149,6 +1150,7 @@ class PostgresTaskService:
             resume_reason=("session_not_resumable" if stored_resume_available and not (session_id and executor_attempt_id) else getattr(record, "resume_reason", None)),
             session_id=session_id,
             executor_attempt_id=executor_attempt_id,
+            workspace_selector=getattr(record, "workspace_selector", None) if isinstance(getattr(record, "workspace_selector", None), str) else None,
             resume_attempts=int(getattr(record, "resume_attempt_count", 0) or 0),
             resume_started_at=_iso(getattr(record, "resume_started_at", None)) if getattr(record, "resume_started_at", None) else None,
             first_error=sanitize_error(getattr(record, "first_error", None)) if isinstance(getattr(record, "first_error", None), dict) else None,
@@ -1177,6 +1179,13 @@ class PostgresTaskService:
         stable_payload = {key: value for key, value in payload.items() if not key.startswith("_")}
         input_digest = hashlib.sha256(json.dumps(stable_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         now = utcnow()
+        raw_selector = payload.get("_workspace_selector")
+        if raw_selector is not None and (
+            not isinstance(raw_selector, str)
+            or not SELECTOR_RE.fullmatch(raw_selector)
+            or (self.scope.scope_id != "local" and raw_selector == "local")
+        ):
+            return
         with self.resources.environment(self.scope.scope_id) as environment:
             session = environment.uow.session
             current_task = session.scalar(
@@ -1211,6 +1220,7 @@ class PostgresTaskService:
                     session_id=str(payload.get("_resume_session_id") or payload.get("session_id")) if (payload.get("_resume_session_id") or payload.get("session_id")) else None,
                     executor_attempt_id=normalize_identifier(payload.get("_executor_attempt_id"), kind="attempt"),
                     resume_of_attempt_id=normalize_identifier(payload.get("_resume_of_attempt_id"), kind="attempt"),
+                    workspace_selector=str(payload.get("_workspace_selector")) if isinstance(payload.get("_workspace_selector"), str) and SELECTOR_RE.fullmatch(str(payload.get("_workspace_selector"))) else None,
                     processing_config_hash=normalize_config_hash(payload.get("processing_config_hash")),
                     input_digest=input_digest,
                     target_sha256=target_sha.lower(),
@@ -1221,12 +1231,16 @@ class PostgresTaskService:
                 # 旧 Worker 不能把新 claim 的 attempt 状态覆盖回去。
                 if row.claim_generation != claim.claim_generation:
                     return
+                if isinstance(raw_selector, str) and row.workspace_selector is not None and row.workspace_selector != raw_selector:
+                    return
                 row.state = state
                 row.updated_at = now
                 if normalize_identifier(payload.get("_resume_session_id"), kind="session"):
                     row.session_id = str(payload["_resume_session_id"])
                 if normalize_identifier(payload.get("_executor_attempt_id"), kind="attempt"):
                     row.executor_attempt_id = str(payload["_executor_attempt_id"])
+                if isinstance(payload.get("_workspace_selector"), str) and SELECTOR_RE.fullmatch(str(payload["_workspace_selector"])):
+                    row.workspace_selector = str(payload["_workspace_selector"])
             session.commit()
 
     def record_agent_attempt(
@@ -1236,6 +1250,7 @@ class PostgresTaskService:
         error: dict[str, Any] | None = None,
         session_id: str | None = None,
         executor_attempt_id: str | None = None,
+        workspace_selector: str | None = None,
         resume_available: bool = False,
         resume_reason: str | None = None,
     ) -> bool:
@@ -1248,6 +1263,17 @@ class PostgresTaskService:
             return False
         safe_session = normalize_identifier(session_id, kind="session")
         safe_executor_attempt = normalize_identifier(executor_attempt_id, kind="attempt")
+        supplied_selector = workspace_selector if workspace_selector is not None else payload.get("_workspace_selector")
+        if supplied_selector is not None and (
+            not isinstance(supplied_selector, str)
+            or not SELECTOR_RE.fullmatch(supplied_selector)
+            or (self.scope.scope_id != "local" and supplied_selector == "local")
+        ):
+            return False
+        safe_workspace_selector = supplied_selector if isinstance(supplied_selector, str) else None
+        if self.scope.scope_id != "local" and safe_workspace_selector is None:
+            # non-local attempt 缺少绑定时不能把失败或成功写成可继续执行的事实。
+            return False
         payload_config_hash = normalize_config_hash(payload.get("processing_config_hash"))
         if payload.get("processing_config_hash") is not None and payload_config_hash is None:
             return False
@@ -1290,12 +1316,21 @@ class PostgresTaskService:
             if normalize_config_hash(row.processing_config_hash) != payload_config_hash:
                 session.commit()
                 return False
+            if safe_workspace_selector is not None and row.workspace_selector is not None and row.workspace_selector != safe_workspace_selector:
+                session.commit()
+                return False
+            if safe_workspace_selector is not None and task.workspace_selector is not None and task.workspace_selector != safe_workspace_selector:
+                session.commit()
+                return False
             if safe_session:
                 row.session_id = safe_session
                 task.resume_session_id = safe_session
             if safe_executor_attempt:
                 row.executor_attempt_id = safe_executor_attempt
                 task.executor_attempt_id = safe_executor_attempt
+            if safe_workspace_selector:
+                row.workspace_selector = safe_workspace_selector
+                task.workspace_selector = safe_workspace_selector
             if safe_error:
                 row.error = safe_error
                 row.resume_reason = resume_reason or safe_error.get("error")
@@ -1356,6 +1391,14 @@ class PostgresTaskService:
         executor_attempt_id = normalize_identifier(getattr(previous, "executor_attempt_id", None), kind="attempt") if previous else None
         if not session_id or not executor_attempt_id:
             return None
+        selector = getattr(previous, "workspace_selector", None) if previous is not None else None
+        if not isinstance(selector, str) or not SELECTOR_RE.fullmatch(selector):
+            if self.scope.scope_id == "local":
+                selector = "local"
+            else:
+                raise RuntimeError("opencode_workspace_mismatch")
+        if self.scope.scope_id != "local" and selector == "local":
+            raise RuntimeError("opencode_workspace_mismatch")
         if normalize_config_hash(getattr(previous, "processing_config_hash", None)) != config_hash:
             return None
         previous_reason = getattr(previous, "resume_reason", None) if previous is not None else None
@@ -1365,6 +1408,7 @@ class PostgresTaskService:
             "executor_attempt_id": executor_attempt_id,
             "resume_of_attempt_id": executor_attempt_id,
             "resume_reason": resume_reason,
+            "workspace_selector": selector,
         }
 
     def _begin_resume(self, claim: Task, candidate: dict[str, str]) -> bool:
@@ -1425,6 +1469,14 @@ class PostgresTaskService:
             # 只要历史上存在可续跑失败，就把当前 claim 收束为 unknown_execution。
             if self.resume_enabled and previous.resume_available:
                 if not normalize_identifier(previous.session_id, kind="session") or not normalize_identifier(previous.executor_attempt_id, kind="attempt"):
+                    return True
+                if self.scope.scope_id != "local" and (
+                    not isinstance(previous.workspace_selector, str)
+                    or not SELECTOR_RE.fullmatch(previous.workspace_selector)
+                    or previous.workspace_selector == "local"
+                ):
+                    # 旧 attempt 已声明可恢复但没有 workspace 绑定，不能退化为
+                    # 新 session 执行；由恢复链收束为不可安全重放。
                     return True
                 if claim.resume_attempt_count >= self.resume_max_attempts or not within_total_timeout(claim.resume_started_at, timeout_seconds=self.resume_timeout_seconds):
                     return True
@@ -1674,7 +1726,23 @@ class PostgresTaskService:
                 )
                 return
 
-            resume_candidate = self._resume_candidate(claim, task_payload)
+            try:
+                resume_candidate = self._resume_candidate(claim, task_payload)
+            except RuntimeError as exc:
+                code = str(exc).partition(":")[0]
+                if code != "opencode_workspace_mismatch":
+                    raise
+                self._image_attempt_state(claim, task_payload, "failed")
+                self._fenced_failure(
+                    task_id,
+                    generation,
+                    message="workspace 绑定无法恢复",
+                    error={"error": code, "message": "workspace selector 与持久恢复事实不一致"},
+                    retry=False,
+                    resume_available=False,
+                    resume_reason=code,
+                )
+                return
             if resume_candidate is not None:
                 if not self._begin_resume(claim, resume_candidate):
                     # 恢复计数的原子 fencing 失败时不能降级为一次全新外部调用；
@@ -1689,6 +1757,7 @@ class PostgresTaskService:
                 # session，也必须保留这份服务端确认的可续跑事实交给 handler。
                 task_payload["_resume_available"] = True
                 task_payload["_resume_reason"] = resume_candidate["resume_reason"]
+                task_payload["_workspace_selector"] = resume_candidate["workspace_selector"]
 
             self._image_attempt_state(claim, task_payload, "prepared")
 

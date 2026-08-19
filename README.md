@@ -158,6 +158,8 @@ API 只绑定 `127.0.0.1:8275`；Agent executor `8277` 和视觉服务 `8276` �
 
 Agent 运行模式仅支持 `auto`、`executor` 和 `host`。`auto` 只有在 executor 地址与非空 token 同时可用时才选择 executor，否则使用 host；显式 `executor` 缺少任一配置会失败关闭，不会回退到 host。旧的 Docker runtime、容器名和容器运行时字段不再受支持；本地回滚请明确设置 `MEMEMEOW_AGENT_RUNTIME_MODE=host`。人工诊断仍可在当前 Compose project 中运行 `docker compose exec mememeow-agent-runtime ...`，不需要也不应配置真实容器名。
 
+OpenCode 的共享数据库、scope-aware workspace、opaque selector、签名 capability 和常规文件工具权限边界见 [`docs/opencode-workspaces.md`](docs/opencode-workspaces.md)。`external_directory` 不是操作系统沙箱；Bash、Python、Node 与网络研究能力仍需由另外的容器或 OS 策略约束。
+
 4. （可选）准备视觉服务权重
 ```bash
 mkdir -p data/models
