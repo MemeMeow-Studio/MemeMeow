@@ -17,6 +17,7 @@ from threading import Lock
 from typing import Any, Callable
 from uuid import uuid4
 
+from backend.agent_resume import normalize_identifier, sanitize_error, sanitize_error_history
 
 TERMINAL = {"succeeded", "failed"}
 STABLE_TASK_ERRORS = {
@@ -106,6 +107,13 @@ STABLE_TASK_ERRORS = {
     "operation_policy_unavailable",
     "operation_grant_invalid",
     "blocked",
+    "agent_provider_rate_limited",
+    "agent_provider_server_error",
+    "agent_connection_interrupted",
+    "session_binding_mismatch",
+    "session_not_resumable",
+    "resume_disabled",
+    "resume_budget_exhausted",
 }
 # 这四类任务由逐图图片处理 Worker 独占扫描、认领和执行；通用任务 Worker
 # 只能处理其它系统任务，避免旧调度器把图片链误判为缺少 handler。
@@ -146,7 +154,16 @@ class TaskRecord:
     updated_at: str = field(default_factory=now)
     completed_at: str | None = None
     attempts: int = 0
-    error: dict[str, str] | None = None
+    error: dict[str, Any] | None = None
+    # 续跑摘要只包含明确 session/attempt 标识和脱敏错误历史。
+    resume_available: bool = False
+    resume_reason: str | None = None
+    session_id: str | None = None
+    executor_attempt_id: str | None = None
+    resume_attempts: int = 0
+    resume_started_at: str | None = None
+    first_error: dict[str, Any] | None = None
+    error_history: list[dict[str, Any]] = field(default_factory=list)
     result: Any = None
     settings_version: str | None = None
     agent_concurrency: int | None = None
@@ -156,6 +173,14 @@ class TaskRecord:
 
     def as_dict(self, *, include_payload: bool = True) -> dict[str, Any]:
         """返回稳定 API 结构；列表调用方可排除内部 payload。"""
+        session_id = normalize_identifier(self.session_id, kind="session")
+        executor_attempt_id = normalize_identifier(self.executor_attempt_id, kind="attempt")
+        resume_available = bool(self.resume_available and session_id and executor_attempt_id)
+        resume_reason = self.resume_reason
+        if self.resume_available and not resume_available:
+            # 旧磁盘记录可能携带损坏的恢复标识；公开摘要必须 fail-closed，不能
+            # 让客户端把一条无法绑定的 session 当成可续跑目标。
+            resume_reason = "session_not_resumable"
         result = {
             "task_id": self.task_id,
             "task_type": self.task_type,
@@ -170,7 +195,15 @@ class TaskRecord:
             "updated_at": self.updated_at,
             "completed_at": self.completed_at,
             "attempts": self.attempts,
-            "error": self.error,
+            "error": sanitize_error(self.error) if isinstance(self.error, dict) else None,
+            "resume_available": resume_available,
+            "resume_reason": resume_reason,
+            "session_id": session_id,
+            "executor_attempt_id": executor_attempt_id,
+            "resume_attempts": self.resume_attempts,
+            "resume_started_at": self.resume_started_at,
+            "first_error": sanitize_error(self.first_error) if isinstance(self.first_error, dict) else None,
+            "error_history": sanitize_error_history(self.error_history),
             "result": self.result,
             "settings_version": self.settings_version,
             "agent_concurrency": self.agent_concurrency,
@@ -188,6 +221,12 @@ class TaskRecord:
         payload = value.get("payload", {})
         if not isinstance(task_id, str) or not task_id or not isinstance(task_type, str) or not task_type or not isinstance(payload, dict):
             raise ValueError("task_record_invalid")
+        session_id = normalize_identifier(value.get("session_id"), kind="session")
+        executor_attempt_id = normalize_identifier(value.get("executor_attempt_id"), kind="attempt")
+        stored_resume_available = bool(value.get("resume_available", False))
+        resume_reason = value.get("resume_reason") if isinstance(value.get("resume_reason"), str) else None
+        if stored_resume_available and not (session_id and executor_attempt_id):
+            resume_reason = "session_not_resumable"
         return cls(
             task_id=task_id,
             task_type=task_type,
@@ -202,7 +241,15 @@ class TaskRecord:
             updated_at=str(value.get("updated_at") or value.get("created_at") or now()),
             completed_at=value.get("completed_at"),
             attempts=int(value.get("attempts", 0)),
-            error=value.get("error") if isinstance(value.get("error"), dict) else None,
+            error=sanitize_error(value.get("error")) if isinstance(value.get("error"), dict) else None,
+            resume_available=bool(stored_resume_available and session_id and executor_attempt_id),
+            resume_reason=resume_reason,
+            session_id=session_id,
+            executor_attempt_id=executor_attempt_id,
+            resume_attempts=max(0, int(value.get("resume_attempts", 0))),
+            resume_started_at=value.get("resume_started_at") if isinstance(value.get("resume_started_at"), str) else None,
+            first_error=sanitize_error(value.get("first_error")) if isinstance(value.get("first_error"), dict) else None,
+            error_history=sanitize_error_history(value.get("error_history", [])),
             result=value.get("result"),
             settings_version=value.get("settings_version"),
             agent_concurrency=value.get("agent_concurrency"),

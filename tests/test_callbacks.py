@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -13,6 +16,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from api import bind_request_scope
 from backend.callbacks import (
+    AGENT_CALLBACK_TOKEN_TTL_SECONDS,
     CALLBACK_METRICS,
     DEFAULT_CALLBACK_REGISTRY,
     CallbackBinding,
@@ -77,6 +81,33 @@ def test_callback_binding_rejects_expired_and_wrong_path_tokens() -> None:
     token = credentials.issue(_binding())
     with pytest.raises(CallbackError, match="agent_callback"):
         credentials.verify(token, path="/internal/unknown")
+
+
+def test_callback_hmac_default_lifetime_is_two_hours() -> None:
+    """默认签发器接受两小时窗口，并拒绝越过统一上限的绑定。"""
+    credentials = HMACCallbackCredentials("active-callback-secret-5678", key_id="active")
+    token = credentials.issue(_binding(expires_in=AGENT_CALLBACK_TOKEN_TTL_SECONDS - 1))
+    verified = credentials.verify(token)
+    assert verified.expires_at > datetime.now(UTC) + timedelta(hours=1, minutes=59)
+
+    with pytest.raises(CallbackError) as error:
+        credentials.issue(_binding(expires_in=AGENT_CALLBACK_TOKEN_TTL_SECONDS + 1))
+    assert error.value.code == "agent_callback_invalid_execution"
+
+
+def test_callback_hmac_verifier_rejects_expiration_beyond_two_hours() -> None:
+    """验证端独立拒绝有效期超过两小时的正确签名凭据。"""
+    secret = b"active-callback-secret-5678"
+    credentials = HMACCallbackCredentials(secret, key_id="active")
+    binding = _binding(expires_in=AGENT_CALLBACK_TOKEN_TTL_SECONDS + 60)
+    header = credentials._encode({"alg": "HS256", "typ": "MMCB", "kid": "active"})
+    body = credentials._encode(binding.claims())
+    signature = hmac.new(secret, f"{header}.{body}".encode(), hashlib.sha256).digest()
+    token = f"{header}.{body}.{base64.urlsafe_b64encode(signature).rstrip(b'=').decode()}"
+
+    with pytest.raises(CallbackError) as error:
+        credentials.verify(token)
+    assert error.value.code == "agent_callback_unauthorized"
 
 
 def test_callback_header_and_request_id_binding_is_strict() -> None:
@@ -145,6 +176,7 @@ def test_callback_body_guard_stops_chunked_body_without_content_length() -> None
     (
         ("id", "task-b"),
         ("scope_id", "scope-b"),
+        ("status", "succeeded"),
         ("claim_generation", 3),
         ("lease_owner", "worker-b"),
         ("attempt_count", 1),
@@ -198,9 +230,9 @@ def test_validate_binding_task_accepts_current_claim_only() -> None:
     assert validate_binding_task(binding, task, registration).scope_id == binding.scope_id
 
 
-def test_validate_binding_task_never_outlives_lease() -> None:
-    """即使 token 自身未过期，其有效期越过 lease 也必须拒绝。"""
-    binding = _binding(expires_in=60)
+def test_validate_binding_task_accepts_long_token_while_claim_lease_is_current() -> None:
+    """两小时 token 可越过本次 lease，但调用时的当前 claim 必须仍然有效。"""
+    binding = _binding(expires_in=AGENT_CALLBACK_TOKEN_TTL_SECONDS - 1)
     task = SimpleNamespace(
         id=binding.task_id,
         scope_id=binding.scope_id,
@@ -217,6 +249,9 @@ def test_validate_binding_task_never_outlives_lease() -> None:
         frozenset({"meme_context_generation"}),
         frozenset({"analysis.reverse_image_search"}),
     )
+    assert validate_binding_task(binding, task, registration).scope_id == binding.scope_id
+
+    task.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
     with pytest.raises(CallbackError) as error:
         validate_binding_task(binding, task, registration)
     assert error.value.code == "agent_callback_invalid_execution"

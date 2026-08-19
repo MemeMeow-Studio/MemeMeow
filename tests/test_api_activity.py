@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-from api import get_task, list_tasks
+from api import _task_summary, get_task, list_tasks
 from backend.opencode_activity import AgentActivity, OpenCodeActivityReader
 from backend.tasks import TaskRecord
 
@@ -50,6 +51,13 @@ def _request(records: list[TaskRecord], reader: FakeActivityReader):
     return SimpleNamespace(app=SimpleNamespace(state=state))
 
 
+def _request_with_settings(record: TaskRecord, reader: FakeActivityReader, settings: object):
+    """构造带续跑 rollout 配置的任务详情请求。"""
+    metadata = SimpleNamespace(image_for_meme=lambda _meme_id: (None, Path("sample.png")))
+    state = SimpleNamespace(tasks=FakeTasks([record]), agent_activity=reader, metadata=metadata, settings=settings)
+    return SimpleNamespace(app=SimpleNamespace(state=state))
+
+
 def _context_record(task_id: str) -> TaskRecord:
     """创建带图片身份的语境任务快照。"""
     return TaskRecord(task_id=task_id, task_type="meme_context_generation", payload={"meme_id": f"meme-{task_id}"}, status="running")
@@ -84,6 +92,56 @@ def test_task_detail_reuses_single_activity_boundary():
     assert response["agent_last_activity_at"].endswith("Z")
 
 
+def test_task_summary_masks_resume_when_rollout_is_disabled_or_budget_exhausted():
+    """任务详情不能把已持久化的 session 在关闭开关或额度耗尽后继续报告为可恢复。"""
+    disabled = _context_record("resume-disabled")
+    disabled.resume_available = True
+    disabled.resume_reason = "agent_provider_server_error"
+    disabled.session_id = "session-resume-disabled"
+    disabled.executor_attempt_id = "attempt-resume-disabled"
+    disabled_request = _request_with_settings(disabled, FakeActivityReader(), SimpleNamespace(agent_resume_enabled=False, agent_resume_max_attempts=2))
+    disabled_response = _task_summary(disabled_request, disabled)
+    assert disabled_response["resume_available"] is False
+    assert disabled_response["resume_reason"] == "resume_disabled"
+
+    exhausted = _context_record("resume-exhausted")
+    exhausted.resume_available = True
+    exhausted.resume_attempts = 2
+    exhausted.session_id = "session-resume-exhausted"
+    exhausted.executor_attempt_id = "attempt-resume-exhausted"
+    exhausted_request = _request_with_settings(exhausted, FakeActivityReader(), SimpleNamespace(agent_resume_enabled=True, agent_resume_max_attempts=2))
+    exhausted_response = _task_summary(exhausted_request, exhausted)
+    assert exhausted_response["resume_available"] is False
+    assert exhausted_response["resume_reason"] == "resume_budget_exhausted"
+
+
+def test_task_summary_keeps_queued_auto_resume_visible_within_budget():
+    """尚未耗尽额度的排队任务仍显示可续跑，便于诊断自动恢复状态。"""
+    record = _context_record("resume-queued")
+    record.status = "queued"
+    record.resume_available = True
+    record.resume_attempts = 1
+    record.session_id = "session-resume-queued"
+    record.executor_attempt_id = "attempt-resume-queued"
+    request = _request_with_settings(record, FakeActivityReader(), SimpleNamespace(agent_resume_enabled=True, agent_resume_max_attempts=2))
+    response = _task_summary(request, record)
+    assert response["status"] == "queued"
+    assert response["resume_available"] is True
+
+
+def test_task_summary_masks_resume_after_cumulative_timeout():
+    """续跑累计时间超过上限后，即使尚未再次 claim 也不显示可恢复。"""
+    record = _context_record("resume-timeout")
+    record.resume_available = True
+    record.resume_started_at = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+    record.session_id = "session-resume-timeout"
+    record.executor_attempt_id = "attempt-resume-timeout"
+    request = _request_with_settings(record, FakeActivityReader(), SimpleNamespace(agent_resume_enabled=True, agent_resume_max_attempts=2, agent_resume_timeout_seconds=60))
+    response = _task_summary(request, record)
+    assert response["resume_available"] is False
+    assert response["resume_reason"] == "resume_budget_exhausted"
+
+
 def test_reader_error_keeps_task_api_successful_and_omits_all_activity():
     """reader 异常只会隐藏活动字段，不改变既有任务响应。"""
     record = _context_record("failed-reader")
@@ -106,6 +164,50 @@ def test_incomplete_activity_is_not_exposed_as_partial_summary():
     response = asyncio.run(get_task(request, "partial"))
 
     assert not {"agent_completed_turns", "agent_turn_running", "agent_last_activity_at"} & response.keys()
+
+
+def test_task_summary_exposes_only_resume_diagnostics():
+    """任务详情公开 session/attempt 和有限错误历史，不泄漏完整执行上下文。"""
+    record = TaskRecord(
+        task_id="resume-detail",
+        task_type="meme_context_generation",
+        payload={"meme_id": "meme-resume-detail", "prompt": "must not appear"},
+        status="failed",
+        resume_available=True,
+        resume_reason="agent_provider_rate_limited",
+        session_id="session-resume-detail",
+        executor_attempt_id="attempt-resume-detail",
+        resume_attempts=1,
+        first_error={"error": "agent_provider_rate_limited", "message": "短暂失败"},
+        error_history=[{"error": "agent_provider_rate_limited", "attempt": 1}],
+    )
+    response = asyncio.run(get_task(_request([record], FakeActivityReader()), record.task_id))
+
+    assert response["resume_available"] is True
+    assert response["session_id"] == "session-resume-detail"
+    assert response["executor_attempt_id"] == "attempt-resume-detail"
+    assert response["resume_attempts"] == 1
+    assert response["first_error"]["error"] == "agent_provider_rate_limited"
+    assert "prompt" not in response
+
+
+def test_task_summary_fails_closed_for_invalid_resume_identifiers():
+    """损坏的历史恢复标识不能在 API 中继续显示为可续跑。"""
+    record = TaskRecord(
+        task_id="resume-invalid",
+        task_type="meme_context_generation",
+        status="failed",
+        resume_available=True,
+        resume_reason="agent_provider_rate_limited",
+        session_id="/runtime/opencode.db",
+        executor_attempt_id="attempt-valid",
+    )
+    response = asyncio.run(get_task(_request([record], FakeActivityReader()), record.task_id))
+
+    assert response["resume_available"] is False
+    assert response["resume_reason"] == "session_not_resumable"
+    assert response["session_id"] is None
+    assert response["executor_attempt_id"] == "attempt-valid"
 
 
 def test_fault_injected_reader_keeps_list_and_detail_successful(tmp_path: Path):

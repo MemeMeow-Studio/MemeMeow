@@ -26,6 +26,8 @@ from backend.database import ScopeContext
 logger = logging.getLogger(__name__)
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+# callback 会随当前 claim 继续做数据库复核，因此签名凭据可以覆盖最长 Agent 执行窗口。
+AGENT_CALLBACK_TOKEN_TTL_SECONDS = 2 * 60 * 60
 
 
 class CallbackError(RuntimeError):
@@ -157,7 +159,7 @@ class HMACCallbackCredentials:
         audience: str = "mememeow-internal",
         key_id: str = "default",
         verification_keys: Mapping[str, str | bytes] | None = None,
-        ttl_seconds: int = 120,
+        ttl_seconds: int = AGENT_CALLBACK_TOKEN_TTL_SECONDS,
     ) -> None:
         """创建显式 HMAC 密钥环，``verification_keys`` 用于轮换窗口。
 
@@ -179,7 +181,7 @@ class HMACCallbackCredentials:
         self.issuer = issuer
         self.audience = audience
         self.key_id = key_id
-        self.ttl_seconds = min(int(ttl_seconds), 3600)
+        self.ttl_seconds = min(int(ttl_seconds), AGENT_CALLBACK_TOKEN_TTL_SECONDS)
 
     @staticmethod
     def _normalize_secret(secret: str | bytes | None) -> bytes:
@@ -262,7 +264,7 @@ class HMACCallbackCredentials:
             )
         except (KeyError, TypeError, ValueError, CallbackError) as exc:
             raise CallbackError() from exc
-        if expires <= now:
+        if expires <= now or expires > now + timedelta(seconds=self.ttl_seconds):
             raise CallbackError()
         if path is not None and path not in {"/internal/reverse-image/search", "/internal/visual-search/match"}:
             raise CallbackError("agent_callback_invalid_execution")
@@ -411,7 +413,9 @@ def validate_binding_task(binding: CallbackBinding, task: object, registration: 
         if getattr(task, "status", None) != "running" or int(getattr(task, "claim_generation", 0)) != binding.claim_generation or getattr(task, "lease_owner", None) != binding.owner:
             raise CallbackError("agent_callback_invalid_execution")
         expires = getattr(task, "lease_expires_at", None)
-        if expires is None or expires <= datetime.now(UTC) or binding.expires_at <= datetime.now(UTC) or binding.expires_at > expires:
+        # token 覆盖两小时 Agent 窗口，但每次调用仍以数据库中的当前 lease 为准。
+        # 因此任务结束、租约失效或重新认领都会立即废止尚未过期的 token。
+        if expires is None or expires <= datetime.now(UTC) or binding.expires_at <= datetime.now(UTC):
             raise CallbackError("agent_callback_invalid_execution")
         if int(getattr(task, "attempt_count", 0)) != binding.attempt:
             raise CallbackError("agent_callback_invalid_execution")

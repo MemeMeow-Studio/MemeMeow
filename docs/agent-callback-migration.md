@@ -12,8 +12,8 @@ operation grant；它只证明一次受控 Agent 执行可以调用指定的内�
    token。executor Bearer token、callback 根 secret、`SERPAPI_API_KEY`、数据库凭据和
    operation grant 不得相互复用。
 3. 先运行数据库迁移和 callback 拒绝回归，再启动 Agent 调度。Runner 只能拿到当前
-   `task_id`、claim generation/attempt、目标 SHA、允许 operation 和不晚于租约的短期
-   callback token。
+   `task_id`、claim generation/attempt、目标 SHA、允许 operation 和最长两小时有效的
+   callback token；每次调用仍以数据库中的当前 claim 和未过期 lease 为准。
 4. 反向图片 Agent 只通过 `/internal/reverse-image/search` 薄客户端调用。`forbid` 不
    读取缓存、不 acquire、不联系 provider；`auto` 仍须经过当前 callback 校验和
    `analysis.reverse_image_search` acquire。SerpApi 密钥只留在 API。
@@ -32,8 +32,8 @@ MEMEMEOW_AGENT_CALLBACK_VERIFICATION_KEYS=old-kid=<old-secret>
 ```
 
 新 token 只用当前根 secret 签发，旧 key 只用于验证已经发出的短期 token。先部署能够
-验证新旧 key 的 API，再滚动重启 Runner/executor 使其取得新 token；确认旧 token 的最大
-租约窗口已结束后，删除 `MEMEMEOW_AGENT_CALLBACK_VERIFICATION_KEYS` 并再次重启 API。
+验证新旧 key 的 API，再滚动重启 Runner/executor 使其取得新 token；确认旧 token 的两小时
+最大验证窗口已结束后，删除 `MEMEMEOW_AGENT_CALLBACK_VERIFICATION_KEYS` 并再次重启 API。
 不要把 secret 写入 `.env` 提交、任务 payload、结果 artifact、缓存、usage、日志或
 OpenCode prompt。轮换期间仍以 PostgreSQL 当前 claim、owner、lease、attempt 和目标
 SHA 为最终授权，验证窗口不会扩大 Task 或 operation 范围。

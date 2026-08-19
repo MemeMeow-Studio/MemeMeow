@@ -54,7 +54,7 @@ callback 验证分成两个逻辑层次：服务认证证明请求来自允许�
 
 任何失败都返回对 Agent 不可区分的 `agent_callback_invalid_execution`，详细原因只进入脱敏服务端诊断。scope 装配失败不得调用只按 task id 的无 fencing 失败写回，也不得终止另一 Worker 的当前 claim；仅持有完整当前 claim 的路径才能收束自己的 Task。
 
-任务重新认领会递增 generation，因此旧执行凭据即使尚未到期也会在数据库比较时失效。凭据过期时间不得晚于其租约边界；heartbeat 延长租约时是否续签凭据由发行器决定，但每次 callback 仍以数据库当前事实为准。
+任务重新认领会递增 generation，因此旧执行凭据即使尚未到期也会在数据库比较时失效。默认 HMAC 凭据覆盖最长两小时 Agent 执行窗口，不与单次 heartbeat lease 的到期时间绑定；每次 callback 仍复核数据库中的当前 claim 和未过期 lease，因此任务结束、租约失效或重新认领都会立即废止尚未过期的凭据。
 
 ### 4. callback operation 必须绑定明确目标和最小输入
 
@@ -90,7 +90,7 @@ callback 验证分成两个逻辑层次：服务认证证明请求来自允许�
 
 - [Risk] callback secret 进入 Agent 后可能被该次任务读取。→ 只签发绑定单 Task/claim/operation/目标且短期有效的最小凭据；根 secret、executor token 和其它任务凭据不进入子进程。
 - [Risk] callback 第一层认证与 FastAPI body 解析顺序实现错误，仍可能在认证前读取大文件。→ 使用 ASGI 级前置测试，以计数 receive/临时文件/Task 查询断言未认证请求零读取、零业务访问。
-- [Risk] Task lease 在长调用中到期会拒绝合法 callback。→ Runner 保持 heartbeat，凭据有效期不超过租约；拒绝后由持久 Task 恢复协议重新认领，不延长旧 claim。
+- [Risk] Task lease 在长调用中到期会拒绝合法 callback。→ Runner 保持 heartbeat；两小时凭据与单次 lease 解耦，但每次 callback 仍复核当前 lease，拒绝后由持久 Task 恢复协议重新认领，不延长旧 claim。
 - [Risk] 凭据轮换使在途 Agent 失败。→ verifier 支持受限双 key 验证窗口，但数据库当前 claim 仍是最终授权；轮换窗口不允许扩大 task/operation 范围。
 - [Risk] 服务端裁剪与现有 Agent 上传裁剪图不兼容。→ 先迁移 CLI 为传递受限裁剪区域或后端派生引用，再强制认证；不得保留任意图片作为兼容旁路。
 - [Risk] 通用 callback 安全能力与反向图片基础 capability 实施顺序错误。→ 已直接修订尚未归档的 `add-task-scoped-reverse-image-search`，使其依赖本安全边界；先完成 `make-application-scope-aware` 的 claim/factory 加固，再联合实施两项 change，先归档反向图片基础 capability，随后归档本通用安全 capability。

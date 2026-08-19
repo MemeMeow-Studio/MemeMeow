@@ -55,7 +55,7 @@ from backend.metadata import MemeContext
 from backend.operation_policy import AllowAllOperationPolicy, GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations, PersistentGrantAssociationStore
 from backend.visual import VisualSearchError, VisualSearchService
 from backend.scope import ScopeServiceFactory
-from backend.pg_services import PostgresTaskWorkerManager
+from backend.pg_services import PostgresTaskService, PostgresTaskWorkerManager
 
 
 class _CountingAllowAllPolicy(AllowAllOperationPolicy):
@@ -1259,6 +1259,112 @@ def test_process_worker_manager_handles_many_scopes_and_restart_claims(postgres_
         factory.shutdown()
         with postgres_engine.begin() as connection:
             connection.execute(text("DELETE FROM scopes WHERE id IN (:scope_a, :scope_b)"), {"scope_a": scope_ids[0], "scope_b": scope_ids[1]})
+
+
+def test_agent_resume_keeps_queued_state_across_two_provider_failures(postgres_resources) -> None:
+    """同一 session 的两次续跑失败仍按预算排队，额度耗尽后才收束未知执行。"""
+    task_service = PostgresTaskService(
+        postgres_resources,
+        agent_concurrency=1,
+        max_attempts=4,
+        resume_enabled=True,
+        resume_max_attempts=2,
+        resume_backoff_seconds=0,
+        resume_max_backoff_seconds=0,
+        resume_timeout_seconds=900,
+    )
+    # 手动认领每个 attempt，避免测试线程自动调度 queued 任务造成竞态。
+    task_service._schedule_queued = lambda: None  # type: ignore[method-assign]
+    observed: list[dict[str, object]] = []
+
+    def provider_failure(payload, _progress):
+        """模拟保留 session 的 provider 错误并持久化当前 attempt。"""
+        attempt = int(payload["_claim_attempt"])
+        inherited_session = payload.get("_resume_session_id")
+        observed.append(
+            {
+                "attempt": attempt,
+                "session_id": inherited_session,
+                "resume_available": payload.get("_resume_available"),
+            }
+        )
+        if attempt == 1:
+            assert inherited_session is None
+        else:
+            assert inherited_session == "resume-session"
+            assert payload.get("_resume_available") is True
+        session_id = str(inherited_session or "resume-session")
+        executor_attempt_id = f"executor-attempt-{attempt}"
+        payload["_resume_session_id"] = session_id
+        payload["_executor_attempt_id"] = executor_attempt_id
+        payload["_resume_available"] = True
+        payload["_resume_reason"] = "agent_provider_server_error"
+        assert task_service.record_agent_attempt(
+            payload,
+            error={"error": "agent_provider_server_error", "message": "provider unavailable"},
+            session_id=session_id,
+            executor_attempt_id=executor_attempt_id,
+            resume_available=True,
+            resume_reason="agent_provider_server_error",
+        ) is True
+        raise RuntimeError("agent_provider_server_error: provider unavailable")
+
+    task_service.register("meme_context_generation", provider_failure)
+    submitted = task_service.submit(
+        "meme_context_generation",
+        {
+            "meme_id": "resume-test-meme",
+            "image_sha256": "a" * 64,
+            "processing_config_hash": "b" * 64,
+            "reverse_image_policy": "forbid",
+        },
+        schedule=False,
+    )
+
+    def run_claimed_attempt():
+        """认领并执行一个 attempt，返回持久任务快照。"""
+        with postgres_resources.environment("local") as environment:
+            claim = environment.tasks.claim(
+                owner=task_service.owner,
+                task_id=submitted.task_id,
+                lane="agent",
+                lane_capacity=task_service.agent_concurrency,
+                lease_seconds=120,
+            )
+        assert claim is not None
+        task_service._run(submitted.task_id, preclaimed=claim)
+        snapshot = task_service.get(submitted.task_id)
+        assert snapshot is not None
+        return snapshot
+
+    try:
+        first = run_claimed_attempt()
+        assert first.status == "queued"
+        assert first.resume_available is True
+        assert first.resume_attempts == 0
+
+        first_resume = run_claimed_attempt()
+        assert first_resume.status == "queued"
+        assert first_resume.resume_available is True
+        assert first_resume.resume_attempts == 1
+
+        second_resume = run_claimed_attempt()
+        assert second_resume.status == "queued"
+        assert second_resume.resume_available is True
+        assert second_resume.resume_attempts == 2
+        assert len(observed) == 3
+        assert [item["session_id"] for item in observed] == [None, "resume-session", "resume-session"]
+        assert [item["resume_available"] for item in observed] == [None, True, True]
+
+        exhausted = run_claimed_attempt()
+        assert exhausted.status == "failed"
+        assert exhausted.error is not None and exhausted.error["error"] == "unknown_execution"
+        assert exhausted.resume_available is False
+        assert exhausted.resume_reason == "unknown_execution"
+        assert len(observed) == 3
+        assert exhausted.first_error is not None and exhausted.first_error["error"] == "agent_provider_server_error"
+    finally:
+        task_service.shutdown()
 
 
 def test_host_database_resources_do_not_require_local_scope(postgres_engine: Engine, tmp_path: Path) -> None:

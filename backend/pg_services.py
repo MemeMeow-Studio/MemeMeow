@@ -43,6 +43,18 @@ from backend.database import (
     UnitOfWork,
     utcnow,
 )
+from backend.agent_resume import (
+    append_error_history,
+    append_task_error_history,
+    agent_failure_requires_unknown,
+    bounded_backoff,
+    classify_resume_error,
+    normalize_config_hash,
+    normalize_identifier,
+    sanitize_error,
+    sanitize_error_history,
+    within_total_timeout,
+)
 from backend.metadata import (
     CONTEXT_STATUSES,
     MAX_SEMANTIC_DOCUMENT_LENGTH,
@@ -620,17 +632,35 @@ class PostgresTaskWorkerManager:
                 )
             )
             for task in rows:
+                recovery_error = {"error": "lease_expired", "message": "Worker 租约已过期"}
+                append_task_error_history(
+                    task,
+                    recovery_error,
+                    attempt=task.attempt_count,
+                    executor_attempt_id=task.executor_attempt_id,
+                    session_id=task.resume_session_id,
+                    occurred_at=now.isoformat(),
+                )
                 if task.attempt_count < task.max_attempts:
                     task.status = "queued"
                     task.available_at = now
                     task.message = "租约已过期，等待重新认领"
-                    task.error = {"error": "lease_expired", "message": "Worker 租约已过期"}
+                    task.error = recovery_error
                     queued.append(task.id)
                 else:
                     task.status = "failed"
                     task.completed_at = now
                     task.message = "任务达到最大尝试次数"
-                    task.error = {"error": "max_attempts_exceeded", "message": "任务达到最大尝试次数"}
+                    terminal_error = {"error": "max_attempts_exceeded", "message": "任务达到最大尝试次数"}
+                    append_task_error_history(
+                        task,
+                        terminal_error,
+                        attempt=task.attempt_count,
+                        executor_attempt_id=task.executor_attempt_id,
+                        session_id=task.resume_session_id,
+                        occurred_at=now.isoformat(),
+                    )
+                    task.error = terminal_error
                 task.lease_owner = None
                 task.lease_expires_at = None
                 task.updated_at = now
@@ -679,7 +709,14 @@ class PostgresTaskWorkerManager:
                     task.completed_at = utcnow()
                     task.lease_owner = None
                     task.lease_expires_at = None
-                    task.error = {"error": "task_scope_invalid", "message": "任务缺少有效 scope"}
+                    task.error = append_task_error_history(
+                        task,
+                        {"error": "task_scope_invalid", "message": "任务缺少有效 scope"},
+                        attempt=task.attempt_count,
+                        executor_attempt_id=task.executor_attempt_id,
+                        session_id=task.resume_session_id,
+                        occurred_at=utcnow().isoformat(),
+                    )
                     task.message = "任务 scope 无效"
                     self._release_slot(session, task.scope_id, task.id)
             session.commit()
@@ -796,7 +833,14 @@ class PostgresTaskWorkerManager:
             task.lease_owner = None
             task.lease_expires_at = None
             task.message = "任务 scope 无法装配"
-            task.error = {"error": "task_scope_unavailable", "message": "任务 scope 当前不可用"}
+            task.error = append_task_error_history(
+                task,
+                {"error": "task_scope_unavailable", "message": "任务 scope 当前不可用"},
+                attempt=getattr(task, "attempt_count", 0),
+                executor_attempt_id=getattr(task, "executor_attempt_id", None),
+                session_id=getattr(task, "resume_session_id", None),
+                occurred_at=utcnow().isoformat(),
+            )
             self._release_slot(session, task.scope_id, task.id, owner=self.owner, claim_generation=claim.claim_generation)
             session.commit()
 
@@ -833,10 +877,19 @@ class PostgresTaskWorkerManager:
         with self.resources.factory() as session:
             rows = list(session.scalars(select(Task).where(Task.status == "running", Task.lease_owner == self.owner).with_for_update(skip_locked=True)))
             for task in rows:
+                interrupted_error = {"error": "task_interrupted", "message": "任务执行 Worker 已停止"}
+                append_task_error_history(
+                    task,
+                    interrupted_error,
+                    attempt=task.attempt_count,
+                    executor_attempt_id=task.executor_attempt_id,
+                    session_id=task.resume_session_id,
+                    occurred_at=now.isoformat(),
+                )
                 task.status = "failed"
                 task.completed_at = now
                 task.message = "Worker 已停止"
-                task.error = {"error": "task_interrupted", "message": "任务执行 Worker 已停止"}
+                task.error = interrupted_error
                 task.lease_owner = None
                 task.lease_expires_at = None
                 task.updated_at = now
@@ -856,7 +909,7 @@ class PostgresTaskService:
     恢复并校验 scope，避免普通 payload 或 Worker 的历史默认值成为归属事实。
     """
 
-    def __init__(self, resources: DatabaseResources, *, scope_id: str | ScopeContext = "local", agent_concurrency: int = 1, agent_backpressure: int = 32, settings_version: str | None = None, lease_seconds: int = 120, max_attempts: int = 3, executor: ThreadPoolExecutor | None = None, worker_manager: PostgresTaskWorkerManager | None = None, finalize_image_tasks: bool = True, operation_policy: OperationPolicyGateway | None = None, grant_store: GrantAssociationStore | None = None):
+    def __init__(self, resources: DatabaseResources, *, scope_id: str | ScopeContext = "local", agent_concurrency: int = 1, agent_backpressure: int = 32, settings_version: str | None = None, lease_seconds: int = 120, max_attempts: int = 3, executor: ThreadPoolExecutor | None = None, worker_manager: PostgresTaskWorkerManager | None = None, finalize_image_tasks: bool = True, operation_policy: OperationPolicyGateway | None = None, grant_store: GrantAssociationStore | None = None, resume_enabled: bool = False, resume_max_attempts: int = 2, resume_backoff_seconds: int = 2, resume_max_backoff_seconds: int = 60, resume_timeout_seconds: int = 900):
         self.resources = resources
         self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
         self.agent_concurrency = max(1, min(int(agent_concurrency), 8))
@@ -864,6 +917,11 @@ class PostgresTaskService:
         self.settings_version = settings_version
         self.lease_seconds = lease_seconds
         self.max_attempts = max_attempts
+        self.resume_enabled = bool(resume_enabled)
+        self.resume_max_attempts = max(0, min(int(resume_max_attempts), 10))
+        self.resume_backoff_seconds = max(0, min(int(resume_backoff_seconds), 300))
+        self.resume_max_backoff_seconds = max(0, min(int(resume_max_backoff_seconds), 3600))
+        self.resume_timeout_seconds = max(1, min(int(resume_timeout_seconds), 86400))
         # 图片 Worker 执行叶子任务时关闭旧批次 finalizer，避免再次隐式创建
         # cache_generation；普通兼容 facade 仍保留既有显式批次能力。
         self._finalize_image_tasks = bool(finalize_image_tasks)
@@ -1040,6 +1098,9 @@ class PostgresTaskService:
 
     def _record_to_dataclass(self, record: Any, *, slot_id: int | None = None) -> TaskRecord:
         """将 ORM 任务转换为 API/旧领域共用的安全快照。"""
+        session_id = normalize_identifier(getattr(record, "resume_session_id", None), kind="session")
+        executor_attempt_id = normalize_identifier(getattr(record, "executor_attempt_id", None), kind="attempt")
+        stored_resume_available = bool(getattr(record, "resume_available", False))
         return TaskRecord(
             task_id=record.id,
             task_type=record.task_type,
@@ -1054,7 +1115,15 @@ class PostgresTaskService:
             updated_at=_iso(record.updated_at),
             completed_at=_iso(record.completed_at) if record.completed_at else None,
             attempts=record.attempt_count,
-            error=record.error,
+            error=sanitize_error(record.error) if isinstance(getattr(record, "error", None), dict) else None,
+            resume_available=bool(stored_resume_available and session_id and executor_attempt_id),
+            resume_reason=("session_not_resumable" if stored_resume_available and not (session_id and executor_attempt_id) else getattr(record, "resume_reason", None)),
+            session_id=session_id,
+            executor_attempt_id=executor_attempt_id,
+            resume_attempts=int(getattr(record, "resume_attempt_count", 0) or 0),
+            resume_started_at=_iso(getattr(record, "resume_started_at", None)) if getattr(record, "resume_started_at", None) else None,
+            first_error=sanitize_error(getattr(record, "first_error", None)) if isinstance(getattr(record, "first_error", None), dict) else None,
+            error_history=sanitize_error_history(getattr(record, "error_history", None)),
             result=record.result,
             settings_version=record.settings_version,
             agent_concurrency=self.agent_concurrency if record.lane == "agent" else None,
@@ -1074,11 +1143,26 @@ class PostgresTaskService:
         target_sha = payload.get("image_sha256")
         if not isinstance(target_sha, str) or len(target_sha) != 64:
             return
-        stable_payload = {key: value for key, value in payload.items() if not key.startswith("_claim_")}
+        # claim、resume 和 attempt 绑定字段都是运行时事实，不属于同一输入的
+        # 业务摘要；排除全部内部字段才能让续跑 attempt 与原 attempt 对齐。
+        stable_payload = {key: value for key, value in payload.items() if not key.startswith("_")}
         input_digest = hashlib.sha256(json.dumps(stable_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         now = utcnow()
         with self.resources.environment(self.scope.scope_id) as environment:
             session = environment.uow.session
+            current_task = session.scalar(
+                select(Task)
+                .where(
+                    Task.scope_id == self.scope.scope_id,
+                    Task.id == claim.id,
+                    Task.status == "running",
+                    Task.claim_generation == claim.claim_generation,
+                    Task.lease_owner == self.owner,
+                    Task.lease_expires_at > now,
+                )
+            )
+            if current_task is None:
+                return
             row = session.scalar(
                 select(ImageProcessingAttempt).where(
                     ImageProcessingAttempt.scope_id == self.scope.scope_id,
@@ -1095,9 +1179,12 @@ class PostgresTaskService:
                     stage=str(payload.get("stage") or claim.task_type),
                     state=state,
                     request_id=str(payload.get("request_id")) if payload.get("request_id") else None,
-                    session_id=str(payload.get("session_id")) if payload.get("session_id") else None,
+                    session_id=str(payload.get("_resume_session_id") or payload.get("session_id")) if (payload.get("_resume_session_id") or payload.get("session_id")) else None,
+                    executor_attempt_id=normalize_identifier(payload.get("_executor_attempt_id"), kind="attempt"),
+                    resume_of_attempt_id=normalize_identifier(payload.get("_resume_of_attempt_id"), kind="attempt"),
+                    processing_config_hash=normalize_config_hash(payload.get("processing_config_hash")),
                     input_digest=input_digest,
-                    target_sha256=target_sha,
+                    target_sha256=target_sha.lower(),
                     claim_generation=claim.claim_generation,
                 )
                 session.add(row)
@@ -1107,12 +1194,190 @@ class PostgresTaskService:
                     return
                 row.state = state
                 row.updated_at = now
+                if normalize_identifier(payload.get("_resume_session_id"), kind="session"):
+                    row.session_id = str(payload["_resume_session_id"])
+                if normalize_identifier(payload.get("_executor_attempt_id"), kind="attempt"):
+                    row.executor_attempt_id = str(payload["_executor_attempt_id"])
             session.commit()
+
+    def record_agent_attempt(
+        self,
+        payload: dict[str, Any],
+        *,
+        error: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        executor_attempt_id: str | None = None,
+        resume_available: bool = False,
+        resume_reason: str | None = None,
+    ) -> bool:
+        """在当前 claim fencing 下持久化 Agent session、executor attempt 和失败历史。"""
+        task_id = payload.get("_claim_task_id")
+        generation = payload.get("_claim_generation")
+        owner = payload.get("_claim_owner")
+        attempt = payload.get("_claim_attempt")
+        if not isinstance(task_id, str) or not isinstance(generation, int) or not isinstance(owner, str) or not isinstance(attempt, int):
+            return False
+        safe_session = normalize_identifier(session_id, kind="session")
+        safe_executor_attempt = normalize_identifier(executor_attempt_id, kind="attempt")
+        payload_config_hash = normalize_config_hash(payload.get("processing_config_hash"))
+        if payload.get("processing_config_hash") is not None and payload_config_hash is None:
+            return False
+        now = utcnow()
+        safe_error = sanitize_error(error) if error else None
+        with self.resources.environment(self.scope.scope_id) as environment:
+            session = environment.uow.session
+            task = session.scalar(
+                select(Task)
+                .where(
+                    Task.scope_id == self.scope.scope_id,
+                    Task.id == task_id,
+                    Task.status == "running",
+                    Task.claim_generation == generation,
+                    Task.lease_owner == owner,
+                    Task.lease_expires_at > now,
+                )
+                .with_for_update()
+            )
+            if task is None:
+                session.commit()
+                return False
+            row = session.scalar(
+                select(ImageProcessingAttempt)
+                .where(
+                    ImageProcessingAttempt.scope_id == self.scope.scope_id,
+                    ImageProcessingAttempt.task_id == task_id,
+                    ImageProcessingAttempt.attempt == attempt,
+                )
+                .with_for_update()
+            )
+            if row is None:
+                session.commit()
+                return False
+            if row.claim_generation != generation:
+                # attempt 行也必须与当前 claim generation 一致；只校验 Task
+                # 行会允许旧 attempt 借用同一 attempt 序号写入新 claim。
+                session.commit()
+                return False
+            if normalize_config_hash(row.processing_config_hash) != payload_config_hash:
+                session.commit()
+                return False
+            if safe_session:
+                row.session_id = safe_session
+                task.resume_session_id = safe_session
+            if safe_executor_attempt:
+                row.executor_attempt_id = safe_executor_attempt
+                task.executor_attempt_id = safe_executor_attempt
+            if safe_error:
+                row.error = safe_error
+                row.resume_reason = resume_reason or safe_error.get("error")
+            row.resume_available = bool(resume_available and safe_session and safe_executor_attempt)
+            row.state = "failed" if safe_error else "completed"
+            row.updated_at = now
+            if safe_error:
+                task.first_error = sanitize_error(task.first_error) if isinstance(task.first_error, dict) else safe_error
+                task.error_history = append_error_history(
+                    task.error_history,
+                    safe_error,
+                    attempt=attempt,
+                    executor_attempt_id=safe_executor_attempt,
+                    session_id=safe_session,
+                    occurred_at=now.isoformat(),
+                )
+                task.resume_available = bool(resume_available and safe_session and safe_executor_attempt)
+                task.resume_reason = resume_reason or safe_error.get("error")
+                if task.resume_available and task.resume_started_at is None:
+                    task.resume_started_at = now
+            else:
+                task.resume_available = False
+                task.resume_reason = None
+            session.commit()
+            return True
+
+    def _resume_candidate(self, claim: Task, payload: dict[str, Any]) -> dict[str, str] | None:
+        """读取并校验同一任务最近的可续跑 attempt，拒绝猜测 session。"""
+        if not self.resume_enabled or claim.task_type != "meme_context_generation":
+            return None
+        if claim.resume_attempt_count >= self.resume_max_attempts:
+            return None
+        if not within_total_timeout(claim.resume_started_at, timeout_seconds=self.resume_timeout_seconds):
+            return None
+        target_sha = payload.get("image_sha256")
+        if not isinstance(target_sha, str) or len(target_sha) != 64:
+            return None
+        config_hash = normalize_config_hash(payload.get("processing_config_hash"))
+        if payload.get("processing_config_hash") is not None and config_hash is None:
+            return None
+        stable_payload = {key: value for key, value in payload.items() if not key.startswith("_")}
+        input_digest = hashlib.sha256(json.dumps(stable_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        with self.resources.factory() as session:
+            previous = session.scalar(
+                select(ImageProcessingAttempt)
+                .where(
+                    ImageProcessingAttempt.scope_id == self.scope.scope_id,
+                    ImageProcessingAttempt.task_id == claim.id,
+                    ImageProcessingAttempt.attempt < claim.attempt_count,
+                    ImageProcessingAttempt.state == "failed",
+                    ImageProcessingAttempt.resume_available.is_(True),
+                    ImageProcessingAttempt.target_sha256 == target_sha.lower(),
+                    ImageProcessingAttempt.input_digest == input_digest,
+                )
+                .order_by(ImageProcessingAttempt.attempt.desc())
+            )
+        session_id = normalize_identifier(getattr(previous, "session_id", None), kind="session") if previous else None
+        executor_attempt_id = normalize_identifier(getattr(previous, "executor_attempt_id", None), kind="attempt") if previous else None
+        if not session_id or not executor_attempt_id:
+            return None
+        if normalize_config_hash(getattr(previous, "processing_config_hash", None)) != config_hash:
+            return None
+        previous_reason = getattr(previous, "resume_reason", None) if previous is not None else None
+        resume_reason = previous_reason if isinstance(previous_reason, str) and previous_reason else "session_resumable"
+        return {
+            "session_id": session_id,
+            "executor_attempt_id": executor_attempt_id,
+            "resume_of_attempt_id": executor_attempt_id,
+            "resume_reason": resume_reason,
+        }
+
+    def _begin_resume(self, claim: Task, candidate: dict[str, str]) -> bool:
+        """在 claim fencing 下原子递增续跑次数，防止并发恢复器重复使用 session。"""
+        now = utcnow()
+        with self.resources.environment(self.scope.scope_id) as environment:
+            session = environment.uow.session
+            task = session.scalar(
+                select(Task)
+                .where(
+                    Task.scope_id == self.scope.scope_id,
+                    Task.id == claim.id,
+                    Task.status == "running",
+                    Task.claim_generation == claim.claim_generation,
+                    Task.lease_owner == self.owner,
+                    Task.lease_expires_at > now,
+                    Task.resume_attempt_count < self.resume_max_attempts,
+                )
+                .with_for_update()
+            )
+            if task is None:
+                session.commit()
+                return False
+            task.resume_attempt_count += 1
+            task.resume_started_at = task.resume_started_at or now
+            task.resume_available = False
+            task.resume_reason = "resume_started"
+            task.resume_session_id = candidate["session_id"]
+            session.commit()
+            return True
 
     def _image_attempt_requires_unknown(self, claim: Task) -> bool:
         """判断新 claim 前是否存在无法证明已完成的图片外部 attempt。"""
         if claim.task_type not in IMAGE_PROCESSING_TASK_TYPES or claim.attempt_count <= 1:
             return False
+        # 续跑配置已启用时，额度或累计时间耗尽即使历史 attempt 行缺失也必须
+        # 直接 fencing；否则数据库部分损坏会把恢复请求降级成一次新外部调用。
+        if claim.task_type == "meme_context_generation" and self.resume_enabled:
+            if claim.resume_attempt_count >= self.resume_max_attempts:
+                return True
+            if claim.resume_started_at is not None and not within_total_timeout(claim.resume_started_at, timeout_seconds=self.resume_timeout_seconds):
+                return True
         with self.resources.factory() as session:
             previous = session.scalar(
                 select(ImageProcessingAttempt)
@@ -1123,7 +1388,18 @@ class PostgresTaskService:
                 )
                 .order_by(ImageProcessingAttempt.attempt.desc())
             )
-            return previous is not None and previous.state in {"grant_committed", "external_started", "completed"}
+            if previous is None:
+                return False
+            if previous.state in {"grant_committed", "external_started", "completed"}:
+                return True
+            # 续跑额度或累计时间耗尽后，不得退化成新的无 session 外部调用；
+            # 只要历史上存在可续跑失败，就把当前 claim 收束为 unknown_execution。
+            if self.resume_enabled and previous.resume_available:
+                if not normalize_identifier(previous.session_id, kind="session") or not normalize_identifier(previous.executor_attempt_id, kind="attempt"):
+                    return True
+                if claim.resume_attempt_count >= self.resume_max_attempts or not within_total_timeout(claim.resume_started_at, timeout_seconds=self.resume_timeout_seconds):
+                    return True
+            return False
 
     def _commit_agent_grant(self, claim: Task, payload: dict[str, Any]) -> None:
         """在 Agent 外部执行前幂等提交服务端 grant。"""
@@ -1180,6 +1456,10 @@ class PostgresTaskService:
         # 也不得让它们进入后续 handler 作为授权事实。
         payload.pop("scope_id", None)
         payload.pop("user_id", None)
+        # session/attempt 只能由当前 Worker 从持久 attempt 恢复，客户端 payload
+        # 即使携带同名字段也不得改变续跑绑定事实。
+        for internal_field in ("session_id", "executor_attempt_id", "attempt_id", "resume_available", "resume_reason"):
+            payload.pop(internal_field, None)
         lane = "agent" if task_type == "meme_context_generation" else "default"
         image_stage = None
         submission_mode = None
@@ -1304,6 +1584,8 @@ class PostgresTaskService:
                     task_payload["_claim_generation"] = generation
                     task_payload["_claim_owner"] = self.owner
                     task_payload["_claim_attempt"] = claim.attempt_count
+                    task_payload["_resume_attempt_count"] = claim.resume_attempt_count
+                    task_payload["_resume_started_at"] = claim.resume_started_at
                     try:
                         claim_scope = ScopeContext(claim.scope_id)
                     except (TypeError, ValueError) as exc:
@@ -1323,6 +1605,8 @@ class PostgresTaskService:
                 task_payload["_claim_generation"] = generation
                 task_payload["_claim_owner"] = self.owner
                 task_payload["_claim_attempt"] = claim.attempt_count
+                task_payload["_resume_attempt_count"] = claim.resume_attempt_count
+                task_payload["_resume_started_at"] = claim.resume_started_at
                 try:
                     claim_scope = ScopeContext(claim.scope_id)
                 except (TypeError, ValueError):
@@ -1356,8 +1640,27 @@ class PostgresTaskService:
                     message="外部执行结果无法确认",
                     error={"error": "unknown_execution", "message": "上一次图片阶段已进入外部执行窗口，无法安全重放"},
                     retry=False,
+                    resume_available=False,
+                    resume_reason="unknown_execution",
                 )
                 return
+
+            resume_candidate = self._resume_candidate(claim, task_payload)
+            if resume_candidate is not None:
+                if not self._begin_resume(claim, resume_candidate):
+                    # 恢复计数的原子 fencing 失败时不能降级为一次全新外部调用；
+                    # 让当前 claim 自然收束，由仍有效的 Worker 重新决定。
+                    return
+                # session 只来自上一条同 scope/Task/输入摘要的 attempt，不能从
+                # 普通 payload 或客户端请求直接注入。
+                task_payload["_resume_session_id"] = resume_candidate["session_id"]
+                task_payload["_resume_of_attempt_id"] = resume_candidate["resume_of_attempt_id"]
+                task_payload["_previous_executor_attempt_id"] = resume_candidate["executor_attempt_id"]
+                # 候选已通过全部恢复绑定校验；即使下一次 executor 错误没有回传
+                # session，也必须保留这份服务端确认的可续跑事实交给 handler。
+                task_payload["_resume_available"] = True
+                task_payload["_resume_reason"] = resume_candidate["resume_reason"]
+
             self._image_attempt_state(claim, task_payload, "prepared")
 
             def progress(value: float | None, message: str | None = None) -> None:
@@ -1389,7 +1692,31 @@ class PostgresTaskService:
                 else:
                     diagnostic = str(exc)[:500]
                     code = diagnostic.partition(":")[0] if diagnostic.partition(":")[0] in STABLE_TASK_ERRORS else "task_failed"
+                resume_available = bool(task_payload.get("_resume_available"))
+                resume_reason = task_payload.get("_resume_reason") if isinstance(task_payload.get("_resume_reason"), str) else None
+                session_id = task_payload.get("_resume_session_id") if isinstance(task_payload.get("_resume_session_id"), str) else None
+                executor_attempt_id = task_payload.get("_executor_attempt_id") if isinstance(task_payload.get("_executor_attempt_id"), str) else None
+                if claim.task_type == "meme_context_generation" and agent_failure_requires_unknown(
+                    code,
+                    session_id=session_id,
+                    resume_available=resume_available,
+                    resuming=isinstance(task_payload.get("_resume_session_id"), str),
+                    resume_enabled=self.resume_enabled,
+                ):
+                    # handler 已尽力记录原始 executor/provider 错误；任务终态必须
+                    # 另行收束为 unknown_execution，阻止同一业务任务从头重放。
+                    original_code = code
+                    code = "unknown_execution"
+                    diagnostic = f"外部执行状态无法确认（{original_code}）"
+                    resume_available = False
+                    if resume_reason != "resume_budget_exhausted":
+                        resume_reason = "unknown_execution"
                 self._image_attempt_state(claim, task_payload, "unknown_execution" if code in {"unknown_execution", "reverse_image_unknown_execution"} else "failed")
+                retry_delay = bounded_backoff(
+                    claim.resume_attempt_count,
+                    base_seconds=self.resume_backoff_seconds if self.resume_enabled and resume_available else 0,
+                    max_seconds=self.resume_max_backoff_seconds,
+                )
                 retry = code not in {
                     "target_changed",
                     "agent_output_schema_invalid",
@@ -1446,7 +1773,19 @@ class PostgresTaskService:
                     "blocked",
                 }
                 audit_result = self._with_reverse_image_audit(task_id, None, write_provenance=False)
-                self._fenced_failure(task_id, generation, message="任务执行失败", error={"error": code, "message": diagnostic}, retry=retry, result=audit_result)
+                self._fenced_failure(
+                    task_id,
+                    generation,
+                    message="任务执行失败",
+                    error={"error": code, "message": diagnostic},
+                    retry=retry,
+                    result=audit_result,
+                    retry_delay_seconds=retry_delay,
+                    resume_available=resume_available,
+                    resume_reason=resume_reason,
+                    session_id=session_id,
+                    executor_attempt_id=executor_attempt_id,
+                )
             else:
                 # 只有当前 claim 仍有效时才写入任务终态和 Meme provenance。
                 self._image_attempt_state(claim, task_payload, "completed")
@@ -1503,10 +1842,23 @@ class PostgresTaskService:
             self._write_reverse_image_provenance(task_id, generation)
         return changed
 
-    def _fenced_failure(self, task_id: str, generation: int, *, message: str, error: dict[str, Any], retry: bool, result: Any | None = None) -> bool:
+    def _fenced_failure(self, task_id: str, generation: int, *, message: str, error: dict[str, Any], retry: bool, result: Any | None = None, retry_delay_seconds: int = 0, resume_available: bool | None = None, resume_reason: str | None = None, session_id: str | None = None, executor_attempt_id: str | None = None) -> bool:
         """按最大尝试次数将当前 claim 重新排队或置为失败。"""
         with self.resources.environment(self.scope.scope_id) as environment:
-            changed, should_retry = environment.tasks.fail_fenced(task_id, generation, self.owner, error=error, message=message, retry=retry, result=result)
+            changed, should_retry = environment.tasks.fail_fenced(
+                task_id,
+                generation,
+                self.owner,
+                error=error,
+                message=message,
+                retry=retry,
+                result=result,
+                retry_delay_seconds=retry_delay_seconds,
+                resume_available=resume_available,
+                resume_reason=resume_reason,
+                session_id=session_id,
+                executor_attempt_id=executor_attempt_id,
+            )
         if changed and should_retry:
             self._schedule(task_id)
         return changed

@@ -35,6 +35,7 @@ from backend.database import (
     utcnow,
 )
 from backend.metadata import MemeContext, Provenance, SidecarMetadata
+from backend.agent_resume import normalize_identifier
 from backend.operation_policy import (
     GrantAssociation,
     GrantAssociationStore,
@@ -371,7 +372,42 @@ class ImageProcessingRepository:
                 message = str(job.error.get("message") or job.error.get("error") or "图片处理失败")
             elif job.current_stage:
                 message = f"阶段：{job.current_stage}"
-            stage_payload = tuple({"stage": item.stage, "status": item.status, "task_id": item.task_id, "attempt": item.attempt_count, "error": item.error, "retry_at": item.retry_at} for item in stages)
+            stage_payload_items: list[dict[str, object]] = []
+            for item in stages:
+                attempt = None
+                if item.task_id:
+                    attempt = session.scalar(
+                        select(ImageProcessingAttempt)
+                        .where(
+                            ImageProcessingAttempt.scope_id == self.scope.scope_id,
+                            ImageProcessingAttempt.task_id == item.task_id,
+                            ImageProcessingAttempt.attempt == item.attempt_count,
+                        )
+                    )
+                attempt_session_id = normalize_identifier(attempt.session_id, kind="session") if attempt else None
+                attempt_executor_id = normalize_identifier(attempt.executor_attempt_id, kind="attempt") if attempt else None
+                attempt_resume_available = bool(attempt and attempt.resume_available and attempt_session_id and attempt_executor_id)
+                attempt_resume_reason = attempt.resume_reason if attempt else None
+                if attempt and attempt.resume_available and not attempt_resume_available:
+                    # 旧 attempt 的恢复标识损坏时，阶段详情也必须保持不可续跑。
+                    attempt_resume_reason = "session_not_resumable"
+                stage_payload_items.append(
+                    {
+                        "stage": item.stage,
+                        "status": item.status,
+                        "task_id": item.task_id,
+                        "attempt": item.attempt_count,
+                        "error": item.error,
+                        "retry_at": item.retry_at,
+                        # 这些字段来自服务端 attempt 事实，前端不能通过 stage
+                        # payload 注入或替换恢复绑定。
+                        "session_id": attempt_session_id,
+                        "executor_attempt_id": attempt_executor_id,
+                        "resume_available": attempt_resume_available,
+                        "resume_reason": attempt_resume_reason,
+                    }
+                )
+            stage_payload = tuple(stage_payload_items)
             warning_visible = job.status not in {"failed", "blocked", "unknown_execution"}
             warnings = tuple(
                 {
@@ -702,6 +738,13 @@ class ImageProcessingWorker:
                 finalize_image_tasks=False,
                 operation_policy=self.policy,
                 grant_store=self.grants,
+                # 图片叶子 facade 必须继承应用级恢复开关和边界，否则完整
+                # pipeline 会悄悄退回普通任务重试，绕过 session 续跑策略。
+                resume_enabled=bool(getattr(task_service, "resume_enabled", False)),
+                resume_max_attempts=int(getattr(task_service, "resume_max_attempts", 2)),
+                resume_backoff_seconds=int(getattr(task_service, "resume_backoff_seconds", 2)),
+                resume_max_backoff_seconds=int(getattr(task_service, "resume_max_backoff_seconds", 60)),
+                resume_timeout_seconds=int(getattr(task_service, "resume_timeout_seconds", 900)),
             )
             for task_type, handler in (task_handlers or {}).items():
                 self._task_runner.register(task_type, handler)

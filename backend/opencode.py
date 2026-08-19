@@ -29,6 +29,7 @@ from typing import Any, BinaryIO, Callable, Iterator
 
 from backend.config import Settings
 from backend.agent_executor import AgentExecutorClient, AgentExecutorError
+from backend.agent_resume import classify_resume_error, normalize_identifier
 from backend.metadata import MemeContext
 
 try:
@@ -106,14 +107,53 @@ RESULT_FILE_NAME = "result.json.tmp"
 RESULT_DRAFT_NAME = "result.json.draft"
 RESULT_DEFAULT_MAX_BYTES = 1024 * 1024
 EXECUTOR_IMAGE_ROOT = Path("/images")
+_SECRET_PATTERNS = (
+    # 分开处理 JSON 字符串值和普通 header/日志格式，保留原有引号结构。
+    re.compile(r"(?i)(authorization\s*[\"']?\s*:\s*[\"']?bearer\s+)[^\s,;}\]\"']+"),
+    re.compile(r"(?i)([\"']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)[\"']?\s*:\s*)([\"'])(.*?)\2"),
+    re.compile(r"(?i)([\"']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)[\"']?\s*[:=]\s*)[^\s,;}\]\"']+"),
+)
+_PATH_PATTERN = re.compile(r"(?:/runtime|/images|/skills|/app|[A-Za-z]:\\)[^\s,;]+")
+_GENERIC_PATH_PATTERN = re.compile(r"(?<![A-Za-z0-9:/])/(?:[^\s,;:'\"()\[\]{}]+/)+[^\s,;:'\"()\[\]{}]+")
+
+
+def _redact_runtime_diagnostic(value: str, secrets: tuple[str, ...] = ()) -> str:
+    """从 host OpenCode 诊断中移除凭据、路径和多行 transcript。"""
+    value = value.splitlines()[0] if value.splitlines() else value
+    for secret in secrets:
+        if secret:
+            value = value.replace(secret, "[REDACTED]")
+    for pattern in _SECRET_PATTERNS:
+        if pattern.groups == 3:
+            value = pattern.sub(r"\1\2[REDACTED]\2", value)
+        else:
+            value = pattern.sub(r"\1[REDACTED]", value)
+    value = _PATH_PATTERN.sub("[PATH]", value)
+    return _GENERIC_PATH_PATTERN.sub("[PATH]", value)[:500]
+
+
+def _stream_sample(stream: BinaryIO, limit: int) -> bytes:
+    """读取临时输出的头尾样本，避免大 JSONL 将 provider 错误留在不可见尾部。"""
+    stream.seek(0)
+    head = stream.read(limit)
+    stream.seek(0, os.SEEK_END)
+    size = stream.tell()
+    if size <= limit:
+        return head
+    stream.seek(max(0, size - limit))
+    return head + b"\n" + stream.read(limit)
 
 
 class OpenCodeError(RuntimeError):
     """携带稳定错误码的 OpenCode 运行失败。"""
 
-    def __init__(self, code: str, message: str | None = None):
+    def __init__(self, code: str, message: str | None = None, *, session_id: str | None = None, executor_attempt_id: str | None = None, retryable: bool | None = None, http_status: int | None = None):
         super().__init__(message or code)
         self.code = code
+        self.session_id = normalize_identifier(session_id, kind="session")
+        self.executor_attempt_id = normalize_identifier(executor_attempt_id, kind="attempt")
+        self.retryable = retryable
+        self.http_status = http_status
 
 
 class OpenCodeRunner:
@@ -143,6 +183,7 @@ class OpenCodeRunner:
         self._process_tasks: dict[subprocess.Popen[bytes], str | None] = {}
         self._active_task_ids: set[str] = set()
         self._active_executor_task_ids: set[str] = set()
+        self._last_executor_attempt_ids: dict[str, str] = {}
         self._cancelled_task_ids: set[str] = set()
         self.executor = AgentExecutorClient(
             getattr(settings, "agent_executor_url", None),
@@ -160,6 +201,27 @@ class OpenCodeRunner:
             return True
         return mode == "auto" and self.executor.configured
 
+    @property
+    def last_executor_attempt_id(self) -> str | None:
+        """返回最近一次当前线程任务的 executor attempt 摘要。"""
+        # 该属性只作为成功写回的诊断补充；真正的绑定事实仍来自 executor 响应。
+        with self._process_lock:
+            if not self._last_executor_attempt_ids:
+                return None
+            return next(reversed(self._last_executor_attempt_ids.values()))
+
+    def executor_attempt_id_for(self, task_id: str) -> str | None:
+        """按业务 task 读取最近 attempt，避免并发任务互相串接诊断。"""
+        with self._process_lock:
+            return self._last_executor_attempt_ids.get(task_id)
+
+    def _remember_executor_attempt(self, task_id: str, executor_attempt_id: str) -> None:
+        """保存任务 attempt 摘要并限制长期运行进程的内存历史。"""
+        with self._process_lock:
+            self._last_executor_attempt_ids[task_id] = executor_attempt_id
+            while len(self._last_executor_attempt_ids) > 5000:
+                self._last_executor_attempt_ids.pop(next(iter(self._last_executor_attempt_ids)))
+
     @staticmethod
     def _executor_error_code(code: str, *, health: bool = False) -> str:
         """把 executor 客户端异常收口为任务服务可识别的稳定错误码。"""
@@ -169,6 +231,7 @@ class OpenCodeRunner:
             "agent_timeout",
             "task_interrupted",
             "agent_process_failed",
+            "unknown_execution",
             "agent_output_invalid_json",
             "agent_result_file_missing",
             "agent_result_file_unreadable",
@@ -184,6 +247,11 @@ class OpenCodeRunner:
             "invalid_reverse_image_policy",
             "agent_backpressure",
             "task_exists",
+            "agent_provider_rate_limited",
+            "agent_provider_server_error",
+            "agent_connection_interrupted",
+            "session_binding_mismatch",
+            "session_not_resumable",
             "agent_executor_not_configured",
             "agent_executor_unavailable",
             "agent_executor_unauthorized",
@@ -521,17 +589,41 @@ class OpenCodeRunner:
         return None
 
     @staticmethod
-    def _process_error_diagnostic(stdout: bytes, stderr: bytes) -> str:
+    def _process_error_diagnostic(stdout: bytes, stderr: bytes, *, secrets: tuple[str, ...] = ()) -> str:
         """从 CLI 的 stderr 或 JSONL error 事件提取有限且可展示的诊断。"""
-        return OpenCodeRunner._process_error_diagnostic_stream(BytesIO(stdout), BytesIO(stderr))
+        return OpenCodeRunner._process_error_diagnostic_stream(BytesIO(stdout), BytesIO(stderr), secrets=secrets)
 
     @staticmethod
-    def _process_error_diagnostic_stream(stdout: BinaryIO, stderr: BinaryIO) -> str:
+    def _classify_process_failure(stdout: BinaryIO, stderr: BinaryIO) -> str:
+        """按有限错误事件区分 provider、网络和普通进程失败。"""
+        raw = _stream_sample(stdout, STREAM_COPY_CHUNK_BYTES * 4)
+        raw += _stream_sample(stderr, STREAM_COPY_CHUNK_BYTES)
+        text = raw.decode("utf-8", errors="replace").lower()
+        statuses = [int(match) for match in re.findall(r"(?:statuscode|status|http)[^0-9]{0,8}(\d{3})", text)]
+        if any(status == 429 for status in statuses):
+            return "agent_provider_rate_limited"
+        if any(500 <= status <= 599 for status in statuses):
+            return "agent_provider_server_error"
+        if any(token in text for token in ("econnreset", "connection reset", "connection refused", "socket hang up", "network error", "timed out")):
+            return "agent_connection_interrupted"
+        return "agent_process_failed"
+
+    @staticmethod
+    def _process_http_status(stdout: BinaryIO, stderr: BinaryIO) -> int | None:
+        """从有限进程输出提取 provider HTTP 状态，供脱敏错误摘要使用。"""
+        raw = _stream_sample(stdout, STREAM_COPY_CHUNK_BYTES * 4)
+        raw += _stream_sample(stderr, STREAM_COPY_CHUNK_BYTES)
+        text = raw.decode("utf-8", errors="replace").lower()
+        statuses = [int(match) for match in re.findall(r"(?:statuscode|status|http)[^0-9]{0,8}(\d{3})", text)]
+        return next((status for status in statuses if status == 429 or 500 <= status <= 599), None)
+
+    @staticmethod
+    def _process_error_diagnostic_stream(stdout: BinaryIO, stderr: BinaryIO, *, secrets: tuple[str, ...] = ()) -> str:
         """从临时输出文件提取诊断，读取量受控且不影响完整输出处理。"""
         stderr.seek(0)
         stderr_text = stderr.read(STREAM_COPY_CHUNK_BYTES).decode("utf-8", errors="replace").strip()
         if stderr_text:
-            return stderr_text[:500]
+            return _redact_runtime_diagnostic(stderr_text, secrets)
         stdout.seek(0)
         diagnostic: str | None = None
         for line in stdout:
@@ -549,7 +641,7 @@ class OpenCodeRunner:
             status = data.get("statusCode")
             if isinstance(message, str) and message.strip():
                 suffix = f" (HTTP {status})" if isinstance(status, int) else ""
-                diagnostic = f"{message.strip()}{suffix}"
+                diagnostic = _redact_runtime_diagnostic(f"{message.strip()}{suffix}", secrets)
         return diagnostic[:500] if diagnostic else "OpenCode 进程以非零状态退出"
 
     @staticmethod
@@ -989,8 +1081,8 @@ class OpenCodeRunner:
                     removed += 1
             return removed
 
-    def _run_command(self, image: Path, prompt: str, *, slot_id: int | None = None, task_id: str | None = None, result_path: Path | None = None, callback_token: str | None = None) -> list[str]:
-        """构造宿主模式单图研究 CLI 参数，固定模型推理变体以保证结果质量一致。"""
+    def _run_command(self, image: Path, prompt: str, *, slot_id: int | None = None, task_id: str | None = None, result_path: Path | None = None, callback_token: str | None = None, resume_session_id: str | None = None) -> list[str]:
+        """构造宿主模式单图研究 CLI 参数；续跑只能显式传入 session。"""
         # host 回滚支持开发者直接检查临时图片；业务 API 在提交前仍通过 map_image_path
         # 验证受控图片根，executor 路径则单独执行同一边界校验。
         image_path = image.expanduser().resolve()
@@ -1012,15 +1104,21 @@ class OpenCodeRunner:
             OPENCODE_REASONING_VARIANT,
             "--title",
             f"mememeow-task-{task_id or 'interactive'}",
-            prompt,
         ]
+        if resume_session_id:
+            command.extend(("--session", resume_session_id))
+        command.append(prompt)
         return command
 
-    def run(self, image: Path, progress: Callable[[float | None, str | None], None], *, task_id: str | None = None, reverse_image_policy: str = "forbid", callback_token: str | None = None) -> tuple[dict[str, Any], str]:
-        """执行单张图片研究并从任务专属结果文件接收候选与 session ID。"""
+    def run(self, image: Path, progress: Callable[[float | None, str | None], None], *, task_id: str | None = None, reverse_image_policy: str = "forbid", callback_token: str | None = None, resume_session_id: str | None = None, resume_of_attempt_id: str | None = None, processing_config_hash: str | None = None) -> tuple[dict[str, Any], str]:
+        """执行单张图片研究；失败也尽力返回可验证 session 诊断。"""
         task_id = task_id or uuid.uuid4().hex
+        # host 回滚模式也需要 attempt 级诊断标识；executor 模式提交后会以
+        # 服务端生成的独立 attempt 覆盖该临时值。
+        local_executor_attempt_id = f"host-attempt-{uuid.uuid4().hex}"
+        self._remember_executor_attempt(task_id, local_executor_attempt_id)
         if self._take_pre_cancelled(task_id) or self._closing.is_set():
-            raise OpenCodeError("task_interrupted", "OpenCode runner 正在关闭或任务已取消")
+            raise OpenCodeError("task_interrupted", "OpenCode runner 正在关闭或任务已取消", executor_attempt_id=local_executor_attempt_id)
         self.prepare_runtime()
         slot_id, lock_handle = self._acquire_slot()
         try:
@@ -1029,7 +1127,11 @@ class OpenCodeRunner:
                 if self.executor_mode:
                     self._active_executor_task_ids.add(task_id)
                 _draft_path, result_path = self.task_result_paths(task_id)
-            self._reset_task_result_files(_draft_path, result_path)
+            if resume_session_id and not normalize_identifier(resume_session_id, kind="session"):
+                raise OpenCodeError("session_binding_mismatch", "续跑 session 标识无效", executor_attempt_id=local_executor_attempt_id)
+            # 续跑必须保留既有 draft/中间产物；新业务 attempt 才初始化结果文件。
+            if not resume_session_id:
+                self._reset_task_result_files(_draft_path, result_path)
             result_runtime_root = self.runtime_root
             if self.executor_mode:
                 mapped_image = self.map_image_path(image)
@@ -1038,7 +1140,7 @@ class OpenCodeRunner:
                 except ValueError as exc:
                     raise OpenCodeError("agent_image_path_forbidden", "图片路径不在 executor 受控目录内") from exc
                 if self._take_pre_cancelled(task_id):
-                    raise OpenCodeError("task_interrupted", "Agent 任务已取消")
+                    raise OpenCodeError("task_interrupted", "Agent 任务已取消", executor_attempt_id=local_executor_attempt_id)
                 progress(0.1, "正在提交 Agent executor 任务")
                 try:
                     response = self.executor.run(
@@ -1047,39 +1149,59 @@ class OpenCodeRunner:
                         reverse_image_policy=reverse_image_policy if reverse_image_policy in {"forbid", "auto"} else "forbid",
                         timeout_seconds=min(int(self.settings.opencode_timeout_seconds), int(getattr(self.settings, "agent_executor_max_timeout_seconds", 1800))),
                         callback_token=callback_token,
+                        session_id=resume_session_id,
+                        resume_of_attempt_id=resume_of_attempt_id,
+                        processing_config_hash=processing_config_hash,
                     )
+                    if response.executor_attempt_id:
+                        self._remember_executor_attempt(task_id, response.executor_attempt_id)
                 except AgentExecutorError as exc:
                     code = self._executor_error_code(exc.code)
+                    if exc.executor_attempt_id:
+                        self._remember_executor_attempt(task_id, exc.executor_attempt_id)
                     if code in {"agent_timeout", "agent_executor_unavailable", "agent_runtime_unavailable", "agent_executor_invalid_response"}:
                         try:
-                            self.executor.cancel(task_id)
+                            self.executor.cancel(exc.executor_attempt_id or task_id)
                         except AgentExecutorError:
                             pass
+                    decision = classify_resume_error(code, session_id=exc.session_id, target_unchanged=True, grant_state="committed")
                     if code == "agent_timeout":
-                        raise OpenCodeError("agent_timeout", "OpenCode 执行超时") from exc
-                    raise OpenCodeError(code, str(exc)[:500]) from exc
+                        raise OpenCodeError("agent_timeout", "OpenCode 执行超时", session_id=exc.session_id, executor_attempt_id=exc.executor_attempt_id, http_status=exc.http_status) from exc
+                    raise OpenCodeError(code, str(exc)[:500], session_id=exc.session_id, executor_attempt_id=exc.executor_attempt_id, retryable=decision.retryable, http_status=exc.http_status) from exc
                 if self._take_pre_cancelled(task_id):
                     try:
-                        self.executor.cancel(task_id)
+                        self.executor.cancel(response.executor_attempt_id or task_id)
                     except AgentExecutorError:
                         pass
-                    raise OpenCodeError("task_interrupted", "Agent 任务已取消")
+                    raise OpenCodeError("task_interrupted", "Agent 任务已取消", executor_attempt_id=response.executor_attempt_id or local_executor_attempt_id)
                 if response.status != "succeeded":
-                    raise OpenCodeError("agent_executor_invalid_response", "Agent executor 任务未返回成功状态")
+                    raise OpenCodeError("agent_executor_invalid_response", "Agent executor 任务未返回成功状态", session_id=response.session_id, executor_attempt_id=response.executor_attempt_id)
+                if not response.session_id:
+                    raise OpenCodeError(
+                        "agent_output_invalid_json",
+                        "Agent executor 未返回 session 标识",
+                        executor_attempt_id=response.executor_attempt_id or local_executor_attempt_id,
+                    )
                 progress(0.65, "正在读取研究结果文件")
                 candidate = self._read_result_file(result_path)
                 progress(0.9, "正在校验并写入语境")
-                return candidate, response.session_id or task_id
+                return candidate, response.session_id
+            resume_instruction = (
+                "这是同一 OpenCode session 的受控续跑；保留并检查已有草稿和中间产物，只完成尚未完成的工作。"
+                if resume_session_id
+                else "这是首次执行；先建立任务草稿并逐步完成研究。"
+            )
             prompt = (
                 "使用 research-meme-context skill 分析这张表情包。"
                 "遇到错误时自行尝试可行的替代方案；确认无法解决时，简短说明原因并退出。"
                 f"本任务 reverse_image_policy={reverse_image_policy if reverse_image_policy in {'forbid', 'auto'} else 'forbid'}；只能通过项目内部反向图片接口使用能力，绝不读取或请求供应商密钥。"
+                f"{resume_instruction}"
                 f"结果必须写入 {result_runtime_root / 'task-results' / task_id / RESULT_FILE_NAME}。"
                 f"先在同目录写入 {result_runtime_root / 'task-results' / task_id / RESULT_DRAFT_NAME}，"
                 "使用 output-schema.json 校验完整 JSON 对象后，使用同一文件系统的原子 rename/mv 将草稿替换为最终文件。"
                 "不要把业务 JSON 作为 assistant 文本交付，不要写入数据库；完成后简短说明即可。"
             )
-            command = self._run_command(image, prompt, slot_id=slot_id, task_id=task_id, result_path=result_path, callback_token=callback_token)
+            command = self._run_command(image, prompt, slot_id=slot_id, task_id=task_id, result_path=result_path, callback_token=callback_token, resume_session_id=resume_session_id)
             execution_command = command
             environment = self.build_environment(slot_id, task_id, callback_token)
             progress(0.1, f"正在启动语境研究（slot {slot_id}）")
@@ -1098,25 +1220,25 @@ class OpenCodeRunner:
                     start_new_session=True,
                 )
                 self._track_process(process, task_id)
+                timed_out = False
+                interrupted = False
                 try:
                     if self._take_pre_cancelled(task_id):
                         self._terminate(process)
-                        raise OpenCodeError("task_interrupted", "Agent 任务已取消")
-                    # stdout/stderr 已重定向到临时文件；communicate 只等待进程。
-                    process.communicate(timeout=self.settings.opencode_timeout_seconds)
-                except subprocess.TimeoutExpired as exc:
+                        interrupted = True
+                    else:
+                        # stdout/stderr 已重定向到临时文件；communicate 只等待进程。
+                        process.communicate(timeout=self.settings.opencode_timeout_seconds)
+                except subprocess.TimeoutExpired:
                     self._terminate(process)
-                    raise OpenCodeError("agent_timeout", "OpenCode 执行超时") from exc
+                    timed_out = True
                 finally:
                     self._untrack_process(process)
-                if self._take_pre_cancelled(task_id):
-                    raise OpenCodeError("task_interrupted", "Agent 任务已取消")
+                interrupted = interrupted or self._take_pre_cancelled(task_id)
                 log_path = self.log_root / f"{hashlib.sha256(str(image).encode()).hexdigest()[:16]}.jsonl"
                 stdout_stream.flush()
                 stderr_stream.flush()
                 self._write_diagnostic_log(stdout_stream, log_path)
-                if process.returncode != 0:
-                    raise OpenCodeError("agent_process_failed", self._process_error_diagnostic_stream(stdout_stream, stderr_stream))
                 session_id = None
                 stdout_stream.seek(0)
                 for line in stdout_stream:
@@ -1124,15 +1246,50 @@ class OpenCodeRunner:
                         continue
                     try:
                         event = json.loads(line)
-                    except json.JSONDecodeError as exc:
-                        raise OpenCodeError("agent_event_invalid", "OpenCode JSONL 事件无效") from exc
-                    session_id = self._event_session(event) or session_id
+                    except json.JSONDecodeError:
+                        # 失败路径只要已有合法 session 就继续保留它；成功路径仍由
+                        # 结果文件/schema 校验收束，不把噪声日志当成 session。
+                        continue
+                    found = self._event_session(event)
+                    if found:
+                        normalized_found = normalize_identifier(found, kind="session")
+                        if normalized_found is None:
+                            continue
+                        if resume_session_id and normalized_found != resume_session_id:
+                            raise OpenCodeError("session_binding_mismatch", "OpenCode 返回了不匹配的 session", session_id=normalized_found, executor_attempt_id=local_executor_attempt_id)
+                        if session_id and normalized_found != session_id:
+                            raise OpenCodeError("session_binding_mismatch", "OpenCode 返回了多个不匹配的 session", session_id=normalized_found, executor_attempt_id=local_executor_attempt_id)
+                        session_id = normalized_found
+                if not session_id:
+                    session_id = resume_session_id
+                if interrupted:
+                    raise OpenCodeError("task_interrupted", "Agent 任务已取消", session_id=session_id, executor_attempt_id=local_executor_attempt_id)
+                if timed_out:
+                    raise OpenCodeError("agent_timeout", "OpenCode 执行超时", session_id=session_id, executor_attempt_id=local_executor_attempt_id)
+                if process.returncode != 0:
+                    diagnostic = self._process_error_diagnostic_stream(
+                        stdout_stream,
+                        stderr_stream,
+                        secrets=(
+                            str(getattr(self.settings, "opencode_api_key", "") or ""),
+                            str(getattr(self.settings, "agent_executor_token", "") or ""),
+                            callback_token or "",
+                        ),
+                    )
+                    failure_code = self._classify_process_failure(stdout_stream, stderr_stream)
+                    http_status = self._process_http_status(stdout_stream, stderr_stream)
+                    decision = classify_resume_error(failure_code, session_id=session_id, target_unchanged=True, grant_state="committed")
+                    raise OpenCodeError(failure_code, diagnostic, session_id=session_id, executor_attempt_id=local_executor_attempt_id, retryable=decision.retryable, http_status=http_status)
             if not session_id:
-                raise OpenCodeError("agent_output_invalid_json", "OpenCode 未返回 session 标识")
+                raise OpenCodeError("agent_output_invalid_json", "OpenCode 未返回 session 标识", executor_attempt_id=local_executor_attempt_id)
             progress(0.65, "正在读取研究结果文件")
             try:
                 candidate = self._read_result_file(result_path)
             except OpenCodeError:
+                if resume_session_id:
+                    # 续跑必须以受控结果文件为边界；已有 draft/result 损坏时
+                    # 不能退回 transcript 解析，否则会绕过副作用和产物完整性判定。
+                    raise
                 # 显式 host 回滚继续兼容旧 session 结果读取；executor 任务在上方已直接失败。
                 data = self._session_messages(session_id, environment, task_id)
                 candidate = self.validate_candidate(self.extract_candidate(self._last_assistant_text(data)))
@@ -1164,10 +1321,10 @@ class OpenCodeRunner:
         self._closing.set()
         with self._process_lock:
             self._cancelled_task_ids.update(self._active_task_ids)
-            executor_task_ids = list(self._active_executor_task_ids)
-        for task_id in executor_task_ids:
+            executor_business_ids = list(self._active_executor_task_ids)
+        for task_id in executor_business_ids:
             try:
-                self.executor.cancel(task_id)
+                self.executor.cancel(self.executor.attempt_id_for(task_id) or task_id)
             except AgentExecutorError:
                 pass
         with self._process_lock:
@@ -1190,7 +1347,7 @@ class OpenCodeRunner:
             self._cancelled_task_ids.add(task_id)
         if self.executor_mode:
             try:
-                self.executor.cancel(task_id)
+                self.executor.cancel(self.executor.attempt_id_for(task_id) or task_id)
             except AgentExecutorError:
                 # 数据库任务已被取消时，executor 可能已经重启或忘记任务；不阻塞 API 收束。
                 return

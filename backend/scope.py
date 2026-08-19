@@ -316,6 +316,11 @@ class ScopeServiceFactory:
                 settings_version=self._task_config.get("settings_version", getattr(self.settings, "settings_version", None)),
                 lease_seconds=self._task_config.get("lease_seconds", getattr(self.settings, "worker_lease_seconds", 120)),
                 max_attempts=self._task_config.get("max_attempts", getattr(self.settings, "worker_max_attempts", 3)),
+                resume_enabled=self._task_config.get("resume_enabled", getattr(self.settings, "agent_resume_enabled", False)),
+                resume_max_attempts=self._task_config.get("resume_max_attempts", getattr(self.settings, "agent_resume_max_attempts", 2)),
+                resume_backoff_seconds=self._task_config.get("resume_backoff_seconds", getattr(self.settings, "agent_resume_backoff_seconds", 2)),
+                resume_max_backoff_seconds=self._task_config.get("resume_max_backoff_seconds", getattr(self.settings, "agent_resume_max_backoff_seconds", 60)),
+                resume_timeout_seconds=self._task_config.get("resume_timeout_seconds", getattr(self.settings, "agent_resume_timeout_seconds", 900)),
                 worker_manager=self._worker_manager,
             )
             register = self._task_config.get("register_handlers")

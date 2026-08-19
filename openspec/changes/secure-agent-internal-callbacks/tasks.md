@@ -7,7 +7,7 @@
 
 ## 2. Task Claim 执行绑定
 
-- [x] 2.1 仅在 Task 已取得完整非零 claim 后，为该次执行签发或取得绑定 `task_id`、`scope_id`、claim generation/owner、attempt、允许 operation、目标 SHA 和有效期的最小 callback 凭据；凭据有效期不得越过租约授权边界。
+- [x] 2.1 仅在 Task 已取得完整非零 claim 后，为该次执行签发或取得绑定 `task_id`、`scope_id`、claim generation/owner、attempt、允许 operation、目标 SHA 和有效期的最小 callback 凭据；默认凭据有效期为两小时，每次调用仍必须通过当前 claim 和未过期 lease 复核。
 - [x] 2.2 更新 host、Docker 和 executor Agent Runner，只向对应 OpenCode 执行传递 callback 地址与任务级凭据；API 到 executor 的 Bearer token、根 secret、用户 token、grant、数据库和 provider 凭据不得进入子进程。
 - [x] 2.3 实现 callback 的 Task 权威复核：校验允许类型、`running`、非零当前 generation、owner、未过期 lease、attempt、scope 和目标，并在重新认领、取消或终态后拒绝旧执行绑定。
 - [x] 2.4 从持久 `Task.scope_id` 构造 `ScopeServices`，复用 factory scope 一致性校验覆盖外层及 callback 使用的子服务；装配失败不得回退 local，也不得以不完整 claim 终止其它 Worker 的任务。

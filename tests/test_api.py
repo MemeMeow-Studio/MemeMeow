@@ -8,6 +8,7 @@ import zipfile
 import os
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -567,6 +568,9 @@ def test_pending_agent_ready_sidecar_and_v4_embedding_pipeline_is_backend_owned(
             del progress, kwargs
             assert task_id and callback_token
             assert callback_token != "test-agent-callback-secret-1234"
+            binding = test_client.app.state.callback_verifier.verify(callback_token)
+            remaining = binding.expires_at - datetime.now(UTC)
+            assert timedelta(hours=1, minutes=59) < remaining <= timedelta(hours=2)
             runner = test_client.app.state.opencode
             draft_path, result_path = runner.create_task_result_paths(task_id)
             candidate = {

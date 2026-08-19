@@ -50,6 +50,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 from backend.paths import SUPPORTED_EXTENSIONS, validate_business_storage_key
 from backend.storage_security import StorageRootError, validate_controlled_root
+from backend.agent_resume import append_error_history, append_task_error_history, normalize_identifier, sanitize_error
 
 
 EMBEDDING_DIMENSIONS = 1024
@@ -57,7 +58,7 @@ VISUAL_EMBEDDING_DIMENSIONS = 768
 SCOPE_LOCAL = "local"
 UTC = timezone.utc
 # 当前代码要求的 Alembic head；数据库初始化脚本会显式传入同一 revision。
-CURRENT_SCHEMA_REVISION = "0012_image_processing_options_auto_rename"
+CURRENT_SCHEMA_REVISION = "0013_resume_opencode_session_after_failure"
 
 
 def utcnow() -> datetime:
@@ -311,7 +312,9 @@ class Task(Base):
 
     ``submission_mode``、``image_stage`` 和 ``processing_job_id`` 是图片阶段任务
     的持久化归属事实。历史记录允许三者为空，但新建图片阶段必须由受信控制面
-    写入完整来源，不能以普通 payload 推断 Job 或独立任务归属。
+    写入完整来源，不能以普通 payload 推断 Job 或独立任务归属。Agent 失败时，
+    ``resume_*`` 字段和 ``error_history`` 记录同 scope、同输入 attempt 的有限恢复
+    摘要，供任务详情和恢复 Worker 使用。
     """
 
     __tablename__ = "tasks"
@@ -329,6 +332,15 @@ class Task(Base):
     message: Mapped[str | None] = mapped_column(String(500), nullable=True)
     result: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
     error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # Agent session 恢复摘要只保存稳定标识和脱敏错误，不保存 prompt/transcript。
+    resume_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    resume_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resume_session_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    executor_attempt_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    resume_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    resume_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    first_error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    error_history: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
     settings_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -534,7 +546,11 @@ class ImageProcessingStage(Base):
 
 
 class ImageProcessingAttempt(Base):
-    """外部叶子 Task 的输入摘要和未知执行恢复事实。"""
+    """外部叶子 Task 的输入摘要和未知执行恢复事实。
+
+    每行对应一个业务 Task attempt；session、executor attempt、配置哈希和目标
+    SHA 共同构成恢复绑定，claim generation 用于拒绝旧 Worker 的迟到写回。
+    """
 
     __tablename__ = "image_processing_attempts"
 
@@ -546,6 +562,12 @@ class ImageProcessingAttempt(Base):
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="prepared")
     request_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     session_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    executor_attempt_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    resume_of_attempt_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    processing_config_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resume_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    resume_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     input_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     target_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     claim_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -556,6 +578,13 @@ class ImageProcessingAttempt(Base):
         ForeignKeyConstraint(["scope_id", "task_id"], ["tasks.scope_id", "tasks.id"], ondelete="CASCADE"),
         CheckConstraint("state IN ('prepared','grant_committed','external_started','completed','failed','unknown_execution')", name="ck_image_processing_attempt_state"),
         Index("ix_image_processing_attempts_task", "scope_id", "task_id", "attempt"),
+        Index(
+            "uq_image_processing_attempt_executor_id",
+            "executor_attempt_id",
+            unique=True,
+            postgresql_where=text("executor_attempt_id IS NOT NULL"),
+        ),
+        Index("ix_image_processing_attempts_resume", "scope_id", "task_id", "resume_available", "updated_at"),
     )
 
 
@@ -722,6 +751,24 @@ def ensure_optional_control_schema(engine: Engine) -> None:
             connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS submission_mode VARCHAR(16)"))
             connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS image_stage VARCHAR(32)"))
             connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS processing_job_id UUID"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_available BOOLEAN NOT NULL DEFAULT FALSE"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_reason VARCHAR(64)"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_session_id VARCHAR(255)"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS executor_attempt_id VARCHAR(255)"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_attempt_count INTEGER NOT NULL DEFAULT 0"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_started_at TIMESTAMPTZ"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS first_error JSONB"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS error_history JSONB NOT NULL DEFAULT '[]'::jsonb"))
+            connection.execute(text("UPDATE tasks SET resume_attempt_count = COALESCE(resume_attempt_count, 0), error_history = COALESCE(error_history, '[]'::jsonb)"))
+            connection.execute(text("ALTER TABLE tasks ALTER COLUMN resume_available SET DEFAULT FALSE, ALTER COLUMN resume_available SET NOT NULL, ALTER COLUMN resume_attempt_count SET DEFAULT 0, ALTER COLUMN resume_attempt_count SET NOT NULL, ALTER COLUMN error_history SET DEFAULT '[]'::jsonb, ALTER COLUMN error_history SET NOT NULL"))
+            connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS executor_attempt_id VARCHAR(255)"))
+            connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS resume_of_attempt_id VARCHAR(255)"))
+            connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS processing_config_hash VARCHAR(64)"))
+            connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS resume_available BOOLEAN NOT NULL DEFAULT FALSE"))
+            connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS resume_reason VARCHAR(64)"))
+            connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS error JSONB"))
+            connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_image_processing_attempt_executor_id ON image_processing_attempts(executor_attempt_id) WHERE executor_attempt_id IS NOT NULL"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_image_processing_attempts_resume ON image_processing_attempts(scope_id, task_id, resume_available, updated_at)"))
             connection.execute(text("ALTER TABLE image_processing_jobs ADD COLUMN IF NOT EXISTS auto_name BOOLEAN NOT NULL DEFAULT FALSE"))
             # 旧兼容表可能已经有可空列；不能让 NULL 继续绕过 Job 选项契约。
             connection.execute(text("UPDATE image_processing_jobs SET auto_name = FALSE WHERE auto_name IS NULL"))
@@ -1935,17 +1982,35 @@ class TaskRepository:
         for task in rows:
             previous_owner = task.lease_owner
             previous_generation = task.claim_generation
+            recovery_error = {"error": "lease_expired", "message": "Worker 租约已过期"}
+            append_task_error_history(
+                task,
+                recovery_error,
+                attempt=task.attempt_count,
+                executor_attempt_id=task.executor_attempt_id,
+                session_id=task.resume_session_id,
+                occurred_at=now.isoformat(),
+            )
             if task.attempt_count < task.max_attempts:
                 task.status = "queued"
                 task.available_at = now
                 task.message = "租约已过期，等待重新认领"
-                task.error = {"error": "lease_expired", "message": "Worker 租约已过期"}
+                task.error = recovery_error
                 queued.append(task.id)
             else:
                 task.status = "failed"
                 task.completed_at = now
                 task.message = "任务达到最大尝试次数"
-                task.error = {"error": "max_attempts_exceeded", "message": "任务达到最大尝试次数"}
+                terminal_error = {"error": "max_attempts_exceeded", "message": "任务达到最大尝试次数"}
+                append_task_error_history(
+                    task,
+                    terminal_error,
+                    attempt=task.attempt_count,
+                    executor_attempt_id=task.executor_attempt_id,
+                    session_id=task.resume_session_id,
+                    occurred_at=now.isoformat(),
+                )
+                task.error = terminal_error
             task.lease_owner = None
             task.lease_expires_at = None
             task.updated_at = now
@@ -1958,10 +2023,19 @@ class TaskRepository:
         now = utcnow()
         rows = list(self.session.scalars(select(Task).where(Task.scope_id == self.scope.scope_id, Task.status == "running", Task.lease_owner == owner).with_for_update(skip_locked=True)))
         for task in rows:
+            interrupted_error = {"error": "task_interrupted", "message": "任务执行 Worker 已停止"}
+            append_task_error_history(
+                task,
+                interrupted_error,
+                attempt=task.attempt_count,
+                executor_attempt_id=task.executor_attempt_id,
+                session_id=task.resume_session_id,
+                occurred_at=now.isoformat(),
+            )
             task.status = "failed"
             task.completed_at = now
             task.message = "Worker 已停止"
-            task.error = {"error": "task_interrupted", "message": "任务执行 Worker 已停止"}
+            task.error = interrupted_error
             task.lease_owner = None
             task.lease_expires_at = None
             task.updated_at = now
@@ -1977,7 +2051,15 @@ class TaskRepository:
         task.status = "failed"
         task.completed_at = utcnow()
         task.message = message
-        task.error = error
+        safe_error = append_task_error_history(
+            task,
+            error,
+            attempt=task.attempt_count,
+            executor_attempt_id=task.executor_attempt_id,
+            session_id=task.resume_session_id,
+            occurred_at=utcnow().isoformat(),
+        )
+        task.error = safe_error
         task.lease_owner = None
         task.lease_expires_at = None
         task.updated_at = utcnow()
@@ -2178,18 +2260,41 @@ class TaskRepository:
             self.session.flush()
         return True
 
-    def fail_fenced(self, task_id: str, claim_generation: int, owner: str, *, error: dict[str, Any], message: str, retry: bool = True, result: Any | None = None) -> tuple[bool, bool]:
-        """在 fencing 条件下失败或重新排队任务，返回 (已更新, 是否可重试)。"""
+    def fail_fenced(self, task_id: str, claim_generation: int, owner: str, *, error: dict[str, Any], message: str, retry: bool = True, result: Any | None = None, retry_delay_seconds: int = 0, resume_available: bool | None = None, resume_reason: str | None = None, session_id: str | None = None, executor_attempt_id: str | None = None) -> tuple[bool, bool]:
+        """在 fencing 条件下失败或重新排队任务，并追加有限错误历史。"""
         now = utcnow()
         task = self.session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.id == task_id).with_for_update())
         if task is None or task.status != "running" or task.claim_generation != claim_generation or task.lease_owner != owner or not task.lease_expires_at or task.lease_expires_at <= now:
             return False, False
+        safe_error = sanitize_error(error)
+        task.first_error = sanitize_error(task.first_error) if isinstance(task.first_error, dict) else safe_error
+        task.error_history = append_error_history(
+            task.error_history,
+            safe_error,
+            attempt=task.attempt_count,
+            executor_attempt_id=executor_attempt_id or task.executor_attempt_id,
+            session_id=session_id or task.resume_session_id,
+            occurred_at=now.isoformat(),
+        )
+        if session_id:
+            task.resume_session_id = session_id
+        if executor_attempt_id:
+            task.executor_attempt_id = executor_attempt_id
+        if resume_available is not None:
+            task.resume_available = bool(
+                resume_available
+                and normalize_identifier(task.resume_session_id, kind="session")
+                and normalize_identifier(task.executor_attempt_id, kind="attempt")
+            )
+            task.resume_reason = resume_reason
+            if task.resume_available and task.resume_started_at is None:
+                task.resume_started_at = now
         should_retry = bool(retry and task.attempt_count < task.max_attempts)
         if should_retry:
             task.status = "queued"
-            task.available_at = now
+            task.available_at = now + timedelta(seconds=max(0, min(int(retry_delay_seconds), 3600)))
             task.message = message
-            task.error = error
+            task.error = safe_error
             if result is not None:
                 task.result = result
             task.lease_owner = None
@@ -2200,7 +2305,7 @@ class TaskRepository:
             task.status = "failed"
             task.completed_at = now
             task.message = message
-            task.error = error
+            task.error = safe_error
             if result is not None:
                 task.result = result
             task.lease_owner = None
@@ -2221,6 +2326,12 @@ class TaskRepository:
             values["status"] = requested_status
             values["completed_at"] = now
             values["lease_expires_at"] = None
+            if requested_status == "succeeded":
+                # 首次/历史错误由 first_error 和 error_history 保留；当前成功
+                # 终态的主错误字段必须清空，避免 API 把成功显示为失败。
+                values["error"] = None
+                values["resume_available"] = False
+                values["resume_reason"] = None
         values["updated_at"] = now
         result = self.session.execute(update(Task).where(Task.scope_id == self.scope.scope_id, Task.id == task_id, Task.claim_generation == claim_generation, Task.lease_owner == owner, Task.status == "running", Task.lease_expires_at > now).values(**values))
         if result.rowcount != 1:
@@ -2256,6 +2367,9 @@ class TaskRepository:
         task.progress = 1.0
         task.message = "任务完成"
         task.result = result
+        task.error = None
+        task.resume_available = False
+        task.resume_reason = None
         task.completed_at = now
         task.updated_at = now
         task.lease_expires_at = None

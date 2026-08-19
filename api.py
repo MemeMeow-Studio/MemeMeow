@@ -57,6 +57,7 @@ from backend.visual import VisualEmbeddingError, VisualInferenceClient, VisualSe
 from backend.scope import LocalScopeResolver, ScopeResolutionError, ScopeResolver, ScopeServiceFactory, ScopeServices, resolve_scope, resolve_scope_async, validate_scope_services
 from backend.operation_policy import AllowAllOperationPolicy, GrantAssociation, GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations, PersistentGrantAssociationStore, UnavailableOperationPolicy, require_allowed
 from backend.callbacks import (
+    AGENT_CALLBACK_TOKEN_TTL_SECONDS,
     CallbackBinding,
     CallbackError,
     CallbackRegistry,
@@ -72,6 +73,7 @@ from backend.callbacks import (
     verify_content_length,
 )
 from backend.image_processing import AUTO_RENAME_WARNING_ERRORS, ImageProcessingError, ImageProcessingOptions, ImageProcessingRepository, ImageProcessingSnapshot, ImageProcessingWorker, SingleImageEmbeddingService, image_file_matches, processing_config_hash, stable_input_digest
+from backend.agent_resume import ResumeDecision, classify_resume_error, normalize_identifier, within_total_timeout
 from backend.app_extensions import ApplicationExtension, extension_paths, path_is_exempt
 
 
@@ -580,6 +582,12 @@ async def lifespan(app: FastAPI):
     configured_resolver = getattr(app.state, "scope_resolver", None)
     local_mode = isinstance(configured_resolver, LocalScopeResolver) and configured_resolver.scope.scope_id == "local"
     settings = Settings.from_env()
+    # 兼容宿主自定义 Settings 夹具；缺失的续跑字段按默认关闭处理。
+    resume_enabled = bool(getattr(settings, "agent_resume_enabled", False))
+    resume_max_attempts = int(getattr(settings, "agent_resume_max_attempts", 2))
+    resume_backoff_seconds = int(getattr(settings, "agent_resume_backoff_seconds", 2))
+    resume_max_backoff_seconds = int(getattr(settings, "agent_resume_max_backoff_seconds", 60))
+    resume_timeout_seconds = int(getattr(settings, "agent_resume_timeout_seconds", 900))
     configured_policy = getattr(app.state, "operation_policy", None)
     if configured_policy is None and configured_factory is not None:
         configured_policy = getattr(configured_factory, "operation_policy", None)
@@ -701,6 +709,11 @@ async def lifespan(app: FastAPI):
                 settings_version=settings.settings_version,
                 lease_seconds=settings.worker_lease_seconds,
                 max_attempts=settings.worker_max_attempts,
+                resume_enabled=resume_enabled,
+                resume_max_attempts=resume_max_attempts,
+                resume_backoff_seconds=resume_backoff_seconds,
+                resume_max_backoff_seconds=resume_max_backoff_seconds,
+                resume_timeout_seconds=resume_timeout_seconds,
                 worker_manager=worker_manager,
             )
             local_services = ScopeServices(
@@ -874,10 +887,20 @@ async def lifespan(app: FastAPI):
         if not isinstance(claim_task_id, str) or not isinstance(claim_generation, int) or not isinstance(claim_owner, str) or not isinstance(claim_attempt, int) or claim_generation < 1 or claim_attempt < 1 or not callable(getattr(issuer, "issue", None)):
             # Agent callback 必须绑定当前持久 claim；没有发行能力不能把内网地址当作授权。
             raise RuntimeError("agent_callback_unavailable")
+        try:
+            # 宿主 issuer 可以收紧有效期，但不能把核心两小时上限继续放大；未暴露
+            # TTL 的旧 issuer 保留原有 120 秒契约，避免升级后突然收到超长 binding。
+            callback_ttl_seconds = min(
+                AGENT_CALLBACK_TOKEN_TTL_SECONDS,
+                int(getattr(issuer, "ttl_seconds", 120)),
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("agent_callback_unavailable") from exc
+        if callback_ttl_seconds <= 0:
+            raise RuntimeError("agent_callback_unavailable")
         with app.state.database.environment(service.scope) as environment:
             claimed_task = environment.tasks.get(claim_task_id)
-            binding_expires = getattr(claimed_task, "lease_expires_at", None)
-            if claimed_task is None or binding_expires is None:
+            if claimed_task is None or getattr(claimed_task, "lease_expires_at", None) is None:
                 raise RuntimeError("agent_callback_invalid_execution")
             try:
                 binding = CallbackBinding(
@@ -890,7 +913,7 @@ async def lifespan(app: FastAPI):
                     target_sha256=expected_sha,
                     issuer=str(getattr(issuer, "issuer", "mememeow")),
                     audience=str(getattr(issuer, "audience", "mememeow-internal")),
-                    expires_at=min(binding_expires, datetime.now(timezone.utc) + timedelta(seconds=120)),
+                    expires_at=datetime.now(timezone.utc) + timedelta(seconds=callback_ttl_seconds),
                     key_id=str(getattr(issuer, "key_id", "default")),
                 )
                 validate_binding_task(binding, claimed_task)
@@ -933,8 +956,63 @@ async def lifespan(app: FastAPI):
                 task_id=claim_task_id,
                 reverse_image_policy=str(payload.get("reverse_image_policy") or "forbid"),
                 callback_token=callback_token,
+                resume_session_id=payload.get("_resume_session_id") if isinstance(payload.get("_resume_session_id"), str) else None,
+                resume_of_attempt_id=payload.get("_resume_of_attempt_id") if isinstance(payload.get("_resume_of_attempt_id"), str) else None,
+                processing_config_hash=config_hash,
             )
         except OpenCodeError as exc:
+            # 续跑候选已由 Worker 按持久 session、scope、输入摘要和配置 hash
+            # 校验；executor 的 HTTP/连接错误可能没有重复回传 session，此时沿用
+            # 该受信候选，避免把合法续跑误收束为 unknown_execution。
+            inherited_session_id = payload.get("_resume_session_id") if payload.get("_resume_available") is True else None
+            if not normalize_identifier(inherited_session_id, kind="session"):
+                inherited_session_id = None
+            failure_session_id = getattr(exc, "session_id", None) or inherited_session_id
+            decision = classify_resume_error(
+                exc.code,
+                session_id=failure_session_id,
+                external_started=False,
+                result_valid=False,
+                target_unchanged=True,
+                grant_state="committed" if grant is not None else None,
+            )
+            if not resume_enabled:
+                # rollout 关闭时保留旧任务级 retry，但不得把 session 标成可续跑；
+                # 否则开关热切换或任务详情会误把旧失败当成恢复目标。
+                decision = ResumeDecision(False, "resume_disabled", False)
+            else:
+                # 当前 claim 的续跑次数和累计窗口属于服务端事实；额度耗尽时不能
+                # 暂时把最后一次失败暴露为仍可恢复，避免队列状态与恢复边界分叉。
+                raw_resume_attempts = payload.get("_resume_attempt_count", 0)
+                resume_attempts = int(raw_resume_attempts) if isinstance(raw_resume_attempts, int) and not isinstance(raw_resume_attempts, bool) else 0
+                resume_started_at = payload.get("_resume_started_at")
+                if resume_attempts >= resume_max_attempts:
+                    decision = ResumeDecision(False, "resume_budget_exhausted", False)
+                elif isinstance(resume_started_at, datetime) and not within_total_timeout(resume_started_at, timeout_seconds=resume_timeout_seconds):
+                    decision = ResumeDecision(False, "resume_budget_exhausted", False)
+            payload["_resume_available"] = decision.available
+            payload["_resume_reason"] = decision.reason
+            if failure_session_id:
+                payload["_resume_session_id"] = failure_session_id
+            if getattr(exc, "executor_attempt_id", None):
+                payload["_executor_attempt_id"] = exc.executor_attempt_id
+            record_attempt = getattr(service.tasks, "record_agent_attempt", None)
+            try:
+                if callable(record_attempt):
+                    recorded = record_attempt(
+                        payload,
+                        error={"error": exc.code, "message": str(exc), **({"http_status": exc.http_status} if getattr(exc, "http_status", None) else {})},
+                        session_id=failure_session_id,
+                        executor_attempt_id=getattr(exc, "executor_attempt_id", None),
+                        resume_available=decision.available,
+                        resume_reason=decision.reason,
+                    )
+                    if recorded is False:
+                        raise RuntimeError("unknown_execution: Agent attempt 事实未能通过 claim fencing 保存")
+                elif resume_enabled:
+                    raise RuntimeError("unknown_execution: Agent attempt 持久化能力不可用")
+            except Exception as persist_error:  # noqa: BLE001 - 外部执行后的持久化失败必须禁止重放
+                raise RuntimeError("unknown_execution: Agent attempt 事实无法保存") from persist_error
             try:
                 service.metadata.record_error(image, producer="research", model=app.state.settings.opencode_model, error=exc.code)
             except MetadataError:
@@ -947,6 +1025,26 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("target_changed") from exc
         if current_sha != expected_sha:
             raise RuntimeError("target_changed")
+        payload["_resume_session_id"] = session_id
+        attempt_reader = getattr(app.state.opencode, "executor_attempt_id_for", None)
+        executor_attempt_id = attempt_reader(claim_task_id) if callable(attempt_reader) else getattr(app.state.opencode, "last_executor_attempt_id", None)
+        if isinstance(executor_attempt_id, str):
+            payload["_executor_attempt_id"] = executor_attempt_id
+        record_attempt = getattr(service.tasks, "record_agent_attempt", None)
+        try:
+            if callable(record_attempt):
+                recorded = record_attempt(
+                    payload,
+                    session_id=session_id,
+                    executor_attempt_id=executor_attempt_id,
+                    resume_available=False,
+                )
+                if recorded is False:
+                    raise RuntimeError("unknown_execution: Agent attempt 事实未能通过 claim fencing 保存")
+            elif resume_enabled:
+                raise RuntimeError("unknown_execution: Agent attempt 持久化能力不可用")
+        except Exception as persist_error:  # noqa: BLE001 - 成功外部执行也不能在事实丢失时重放
+            raise RuntimeError("unknown_execution: Agent attempt 事实无法保存") from persist_error
         claim = None
         if isinstance(payload.get("_claim_task_id"), str) and isinstance(payload.get("_claim_generation"), int) and isinstance(payload.get("_claim_owner"), str):
             claim = (str(payload["_claim_task_id"]), int(payload["_claim_generation"]), str(payload["_claim_owner"]))
@@ -1198,6 +1296,11 @@ async def lifespan(app: FastAPI):
             "settings_version": settings.settings_version,
             "lease_seconds": settings.worker_lease_seconds,
             "max_attempts": settings.worker_max_attempts,
+            "resume_enabled": resume_enabled,
+            "resume_max_attempts": resume_max_attempts,
+            "resume_backoff_seconds": resume_backoff_seconds,
+            "resume_max_backoff_seconds": resume_max_backoff_seconds,
+            "resume_timeout_seconds": resume_timeout_seconds,
             "executor": shared_worker_executor,
             "operation_policy": app.state.operation_policy_gateway,
             "grant_store": app.state.operation_grants,
@@ -1613,6 +1716,7 @@ async def health(request: Request) -> dict[str, object]:
     return {
         "status": "ok" if getattr(request.app.state, "service_factory", None) is not None else "degraded",
         "visual_available": bool(visual_status.get("available")),
+        "agent_resume_enabled": bool(getattr(settings, "agent_resume_enabled", False)),
         "storage_preflight": _storage_preflight_summary(getattr(request.app.state, "storage_preflight", None)),
     }
 
@@ -1994,6 +2098,26 @@ def _task_summary(request: Request, record: TaskRecord, activities: Mapping[str,
         activities = _read_agent_activity(request, [record])
     data = record.as_dict(include_payload=False)
     payload = record.payload
+    settings = getattr(request.app.state, "settings", None)
+    if settings is not None and record.task_type == "meme_context_generation" and data.get("resume_available"):
+        resume_enabled = bool(getattr(settings, "agent_resume_enabled", False))
+        if not resume_enabled:
+            data["resume_available"] = False
+            data["resume_reason"] = "resume_disabled"
+        elif record.resume_attempts >= int(getattr(settings, "agent_resume_max_attempts", 2)):
+            data["resume_available"] = False
+            data["resume_reason"] = "resume_budget_exhausted"
+        elif isinstance(record.resume_started_at, str):
+            try:
+                resume_started_at = datetime.fromisoformat(record.resume_started_at.replace("Z", "+00:00"))
+            except ValueError:
+                resume_started_at = None
+            if resume_started_at is not None and not within_total_timeout(
+                resume_started_at,
+                timeout_seconds=int(getattr(settings, "agent_resume_timeout_seconds", 900)),
+            ):
+                data["resume_available"] = False
+                data["resume_reason"] = "resume_budget_exhausted"
     if record.task_type in {"visual_embedding_generation", "meme_context_generation", "image_auto_rename", "text_embedding_generation"}:
         # NULL 来源只代表旧历史无法可靠归类，不能被前端解释为 standalone。
         data["historical_unclassified"] = record.submission_mode is None

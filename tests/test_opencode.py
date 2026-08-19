@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from io import BytesIO
 import json
 import os
 import shutil
@@ -250,6 +251,62 @@ def test_runner_fixes_luna_at_max_reasoning_variant(tmp_path: Path):
     assert command[file_index + 1] == str((tmp_path / "image.png").resolve())
     variant_index = command.index("--variant")
     assert command[variant_index + 1] == OPENCODE_REASONING_VARIANT == "max"
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        (b'{"error":{"statusCode":429}}\n', "agent_provider_rate_limited"),
+        (b'{"error":{"status":503}}\n', "agent_provider_server_error"),
+        (b"connection reset by peer\n", "agent_connection_interrupted"),
+    ],
+)
+def test_runner_classifies_transient_process_failures(output: bytes, expected: str) -> None:
+    """Runner 将 429、5xx 和连接中断收敛为可审计稳定错误。"""
+    assert OpenCodeRunner._classify_process_failure(BytesIO(output), BytesIO()) == expected
+
+
+def test_runner_classifies_provider_error_in_large_output_tail() -> None:
+    """大 JSONL 前缀超过采样上限时，尾部 521 仍必须映射为 provider 失败。"""
+    output = b"noise" * (opencode_module.STREAM_COPY_CHUNK_BYTES * 8) + b'\n{"error":{"statusCode":521}}\n'
+    assert OpenCodeRunner._classify_process_failure(BytesIO(output), BytesIO()) == "agent_provider_server_error"
+    assert OpenCodeRunner._process_http_status(BytesIO(output), BytesIO()) == 521
+
+
+def test_runner_resume_command_requires_explicit_session(tmp_path: Path) -> None:
+    """host 回滚续跑只追加明确 session，不使用全局 continue。"""
+    runner = OpenCodeRunner(make_settings(tmp_path))
+    command = runner._run_command(tmp_path / "image.png", "prompt", resume_session_id="session-1")
+    assert command[command.index("--session") + 1] == "session-1"
+    assert "--continue" not in command
+
+
+def test_host_resume_prompt_requires_finishing_unfinished_work(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """host 回滚续跑 prompt 必须明确保留草稿并继续未完成工作。"""
+    settings = Settings(
+        **{
+            **make_settings(tmp_path).__dict__,
+            "opencode_model": "mememeow/gpt-5.6-luna",
+            "opencode_base_url": "https://example.invalid/v1",
+            "opencode_api_key": "test-key",
+            "agent_runtime_mode": "host",
+        }
+    )
+    runner = OpenCodeRunner(settings, project_root=tmp_path)
+    runner.runtime_root.mkdir(parents=True, exist_ok=True)
+    runner.workspace.mkdir(parents=True, exist_ok=True)
+    runner.slots_root.mkdir(parents=True, exist_ok=True)
+    runner.log_root.mkdir(parents=True, exist_ok=True)
+    image = tmp_path / "image.png"
+    image.write_bytes(b"image")
+    captured: dict[str, str] = {}
+    monkeypatch.setattr(runner, "prepare_runtime", lambda: None)
+    monkeypatch.setattr(runner, "_run_command", lambda _image, prompt, **_kwargs: captured.setdefault("prompt", prompt) or ["fake-opencode"])
+    monkeypatch.setattr(opencode_module.subprocess, "Popen", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("stop-after-prompt")))
+    with pytest.raises(RuntimeError, match="stop-after-prompt"):
+        runner.run(image, lambda _value, _message: None, task_id="host-resume", resume_session_id="session-1")
+    assert "同一 OpenCode session 的受控续跑" in captured["prompt"]
+    assert "只完成尚未完成的工作" in captured["prompt"]
 
 
 def test_runner_accepts_large_cli_output_without_accumulating_pipe_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

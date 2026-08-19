@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import os
@@ -30,8 +31,11 @@ from executor.token import ExecutorTokenError, ensure_token_file, read_token_fil
 
 
 TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,254}\Z")
+CONFIG_HASH_RE = re.compile(r"[0-9a-fA-F]{64}\Z")
 RESULT_FILE_NAME = "result.json.tmp"
 RESULT_DRAFT_NAME = "result.json.draft"
+ATTEMPT_METADATA_NAME = ".executor-attempts.json"
 RUNTIME_ROOT = Path(os.getenv("MEMEMEOW_EXECUTOR_RUNTIME_ROOT", "/runtime"))
 IMAGE_ROOT = Path(os.getenv("MEMEMEOW_EXECUTOR_IMAGE_ROOT", "/images"))
 WORKSPACE = RUNTIME_ROOT / "workspace"
@@ -40,7 +44,19 @@ LOG_ROOT = RUNTIME_ROOT / "logs"
 SKILL_ROOT = Path(os.getenv("MEMEMEOW_EXECUTOR_SKILL_ROOT", "/skills/research-meme-context"))
 DEFAULT_MAX_RESULT_BYTES = 1024 * 1024
 ALLOWED_REQUEST_FIELDS = frozenset(
-    {"task_id", "image_relative_path", "reverse_image_policy", "timeout_seconds", "wait", "callback_token"}
+    {
+        "task_id",
+        "business_task_id",
+        "executor_attempt_id",
+        "resume_of_attempt_id",
+        "session_id",
+        "processing_config_hash",
+        "image_relative_path",
+        "reverse_image_policy",
+        "timeout_seconds",
+        "wait",
+        "callback_token",
+    }
 )
 REQUIRED_RESULT_FIELDS = frozenset(
     {"title", "summary", "subjects", "visible_text", "references", "meaning", "keywords", "search_queries", "uncertainties"}
@@ -51,6 +67,7 @@ _EXECUTOR_ERROR_CODES = frozenset(
         "agent_timeout",
         "task_interrupted",
         "agent_process_failed",
+        "unknown_execution",
         "agent_output_invalid_json",
         "agent_result_file_missing",
         "agent_result_file_unreadable",
@@ -66,12 +83,31 @@ _EXECUTOR_ERROR_CODES = frozenset(
         "invalid_reverse_image_policy",
         "agent_backpressure",
         "task_exists",
+        "agent_provider_rate_limited",
+        "agent_provider_server_error",
+        "agent_connection_interrupted",
+        "session_binding_mismatch",
+        "session_not_resumable",
     }
 )
 _SECRET_PATTERNS = (
-    re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+"),
-    re.compile(r"(?i)((?:api[_-]?key|token|secret|password)\s*[:=]\s*)[^\s,;\"']+"),
+    # 分开处理 JSON 字符串值和普通 header/日志格式，保留原有引号结构。
+    re.compile(r"(?i)(authorization\s*[\"']?\s*:\s*[\"']?bearer\s+)[^\s,;}\]\"']+"),
+    re.compile(r"(?i)([\"']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)[\"']?\s*:\s*)([\"'])(.*?)\2"),
+    re.compile(r"(?i)([\"']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)[\"']?\s*[:=]\s*)[^\s,;}\]\"']+"),
 )
+_PATH_PATTERN = re.compile(r"(?:/runtime|/images|/skills|/app|[A-Za-z]:\\)[^\s,;]+")
+_GENERIC_PATH_PATTERN = re.compile(r"(?<![A-Za-z0-9:/])/(?:[^\s,;:'\"()\[\]{}]+/)+[^\s,;:'\"()\[\]{}]+")
+
+
+class _ProcessFailure(RuntimeError):
+    """保存 OpenCode 进程失败的稳定错误码和可选 HTTP 状态。"""
+
+    def __init__(self, code: str, message: str, *, http_status: int | None = None):
+        """初始化进程失败；message 只允许作为有限诊断返回。"""
+        super().__init__(message)
+        self.code = code
+        self.http_status = http_status
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -83,18 +119,24 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(value, maximum))
 
 
-def _json_error(code: str, message: str) -> dict[str, str]:
+def _json_error(code: str, message: str) -> dict[str, object]:
     """构造不包含本地路径、命令或秘密的稳定错误响应。"""
     return {"error": code, "message": message}
 
 
 def _redact_diagnostic(value: str, secrets: tuple[str, ...] = ()) -> str:
     """从上游诊断中移除已知密钥和常见凭据格式，保留有限可读错误。"""
+    value = value.splitlines()[0] if value.splitlines() else value
     for secret in secrets:
         if secret:
             value = value.replace(secret, "[REDACTED]")
     for pattern in _SECRET_PATTERNS:
-        value = pattern.sub(r"\1[REDACTED]", value)
+        if pattern.groups == 3:
+            value = pattern.sub(r"\1\2[REDACTED]\2", value)
+        else:
+            value = pattern.sub(r"\1[REDACTED]", value)
+    value = _PATH_PATTERN.sub("[PATH]", value)
+    value = _GENERIC_PATH_PATTERN.sub("[PATH]", value)
     return value[:500]
 
 
@@ -141,6 +183,18 @@ def _diagnostic(stdout: bytes, stderr: bytes, *, secrets: tuple[str, ...] = ()) 
     return "OpenCode 进程执行失败"
 
 
+def _stream_sample(stream: Any, limit: int) -> bytes:
+    """读取临时输出的头尾样本，避免大 JSONL 将 provider 错误留在不可见尾部。"""
+    stream.seek(0)
+    head = stream.read(limit)
+    stream.seek(0, os.SEEK_END)
+    size = stream.tell()
+    if size <= limit:
+        return head
+    stream.seek(max(0, size - limit))
+    return head + b"\n" + stream.read(limit)
+
+
 def _relative_image_path(value: object) -> Path:
     """验证图片相对路径，拒绝绝对路径、父级跳转和符号链接入口。"""
     if not isinstance(value, str) or not value or len(value) > 512 or "\\" in value:
@@ -153,19 +207,25 @@ def _relative_image_path(value: object) -> Path:
 
 @dataclass
 class TaskState:
-    """一个 executor 任务的受控状态和取消句柄。"""
+    """一个 executor attempt 的受控状态和取消句柄。"""
 
     task_id: str
+    business_task_id: str
+    executor_attempt_id: str
     image_relative_path: str
     reverse_image_policy: str
     timeout_seconds: int
+    processing_config_hash: str | None = None
+    session_id: str | None = None
+    resume_of_attempt_id: str | None = None
+    is_resume: bool = False
     callback_token: str | None = field(default=None, repr=False)
     status: str = "queued"
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     completed_at: float | None = None
-    session_id: str | None = None
-    error: dict[str, str] | None = None
+    process_reaped: bool = True
+    error: dict[str, object] | None = None
     result_path: str | None = None
     process: subprocess.Popen[bytes] | None = field(default=None, repr=False)
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -174,16 +234,22 @@ class TaskState:
     def public(self) -> dict[str, object]:
         """返回 API 可见状态，不暴露进程对象和 executor 本地实现细节。"""
         return {
-            "task_id": self.task_id,
+            "task_id": self.business_task_id,
+            "business_task_id": self.business_task_id,
+            "executor_attempt_id": self.executor_attempt_id,
             "status": self.status,
             "image_relative_path": self.image_relative_path,
             "reverse_image_policy": self.reverse_image_policy,
             "session_id": self.session_id,
+            "resume_of_attempt_id": self.resume_of_attempt_id,
+            "processing_config_hash": self.processing_config_hash,
+            "is_resume": self.is_resume,
             "result_path": self.result_path,
             "error": self.error,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
+            "process_reaped": self.process_reaped,
         }
 
 
@@ -283,11 +349,139 @@ class Executor:
             key=lambda task: (task.completed_at or task.created_at, task.created_at, task.task_id),
         )
         for task in terminal[:overflow]:
-            self.tasks.pop(task.task_id, None)
-            self.futures.pop(task.task_id, None)
+            self.tasks.pop(task.executor_attempt_id, None)
+            self.futures.pop(task.executor_attempt_id, None)
 
-    def _validate_request(self, payload: object) -> tuple[str, str, str, int, bool, str | None]:
-        """校验固定任务字段并返回规范化参数。"""
+    def _attempt_metadata_path(self, business_task_id: str) -> Path:
+        """返回任务专属 attempt 元数据路径，并验证业务标识可安全拼接。"""
+        if not TASK_ID_RE.fullmatch(business_task_id):
+            raise ValueError("agent_result_path_invalid")
+        root_info = RESULT_ROOT.lstat()
+        if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+            raise ValueError("agent_result_path_invalid")
+        result_dir = RESULT_ROOT / business_task_id
+        if result_dir.is_symlink() or (result_dir.exists() and not result_dir.is_dir()):
+            raise ValueError("agent_result_path_invalid")
+        return result_dir / ATTEMPT_METADATA_NAME
+
+    def _metadata_signature(self, attempts: list[dict[str, object]]) -> str:
+        """使用 executor token 对可恢复 attempt 事实做完整性签名。"""
+        raw = json.dumps(attempts, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hmac.new(self.token.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+
+    def _load_attempt_metadata(self, business_task_id: str) -> list[dict[str, object]]:
+        """读取并验证 runtime 中持久化的 attempt 绑定，损坏时返回空集合。"""
+        try:
+            path = self._attempt_metadata_path(business_task_id)
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 256 * 1024:
+                return []
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                raw = os.read(descriptor, 256 * 1024 + 1)
+            finally:
+                os.close(descriptor)
+            document = json.loads(raw.decode("utf-8"))
+            attempts = document.get("attempts") if isinstance(document, dict) else None
+            signature = document.get("signature") if isinstance(document, dict) else None
+            if not isinstance(attempts, list) or not isinstance(signature, str):
+                return []
+            values = [item for item in attempts if isinstance(item, dict)]
+            if len(values) != len(attempts) or not hmac.compare_digest(signature, self._metadata_signature(values)):
+                return []
+            return values[-32:]
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, RecursionError):
+            return []
+
+    def _persist_attempt_metadata(self, task: TaskState) -> None:
+        """原子保存终态 attempt 的最小绑定事实，供 executor 重启后恢复。"""
+        # 同一业务任务的两个 attempt 可能几乎同时收束；锁住读-改-写序列，
+        # 避免后完成的 attempt 覆盖前一个失败事实，导致重启后无法续跑。
+        with self.lock:
+            self._persist_attempt_metadata_locked(task)
+
+    def _persist_attempt_metadata_locked(self, task: TaskState) -> None:
+        """在 executor 锁内原子保存 attempt 元数据，调用者负责持有锁。"""
+        path = self._attempt_metadata_path(task.business_task_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing = self._load_attempt_metadata(task.business_task_id)
+        entry: dict[str, object] = {
+            "business_task_id": task.business_task_id,
+            "executor_attempt_id": task.executor_attempt_id,
+            "image_relative_path": task.image_relative_path,
+            "reverse_image_policy": task.reverse_image_policy,
+            "processing_config_hash": task.processing_config_hash,
+            "session_id": task.session_id,
+            "resume_of_attempt_id": task.resume_of_attempt_id,
+            "status": task.status,
+            "error": task.error,
+            "created_at": task.created_at,
+            "completed_at": task.completed_at,
+            "process_reaped": task.process_reaped,
+        }
+        values = [item for item in existing if item.get("executor_attempt_id") != task.executor_attempt_id]
+        values.append(entry)
+        document = {"attempts": values[-32:], "signature": self._metadata_signature(values[-32:])}
+        raw = _safe_json(document)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".executor-attempts.", dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(raw)
+            os.chmod(temporary_name, stat.S_IRUSR | stat.S_IWUSR)
+            os.replace(temporary_name, path)
+        except Exception:
+            try:
+                os.unlink(temporary_name)
+            except OSError:
+                pass
+            raise
+
+    def _persisted_resume_source(self, values: dict[str, object]) -> TaskState | None:
+        """从签名元数据恢复失败 attempt，供 executor 服务重启后续跑。"""
+        business_task_id = str(values["business_task_id"])
+        session_id = values.get("session_id")
+        resume_of = values.get("resume_of_attempt_id")
+        if not isinstance(session_id, str):
+            return None
+        for entry in reversed(self._load_attempt_metadata(business_task_id)):
+            if (
+                entry.get("business_task_id") != business_task_id
+                or entry.get("session_id") != session_id
+                or entry.get("image_relative_path") != values.get("image_relative_path")
+                or entry.get("reverse_image_policy") != values.get("reverse_image_policy")
+                or entry.get("processing_config_hash") != values.get("processing_config_hash")
+                or (resume_of is not None and entry.get("executor_attempt_id") != resume_of)
+            ):
+                continue
+            if entry.get("status") != "failed" or entry.get("process_reaped") is not True or not isinstance(entry.get("executor_attempt_id"), str):
+                continue
+            error = entry.get("error") if isinstance(entry.get("error"), dict) else {}
+            if error.get("error") not in {
+                "agent_provider_rate_limited",
+                "agent_provider_server_error",
+                "agent_connection_interrupted",
+                "agent_process_failed",
+            }:
+                continue
+            return TaskState(
+                task_id=business_task_id,
+                business_task_id=business_task_id,
+                executor_attempt_id=str(entry["executor_attempt_id"]),
+                image_relative_path=str(entry["image_relative_path"]),
+                reverse_image_policy=str(entry["reverse_image_policy"]),
+                timeout_seconds=int(values["timeout_seconds"]),
+                processing_config_hash=values.get("processing_config_hash") if isinstance(values.get("processing_config_hash"), str) else None,
+                session_id=session_id,
+                status="failed",
+                error={str(key): value for key, value in error.items()},
+                created_at=float(entry.get("created_at")) if isinstance(entry.get("created_at"), (int, float)) else time.time(),
+                completed_at=float(entry.get("completed_at")) if isinstance(entry.get("completed_at"), (int, float)) else time.time(),
+                process_reaped=True,
+            )
+        return None
+
+    def _validate_request(self, payload: object) -> dict[str, object]:
+        """校验固定任务字段并返回业务任务与 attempt 的规范化参数。"""
         if not isinstance(payload, dict):
             raise ValueError("invalid_task")
         unknown = set(payload) - ALLOWED_REQUEST_FIELDS
@@ -296,6 +490,30 @@ class Executor:
         task_id = payload.get("task_id")
         if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
             raise ValueError("agent_result_path_invalid")
+        business_task_id = payload.get("business_task_id", task_id)
+        if not isinstance(business_task_id, str) or not TASK_ID_RE.fullmatch(business_task_id) or business_task_id != task_id:
+            raise ValueError("invalid_task")
+        raw_attempt_id = payload.get("executor_attempt_id")
+        # 旧客户端没有 attempt 字段时使用业务 ID 作为兼容别名；新客户端总是
+        # 发送独立 attempt，因而终态历史不会被恢复请求复用。
+        executor_attempt_id = raw_attempt_id if raw_attempt_id is not None else business_task_id
+        if not isinstance(executor_attempt_id, str) or not TASK_ID_RE.fullmatch(executor_attempt_id):
+            raise ValueError("invalid_task")
+        raw_resume_of = payload.get("resume_of_attempt_id")
+        if raw_resume_of is not None and (
+            not isinstance(raw_resume_of, str) or not TASK_ID_RE.fullmatch(raw_resume_of)
+        ):
+            raise ValueError("invalid_task")
+        session_id = payload.get("session_id")
+        if session_id is not None and (not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id)):
+            raise ValueError("session_binding_mismatch")
+        if raw_resume_of is not None and session_id is None:
+            raise ValueError("session_binding_mismatch")
+        processing_config_hash = payload.get("processing_config_hash")
+        if processing_config_hash is not None and (
+            not isinstance(processing_config_hash, str) or not CONFIG_HASH_RE.fullmatch(processing_config_hash)
+        ):
+            raise ValueError("invalid_task")
         relative = _relative_image_path(payload.get("image_relative_path"))
         image = IMAGE_ROOT / relative
         try:
@@ -335,26 +553,106 @@ class Executor:
             or any(character.isspace() or ord(character) < 0x20 for character in callback_token)
         ):
             raise ValueError("invalid_task")
-        return task_id, relative.as_posix(), str(policy), timeout, wait, callback_token
+        return {
+            "task_id": business_task_id,
+            "business_task_id": business_task_id,
+            "executor_attempt_id": executor_attempt_id,
+            "resume_of_attempt_id": raw_resume_of,
+            "session_id": session_id,
+            "processing_config_hash": processing_config_hash.lower() if isinstance(processing_config_hash, str) else None,
+            "image_relative_path": relative.as_posix(),
+            "reverse_image_policy": str(policy),
+            "timeout_seconds": timeout,
+            "wait": wait,
+            "callback_token": callback_token,
+        }
+
+    def _resume_source(self, values: dict[str, object]) -> TaskState | None:
+        """查找与续跑 session 完全绑定的失败 attempt，拒绝跨任务猜测。"""
+        session_id = values.get("session_id")
+        if not isinstance(session_id, str):
+            return None
+        business_task_id = values["business_task_id"]
+        resume_of = values.get("resume_of_attempt_id")
+        matches = [
+            task
+            for task in self.tasks.values()
+            if task.session_id == session_id
+            and task.business_task_id == business_task_id
+            and task.image_relative_path == values["image_relative_path"]
+            and task.reverse_image_policy == values["reverse_image_policy"]
+            and task.processing_config_hash == values.get("processing_config_hash")
+            and (resume_of is None or task.executor_attempt_id == resume_of)
+        ]
+        if not matches:
+            persisted = self._persisted_resume_source(values)
+            if persisted is not None:
+                return persisted
+            # 同一 session 若属于其它业务任务，明确返回绑定错误；完全未知的
+            # session 则返回不可续跑，避免把最近会话当作恢复目标。
+            if any(task.session_id == session_id for task in self.tasks.values()):
+                raise RuntimeError("session_binding_mismatch")
+            raise RuntimeError("session_not_resumable")
+        source = max(matches, key=lambda task: (task.completed_at or task.created_at, task.created_at))
+        if source.status != "failed":
+            raise RuntimeError("session_not_resumable")
+        if source.process_reaped is not True:
+            raise RuntimeError("session_not_resumable")
+        source_error = (source.error or {}).get("error")
+        if source_error not in {
+            "agent_provider_rate_limited",
+            "agent_provider_server_error",
+            "agent_connection_interrupted",
+            "agent_process_failed",
+        }:
+            raise RuntimeError("session_not_resumable")
+        return source
 
     def submit(self, payload: object) -> tuple[TaskState, bool]:
         """创建固定研究任务并交给受限线程池，返回状态和同步等待标记。"""
-        task_id, relative, policy, timeout, wait, callback_token = self._validate_request(payload)
+        values = self._validate_request(payload)
         with self.lock:
             self._prune_history_locked()
             if not self.health().get("ready"):
                 raise RuntimeError("agent_runtime_unavailable")
             if not self.model or not self.base_url or not self.api_key:
                 raise RuntimeError("opencode_not_configured")
-            existing = self.tasks.get(task_id)
+            existing = self.tasks.get(values["executor_attempt_id"])
             if existing is not None:
+                raise RuntimeError("task_exists")
+            same_business = [
+                task
+                for task in self.tasks.values()
+                if task.business_task_id == values["business_task_id"]
+                and task.executor_attempt_id != values["executor_attempt_id"]
+                and (task.status in {"queued", "running"} or task.process_reaped is not True)
+            ]
+            if same_business:
+                # 同一业务 Task 只能有一个活动 attempt；未确认回收的旧进程更严格地
+                # 收束为 unknown_execution，避免其晚到结果污染新 attempt。
+                if not any(task.status in {"queued", "running"} for task in same_business) and any(task.process_reaped is not True for task in same_business):
+                    raise RuntimeError("unknown_execution")
                 raise RuntimeError("task_exists")
             if self._queued_count() >= self.backpressure:
                 raise RuntimeError("agent_backpressure")
-            task = TaskState(task_id, relative, policy, timeout, callback_token=callback_token, result_path=f"task-results/{task_id}/{RESULT_FILE_NAME}")
-            self.tasks[task_id] = task
-            self.futures[task_id] = self.pool.submit(self._run, task)
-            return task, wait
+            source = self._resume_source(values) if values.get("session_id") else None
+            task = TaskState(
+                task_id=str(values["business_task_id"]),
+                business_task_id=str(values["business_task_id"]),
+                executor_attempt_id=str(values["executor_attempt_id"]),
+                image_relative_path=str(values["image_relative_path"]),
+                reverse_image_policy=str(values["reverse_image_policy"]),
+                timeout_seconds=int(values["timeout_seconds"]),
+                processing_config_hash=values.get("processing_config_hash") if isinstance(values.get("processing_config_hash"), str) else None,
+                session_id=values.get("session_id") if isinstance(values.get("session_id"), str) else None,
+                resume_of_attempt_id=source.executor_attempt_id if source else None,
+                is_resume=source is not None,
+                callback_token=values.get("callback_token") if isinstance(values.get("callback_token"), str) else None,
+                result_path=f"task-results/{values['business_task_id']}/{RESULT_FILE_NAME}",
+            )
+            self.tasks[task.executor_attempt_id] = task
+            self.futures[task.executor_attempt_id] = self.pool.submit(self._run, task)
+            return task, bool(values["wait"])
 
     def _task_environment(self, task: TaskState) -> dict[str, str]:
         """构造 OpenCode 最小环境白名单，不继承 executor 容器中的无关变量。"""
@@ -368,7 +666,8 @@ class Executor:
             "MEMEMEOW_OPENCODE_BASE_URL": self.base_url,
             "MEMEMEOW_OPENCODE_API_KEY": self.api_key,
             "MEMEMEOW_OPENCODE_SLOT": "0",
-            "MEMEMEOW_AGENT_TASK_ID": task.task_id,
+            "MEMEMEOW_AGENT_TASK_ID": task.business_task_id,
+            "MEMEMEOW_AGENT_EXECUTOR_ATTEMPT_ID": task.executor_attempt_id,
             **({"MEMEMEOW_AGENT_CALLBACK_TOKEN": task.callback_token} if task.callback_token else {}),
             "MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL": os.getenv("MEMEMEOW_AGENT_REVERSE_IMAGE_INTERNAL_URL", ""),
             "MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL": os.getenv("MEMEMEOW_AGENT_VISUAL_SEARCH_INTERNAL_URL", ""),
@@ -382,9 +681,15 @@ class Executor:
     def _prompt(self, task: TaskState) -> str:
         """生成唯一业务 prompt；调用方不能覆盖路径、命令或提示词。"""
         result_dir = RESULT_ROOT / task.task_id
+        resume_instruction = (
+            "这是同一 OpenCode session 的受控续跑；保留并检查已有草稿和中间产物，只完成尚未完成的工作。"
+            if task.is_resume
+            else "这是首次执行；先建立任务草稿并逐步完成研究。"
+        )
         return (
             "使用 research-meme-context skill 分析这张表情包；只通过项目内部接口使用可选反向图片能力。"
             f"本任务 reverse_image_policy={task.reverse_image_policy}。"
+            f"{resume_instruction}"
             f"结果必须写入 {result_dir / RESULT_FILE_NAME}；先写 {result_dir / RESULT_DRAFT_NAME}，"
             "使用 output-schema.json 校验后通过同一文件系统的原子 rename/mv 替换最终文件。"
             "不要把业务 JSON 作为 assistant 文本交付，不要写入数据库。"
@@ -395,6 +700,7 @@ class Executor:
         process: subprocess.Popen[bytes] | None = None
         stdout = b""
         stderr = b""
+        timed_out = False
         try:
             with self.lock:
                 if task.cancel_event.is_set():
@@ -409,10 +715,13 @@ class Executor:
                 if result_dir.is_symlink() or (result_dir.exists() and not result_dir.is_dir()):
                     raise RuntimeError("agent_result_path_invalid")
                 result_dir.mkdir(parents=True, exist_ok=True)
-                for filename in (RESULT_FILE_NAME, RESULT_DRAFT_NAME):
-                    path = result_dir / filename
-                    if path.exists() or path.is_symlink():
-                        path.unlink()
+                # 续跑必须保留原 attempt 的草稿和已验证结果，首次 attempt 才清理
+                # 任务目录中的两个受控交付文件。
+                if not task.is_resume:
+                    for filename in (RESULT_FILE_NAME, RESULT_DRAFT_NAME):
+                        path = result_dir / filename
+                        if path.exists() or path.is_symlink():
+                            path.unlink()
             env = self._task_environment(task)
             image = IMAGE_ROOT / _relative_image_path(task.image_relative_path)
             command = [
@@ -431,41 +740,55 @@ class Executor:
                 "max",
                 "--title",
                 f"mememeow-task-{task.task_id}",
-                self._prompt(task),
             ]
+            if task.session_id:
+                command.extend(("--session", task.session_id))
+            command.append(self._prompt(task))
             with tempfile.TemporaryFile(dir=LOG_ROOT, prefix=f"{task.task_id}-", mode="w+b") as out, tempfile.TemporaryFile(dir=LOG_ROOT, prefix=f"{task.task_id}-", mode="w+b") as err:
                 process = subprocess.Popen(command, cwd=WORKSPACE, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
                 with self.lock:
                     task.process = process
+                    # 进程启动后，只有父进程确认 waitpid 收束才允许该 attempt 作为续跑源。
+                    task.process_reaped = False
                 deadline = time.monotonic() + task.timeout_seconds
                 while process.poll() is None:
                     if task.cancel_event.is_set():
-                        self._terminate(process)
-                        raise RuntimeError("task_interrupted")
+                        reaped = self._terminate(process)
+                        with self.lock:
+                            task.process_reaped = reaped
+                        if not reaped:
+                            raise _ProcessFailure("unknown_execution", "无法确认 OpenCode 进程已终止")
+                        break
                     if time.monotonic() >= deadline:
-                        self._terminate(process)
-                        raise RuntimeError("agent_timeout")
+                        reaped = self._terminate(process)
+                        with self.lock:
+                            task.process_reaped = reaped
+                        if not reaped:
+                            raise _ProcessFailure("unknown_execution", "无法确认 OpenCode 进程已终止")
+                        timed_out = True
+                        break
                     time.sleep(0.05)
+                if process.poll() is not None:
+                    with self.lock:
+                        task.process_reaped = True
                 out.flush()
                 err.flush()
                 out.seek(0)
                 err.seek(0)
-                stdout = out.read(256 * 1024)
-                stderr = err.read(16 * 1024)
+                stdout = _stream_sample(out, 256 * 1024)
+                stderr = _stream_sample(err, 16 * 1024)
+            self._capture_session(task, stdout)
             if task.cancel_event.is_set():
                 raise RuntimeError("task_interrupted")
+            if timed_out:
+                raise _ProcessFailure("agent_timeout", "OpenCode 执行超时")
             if process.returncode != 0:
-                raise RuntimeError(
-                    "agent_process_failed:"
-                    + _diagnostic(stdout, stderr, secrets=(self.api_key, self.token, task.callback_token or ""))
+                code, http_status = self._classify_process_failure(stdout, stderr)
+                raise _ProcessFailure(
+                    code,
+                    _diagnostic(stdout, stderr, secrets=(self.api_key, self.token, task.callback_token or "")),
+                    http_status=http_status,
                 )
-            for line in stdout.splitlines():
-                try:
-                    session = _session_id_from_event(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-                if session:
-                    task.session_id = session
             if not task.session_id:
                 raise RuntimeError("agent_output_invalid_json")
             self._validate_result_file(RESULT_ROOT / task.task_id / RESULT_FILE_NAME)
@@ -474,12 +797,31 @@ class Executor:
                     raise RuntimeError("task_interrupted")
                 task.status = "succeeded"
                 task.completed_at = time.time()
+        except _ProcessFailure as exc:
+            with self.lock:
+                # 未确认进程已回收时，取消/超时也不能伪装成可安全重试的普通失败。
+                code = exc.code
+                if task.cancel_event.is_set() and code != "unknown_execution":
+                    code = "task_interrupted"
+                task.status = "cancelled" if code == "task_interrupted" else "failed"
+                error: dict[str, object] = {
+                    "error": code,
+                    "message": _redact_diagnostic(exc.args[0], (self.api_key, self.token, task.callback_token or "")),
+                }
+                if exc.http_status is not None:
+                    error["http_status"] = exc.http_status
+                task.error = error
+                task.completed_at = time.time()
         except RuntimeError as exc:
             code, _, detail = str(exc).partition(":")
             with self.lock:
                 # 取消与子进程自然退出可能同时发生；持锁后以取消为最终事实，避免把
                 # 用户明确取消的任务误记为普通进程失败。
-                if task.cancel_event.is_set():
+                if process is not None and process.poll() is not None:
+                    task.process_reaped = True
+                if task.process_reaped is not True:
+                    code, detail = "unknown_execution", "无法确认 OpenCode 进程已终止"
+                elif task.cancel_event.is_set():
                     code, detail = "task_interrupted", ""
                 if code not in _EXECUTOR_ERROR_CODES:
                     code = "agent_process_failed"
@@ -492,20 +834,62 @@ class Executor:
                 task.completed_at = time.time()
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             with self.lock:
-                code = "task_interrupted" if task.cancel_event.is_set() else "agent_process_failed"
+                if process is not None and process.poll() is not None:
+                    task.process_reaped = True
+                code = "unknown_execution" if task.process_reaped is not True else "task_interrupted" if task.cancel_event.is_set() else "agent_process_failed"
                 task.status = "cancelled" if code == "task_interrupted" else "failed"
-                task.error = _json_error(code, "任务已取消" if code == "task_interrupted" else _redact_diagnostic(str(exc), (self.api_key, self.token, task.callback_token or "")))
+                task.error = _json_error(code, "任务已取消" if code == "task_interrupted" else "无法确认 OpenCode 进程已终止" if code == "unknown_execution" else _redact_diagnostic(str(exc), (self.api_key, self.token, task.callback_token or "")))
                 task.completed_at = time.time()
         except Exception as exc:  # noqa: BLE001 - 任务必须以终态收束，不能留下永久 running
             with self.lock:
-                code = "task_interrupted" if task.cancel_event.is_set() else "agent_process_failed"
+                if process is not None and process.poll() is not None:
+                    task.process_reaped = True
+                code = "unknown_execution" if task.process_reaped is not True else "task_interrupted" if task.cancel_event.is_set() else "agent_process_failed"
                 task.status = "cancelled" if code == "task_interrupted" else "failed"
-                task.error = _json_error(code, "任务已取消" if code == "task_interrupted" else _redact_diagnostic(str(exc), (self.api_key, self.token, task.callback_token or "")))
+                task.error = _json_error(code, "任务已取消" if code == "task_interrupted" else "无法确认 OpenCode 进程已终止" if code == "unknown_execution" else _redact_diagnostic(str(exc), (self.api_key, self.token, task.callback_token or "")))
                 task.completed_at = time.time()
         finally:
             with self.lock:
                 task.process = None
+                try:
+                    self._persist_attempt_metadata(task)
+                except (OSError, ValueError, TypeError):
+                    # 元数据仅用于跨重启诊断；写入失败不能让当前任务悬挂，
+                    # 但此时新 executor 必须因缺少签名事实而拒绝自动续跑。
+                    pass
                 task.done.set()
+
+    def _capture_session(self, task: TaskState, stdout: bytes) -> None:
+        """从成功、失败和超时的有限 JSONL 输出中绑定 session 标识。"""
+        found_session: str | None = None
+        for line in stdout.splitlines():
+            try:
+                candidate = _session_id_from_event(json.loads(line))
+            except (json.JSONDecodeError, RecursionError):
+                continue
+            if candidate and SESSION_ID_RE.fullmatch(candidate):
+                if task.session_id and candidate != task.session_id:
+                    raise RuntimeError("session_binding_mismatch")
+                if found_session and candidate != found_session:
+                    raise RuntimeError("session_binding_mismatch")
+                found_session = candidate
+        if found_session:
+            with self.lock:
+                task.session_id = found_session
+
+    @staticmethod
+    def _classify_process_failure(stdout: bytes, stderr: bytes) -> tuple[str, int | None]:
+        """按有限输出区分 provider 网关、网络和普通进程暂态错误。"""
+        text = (stdout[:256 * 1024] + stderr[:16 * 1024]).decode("utf-8", errors="replace").lower()
+        statuses = [int(match) for match in re.findall(r"(?:statuscode|status|http)[^0-9]{0,8}(\d{3})", text)]
+        if any(status == 429 for status in statuses):
+            return "agent_provider_rate_limited", 429
+        server_status = next((status for status in statuses if 500 <= status <= 599), None)
+        if server_status is not None:
+            return "agent_provider_server_error", server_status
+        if any(token in text for token in ("econnreset", "connection reset", "connection refused", "socket hang up", "network error", "timed out")):
+            return "agent_connection_interrupted", None
+        return "agent_process_failed", None
 
     def _validate_result_file(self, path: Path) -> None:
         """验证结果文件位置、大小和基本 JSON 结构；完整 schema 由后端复核。"""
@@ -564,10 +948,10 @@ class Executor:
             raise RuntimeError("agent_result_file_schema_invalid")
 
     @staticmethod
-    def _terminate(process: subprocess.Popen[bytes]) -> None:
-        """终止任务进程组，避免取消或超时留下 OpenCode 子进程。"""
+    def _terminate(process: subprocess.Popen[bytes]) -> bool:
+        """终止任务进程组并返回父进程是否已被 waitpid 确认回收。"""
         if process.poll() is not None:
-            return
+            return True
         try:
             os.killpg(process.pid, signal.SIGTERM)
             process.wait(timeout=2)
@@ -576,10 +960,11 @@ class Executor:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=2)
             except OSError:
-                pass
+                return process.poll() is not None
             except subprocess.TimeoutExpired:
                 # 进程组仍未收束时不阻塞 executor；调用方会把任务标记为失败。
-                pass
+                return process.poll() is not None
+        return process.poll() is not None
 
     def cancel(self, task_id: str) -> TaskState:
         """取消指定任务；只终止该任务进程，不影响 executor 或其他任务。"""
@@ -598,13 +983,19 @@ class Executor:
             if process is None and was_queued:
                 task.done.set()
         if process is not None:
-            self._terminate(process)
+            reaped = self._terminate(process)
+            with self.lock:
+                task.process_reaped = reaped
+                if not reaped:
+                    task.status = "failed"
+                    task.error = _json_error("unknown_execution", "无法确认 OpenCode 进程已终止")
+                    task.completed_at = time.time()
         return task
 
     def close(self) -> None:
         """停止线程池并取消仍未结束的任务。"""
         with self.lock:
-            ids = [task.task_id for task in self.tasks.values() if task.status not in {"succeeded", "failed", "cancelled"}]
+            ids = [task.executor_attempt_id for task in self.tasks.values() if task.status not in {"succeeded", "failed", "cancelled"}]
         for task_id in ids:
             self.cancel(task_id)
         self.pool.shutdown(wait=False, cancel_futures=True)
@@ -721,6 +1112,7 @@ class Handler(BaseHTTPRequestHandler):
                 "agent_result_path_invalid": "任务标识非法",
                 "invalid_reverse_image_policy": "反向图片策略无效",
                 "agent_timeout_limit_exceeded": "任务超时超过 executor 上限",
+                "session_binding_mismatch": "续跑 session 与任务事实不匹配",
             }
             if code not in messages and code not in {"invalid_task"}:
                 code = "invalid_task"
@@ -728,11 +1120,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         except RuntimeError as exc:
             code = str(exc)
-            if code not in {"agent_backpressure", "task_exists", "agent_runtime_unavailable", "opencode_not_configured"}:
+            if code not in {
+                "agent_backpressure",
+                "task_exists",
+                "agent_runtime_unavailable",
+                "opencode_not_configured",
+                "session_binding_mismatch",
+                "session_not_resumable",
+                "unknown_execution",
+            }:
                 code = "agent_runtime_unavailable"
             status = {
                 "agent_backpressure": 429,
                 "task_exists": 409,
+                "session_binding_mismatch": 409,
+                "session_not_resumable": 409,
+                "unknown_execution": 409,
                 "agent_runtime_unavailable": 503,
                 "opencode_not_configured": 503,
             }.get(code, 503)

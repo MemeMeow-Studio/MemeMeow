@@ -95,7 +95,7 @@ app = create_app(scope_resolver=LocalScopeResolver("local"))
 
 - `POST /generate-cache`：返回 `202`、`task_id`、`status=queued`；同类任务不会并发执行。
 - `GET /tasks?status=running&task_type=meme_context_generation&cursor=...&limit=50`：按状态、类型和 cursor 分页返回安全任务摘要。
-- `GET /tasks/{task_id}`：返回任务类型、`queued/running/succeeded/failed`、进度、消息、时间、错误和有限结果。
+- `GET /tasks/{task_id}`：返回任务类型、`queued/running/succeeded/failed`、进度、消息、时间、错误和有限结果。Agent 失败任务额外返回 `resume_available`、`resume_reason`、`session_id`、`executor_attempt_id`、`resume_attempts`、`resume_started_at`、`first_error` 和有限 `error_history`；这些字段只保留脱敏稳定诊断，不返回 prompt、工具参数、密钥或 transcript。自动续跑由 `MEMEMEOW_AGENT_RESUME_ENABLED` 控制且默认关闭；关闭时已持久化的 session 也显示为 `resume_available=false`、`resume_reason=resume_disabled`，但既有任务级 retry 仍按原策略执行。达到续跑次数或累计时间上限时显示 `resume_reason=resume_budget_exhausted`；额度未耗尽的失败会暂时显示为 `queued`，表示等待自动恢复。
 - `POST /tasks/{task_id}/retry`：图片阶段 Task 一律返回稳定错误 `image_stage_retry_forbidden`；完整 Job 必须调用 Job retry，独立阶段必须调用 `/images/stages`。普通非图片任务仍可使用该入口。
 
 任务记录、去重、claim generation 和租约持久化在 PostgreSQL；服务重启后 queued 可继续执行，过期 running 按租约重新认领或失败。三类图片处理 Task 只由逐图 ImageProcessingWorker 扫描、认领和执行；进程级通用 Worker manager 会排除它们，也不会为图片链创建旧的批次 `cache_generation` finalizer。

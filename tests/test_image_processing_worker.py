@@ -100,6 +100,51 @@ def test_active_agent_task_is_bound_before_policy_acquire() -> None:
         worker.shutdown()
 
 
+def test_image_leaf_runner_inherits_resume_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """完整图片流水线创建叶子 facade 时必须传递 session 续跑边界。"""
+    captured: dict[str, object] = {}
+
+    class _CapturingTaskRunner:
+        """只记录叶子 facade 构造参数的最小替身。"""
+
+        def __init__(self, _resources, **kwargs):
+            captured.update(kwargs)
+
+        def register(self, _task_type, _handler):
+            """接受图片阶段 handler 注册。"""
+
+        def shutdown(self):
+            """模拟叶子 facade 关闭。"""
+
+    monkeypatch.setattr("backend.pg_services.PostgresTaskService", _CapturingTaskRunner)
+    task_service = SimpleNamespace(
+        agent_concurrency=2,
+        agent_backpressure=12,
+        settings_version="settings-test",
+        lease_seconds=45,
+        max_attempts=4,
+        resume_enabled=True,
+        resume_max_attempts=3,
+        resume_backoff_seconds=5,
+        resume_max_backoff_seconds=90,
+        resume_timeout_seconds=1200,
+    )
+    worker = ImageProcessingWorker(
+        SimpleNamespace(factory=lambda: None),
+        scope_id="local",
+        task_service=task_service,
+        task_handlers={"meme_context_generation": lambda *_args: None},
+    )
+    try:
+        assert captured["resume_enabled"] is True
+        assert captured["resume_max_attempts"] == 3
+        assert captured["resume_backoff_seconds"] == 5
+        assert captured["resume_max_backoff_seconds"] == 90
+        assert captured["resume_timeout_seconds"] == 1200
+    finally:
+        worker.shutdown()
+
+
 def test_submit_failure_releases_only_uncommitted_grant() -> None:
     """叶子 Task 未创建时才补偿释放已取得的 grant。"""
     tasks = _TaskService(fail_submit=True)
@@ -144,6 +189,12 @@ def test_standalone_stage_aliases_are_canonical_and_mode_isolated() -> None:
         {"submission_mode": "standalone", "meme_id": "meme", "image_sha256": "a" * 64, "processing_config_hash": "b" * 64, "reverse_image_policy": "forbid"},
     )
     assert pipeline != standalone
+
+
+def test_unknown_standalone_stage_is_rejected() -> None:
+    """阶段控制面拒绝未知标识，避免客户端选择落入错误处理器。"""
+    with pytest.raises(ImageProcessingError, match="invalid_image_stage"):
+        ImageProcessingWorker._canonical_stage("metadata_repair")
 
 
 def test_processing_options_use_safe_defaults_but_reject_explicit_empty_values() -> None:

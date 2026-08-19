@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     agent_executor_token_file: Path | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_AGENT_EXECUTOR_TOKEN_FILE", "agent_executor_token_file"), repr=False)
     agent_executor_request_timeout_seconds: int = Field(default=1810, ge=1, le=7200, validation_alias=AliasChoices("MEMEMEOW_AGENT_EXECUTOR_REQUEST_TIMEOUT_SECONDS", "agent_executor_request_timeout_seconds"))
     agent_executor_max_timeout_seconds: int = Field(default=1800, ge=1, le=7200, validation_alias=AliasChoices("MEMEMEOW_AGENT_EXECUTOR_MAX_TIMEOUT_SECONDS", "agent_executor_max_timeout_seconds"))
+    # 会话自动续跑是独立 rollout 开关，默认关闭；旧的任务级自动重试不受影响。
+    agent_resume_enabled: bool = Field(default=False, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESUME_ENABLED", "agent_resume_enabled"))
+    agent_resume_max_attempts: int = Field(default=2, ge=0, le=10, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESUME_MAX_ATTEMPTS", "agent_resume_max_attempts"))
+    agent_resume_backoff_seconds: int = Field(default=2, ge=0, le=300, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESUME_BACKOFF_SECONDS", "agent_resume_backoff_seconds"))
+    agent_resume_max_backoff_seconds: int = Field(default=60, ge=0, le=3600, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESUME_MAX_BACKOFF_SECONDS", "agent_resume_max_backoff_seconds"))
+    agent_resume_timeout_seconds: int = Field(default=900, ge=1, le=86400, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESUME_TIMEOUT_SECONDS", "agent_resume_timeout_seconds"))
     visual_internal_token: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_VISUAL_INTERNAL_TOKEN", "VISUAL_INTERNAL_TOKEN", "visual_internal_token"), repr=False)
     agent_callback_secret: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_AGENT_CALLBACK_SECRET", "agent_callback_secret"), repr=False)
     agent_callback_verification_keys: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_AGENT_CALLBACK_VERIFICATION_KEYS", "agent_callback_verification_keys"), repr=False)
@@ -258,6 +264,11 @@ class Settings(BaseSettings):
             "agent_runtime_mode": self.agent_runtime_mode,
             "agent_executor_configured": bool(self.agent_executor_url),
             "agent_executor_token_configured": bool(self.agent_executor_token),
+            "agent_resume_enabled": self.agent_resume_enabled,
+            "agent_resume_max_attempts": self.agent_resume_max_attempts,
+            "agent_resume_backoff_seconds": self.agent_resume_backoff_seconds,
+            "agent_resume_max_backoff_seconds": self.agent_resume_max_backoff_seconds,
+            "agent_resume_timeout_seconds": self.agent_resume_timeout_seconds,
             "opencode_concurrency": self.opencode_concurrency,
             "agent_backpressure": self.agent_backpressure,
             "protected_mode": self.protected_mode,
@@ -331,6 +342,11 @@ class Settings(BaseSettings):
             "agent_runtime_mode": self.agent_runtime_mode,
             "agent_executor_configured": bool(self.agent_executor_url),
             "agent_executor_token_configured": bool(self.agent_executor_token),
+            "agent_resume_enabled": self.agent_resume_enabled,
+            "agent_resume_max_attempts": self.agent_resume_max_attempts,
+            "agent_resume_backoff_seconds": self.agent_resume_backoff_seconds,
+            "agent_resume_max_backoff_seconds": self.agent_resume_max_backoff_seconds,
+            "agent_resume_timeout_seconds": self.agent_resume_timeout_seconds,
             "opencode_configured": bool(self.opencode_executable and self.opencode_model and self.opencode_base_url and self.opencode_api_key),
             "embedding_cache_ready": cache_ready,
             "reverse_image_available": bool(self.serpapi_api_key),

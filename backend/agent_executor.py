@@ -12,6 +12,7 @@ import socket
 import time
 import urllib.error
 import urllib.request
+from uuid import uuid4
 from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import quote, urlsplit
@@ -20,17 +21,22 @@ from urllib.parse import quote, urlsplit
 class AgentExecutorError(RuntimeError):
     """executor 请求失败，携带稳定错误码和安全诊断。"""
 
-    def __init__(self, code: str, message: str | None = None):
+    def __init__(self, code: str, message: str | None = None, *, session_id: str | None = None, executor_attempt_id: str | None = None, http_status: int | None = None):
         super().__init__(message or code)
         self.code = code
+        self.session_id = session_id
+        self.executor_attempt_id = executor_attempt_id
+        self.http_status = http_status
 
 
 _PENDING_STATUSES = frozenset({"queued", "running"})
+_ATTEMPT_HISTORY_LIMIT = 5000
 _KNOWN_TASK_ERRORS = frozenset(
     {
         "agent_timeout",
         "task_interrupted",
         "agent_process_failed",
+        "unknown_execution",
         "agent_output_invalid_json",
         "agent_result_file_missing",
         "agent_result_file_unreadable",
@@ -46,6 +52,11 @@ _KNOWN_TASK_ERRORS = frozenset(
         "invalid_reverse_image_policy",
         "agent_backpressure",
         "task_exists",
+        "agent_provider_rate_limited",
+        "agent_provider_server_error",
+        "agent_connection_interrupted",
+        "session_binding_mismatch",
+        "session_not_resumable",
     }
 )
 
@@ -70,6 +81,8 @@ class ExecutorTaskResponse:
     session_id: str | None
     error: dict[str, str] | None
     result_path: str | None
+    executor_attempt_id: str | None = None
+    business_task_id: str | None = None
 
 
 class AgentExecutorClient:
@@ -81,6 +94,7 @@ class AgentExecutorClient:
         self.token = (token or "").strip()
         self.opener = opener or _DEFAULT_OPENER.open
         self.timeout = max(1, int(timeout))
+        self._attempt_ids: dict[str, str] = {}
 
     @property
     def configured(self) -> bool:
@@ -122,7 +136,7 @@ class AgentExecutorClient:
                 code = "agent_executor_http_error"
             if exc.code in {401, 403}:
                 code = "agent_executor_unauthorized"
-            raise AgentExecutorError(code, str(message or "Agent executor 请求失败")[:500]) from exc
+            raise AgentExecutorError(code, str(message or "Agent executor 请求失败")[:500], http_status=exc.code) from exc
         except urllib.error.URLError as exc:
             if isinstance(getattr(exc, "reason", None), (TimeoutError, socket.timeout)):
                 raise AgentExecutorError("agent_timeout", "Agent executor 请求超时") from exc
@@ -155,12 +169,27 @@ class AgentExecutorClient:
             session_id=value.get("session_id") if isinstance(value.get("session_id"), str) else None,
             error={str(key): str(item) for key, item in error.items()} if error else None,
             result_path=value.get("result_path") if isinstance(value.get("result_path"), str) else None,
+            executor_attempt_id=value.get("executor_attempt_id") if isinstance(value.get("executor_attempt_id"), str) else None,
+            business_task_id=value.get("business_task_id") if isinstance(value.get("business_task_id"), str) else None,
         )
 
     @staticmethod
     def _for_task(response: ExecutorTaskResponse, task_id: str) -> ExecutorTaskResponse:
         """确认响应仍绑定原始任务，避免代理或服务错误串接其它任务状态。"""
         if response.task_id != task_id:
+            raise AgentExecutorError("agent_executor_invalid_response", "Agent executor 任务标识不匹配")
+        if response.business_task_id is not None and response.business_task_id != task_id:
+            raise AgentExecutorError("agent_executor_invalid_response", "Agent executor 业务任务标识不匹配")
+        return response
+
+    @staticmethod
+    def _for_executor_attempt(response: ExecutorTaskResponse, executor_attempt_id: str) -> ExecutorTaskResponse:
+        """确认按 attempt 路径查询的响应没有串接到其它 executor 任务。"""
+        if response.executor_attempt_id:
+            if response.executor_attempt_id != executor_attempt_id:
+                raise AgentExecutorError("agent_executor_invalid_response", "Agent executor attempt 标识不匹配")
+        elif response.task_id != executor_attempt_id:
+            # 旧服务只支持业务 task 路径；只有没有新字段时才允许该兼容分支。
             raise AgentExecutorError("agent_executor_invalid_response", "Agent executor 任务标识不匹配")
         return response
 
@@ -170,7 +199,7 @@ class AgentExecutorClient:
         code = (response.error or {}).get("error")
         return code if code in _KNOWN_TASK_ERRORS else "agent_process_failed"
 
-    def _wait_for_terminal(self, response: ExecutorTaskResponse, *, task_id: str, timeout_seconds: int) -> ExecutorTaskResponse:
+    def _wait_for_terminal(self, response: ExecutorTaskResponse, *, task_id: str, executor_task_id: str, timeout_seconds: int) -> ExecutorTaskResponse:
         """轮询同步提交的非终态响应，超时后只取消当前任务。"""
         deadline = time.monotonic() + max(5, int(timeout_seconds) + 10)
         poll_delay = 0.2
@@ -178,18 +207,18 @@ class AgentExecutorClient:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 try:
-                    self.cancel(task_id)
+                    self.cancel(executor_task_id)
                 except AgentExecutorError:
                     pass
                 raise AgentExecutorError("agent_timeout", "Agent executor 等待任务终态超时")
             time.sleep(min(poll_delay, remaining))
             poll_delay = min(2.0, poll_delay * 1.5)
             try:
-                response = self._for_task(self.status(task_id), task_id)
+                response = self._for_task(self.status(executor_task_id), task_id)
             except AgentExecutorError:
                 # 轮询链路断开时尽力取消已提交任务，防止 HTTP 响应丢失后孤儿执行。
                 try:
-                    self.cancel(task_id)
+                    self.cancel(executor_task_id)
                 except AgentExecutorError:
                     pass
                 raise
@@ -216,30 +245,75 @@ class AgentExecutorClient:
             if key in value
         }
 
-    def run(self, *, task_id: str, image_relative_path: str, reverse_image_policy: str, timeout_seconds: int, callback_token: str | None = None) -> ExecutorTaskResponse:
-        """提交固定语境任务并同步等待其终态。"""
+    def attempt_id_for(self, task_id: str) -> str | None:
+        """返回当前业务任务最近一次提交的 executor attempt 标识。"""
+        return self._attempt_ids.get(task_id)
+
+    def run(self, *, task_id: str, image_relative_path: str, reverse_image_policy: str, timeout_seconds: int, callback_token: str | None = None, executor_attempt_id: str | None = None, session_id: str | None = None, resume_of_attempt_id: str | None = None, processing_config_hash: str | None = None) -> ExecutorTaskResponse:
+        """提交业务任务的独立 executor attempt，并可按明确 session 续跑。"""
         timeout_value = int(timeout_seconds)
-        _status, value = self._request(
-            "POST",
-            "/v1/tasks",
-            {
-                "task_id": task_id,
-                "image_relative_path": image_relative_path,
-                "reverse_image_policy": reverse_image_policy,
-                "timeout_seconds": timeout_value,
-                "wait": True,
-                **({"callback_token": callback_token} if callback_token else {}),
-            },
-            timeout=max(self.timeout, timeout_value + 10),
-        )
+        attempt_id = executor_attempt_id or f"attempt-{uuid4().hex}"
+        self._attempt_ids[task_id] = attempt_id
+        # 该映射只服务于取消和诊断；限制历史长度避免长期 API 进程被业务 task ID 耗尽内存。
+        while len(self._attempt_ids) > _ATTEMPT_HISTORY_LIMIT:
+            self._attempt_ids.pop(next(iter(self._attempt_ids)))
+        try:
+            _status, value = self._request(
+                "POST",
+                "/v1/tasks",
+                {
+                    "task_id": task_id,
+                    "business_task_id": task_id,
+                    "executor_attempt_id": attempt_id,
+                    "image_relative_path": image_relative_path,
+                    "reverse_image_policy": reverse_image_policy,
+                    "timeout_seconds": timeout_value,
+                    "wait": True,
+                    **({"session_id": session_id} if session_id else {}),
+                    **({"resume_of_attempt_id": resume_of_attempt_id} if resume_of_attempt_id else {}),
+                    **({"processing_config_hash": processing_config_hash} if processing_config_hash else {}),
+                    **({"callback_token": callback_token} if callback_token else {}),
+                },
+                timeout=max(self.timeout, timeout_value + 10),
+            )
+        except AgentExecutorError as exc:
+            raise AgentExecutorError(
+                exc.code,
+                str(exc)[:500],
+                session_id=exc.session_id,
+                executor_attempt_id=exc.executor_attempt_id or attempt_id,
+                http_status=exc.http_status,
+            ) from exc
         response = self._for_task(self._response(value), task_id)
-        response = self._wait_for_terminal(response, task_id=task_id, timeout_seconds=timeout_value)
+        if response.executor_attempt_id and response.executor_attempt_id != attempt_id:
+            raise AgentExecutorError("agent_executor_invalid_response", "Agent executor attempt 标识不匹配", executor_attempt_id=attempt_id)
+        # 旧 executor 响应没有独立 attempt 字段时沿用业务 task 路径，保持升级期间
+        # 的轮询兼容；新协议总会返回显式 executor_attempt_id。
+        executor_task_id = response.executor_attempt_id or task_id
+        try:
+            response = self._wait_for_terminal(response, task_id=task_id, executor_task_id=executor_task_id, timeout_seconds=timeout_value)
+        except AgentExecutorError as exc:
+            raise AgentExecutorError(
+                exc.code,
+                str(exc)[:500],
+                session_id=exc.session_id or response.session_id,
+                executor_attempt_id=exc.executor_attempt_id or response.executor_attempt_id or attempt_id,
+                http_status=exc.http_status,
+            ) from exc
         if response.status == "failed":
             code = self._failure_code(response)
             error = response.error or {}
-            raise AgentExecutorError(code, str(error.get("message") or code)[:500])
+            raw_status = error.get("http_status")
+            http_status = int(raw_status) if isinstance(raw_status, int) or (isinstance(raw_status, str) and raw_status.isdigit()) else None
+            raise AgentExecutorError(
+                code,
+                str(error.get("message") or code)[:500],
+                session_id=response.session_id,
+                executor_attempt_id=response.executor_attempt_id or attempt_id,
+                http_status=http_status,
+            )
         if response.status == "cancelled":
-            raise AgentExecutorError("task_interrupted", "Agent 任务已取消")
+            raise AgentExecutorError("task_interrupted", "Agent 任务已取消", session_id=response.session_id, executor_attempt_id=response.executor_attempt_id or attempt_id)
         if response.status != "succeeded":
             raise AgentExecutorError("agent_executor_invalid_response", "Agent executor 任务状态无效")
         return response
@@ -247,9 +321,9 @@ class AgentExecutorClient:
     def cancel(self, task_id: str) -> ExecutorTaskResponse:
         """取消指定任务，超时或服务关闭时调用。"""
         _status, value = self._request("POST", f"/v1/tasks/{quote(task_id, safe='')}/cancel", timeout=min(10, self.timeout))
-        return self._for_task(self._response(value), task_id)
+        return self._for_executor_attempt(self._response(value), task_id)
 
     def status(self, task_id: str) -> ExecutorTaskResponse:
         """读取指定任务状态，用于诊断和异步调用方。"""
         _status, value = self._request("GET", f"/v1/tasks/{quote(task_id, safe='')}", timeout=min(10, self.timeout))
-        return self._for_task(self._response(value), task_id)
+        return self._for_executor_attempt(self._response(value), task_id)
