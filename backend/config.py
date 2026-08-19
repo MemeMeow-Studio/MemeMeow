@@ -88,7 +88,7 @@ class Settings(BaseSettings):
     rate_limit_requests: int = Field(default=60, ge=1, validation_alias=AliasChoices("MEMEMEOW_RATE_LIMIT_REQUESTS", "rate_limit_requests"))
     rate_limit_window: int = Field(default=60, ge=1, validation_alias=AliasChoices("MEMEMEOW_RATE_LIMIT_WINDOW", "rate_limit_window"))
     max_upload_size: int = Field(default=20 * 1024 * 1024, ge=1, validation_alias=AliasChoices("MEMEMEOW_MAX_UPLOAD_SIZE", "max_upload_size"))
-    # 上传请求边界是服务端权威；客户端只把 /config 中的值用于调度提示。
+    # 文件数和可选总字节预算由服务端强制；并发字段只通过 /config 作为客户端调度提示。
     max_files_per_request: int = Field(default=20, ge=1, le=20, validation_alias=AliasChoices("MEMEMEOW_MAX_FILES_PER_REQUEST", "max_files_per_request"))
     max_concurrent_upload_requests: int = Field(default=2, ge=1, le=2, validation_alias=AliasChoices("MEMEMEOW_MAX_CONCURRENT_UPLOAD_REQUESTS", "max_concurrent_upload_requests"))
     max_request_bytes: int | None = Field(default=None, ge=1, le=4 * 1024 * 1024 * 1024, validation_alias=AliasChoices("MEMEMEOW_MAX_REQUEST_BYTES", "max_request_bytes"))

@@ -53,6 +53,7 @@ interface UploadRun {
 }
 
 const MAX_FILES_PER_REQUEST = 20
+// 这是客户端调度器的公开默认提示；服务端不会把它当作 scope admission semaphore。
 const MAX_CONCURRENT_REQUESTS = 2
 const MAX_CHUNK_RETRIES = 3
 const PERMANENT_ERRORS = new Set([

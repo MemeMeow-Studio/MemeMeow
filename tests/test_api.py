@@ -232,7 +232,7 @@ def test_upload_rejects_more_than_twenty_files_before_durable_write(client):
 
 
 def test_upload_accepts_twenty_files_and_exposes_default_limits(client):
-    """恰好 20 个文件可以逐项入库，配置响应保持默认 20/2/disabled。"""
+    """恰好 20 个文件可以逐项入库，配置响应保持 20/客户端 2 并发提示/disabled。"""
     test_client, _ = client
     response = test_client.post(
         "/images/upload",

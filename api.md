@@ -114,7 +114,7 @@ Agent 只获得当前任务 token、内部地址和 executor token，不获得 c
 
 ## 配置与访问策略
 
-- `GET /config`：只返回模型名、provider 是否配置和 `*_api_key_configured` 布尔状态；完整 URL、路径和密钥不返回。上传能力字段包含 `max_files_per_request: 20`、`max_concurrent_upload_requests: 2` 和可选 `max_request_bytes: null|正整数`，供客户端调度使用，服务端仍是最终边界。
+- `GET /config`：只返回模型名、provider 是否配置和 `*_api_key_configured` 布尔状态；完整 URL、路径和密钥不返回。上传能力字段包含服务端强制的 `max_files_per_request: 20`、仅供客户端调度提示的 `max_concurrent_upload_requests: 2` 和可选 `max_request_bytes: null|正整数`；服务端不以并发提示字段执行在途请求 admission，文件数和总字节预算仍由服务端执行。
 - 本地视觉活动模型固定为 `dinov2_vitb14`、768 维和 `dinov2_vitb14-rgb224-first-frame-v1`；Compose API 从 `mememeow-visual:8276/health` 读取真实模型状态，权重只在视觉容器内只读挂载并按 `MEMEMEOW_VISUAL_WEIGHTS_SHA256` 校验，未配置时任务返回 `visual_model_not_configured`。历史 DINOv3 向量表保留但不会参与活动匹配。
 - 视觉源码目录由 `MEMEMEOW_VISUAL_MODEL_REPO` 配置，仅服务端读取；源码提交和权重许可要求见 [`docs/visual-model-baseline.md`](docs/visual-model-baseline.md)。
 - Agent 通过内部 `POST /internal/visual-search/match` 发送 `{ "task_id": "...", "top_k": 20, "exclude_self": true }`。scope、查询图片和向量空间均从运行中的 Agent 任务推导；候选必须同 scope、当前 SHA 有效并有成功 research provenance。

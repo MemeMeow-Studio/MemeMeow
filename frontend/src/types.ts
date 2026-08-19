@@ -13,8 +13,11 @@ export interface ServiceConfig {
   embedding_model?: string
   embedding_cache_ready?: boolean
   reverse_image_available?: boolean
+  /** 服务端强制的单请求文件数上限。 */
   max_files_per_request?: number
+  /** 仅供客户端调度器使用的并发提示，不代表服务端 admission 限制。 */
   max_concurrent_upload_requests?: number
+  /** 服务端可选的单请求文件字节预算；null 表示 disabled。 */
   max_request_bytes?: number | null
 }
 

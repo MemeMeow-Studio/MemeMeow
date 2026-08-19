@@ -23,7 +23,7 @@ def test_visual_defaults_pin_dinov2_vitb14_identity() -> None:
 
 
 def test_upload_limits_default_to_public_two_lane_contract() -> None:
-    """上传边界默认公开 20 文件、2 并发，并关闭可选总字节预算。"""
+    """上传边界默认公开 20 文件、客户端 2 并发提示，并关闭可选总字节预算。"""
     settings = Settings(_env_file=None)
     assert settings.max_files_per_request == 20
     assert settings.max_concurrent_upload_requests == 2
@@ -32,7 +32,7 @@ def test_upload_limits_default_to_public_two_lane_contract() -> None:
 
 
 def test_upload_limits_validate_deployment_bounds() -> None:
-    """上传文件数、并发数和总预算拒绝越过服务端边界的配置。"""
+    """上传文件数和总预算遵守服务端边界，并发提示保持公开范围。"""
     with pytest.raises(ValidationError):
         Settings(_env_file=None, max_files_per_request=21)
     with pytest.raises(ValidationError):

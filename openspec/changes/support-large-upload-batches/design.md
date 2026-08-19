@@ -18,15 +18,15 @@
 
 ## Decisions
 
-### 1. 请求边界由 multipart 解析和服务端预读共同执行
+### 1. 请求边界由 multipart 解析和逐项 spool 读取共同执行
 
-上传入口调用 Starlette multipart parser 的文件数上界（允许解析一个额外文件以返回稳定业务错误），随后在任何 durable 写入前逐个以固定大小 chunk 读取文件。每个文件最多读取 `max_upload_size + 1` 字节；配置了 `max_request_bytes` 时累计读取值超过预算立即返回请求级 413。这样不依赖 `Content-Length`，chunked 请求也受同一边界约束；没有总预算时仍执行单文件 20 MiB 上限。预读结果只在请求级边界通过后进入既有逐文件处理循环。
+上传入口调用 Starlette multipart parser 的文件数上界（允许解析一个额外文件以返回稳定业务错误），并在 parser 写入 spool 时按文件 part 实际字节校验可选总预算。预算和文件数校验在 parser 返回前完成，不产生 durable 写入；随后从 `SpooledTemporaryFile` 逐个读取文件。每个文件最多读取 `max_upload_size + 1` 字节，当前内容处理完后才读取下一项，避免把整个请求复制到 `preloaded` 列表。这样不依赖 `Content-Length`，chunked 请求也受同一边界约束；没有总预算时仍执行单文件 20 MiB 上限。
 
-相比只检查 Content-Length，这能处理缺失或不可信的头；相比引入自定义 multipart parser，复用框架解析器并把边界集中在入口，改动面更小。预读最多 20 个单文件上限内容，符合现有 API 已经把单文件读入内存的行为；后续可在独立变更中改为磁盘 spool。
+相比只检查 Content-Length，这能处理缺失或不可信的头；相比引入自定义 multipart parser，复用框架解析器并把边界集中在入口，改动面更小。Starlette spool 负责承接请求体，业务层只保留当前单文件上限内容，后续可在独立变更中继续降低单文件处理内存。
 
 ### 2. 上传配置使用启动期 Settings 字段并通过 `/config` 脱敏暴露
 
-新增 `max_files_per_request`（服务端约束为 20）、`max_concurrent_upload_requests`（服务端约束为 2）和可选 `max_request_bytes` 字段，均有 Pydantic 上界校验。`Settings.status()` 返回非敏感整数或 `None`；默认总预算为 `None`。前端将公开值作为调度提示，服务端仍重新执行边界。
+新增 `max_files_per_request`（服务端约束为 20）、仅供客户端调度的 `max_concurrent_upload_requests`（默认提示为 2）和可选 `max_request_bytes` 字段，均有 Pydantic 上界校验。`Settings.status()` 返回非敏感整数或 `None`；默认总预算为 `None`。服务端只重新执行文件数和总字节边界，不把并发提示作为在途请求 admission。
 
 相比让前端读取硬编码常量，这避免部署预算与切片逻辑漂移；相比把预算放在处理任务配置中，上传预算不影响图片产物指纹。
 
@@ -38,7 +38,7 @@
 
 ### 4. 前端使用纯调度 composable 和轻量逐项视图
 
-新增 `useUploadBatch` composable 保存最小状态：文件项、状态、结果、运行请求数、暂停和取消信号。纯函数负责按文件数/可选字节预算切片；单个文件大于预算时单独成片，确保循环前进。调度器只创建最多配置并发数（再由服务端契约封顶 2）的 fetch，结果按分片索引写回；模板用稳定 item key 和 `v-memo`，进度变化不重建未变化的行。
+新增 `useUploadBatch` composable 保存最小状态：文件项、状态、结果、运行请求数、暂停和取消信号。纯函数负责按文件数/可选字节预算切片；单个文件大于预算时单独成片，确保循环前进。调度器只创建不超过公开并发提示（客户端默认 2）的 fetch，结果按分片索引写回；模板用稳定 item key 和 `v-memo`，进度变化不重建未变化的行。
 
 `api.upload` 接受可选 AbortSignal，`request` 将 429 的 `Retry-After` 转成错误元数据。调度器对 429 暂停派发并延迟恢复，对网络/5xx 保留可重试失败，对格式、大小、文件名和冲突等错误保留永久逐项失败。取消只 abort 当前客户端请求和标记本地未发送项，不调用删除或回滚接口。
 
@@ -46,7 +46,7 @@
 
 ## Risks / Trade-offs
 
-- **[预读内存峰值]** 最多 20 个文件会在请求边界预读阶段保留字节 → 每文件仍受单文件 20 MiB 限制，后续可将预读改为受控临时文件；不改变本次 API 契约。
+- **[单文件处理内存峰值]** multipart spool 承接完整请求，业务层每次只读取一个文件且最多保留单文件 20 MiB 加一字节 → 不会按文件数线性复制请求内容；后续可将单文件处理改为受控临时文件流。
 - **[旧客户端硬编码]** 旧客户端可能继续发送超过 20 个文件 → 服务端权威拒绝并返回稳定错误，前端读取 `/config` 后按边界切片。
 - **[Retry-After 日期解析]** 代理可能返回不规范值 → 客户端对无效值使用短退避并保留失败项，绝不扩大并发；服务端不依赖该客户端行为。
 - **[幂等处理选项差异]** 重试请求可能带不同处理选项 → 既有 job 状态优先返回，option 冲突只作为处理状态诊断，不重放 durable 上传；用户仍可使用现有显式阶段重试。

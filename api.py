@@ -127,6 +127,17 @@ async def _parse_upload_form(request: Request, *, max_files: int, max_request_by
         raise _error(400, "invalid_request", "上传 multipart 请求无效") from exc
 
 
+async def _read_upload_content(upload: UploadFile, *, max_upload_size: int) -> tuple[bytes, bool]:
+    """从 multipart spool 顺序读取单个文件，返回受单文件上限截断的字节和超限标记。"""
+    content = bytearray()
+    while len(content) <= max_upload_size:
+        chunk = await upload.read(min(UPLOAD_READ_CHUNK_BYTES, max_upload_size + 1 - len(content)))
+        if not chunk:
+            break
+        content.extend(chunk)
+    return bytes(content), len(content) > max_upload_size
+
+
 class StrictRequestModel(BaseModel):
     """公共业务 JSON 请求基类，拒绝客户端提交范围选择字段。"""
 
@@ -1771,7 +1782,7 @@ async def health(request: Request) -> dict[str, object]:
 
 @app.get("/config", tags=["system"])
 async def config_status(request: Request) -> dict[str, object]:
-    """返回脱敏配置状态，绝不返回完整密钥。"""
+    """返回脱敏配置状态；上传并发字段仅是客户端调度提示，绝不返回完整密钥。"""
     status = request.app.state.settings.status()
     # embedding 缓存属于运行时状态，供前端判断当前是否可以直接检索。
     services = getattr(request.state, "services", None)
@@ -3096,25 +3107,16 @@ async def upload_images(
     if len(files) > file_limit:
         raise _error(413, "too_many_files", "单个上传请求最多包含 20 个文件")
     metadata_service = _service(request, "metadata")
-    preloaded: list[tuple[bytes, bool]] = []
-    request_bytes = 0
-    for upload in files:
-        content = bytearray()
-        while len(content) <= settings.max_upload_size:
-            chunk = await upload.read(min(UPLOAD_READ_CHUNK_BYTES, settings.max_upload_size + 1 - len(content)))
-            if not chunk:
-                break
-            content.extend(chunk)
-        too_large = len(content) > settings.max_upload_size
-        request_bytes += len(content)
-        preloaded.append((bytes(content), too_large))
-        if max_request_bytes is not None and request_bytes > max_request_bytes:
-            raise _error(413, "request_too_large", "上传请求超过服务端总字节预算")
+    # multipart parser 已在返回 form 前按所有文件 part 校验总预算；这里不再把文件
+    # 全部预读到列表，只保留当前文件的受限内容，顺序完成校验和 durable 处理。
     results = []
     upload_batch_id = uuid4().hex if len(files) > 1 else None
     upload_task_ids: list[str] = []
     unified_processing_worker_used = False
-    for upload, (content, too_large) in zip(files, preloaded, strict=True):
+    for upload in files:
+        # 释放上一项的内容缓冲后再触碰下一个 spool，避免请求内文件字节累积。
+        content = b""
+        content, too_large = await _read_upload_content(upload, max_upload_size=settings.max_upload_size)
         original = upload.filename or "image"
         clean = _safe_filename(original)
         if Path(clean).suffix.lower() not in SUPPORTED_EXTENSIONS:
