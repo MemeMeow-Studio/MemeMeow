@@ -2,14 +2,17 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { images, unreadyProcessing, submitImageStage } = vi.hoisted(() => ({
+const { images, imageMetadata, contextBatch, retryImageStagesBatch, unreadyProcessing, submitImageStage } = vi.hoisted(() => ({
   images: vi.fn(),
+  imageMetadata: vi.fn(),
+  contextBatch: vi.fn(),
+  retryImageStagesBatch: vi.fn(),
   unreadyProcessing: vi.fn(),
   submitImageStage: vi.fn(),
 }))
 
 vi.mock('../api', () => ({
-  api: { images, unreadyProcessing, submitImageStage },
+  api: { images, imageMetadata, contextBatch, retryImageStagesBatch, unreadyProcessing, submitImageStage },
 }))
 
 import LibraryWorkspace from './LibraryWorkspace.vue'
@@ -30,6 +33,9 @@ function fullRetryButton(wrapper) {
 describe('LibraryWorkspace', () => {
   beforeEach(() => {
     images.mockReset().mockResolvedValue({ items: [image] })
+    imageMetadata.mockReset().mockResolvedValue({})
+    contextBatch.mockReset().mockResolvedValue({ results: [{ meme_id: 'meme-1', task_id: 'job-1' }] })
+    retryImageStagesBatch.mockReset().mockResolvedValue({ submitted_count: 0, failed_count: 0, results: [] })
     unreadyProcessing.mockReset().mockResolvedValue({
       target_count: 0,
       submitted_count: 0,
@@ -39,6 +45,60 @@ describe('LibraryWorkspace', () => {
       results: [],
     })
     submitImageStage.mockReset().mockResolvedValue({ task_id: 'stage-1' })
+  })
+
+  it('默认显示可选择列表并移除选择图片入口，完整重试保持旧请求契约', async () => {
+    const wrapper = mount(LibraryWorkspace, {
+      props: { config: { reverse_image_available: true }, cacheTask: null, cacheBusy: false, refreshToken: 0 },
+    })
+    await flushPromises()
+
+    expect(wrapper.findAll('.image-check input')).toHaveLength(1)
+    expect(wrapper.text()).not.toContain('选择图片')
+
+    await wrapper.get('.image-check input').setValue(true)
+    await wrapper.findAll('button').find((button) => button.text().includes('重试选中')).trigger('click')
+    expect(wrapper.get('.retry-selected-dialog').text()).toContain('完整重试')
+    await wrapper.get('.retry-selected-dialog form').trigger('submit')
+    await flushPromises()
+    expect(contextBatch).toHaveBeenCalledWith({ items: [{ meme_id: 'meme-1' }], include_unready: true })
+  })
+
+  it('指定部分允许多选三个核心阶段，并发送准确阶段载荷', async () => {
+    const wrapper = mount(LibraryWorkspace, {
+      props: { config: null, cacheTask: null, cacheBusy: false, refreshToken: 0 },
+    })
+    await flushPromises()
+    await wrapper.get('.image-check input').setValue(true)
+    await wrapper.findAll('button').find((button) => button.text().includes('重试选中')).trigger('click')
+    await wrapper.get('.retry-selected-dialog input[value="parts"]').setValue(true)
+    await wrapper.get('.retry-selected-dialog input[value="agent"]').setValue(true)
+    await wrapper.get('.retry-selected-dialog input[value="text_embedding"]').setValue(true)
+    await wrapper.get('.retry-selected-dialog form').trigger('submit')
+    await flushPromises()
+
+    expect(retryImageStagesBatch).toHaveBeenCalledWith({
+      items: [{ meme_id: 'meme-1' }],
+      stages: ['agent', 'text_embedding'],
+    })
+    expect(contextBatch).not.toHaveBeenCalled()
+  })
+
+  it('指定部分没有阶段时不可提交，取消后重新打开恢复完整模式', async () => {
+    const wrapper = mount(LibraryWorkspace, {
+      props: { config: null, cacheTask: null, cacheBusy: false, refreshToken: 0 },
+    })
+    await flushPromises()
+    expect(wrapper.findAll('button').find((button) => button.text().includes('重试选中')).element.disabled).toBe(true)
+
+    await wrapper.get('.image-check input').setValue(true)
+    await wrapper.findAll('button').find((button) => button.text().includes('重试选中')).trigger('click')
+    await wrapper.get('.retry-selected-dialog input[value="parts"]').setValue(true)
+    expect(wrapper.get('.retry-selected-dialog button[type="submit"]').element.disabled).toBe(true)
+    await wrapper.get('[aria-label="取消重试选中"]').trigger('click')
+
+    await wrapper.findAll('button').find((button) => button.text().includes('重试选中')).trigger('click')
+    expect(wrapper.get('.retry-selected-dialog input[value="full"]').element.checked).toBe(true)
   })
 
   it('完整重试只发送处理选项，不携带当前页筛选或 Meme 列表', async () => {
@@ -124,28 +184,78 @@ describe('LibraryWorkspace', () => {
     expect(unreadyProcessing).toHaveBeenCalledTimes(1)
   })
 
-  it('自动重命名 warning 只走受限图片阶段入口', async () => {
+  it('列表行只保留三项状态摘要，阶段明细和恢复入口迁移到详情', async () => {
     images.mockResolvedValue({
       items: [{
         ...image,
         processing_status: 'succeeded',
         processing_has_warnings: true,
         processing_stages: [
+          { stage: 'visual', status: 'failed', error: { error: 'visual_failed' } },
+          { stage: 'agent', status: 'blocked', error: { message: 'agent_blocked' } },
+          { stage: 'text_embedding', status: 'unknown_execution' },
           { stage: 'auto_rename', status: 'warning', task_id: 'rename-1' },
         ],
       }],
     })
     const wrapper = mount(LibraryWorkspace, {
       props: { config: null, cacheTask: null, cacheBusy: false, refreshToken: 0 },
+      attachTo: document.body,
     })
     await flushPromises()
 
-    expect(wrapper.text()).toContain('核心处理已完成，自动命名未完成')
-    const retry = wrapper.get('.stage-actions button')
-    expect(retry.text()).toContain('恢复自动命名')
+    expect(wrapper.get('.image-status-summary').findAll('span')).toHaveLength(3)
+    expect(wrapper.find('.image-processing-stages').exists()).toBe(false)
+    expect(wrapper.find('.stage-actions').exists()).toBe(false)
+    expect(wrapper.get('.image-row-actions').text()).toContain('查看详情')
+    expect(wrapper.get('.image-row-actions').text()).toContain('重命名')
+
+    const detailsTrigger = wrapper.get('.metadata-button')
+    await detailsTrigger.trigger('click')
+    await flushPromises()
+    const details = wrapper.get('.image-processing-details')
+    expect(details.text()).toContain('核心处理已完成，自动命名未完成')
+    expect(details.text()).toContain('视觉向量')
+    expect(details.text()).toContain('visual_failed')
+    expect(details.text()).toContain('agent_blocked')
+    expect(details.text()).toContain('执行状态未知，需人工确认')
+    expect(details.text()).toContain('恢复自动命名')
+    expect(details.findAll('.image-processing-stage-retry')).toHaveLength(4)
+
+    for (const label of ['仅视觉', '仅 Agent', '仅文本']) {
+      const button = details.findAll('.image-processing-stage-retry').find((candidate) => candidate.text().includes(label))
+      expect(button).toBeDefined()
+      await button.trigger('click')
+      await flushPromises()
+    }
+    const retry = details.findAll('.image-processing-stage-retry').find((button) => button.text().includes('恢复自动命名'))
+    expect(retry).toBeDefined()
     await retry.trigger('click')
     await flushPromises()
 
+    expect(submitImageStage).toHaveBeenNthCalledWith(1, { meme_id: 'meme-1', stage: 'visual', reverse_image_policy: 'forbid' })
+    expect(submitImageStage).toHaveBeenNthCalledWith(2, { meme_id: 'meme-1', stage: 'agent', reverse_image_policy: 'forbid' })
+    expect(submitImageStage).toHaveBeenNthCalledWith(3, { meme_id: 'meme-1', stage: 'text_embedding', reverse_image_policy: 'forbid' })
     expect(submitImageStage).toHaveBeenCalledWith({ meme_id: 'meme-1', stage: 'auto_rename', reverse_image_policy: 'forbid' })
+    await wrapper.get('[aria-label="关闭图片预览"]').trigger('click')
+    expect(document.activeElement).toBe(detailsTrigger.element)
+    wrapper.unmount()
+  })
+
+  it('没有阶段记录时详情仍提供可读状态，而不虚构恢复操作', async () => {
+    images.mockResolvedValue({ items: [{ ...image, processing_status: 'queued' }] })
+    const wrapper = mount(LibraryWorkspace, {
+      props: { config: null, cacheTask: null, cacheBusy: false, refreshToken: 0 },
+      attachTo: document.body,
+    })
+    await flushPromises()
+
+    await wrapper.get('.metadata-button').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.image-processing-details').text()).toContain('排队中')
+    expect(wrapper.get('.processing-details-empty').text()).toBe('暂无处理阶段记录')
+    expect(wrapper.find('.image-processing-stage-retry').exists()).toBe(false)
+    await wrapper.get('[aria-label="关闭图片预览"]').trigger('click')
+    wrapper.unmount()
   })
 })

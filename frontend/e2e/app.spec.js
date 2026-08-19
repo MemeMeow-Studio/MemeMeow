@@ -88,6 +88,58 @@ test('完整重试使用 scope 端点，取消不请求且 320px 弹层不越界
   await expect(page.locator('.inline-notice')).toContainText('完整重试：目标 1，提交 1')
 })
 
+/** 使用真实浏览器核对默认选择、指定阶段多选和桌面/移动弹层布局。 */
+test('重试选中默认可选择并按指定阶段提交', async ({ page }) => {
+  const stageRequests = []
+  await page.route('**/api/images?**', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      items: [
+        { meme_id: '55555555-5555-4555-8555-555555555555', filename: 'pending.png', size: 1024, extension: '.png', media_url: '/media/pending', metadata: { status: 'pending' }, embedding_status: 'pending', visual_embedding_status: 'pending' },
+        { meme_id: '66666666-6666-4666-8666-666666666666', filename: 'ready.png', size: 2048, extension: '.png', media_url: '/media/ready', metadata: { status: 'ready' }, embedding_status: 'ready', visual_embedding_status: 'ready' },
+      ],
+      total: 2,
+      page: 1,
+      page_size: 50,
+    }),
+  }))
+  await page.route('**/api/images/stages/batch', async (route) => {
+    stageRequests.push(route.request())
+    await route.fulfill({
+      status: 202,
+      contentType: 'application/json',
+      body: JSON.stringify({ target_count: 2, submitted_count: 2, failed_count: 0, results: [] }),
+    })
+  })
+
+  await page.goto('/')
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  await page.getByRole('button', { name: '图片库' }).click()
+  await expect(page.getByRole('button', { name: '选择图片', exact: true })).toHaveCount(0)
+  await expect(page.locator('.image-check input')).toHaveCount(2)
+  await expect(page.getByRole('button', { name: /^重试选中/ })).toBeDisabled()
+
+  await page.locator('.image-check input').first().check()
+  await page.getByRole('button', { name: /^重试选中/ }).click()
+  const dialog = page.getByRole('dialog', { name: '重试选中' })
+  await expect(dialog).toBeVisible()
+  await page.screenshot({ path: '/home/infstellar/vscode/MemeMeow/frontend/test-results/retry-selected-desktop.png', fullPage: true })
+
+  await dialog.getByRole('radio', { name: '指定部分' }).check()
+  await dialog.getByRole('checkbox', { name: '图片语境' }).check()
+  await dialog.getByRole('checkbox', { name: '文本索引' }).check()
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect(page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).resolves.toBe(true)
+  await page.screenshot({ path: '/home/infstellar/vscode/MemeMeow/frontend/test-results/retry-selected-mobile.png', fullPage: true })
+  await dialog.getByRole('button', { name: '重试已选部分（2）' }).click()
+  await expect.poll(() => stageRequests.length).toBe(1)
+  expect(stageRequests[0].postDataJSON()).toEqual({
+    items: [{ meme_id: '55555555-5555-4555-8555-555555555555' }],
+    stages: ['agent', 'text_embedding'],
+  })
+})
+
 test('首页可加载并切换核心工作区', async ({ page }) => {
   await page.goto('/')
   await expect(page).toHaveTitle('MemeMeow')

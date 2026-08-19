@@ -20,6 +20,18 @@ export interface ImageProcessingOptions {
   auto_name: boolean
 }
 
+/** 图片库批量重试对话框可选择的三个核心处理阶段。 */
+export type CoreImageProcessingStage = 'visual' | 'agent' | 'text_embedding'
+
+/** 图片库批量重试对话框的提交模式。 */
+export type SelectedImageRetryMode = 'full' | 'parts'
+
+/** 图片库按阶段批量提交请求的稳定前端形状。 */
+export interface SelectedImageStageRetryRequest {
+  items: Array<{ meme_id: string }>
+  stages: CoreImageProcessingStage[]
+}
+
 export interface ImageMetadataSummary {
   status?: string
 }
@@ -138,6 +150,20 @@ export interface UnreadyProcessingResponse {
   conflict_count: number
   failed_count: number
   results: Array<{ meme_id: string; processing_job_id?: string; status?: string; reused?: boolean; error?: string; category?: 'submitted' | 'reused' | 'conflict' | 'failed' }>
+}
+
+/** 图片库按阶段批量提交响应的最小稳定形状。 */
+export interface SelectedImageStageRetryResponse {
+  target_count: number
+  submitted_count: number
+  failed_count: number
+  results: Array<{
+    meme_id: string
+    stage: CoreImageProcessingStage
+    task_id?: string
+    status?: string
+    error?: string
+  }>
 }
 
 export interface ClipboardNotice {

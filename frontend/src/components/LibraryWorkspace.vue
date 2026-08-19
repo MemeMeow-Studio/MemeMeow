@@ -2,20 +2,18 @@
 /** 图片库工作区：管理筛选、选择、语境重试、缓存任务和加入合集流程。 */
 import { computed, onMounted, shallowRef, watch } from 'vue'
 import { api } from '../api'
-import type { CollectionSummary, ImageProcessingOptions, ImageProcessingStage, MemeImage, ServiceConfig, TaskItem, UnreadyProcessingResponse } from '../types'
+import type { CollectionSummary, CoreImageProcessingStage, ImageProcessingOptions, ImageProcessingStage, MemeImage, SelectedImageRetryMode, ServiceConfig, TaskItem, UnreadyProcessingResponse } from '../types'
 import {
   embeddingLabel,
   errorMessage,
   imageKey,
-  imageStageLabel,
-  imageStageStatusLabel,
-  isRetryable,
   metadataLabel,
   visualEmbeddingLabel,
 } from '../utils/presentation'
 import CollectionDialog from './CollectionDialog.vue'
 import ImagePreviewDialog from './ImagePreviewDialog.vue'
 import ImageProcessingOptionsDialog from './ImageProcessingOptionsDialog.vue'
+import ImageRetryDialog from './ImageRetryDialog.vue'
 
 const props = defineProps<{
   config: ServiceConfig | null
@@ -33,7 +31,6 @@ const emit = defineEmits<{
 const images = shallowRef<MemeImage[]>([])
 const filter = shallowRef('')
 const busy = shallowRef(false)
-const selectionMode = shallowRef(false)
 const selectedImages = shallowRef(new Set<string>())
 const retryBusy = shallowRef(false)
 const retryNotice = shallowRef('')
@@ -52,11 +49,12 @@ const processingOptionsTrigger = shallowRef<HTMLElement | null>(null)
 const retryDetails = shallowRef<UnreadyProcessingResponse['results']>([])
 const retryOptions = shallowRef<ImageProcessingOptions>({ reverse_image_policy: 'forbid', auto_name: false })
 const preserveRetryOptions = shallowRef(false)
+const retrySelectedDialogOpen = shallowRef(false)
+const retrySelectedDialogTrigger = shallowRef<HTMLElement | null>(null)
 let libraryRequestId = 0
 
 const selectedIds = computed(() => [...selectedImages.value])
 const selectedCount = computed(() => selectedImages.value.size)
-const selectedRetryableCount = computed(() => images.value.filter((item) => selectedImages.value.has(imageKey(item)) && isRetryable(item)).length)
 const cacheGenerating = computed(() => props.cacheBusy || ['queued', 'running'].includes(props.cacheTask?.status || ''))
 const cacheButtonLabel = computed(() => {
   if (!props.config) return '等待服务连接...'
@@ -88,6 +86,9 @@ async function loadLibrary(): Promise<void> {
     const data = await api.images({ search: filter.value })
     if (requestId !== libraryRequestId) return
     images.value = data.items
+    if (previewImage.value) {
+      previewImage.value = data.items.find((item: MemeImage) => item.meme_id === previewImage.value?.meme_id) || null
+    }
     const keys = new Set(images.value.map(imageKey))
     selectedImages.value = new Set([...selectedImages.value].filter((key) => keys.has(key)))
   } catch (reason) {
@@ -104,13 +105,6 @@ function toggleImageSelection(item: MemeImage): void {
   if (next.has(key)) next.delete(key)
   else next.add(key)
   selectedImages.value = next
-}
-
-/** 切换批量选择模式，退出时清空选择与旧反馈。 */
-function toggleSelectionMode(): void {
-  selectionMode.value = !selectionMode.value
-  if (!selectionMode.value) selectedImages.value = new Set()
-  retryNotice.value = ''
 }
 
 /** 加载当前 scope 的合集列表。 */
@@ -141,7 +135,7 @@ function closeCollectionDialog(): void {
   if (!collectionBusy.value) collectionDialogOpen.value = false
 }
 
-/** 将当前选择加入既有合集，并收束选择模式。 */
+/** 将当前选择加入既有合集，并清空已提交的图片选择。 */
 async function addSelectedToCollection(): Promise<void> {
   if (!collectionTarget.value || !selectedIds.value.length || collectionBusy.value) return
   collectionBusy.value = true
@@ -150,7 +144,6 @@ async function addSelectedToCollection(): Promise<void> {
     collectionNotice.value = `已加入 ${result.added_count} 张图片`
     collectionDialogOpen.value = false
     selectedImages.value = new Set()
-    selectionMode.value = false
   } catch (reason) {
     emit('error', errorMessage(reason))
   } finally {
@@ -168,32 +161,10 @@ async function createCollectionAndAdd(): Promise<void> {
     collectionNotice.value = '合集已创建并加入图片'
     collectionDialogOpen.value = false
     selectedImages.value = new Set()
-    selectionMode.value = false
   } catch (reason) {
     emit('error', errorMessage(reason))
   } finally {
     collectionBusy.value = false
-  }
-}
-
-/** 批量提交语境重试任务，并刷新图片状态。 */
-async function retryImages(items: Array<{ meme_id: string }>, label: string): Promise<void> {
-  if (!items.length || retryBusy.value) return
-  emit('clearError')
-  retryNotice.value = ''
-  retryBusy.value = true
-  try {
-    const response = await api.contextBatch({ items, include_unready: true })
-    const queued = response.results.filter((item: { task_id?: string }) => item.task_id).length
-    const failed = response.results.filter((item: { error?: unknown }) => item.error).length
-    retryNotice.value = `${label}：已提交 ${queued} 个任务${failed ? `，${failed} 项未提交` : ''}`
-    selectedImages.value = new Set()
-    selectionMode.value = false
-    await loadLibrary()
-  } catch (reason) {
-    emit('error', errorMessage(reason))
-  } finally {
-    retryBusy.value = false
   }
 }
 
@@ -244,17 +215,44 @@ function canRetryStandaloneAutoRename(item: MemeImage): boolean {
   return processingStage(item, 'auto_rename')?.status === 'warning'
 }
 
-/** 只有核心阶段明确失败或阻止时才显示独立恢复入口，避免重复提交活动任务。 */
-function canRetryCoreStage(item: MemeImage, stage: Exclude<ImageProcessingStageName, 'auto_rename'>): boolean {
-  return ['failed', 'blocked', 'unknown_execution'].includes(processingStage(item, stage)?.status || '')
+/** 打开选中图片重试对话框，并保留关闭后的键盘焦点。 */
+function openRetrySelectedDialog(event: MouseEvent): void {
+  if (retryBusy.value || !selectedCount.value) return
+  retrySelectedDialogTrigger.value = event.currentTarget instanceof HTMLElement ? event.currentTarget : null
+  retrySelectedDialogOpen.value = true
 }
 
-/** 重试当前选中且未就绪的图片。 */
-function retrySelected(): Promise<void> {
-  return retryImages(
-    images.value.filter((item) => selectedImages.value.has(imageKey(item)) && isRetryable(item)).map((item) => ({ meme_id: item.meme_id })),
-    '重试选中',
-  )
+/** 关闭选中图片重试对话框并复位临时表单状态。 */
+function cancelRetrySelected(): void {
+  if (!retryBusy.value) retrySelectedDialogOpen.value = false
+}
+
+/** 为选中图片按完整流水线或指定阶段提交真实处理任务。 */
+async function confirmRetrySelected(payload: { mode: SelectedImageRetryMode; stages: CoreImageProcessingStage[] }): Promise<void> {
+  if (retryBusy.value || !selectedCount.value) return
+  const items = images.value.filter((item) => selectedImages.value.has(imageKey(item))).map((item) => ({ meme_id: item.meme_id }))
+  if (!items.length) return
+  emit('clearError')
+  retryNotice.value = ''
+  retryBusy.value = true
+  try {
+    if (payload.mode === 'full') {
+      const response = await api.contextBatch({ items, include_unready: true })
+      const queued = response.results.filter((item: { task_id?: string }) => item.task_id).length
+      const failed = response.results.filter((item: { error?: unknown }) => item.error).length
+      retryNotice.value = `重试选中：已提交 ${queued} 个完整任务${failed ? `，${failed} 项未提交` : ''}`
+    } else {
+      const response = await api.retryImageStagesBatch({ items, stages: payload.stages })
+      retryNotice.value = `重试选中：已提交 ${response.submitted_count ?? 0} 个阶段任务${response.failed_count ? `，${response.failed_count} 项未提交` : ''}`
+    }
+    retrySelectedDialogOpen.value = false
+    selectedImages.value = new Set()
+    await loadLibrary()
+  } catch (reason) {
+    emit('error', errorMessage(reason))
+  } finally {
+    retryBusy.value = false
+  }
 }
 
 /** 打开 scope 级完整重试的共享选项对话框。 */
@@ -311,6 +309,11 @@ function openImagePreview(item: MemeImage, event: MouseEvent): void {
   previewImage.value = item
 }
 
+/** 将详情中的阶段恢复动作交回工作区，保持稳定 meme_id 和现有提交契约。 */
+function retryPreviewStage(stage: ImageProcessingStageName): void {
+  if (previewImage.value) void retryStage(previewImage.value, stage)
+}
+
 /** 调用稳定 meme_id 完成重命名并刷新图库。 */
 async function rename(item: MemeImage): Promise<void> {
   const name = window.prompt('新文件名', item.filename)
@@ -337,14 +340,11 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
       <button type="button" @click="loadLibrary">刷新</button>
       <span class="toolbar-spacer"></span>
       <div class="toolbar-group library-operations">
-        <button class="quiet" type="button" :class="{ active: selectionMode }" :aria-pressed="selectionMode" @click="toggleSelectionMode">
-          {{ selectionMode ? '完成选择' : '选择图片' }}
-        </button>
         <button class="quiet" type="button" :disabled="retryBusy || !selectedCount" @click="openCollectionDialog">
           加入合集<span v-if="selectedCount">（{{ selectedCount }}）</span>
         </button>
-        <button class="quiet" type="button" :disabled="retryBusy || !selectedRetryableCount" @click="retrySelected">
-          完整重试选中<span v-if="selectedRetryableCount">（{{ selectedRetryableCount }}）</span>
+        <button class="quiet" type="button" :disabled="retryBusy || !selectedCount" @click="openRetrySelectedDialog">
+          重试选中<span v-if="selectedCount">（{{ selectedCount }}）</span>
         </button>
         <button class="primary toolbar-primary" type="button" :disabled="retryBusy" @click="openUnreadyOptions">
           {{ retryBusy ? '提交中...' : '完整重试所有未就绪' }}
@@ -375,7 +375,7 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
     </ul>
     <div class="library-list" role="list">
       <article v-for="item in images" :key="imageKey(item)" class="library-row" role="listitem">
-        <label v-if="selectionMode" class="image-check">
+        <label class="image-check">
           <input
             type="checkbox"
             :checked="selectedImages.has(imageKey(item))"
@@ -385,37 +385,23 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
           />
           <span aria-hidden="true"></span>
         </label>
-        <button class="library-preview-trigger" type="button" :aria-label="`查看 ${item.filename} 图片与元数据`" @click="openImagePreview(item, $event)">
-          <img :src="item.media_url" :alt="`预览 ${item.filename}`" loading="lazy" />
-        </button>
-        <div class="file-meta">
-          <strong :title="item.filename">{{ item.filename }}</strong>
-          <small>{{ Math.ceil((item.size || 0) / 1024) }} KB · {{ item.extension }}</small>
+        <div class="library-row-main">
+          <button class="library-preview-trigger" type="button" :aria-label="`查看 ${item.filename} 图片与详情`" @click="openImagePreview(item, $event)">
+            <img :src="item.media_url" :alt="`预览 ${item.filename}`" loading="lazy" />
+          </button>
+          <div class="file-meta">
+            <strong :title="item.filename">{{ item.filename }}</strong>
+            <small>{{ Math.ceil((item.size || 0) / 1024) }} KB · {{ item.extension }}</small>
+          </div>
         </div>
-        <span class="metadata-state" :class="item.metadata?.status || 'unknown'">{{ metadataLabel(item.metadata?.status) }}</span>
-        <span class="embedding-state" :class="item.embedding_status || 'unknown'">{{ embeddingLabel(item.embedding_status) }}</span>
-        <span class="visual-embedding-state" :class="item.visual_embedding_status || 'unknown'">{{ visualEmbeddingLabel(item.visual_embedding_status) }}</span>
-        <span v-if="item.processing_has_warnings" class="metadata-state warning">
-          {{ item.processing_status === 'succeeded' ? '核心处理已完成，自动命名未完成' : '自动命名未完成' }}
-        </span>
-        <div v-if="item.processing_stages?.length" class="image-processing-stages" aria-label="图片处理阶段状态">
-          <span
-            v-for="stage in item.processing_stages"
-            :key="`${item.meme_id}:${stage.stage}`"
-            class="image-processing-stage"
-            :class="stage.status"
-          >
-            {{ imageStageLabel(stage.stage) }}：{{ imageStageStatusLabel(stage.status) }}
-            <small v-if="stage.error">{{ stage.error.error || '阶段失败' }}</small>
-          </span>
+        <div class="image-status-summary" aria-label="图片状态摘要">
+          <span class="metadata-state" :class="item.metadata?.status || 'unknown'">{{ metadataLabel(item.metadata?.status) }}</span>
+          <span class="embedding-state" :class="item.embedding_status || 'unknown'">{{ embeddingLabel(item.embedding_status) }}</span>
+          <span class="visual-embedding-state" :class="item.visual_embedding_status || 'unknown'">{{ visualEmbeddingLabel(item.visual_embedding_status) }}</span>
         </div>
-        <button class="quiet metadata-button" type="button" @click="openImagePreview(item, $event)">查看元数据</button>
-        <button class="quiet" type="button" @click="rename(item)">重命名</button>
-        <div class="stage-actions" aria-label="图片阶段操作">
-          <button v-if="canRetryCoreStage(item, 'visual')" class="quiet" type="button" :disabled="retryBusy || !!stageBusy" @click.stop="retryStage(item, 'visual')">仅视觉</button>
-          <button v-if="canRetryCoreStage(item, 'agent')" class="quiet" type="button" :disabled="retryBusy || !!stageBusy" @click.stop="retryStage(item, 'agent')">仅 Agent</button>
-          <button v-if="canRetryStandaloneAutoRename(item)" class="quiet" type="button" :disabled="retryBusy || !!stageBusy" @click.stop="retryStage(item, 'auto_rename')">恢复自动命名</button>
-          <button v-if="canRetryCoreStage(item, 'text_embedding')" class="quiet" type="button" :disabled="retryBusy || !!stageBusy" @click.stop="retryStage(item, 'text_embedding')">仅文本</button>
+        <div class="image-row-actions" aria-label="图片操作">
+          <button class="quiet metadata-button" type="button" @click="openImagePreview(item, $event)">查看详情</button>
+          <button class="quiet" type="button" @click="rename(item)">重命名</button>
         </div>
       </article>
       <div v-if="!images.length" class="empty-state compact"><h2>图片库还没有图片</h2><p>上传图片后，它们会出现在这里。</p></div>
@@ -427,7 +413,11 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
     v-if="previewImage"
     :image="previewImage"
     :return-focus="previewTrigger"
+    :retry-busy="retryBusy"
+    :stage-busy="stageBusy"
+    :stage-recovery-enabled="true"
     @close="previewImage = null"
+    @retry-stage="retryPreviewStage"
   />
   <CollectionDialog
     v-if="collectionDialogOpen"
@@ -440,6 +430,14 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
     @close="closeCollectionDialog"
     @add="addSelectedToCollection"
     @create-and-add="createCollectionAndAdd"
+  />
+  <ImageRetryDialog
+    v-if="retrySelectedDialogOpen"
+    :selected-count="selectedCount"
+    :busy="retryBusy"
+    :return-focus="retrySelectedDialogTrigger"
+    @cancel="cancelRetrySelected"
+    @confirm="confirmRetrySelected"
   />
   <ImageProcessingOptionsDialog
     v-if="processingOptionsOpen"

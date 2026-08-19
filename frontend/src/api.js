@@ -59,6 +59,7 @@ export const api = {
   processingJob: (id) => request(`/images/processing/${encodeURIComponent(id)}`),
   retryProcessingJob: (id, payload = {}) => request(`/images/processing/${encodeURIComponent(id)}/retry`, { method: 'POST', body: JSON.stringify(payload) }),
   submitImageStage: (payload) => request('/images/stages', { method: 'POST', body: JSON.stringify(payload) }),
+  retryImageStagesBatch: (payload) => request('/images/stages/batch', { method: 'POST', body: JSON.stringify(payload) }),
   retryImageStage: (payload) => request('/images/stages', { method: 'POST', body: JSON.stringify(payload) }),
   imageStage: (payload) => request('/images/stages', { method: 'POST', body: JSON.stringify(payload) }),
   task: (id) => request(`/tasks/${id}`),

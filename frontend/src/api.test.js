@@ -62,6 +62,19 @@ describe('请求封装', () => {
     })
   })
 
+  it('选中图片阶段批量请求发送准确图片和阶段列表', async () => {
+    await api.retryImageStagesBatch({
+      items: [{ meme_id: 'meme-1' }],
+      stages: ['agent', 'text_embedding'],
+    })
+
+    expect(fetch).toHaveBeenCalledWith('/api/images/stages/batch', {
+      method: 'POST',
+      body: JSON.stringify({ items: [{ meme_id: 'meme-1' }], stages: ['agent', 'text_embedding'] }),
+      headers: { 'Content-Type': 'application/json' },
+    })
+  })
+
   it('上传和 scope 级完整重试发送冻结的处理选项', async () => {
     const file = new File(['image'], 'sample.png', { type: 'image/png' })
     await api.upload([file], { reverse_image_policy: 'auto', auto_name: true })

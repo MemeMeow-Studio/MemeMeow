@@ -196,6 +196,19 @@ class ImageStageSubmissionRequest(StrictRequestModel):
     reverse_image_policy: str = Field(default="forbid", pattern="^(forbid|auto)$")
 
 
+class ImageStageBatchItem(StrictRequestModel):
+    """图片库批量阶段重试中的单张图片标识。"""
+
+    meme_id: str = Field(min_length=1, max_length=255)
+
+
+class ImageStageBatchRequest(StrictRequestModel):
+    """图片库批量阶段重试请求，只允许三个核心阶段。"""
+
+    items: list[ImageStageBatchItem] = Field(default_factory=list, max_length=500)
+    stages: list[str] = Field(min_length=1, max_length=3)
+
+
 class ProcessingBatchRequest(StrictRequestModel):
     """图片库逐图显式处理请求。"""
 
@@ -2352,6 +2365,52 @@ async def submit_image_stage(request: Request, payload: ImageStageSubmissionRequ
         }
     )
     return result
+
+
+@app.post("/images/stages/batch", status_code=202, tags=["images", "tasks"])
+async def submit_image_stage_batch(request: Request, payload: ImageStageBatchRequest) -> dict[str, object]:
+    """为选中图片提交一个或多个真实核心阶段的独立任务。"""
+    allowed_stages = {"visual", "agent", "text_embedding"}
+    if len(set(payload.stages)) != len(payload.stages) or any(stage not in allowed_stages for stage in payload.stages):
+        raise _error(422, "invalid_image_stage", "批量阶段只能选择视觉向量、图片语境或文本索引，且不能重复")
+    if not payload.items:
+        return {"target_count": 0, "submitted_count": 0, "failed_count": 0, "results": []}
+    worker = _processing_worker(request)
+    if worker is None:
+        raise _error(503, "image_processing_unavailable", "图片处理服务当前不可用")
+    results: list[dict[str, object]] = []
+    for item in payload.items:
+        for stage in payload.stages:
+            try:
+                # 复用单阶段入口的目标和 scope 校验；独立阶段始终使用安全的离线策略。
+                record, _image = _service(request, "metadata").image_for_meme(item.meme_id)
+                options = _normalize_processing_options(request, reverse_image_policy="forbid")
+                task = worker.submit_stage(
+                    record.id,
+                    stage,
+                    config=_processing_config(request),
+                    reverse_image_policy=options.reverse_image_policy,
+                    schedule=True,
+                )
+                if task is None:
+                    raise ImageProcessingError("image_processing_unavailable")
+                result = _task_summary(request, task)
+                result.update({"meme_id": item.meme_id, "stage": stage})
+                results.append(result)
+            except MetadataError as exc:
+                code = "meme_not_found" if exc.code in {"metadata_missing", "image_unreadable"} else exc.code
+                results.append({"meme_id": item.meme_id, "stage": stage, "error": code})
+            except ImageProcessingError as exc:
+                results.append({"meme_id": item.meme_id, "stage": stage, "error": exc.code})
+            except (OSError, RuntimeError) as exc:
+                results.append({"meme_id": item.meme_id, "stage": stage, "error": getattr(exc, "code", "stage_submit_failed")})
+    submitted = sum(1 for result in results if result.get("task_id"))
+    return {
+        "target_count": len(results),
+        "submitted_count": submitted,
+        "failed_count": len(results) - submitted,
+        "results": results,
+    }
 
 
 @app.get("/images", tags=["images"])

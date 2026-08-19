@@ -73,6 +73,8 @@ app = create_app(scope_resolver=LocalScopeResolver("local"))
 
 `POST /images/stages` 请求仅接受 `{ "meme_id": "...", "stage": "visual|agent|auto_rename|text_embedding", "reverse_image_policy": "forbid|auto" }`，创建或复用无父 Job 的独立阶段 Task。scope、图片 SHA、配置、grant、标题指纹和目标文件名均由服务端派生；返回 `submission_mode=standalone` 与 `processing_job_id=null`。`image_auto_rename` 不得通过通用 `/tasks/{task_id}/retry` 重试。
 
+`POST /images/stages/batch` 请求 `{ "items": [{"meme_id":"..."}], "stages": ["visual", "agent", "text_embedding"] }`，为每个选中图片和所选阶段创建或复用独立 Task；阶段列表至少一项、最多三项且不得重复，只接受三个核心阶段。完整重试仍使用 `/images/context/batch` 的旧完整流水线契约。
+
 `POST /images/processing/{job_id}/retry` 只接受 `failed`、`blocked` 或 `unknown_execution` job，并创建新的 revision、叶子 Task 和必要的 grant；旧 job、Task 和 grant 保持终态。`unknown_execution` 表示外部执行窗口已经开始但结果无法证明，恢复流程不会自动重放，必须由人工确认后显式 retry。兼容路径 `/image-processing/...` 仍可用但不在 OpenAPI 中展示。
 
 ## 合集

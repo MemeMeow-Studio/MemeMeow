@@ -2,7 +2,7 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { search, images, imageMetadata, contextBatch, unreadyProcessing, generateCache, pollTask, tasks, task } = vi.hoisted(() => ({ search: vi.fn(), images: vi.fn(), imageMetadata: vi.fn(), contextBatch: vi.fn(), unreadyProcessing: vi.fn(), generateCache: vi.fn(), pollTask: vi.fn(), tasks: vi.fn(), task: vi.fn() }))
+const { search, images, imageMetadata, contextBatch, retryImageStagesBatch, unreadyProcessing, generateCache, pollTask, tasks, task } = vi.hoisted(() => ({ search: vi.fn(), images: vi.fn(), imageMetadata: vi.fn(), contextBatch: vi.fn(), retryImageStagesBatch: vi.fn(), unreadyProcessing: vi.fn(), generateCache: vi.fn(), pollTask: vi.fn(), tasks: vi.fn(), task: vi.fn() }))
 vi.mock('./api', () => ({
   api: {
     config: vi.fn(async () => ({ embedding_model: 'test-model', embedding_cache_ready: false })),
@@ -10,6 +10,7 @@ vi.mock('./api', () => ({
     images,
     imageMetadata,
     contextBatch,
+    retryImageStagesBatch,
     unreadyProcessing,
     tasks,
     task,
@@ -27,6 +28,7 @@ describe('App', () => {
     images.mockReset().mockResolvedValue({ items: [] })
     imageMetadata.mockReset().mockResolvedValue({})
     contextBatch.mockReset().mockResolvedValue({ results: [] })
+    retryImageStagesBatch.mockReset().mockResolvedValue({ submitted_count: 0, failed_count: 0, results: [] })
     unreadyProcessing.mockReset().mockResolvedValue({ target_count: 0, submitted_count: 0, reused_count: 0, conflict_count: 0, failed_count: 0, results: [] })
     tasks.mockReset().mockResolvedValue({ items: [], next_cursor: null })
     task.mockReset().mockResolvedValue(null)
@@ -253,14 +255,14 @@ describe('App', () => {
     await flushPromises()
     await wrapper.findAll('.sidebar nav button').find((button) => button.text().includes('图片库')).trigger('click')
     await flushPromises()
-    await wrapper.get('.toolbar .quiet').trigger('click')
     const checkboxes = wrapper.findAll('.image-check input')
     expect(checkboxes).toHaveLength(2)
     expect(checkboxes[1].element.disabled).toBe(false)
     await checkboxes[0].setValue(true)
-    const retrySelectedButton = wrapper.findAll('.toolbar button').find((button) => button.text().includes('完整重试选中'))
+    const retrySelectedButton = wrapper.findAll('.toolbar button').find((button) => button.text().includes('重试选中'))
     expect(retrySelectedButton).toBeDefined()
     await retrySelectedButton.trigger('click')
+    await wrapper.get('.retry-selected-dialog form').trigger('submit')
     await flushPromises()
     expect(contextBatch).toHaveBeenCalledWith({ items: [{ meme_id: '33333333-3333-4333-8333-333333333333' }], include_unready: true })
     expect(wrapper.text()).toContain('文本索引已就绪')

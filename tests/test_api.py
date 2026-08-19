@@ -908,6 +908,33 @@ def test_scope_unready_processing_is_option_only_and_fail_closed(client, monkeyp
     assert filtered.json()["error"] == "invalid_request"
 
 
+def test_selected_stage_batch_validates_core_mapping_and_submits_independent_tasks(client):
+    """选中重试只接受三个核心阶段，并为每个图片阶段创建独立任务。"""
+    test_client, _ = client
+    uploaded = test_client.post(
+        "/images/upload",
+        files=[("files", ("selected-stage.png", png_bytes("green"), "image/png"))],
+    ).json()["results"][0]
+    meme_id = uploaded["meme_id"]
+
+    invalid = test_client.post(
+        "/images/stages/batch",
+        json={"items": [{"meme_id": meme_id}], "stages": ["auto_rename"]},
+    )
+    assert invalid.status_code == 422
+    assert invalid.json()["error"] == "invalid_image_stage"
+
+    response = test_client.post(
+        "/images/stages/batch",
+        json={"items": [{"meme_id": meme_id}], "stages": ["visual", "text_embedding"]},
+    )
+    assert response.status_code == 202
+    body = response.json()
+    assert body["target_count"] == 2
+    assert {item["stage"] for item in body["results"]} == {"visual", "text_embedding"}
+    assert all(item.get("task_id") or item.get("error") for item in body["results"])
+
+
 def test_standalone_auto_rename_invalidates_old_text_embedding_without_creating_job(tmp_path, monkeypatch):
     """独立自动重命名成功后必须失效旧向量，且不能创建父 Job 或文本任务。"""
     monkeypatch.setenv("MEMEMEOW_DATABASE_URL", os.getenv("MEMEMEOW_TEST_DATABASE_URL", ""))
