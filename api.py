@@ -36,6 +36,8 @@ from sqlalchemy import select
 from backend.config import Settings, update_dotenv_concurrency
 from backend.collection_packages import (
     CollectionPackageError,
+    DEFAULT_MAX_FILE_SIZE,
+    MAX_ARCHIVE_COMPRESSED_BYTES,
     MAX_TOTAL_UNCOMPRESSED_BYTES,
     build_export_archive,
     cleanup_archive,
@@ -44,6 +46,7 @@ from backend.collection_packages import (
     safe_download_filename,
     sha256_bytes,
 )
+from backend.image_safety import ImagePreflightError, validate_image_content
 from backend.errors import ErrorBody
 from backend.metadata import MetadataError
 from backend.database import DatabaseError, DatabaseResources, Meme, MemeTextEmbedding, ScopeContext, check_database, create_engine_for_settings, utcnow
@@ -608,8 +611,9 @@ def _collection_error(exc: DatabaseError) -> HTTPException:
 
 def _collection_package_error(exc: CollectionPackageError) -> HTTPException:
     """将合集 ZIP 预检和导出错误映射为稳定 HTTP 响应。"""
-    status = 413 if exc.code in {"file_too_large", "package_too_large", "member_count_exceeded", "manifest_too_large"} else 409 if exc.code in {"collection_exists", "member_unreadable", "member_changed"} else 400
+    status = 413 if exc.code in {"archive_too_large", "file_too_large", "package_too_large", "member_count_exceeded", "manifest_too_large", "compression_ratio_exceeded", "image_frame_count_exceeded", "image_frame_pixels_exceeded", "image_total_pixels_exceeded"} else 409 if exc.code in {"collection_exists", "member_unreadable", "member_changed"} else 400
     messages = {
+        "archive_too_large": "合集 ZIP 压缩包超过 64 MiB 限制",
         "invalid_zip": "合集 ZIP 无法读取",
         "manifest_missing": "合集 ZIP 缺少 manifest.json",
         "manifest_invalid": "合集 manifest 无效",
@@ -619,9 +623,17 @@ def _collection_package_error(exc: CollectionPackageError) -> HTTPException:
         "size_mismatch": "图片大小校验失败",
         "invalid_zip_path": "ZIP 路径非法",
         "unsafe_zip_entry": "ZIP 包含不安全条目",
+        "zip64_not_supported": "不支持 ZIP64 合集包",
+        "compression_ratio_exceeded": "ZIP 压缩放大比超过限制",
+        "nested_archive": "ZIP 不允许嵌套归档",
         "duplicate_zip_entry": "ZIP 包含重复条目",
         "invalid_image": "包内图片无法解码",
         "unsupported_format": "包内图片格式不受支持",
+        "image_frame_count_exceeded": "包内图片动画帧数超过限制",
+        "image_frame_pixels_exceeded": "包内图片单帧像素超过限制",
+        "image_total_pixels_exceeded": "包内图片累计帧像素超过限制",
+        "image_preflight_timeout": "包内图片预检超时",
+        "image_preflight_failed": "包内图片预检失败",
         "member_unreadable": "合集成员图片无法读取",
         "member_changed": "合集成员图片在导出期间发生变化",
         "package_too_large": "合集包解压后超过大小限制",
@@ -2773,7 +2785,14 @@ async def create_collection(request: Request, payload: CollectionRequest) -> dic
 @app.post("/collections/import", tags=["collections"])
 async def import_collection(request: Request) -> dict[str, object]:
     """预检单个合集 ZIP 后创建新合集，并逐图片报告导入结果。"""
-    form = await request.form()
+    try:
+        form = await _parse_upload_form(request, max_files=2, max_request_bytes=MAX_ARCHIVE_COMPRESSED_BYTES)
+    except HTTPException as exc:
+        if isinstance(exc.detail, dict) and exc.detail.get("error") == "request_too_large":
+            raise _collection_package_error(CollectionPackageError("archive_too_large")) from exc
+        if isinstance(exc.detail, dict) and exc.detail.get("error") == "too_many_files":
+            raise _error(400, "file_required", "必须上传一个合集 ZIP 文件") from exc
+        raise
     if set(form.keys()) - {"file"}:
         raise _error(400, "invalid_request", "合集导入只接受一个 file ZIP 字段")
     values = form.getlist("file")
@@ -2784,9 +2803,14 @@ async def import_collection(request: Request) -> dict[str, object]:
     if not str(upload.filename or "").lower().endswith(".zip"):
         raise _error(400, "unsupported_package", "合集导入只接受 ZIP 文件")
     try:
-        package = preflight_archive(await upload.read(), max_file_size=request.app.state.settings.max_upload_size, max_total_size=MAX_TOTAL_UNCOMPRESSED_BYTES)
+        content, too_large = await _read_upload_content(upload, max_upload_size=MAX_ARCHIVE_COMPRESSED_BYTES)
+        if too_large:
+            raise CollectionPackageError("archive_too_large")
+        package = preflight_archive(content, max_file_size=min(int(request.app.state.settings.max_upload_size), DEFAULT_MAX_FILE_SIZE), max_total_size=MAX_TOTAL_UNCOMPRESSED_BYTES)
     except CollectionPackageError as exc:
         raise _collection_package_error(exc) from exc
+    finally:
+        await upload.close()
     collection_name = package.manifest.collection.name
     try:
         with _environment(request) as environment:
@@ -2948,7 +2972,7 @@ async def export_collection(request: Request, collection_id: str):
     temp_dir = Path(tempfile.mkdtemp(prefix=".collection-export-", dir=request.app.state.settings.data_root))
     archive_path: Path | None = None
     try:
-        archive_path = build_export_archive(collection_name, members, _service(request, "metadata").blob_store, temp_root=temp_dir, max_file_size=request.app.state.settings.max_upload_size, max_total_size=MAX_TOTAL_UNCOMPRESSED_BYTES)
+        archive_path = build_export_archive(collection_name, members, _service(request, "metadata").blob_store, temp_root=temp_dir, max_file_size=min(int(request.app.state.settings.max_upload_size), DEFAULT_MAX_FILE_SIZE), max_total_size=MAX_TOTAL_UNCOMPRESSED_BYTES, max_archive_size=MAX_ARCHIVE_COMPRESSED_BYTES)
     except CollectionPackageError as exc:
         cleanup_archive(temp_dir)
         raise _collection_package_error(exc) from exc
@@ -3174,6 +3198,11 @@ async def upload_images(
         except ValueError:
             results.append({"filename": original, "ok": False, "error": "invalid_filename"})
             continue
+        try:
+            validate_image_content(content, Path(clean).suffix.lower())
+        except ImagePreflightError as exc:
+            results.append({"filename": original, "ok": False, "error": exc.code})
+            continue
         content_digest = sha256_bytes(content)
         try:
             existing = metadata_service.find_existing_upload(clean, sha256=content_digest, size_bytes=len(content))
@@ -3188,17 +3217,6 @@ async def upload_images(
             results.append(_idempotent_upload_result(request, metadata_service, existing_record, existing_path, original=original, reverse_image_policy=reverse_image_policy, auto_name=auto_name))
             continue
         target = metadata_service.blob_store.resolve(clean, must_exist=False)
-        try:
-            from io import BytesIO
-            from PIL import Image
-
-            with Image.open(BytesIO(content)) as image:
-                if image.format not in {"PNG", "JPEG", "GIF"}:
-                    raise ValueError("unsupported image format")
-                image.verify()
-        except Exception:  # noqa: BLE001
-            results.append({"filename": original, "ok": False, "error": "invalid_image"})
-            continue
         grant = None
         try:
             upload_key = f"upload:{content_digest}:{clean}"

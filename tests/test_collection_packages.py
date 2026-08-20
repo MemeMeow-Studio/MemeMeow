@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import stat
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,11 +18,13 @@ from backend.collection_packages import (
     CollectionManifestCollection,
     CollectionManifestMember,
     CollectionPackageError,
+    MAX_ARCHIVE_COMPRESSED_BYTES,
     build_export_archive,
     cleanup_archive,
     parse_manifest,
     preflight_archive,
     resolve_import_filename,
+    sha256_bytes,
     serialize_manifest,
 )
 from backend.database import BlobStore, ScopeContext
@@ -38,6 +41,16 @@ def package_bytes(manifest: CollectionManifest, images: dict[str, bytes]) -> byt
     """按照资源包根目录规则构造内存 ZIP。"""
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("manifest.json", serialize_manifest(manifest))
+        for path, content in images.items():
+            archive.writestr(path, content)
+    return output.getvalue()
+
+
+def compressed_package_bytes(manifest: CollectionManifest, images: dict[str, bytes]) -> bytes:
+    """使用 DEFLATE 构造可触发压缩放大比检查的 ZIP。"""
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("manifest.json", serialize_manifest(manifest))
         for path, content in images.items():
             archive.writestr(path, content)
@@ -138,6 +151,68 @@ def test_preflight_rejects_unknown_format_and_resource_limits() -> None:
     assert error.value.code == "package_too_large"
 
 
+def test_preflight_rejects_archive_size_and_compression_amplification() -> None:
+    """压缩包原始字节和单成员放大比在读取图片前受限。"""
+    with pytest.raises(CollectionPackageError) as error:
+        preflight_archive(b"x" * (MAX_ARCHIVE_COMPRESSED_BYTES + 1))
+    assert error.value.code == "archive_too_large"
+
+    content = b"0" * (512 * 1024)
+    item = member(source_id="bomb", filename="bomb.png", content=content)
+    manifest = CollectionManifest(format="mememeow-collection", format_version=1, collection=CollectionManifestCollection(name="放大"), members=[item])
+    with pytest.raises(CollectionPackageError) as error:
+        preflight_archive(compressed_package_bytes(manifest, {item.path: content}))
+    assert error.value.code == "compression_ratio_exceeded"
+
+
+def test_preflight_rejects_declared_member_count_before_materializing_all_entries() -> None:
+    """中央目录声明超过 500 个成员时在构造完整条目校验前拒绝。"""
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+        for index in range(502):
+            archive.writestr(f"entry-{index}.bin", b"")
+    with pytest.raises(CollectionPackageError) as error:
+        preflight_archive(output.getvalue())
+    assert error.value.code == "member_count_exceeded"
+
+
+def test_preflight_rejects_zip64_nested_and_special_entries() -> None:
+    """ZIP64、嵌套归档和 Unix 特殊文件不能进入图片预检。"""
+    content = png_bytes()
+    item = member(source_id="zip64", filename="zip64.png", content=content)
+    manifest = CollectionManifest(format="mememeow-collection", format_version=1, collection=CollectionManifestCollection(name="ZIP64"), members=[item])
+    zip64_output = io.BytesIO()
+    with zipfile.ZipFile(zip64_output, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("manifest.json", serialize_manifest(manifest))
+        with archive.open(item.path, "w", force_zip64=True) as handle:
+            handle.write(content)
+    with pytest.raises(CollectionPackageError) as error:
+        preflight_archive(zip64_output.getvalue())
+    assert error.value.code == "zip64_not_supported"
+
+    nested = io.BytesIO()
+    with zipfile.ZipFile(nested, "w") as archive:
+        archive.writestr("nested.txt", b"nested")
+    nested_item = member(source_id="nested", filename="nested.png", content=nested.getvalue())
+    nested_manifest = CollectionManifest(format="mememeow-collection", format_version=1, collection=CollectionManifestCollection(name="嵌套"), members=[nested_item])
+    with pytest.raises(CollectionPackageError) as error:
+        preflight_archive(package_bytes(nested_manifest, {nested_item.path: nested.getvalue()}))
+    assert error.value.code == "nested_archive"
+
+    special_item = member(source_id="fifo", filename="fifo.png", content=content)
+    special_manifest = CollectionManifest(format="mememeow-collection", format_version=1, collection=CollectionManifestCollection(name="特殊"), members=[special_item])
+    special_output = io.BytesIO()
+    with zipfile.ZipFile(special_output, "w") as archive:
+        archive.writestr("manifest.json", serialize_manifest(special_manifest))
+        info = zipfile.ZipInfo(special_item.path)
+        info.create_system = 3
+        info.external_attr = stat.S_IFIFO << 16
+        archive.writestr(info, content)
+    with pytest.raises(CollectionPackageError) as error:
+        preflight_archive(special_output.getvalue())
+    assert error.value.code == "unsafe_zip_entry"
+
+
 def test_filename_conflicts_use_sha_prefix_and_reuse_same_content() -> None:
     """同名同 SHA 复用，异 SHA 从八位哈希前缀开始递增。"""
     old = SimpleNamespace(id=uuid4(), sha256="a" * 64)
@@ -147,3 +222,32 @@ def test_filename_conflicts_use_sha_prefix_and_reuse_same_content() -> None:
     first_conflict = f"猫-{digest[:8]}.png"
     resolved = resolve_import_filename("猫.png", digest, {"猫.png": old, first_conflict: SimpleNamespace(id=uuid4(), sha256="c" * 64)})
     assert resolved.filename == f"猫-{digest[:16]}.png"
+
+
+def test_cleanup_archive_unlinks_symlink_without_touching_target(tmp_path: Path) -> None:
+    """清理被替换为符号链接的临时路径时只删除链接本身。"""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "marker.txt"
+    marker.write_text("keep", encoding="utf-8")
+    link = tmp_path / ".collection-export-link"
+    link.symlink_to(outside, target_is_directory=True)
+    cleanup_archive(link)
+    assert not link.exists()
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_export_rejects_member_symlink_and_cleans_archive_directory(tmp_path: Path) -> None:
+    """导出成员被替换为符号链接时拒绝读取并清理临时归档目录。"""
+    store = BlobStore(root=tmp_path / "images", scope=ScopeContext("local"), local=True)
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(png_bytes("blue"))
+    link = store.root / "link.png"
+    link.symlink_to(outside)
+    meme = SimpleNamespace(id=uuid4(), storage_key="link.png", extension=".png", size_bytes=outside.stat().st_size, sha256=sha256_bytes(outside.read_bytes()))
+    export_dir = tmp_path / ".collection-export-race"
+    with pytest.raises(CollectionPackageError) as error:
+        build_export_archive("竞态", [meme], store, temp_root=export_dir)
+    assert error.value.code == "member_unreadable"
+    assert not export_dir.exists()
+    assert outside.exists()

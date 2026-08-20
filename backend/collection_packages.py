@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import stat
+import struct
 import tempfile
 import unicodedata
 import zipfile
@@ -19,17 +21,19 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
-from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, ValidationError
 
 from backend.database import BlobStore, DatabaseError
+from backend.image_safety import ImagePreflightError, validate_image_content
 from backend.paths import SUPPORTED_EXTENSIONS, validate_business_storage_key
 
 
 PACKAGE_FORMAT = "mememeow-collection"
 PACKAGE_VERSION = 1
 MAX_MEMBERS = 500
+MAX_ARCHIVE_COMPRESSED_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 100
 DEFAULT_MAX_FILE_SIZE = 20 * 1024 * 1024
 MANIFEST_NAME = "manifest.json"
 IMAGE_ROOT = "images"
@@ -187,45 +191,181 @@ def _is_symlink(info: zipfile.ZipInfo) -> bool:
 
 
 def _validate_image_bytes(content: bytes, extension: str) -> None:
-    """使用 Pillow 验证图片实际格式与声明扩展名一致且可解码。"""
-    expected_format = _IMAGE_FORMATS.get(extension.lower())
-    if expected_format is None:
+    """使用共享预检验证图片格式、帧数、像素和可解码性。"""
+    if extension.lower() not in _IMAGE_FORMATS:
         raise _package_error("unsupported_format")
     try:
-        with Image.open(BytesIO(content)) as image:
-            if image.format != expected_format:
-                raise _package_error("invalid_image")
-            image.verify()
+        validate_image_content(content, extension)
+    except ImagePreflightError as exc:
+        raise _package_error(exc.code) from exc
+
+
+def _uses_zip64(info: zipfile.ZipInfo) -> bool:
+    """检查条目版本或 ZIP32 哨兵值，拒绝不必要的 ZIP64 解析路径。"""
+    return bool(
+        info.create_version >= 45
+        or info.extract_version >= 45
+        or info.file_size >= 0xFFFFFFFF
+        or info.compress_size >= 0xFFFFFFFF
+        or info.header_offset >= 0xFFFFFFFF
+    )
+
+
+def _validate_zip_entry_type(info: zipfile.ZipInfo) -> None:
+    """只允许普通文件条目，拒绝目录、符号链接和 Unix 特殊文件。"""
+    if info.is_dir() or _is_symlink(info):
+        raise _package_error("unsafe_zip_entry")
+    if info.flag_bits & 0x1:
+        raise _package_error("unsafe_zip_entry")
+    mode = (info.external_attr >> 16) & 0xFFFF
+    file_type = stat.S_IFMT(mode)
+    if file_type not in {0, stat.S_IFREG}:
+        raise _package_error("unsafe_zip_entry")
+    # DOS 目录位可能没有尾部斜杠，不能只依赖 ZipInfo.is_dir()。
+    if info.create_system == 0 and info.external_attr & 0x10:
+        raise _package_error("unsafe_zip_entry")
+
+
+def _validate_zip_layout(content: bytes, archive: zipfile.ZipFile, infos: Sequence[zipfile.ZipInfo]) -> None:
+    """校验本地头、名称和压缩数据范围，拒绝重叠条目及伪造声明。"""
+    ranges: list[tuple[int, int]] = []
+    central_directory_start = int(getattr(archive, "start_dir", len(content)))
+    for info in infos:
+        offset = int(info.header_offset)
+        if offset < 0 or offset + 30 > central_directory_start or content[offset:offset + 4] != b"PK\x03\x04":
+            raise _package_error("invalid_zip")
+        try:
+            local_flags, local_method = struct.unpack_from("<HH", content, offset + 6)
+            name_length, extra_length = struct.unpack_from("<HH", content, offset + 26)
+        except struct.error as exc:
+            raise _package_error("invalid_zip") from exc
+        if local_flags != info.flag_bits or local_method != info.compress_type:
+            raise _package_error("invalid_zip")
+        local_name_start = offset + 30
+        local_name_end = local_name_start + name_length
+        if local_name_end > central_directory_start:
+            raise _package_error("invalid_zip")
+        try:
+            local_name = content[local_name_start:local_name_end].decode("utf-8" if info.flag_bits & 0x800 else "cp437")
+        except UnicodeDecodeError as exc:
+            raise _package_error("invalid_zip") from exc
+        if local_name != info.filename:
+            raise _package_error("invalid_zip")
+        data_start = offset + 30 + name_length + extra_length
+        data_end = data_start + int(info.compress_size)
+        if data_start < offset or data_end < data_start or data_end > central_directory_start:
+            raise _package_error("invalid_zip")
+        ranges.append((data_start, data_end))
+    previous_end = -1
+    for start, end in sorted(ranges):
+        if start < previous_end:
+            raise _package_error("unsafe_zip_entry")
+        previous_end = end
+
+
+def _declared_zip_entry_count(content: bytes) -> int:
+    """从 ZIP32 结束记录读取成员数量，在构造中央目录对象前快速拒绝超量包。"""
+    search_start = max(0, len(content) - (22 + 0xFFFF))
+    offset = content.rfind(b"PK\x05\x06", search_start)
+    if offset < 0 or offset + 22 > len(content):
+        raise _package_error("invalid_zip")
+    try:
+        _, disk_number, central_disk, entries_on_disk, entries_total, central_size, central_offset, comment_length = struct.unpack_from("<4s4H2LH", content, offset)
+    except struct.error as exc:
+        raise _package_error("invalid_zip") from exc
+    if offset + 22 + comment_length != len(content):
+        raise _package_error("invalid_zip")
+    if entries_on_disk == 0xFFFF or entries_total == 0xFFFF or central_size == 0xFFFFFFFF or central_offset == 0xFFFFFFFF:
+        raise _package_error("zip64_not_supported")
+    if disk_number != 0 or central_disk != 0 or entries_on_disk != entries_total:
+        raise _package_error("invalid_zip")
+    return int(entries_total)
+
+
+def _read_regular_file(path: Path, *, max_file_size: int) -> bytes:
+    """以不可跟随符号链接的文件描述符读取单个受控普通文件。"""
+    parent_descriptor: int | None = None
+    descriptor: int | None = None
+    try:
+        parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        parent_descriptor = os.open(path.parent, parent_flags)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+    except OSError as exc:
+        if parent_descriptor is not None:
+            try:
+                os.close(parent_descriptor)
+            except OSError:
+                pass
+        raise _package_error("member_unreadable") from exc
+    try:
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = None
+            first_stat = os.fstat(handle.fileno())
+            if not stat.S_ISREG(first_stat.st_mode) or first_stat.st_size > max_file_size:
+                raise _package_error("member_changed")
+            content = handle.read(max_file_size + 1)
+            final_stat = os.fstat(handle.fileno())
+            if not stat.S_ISREG(final_stat.st_mode) or final_stat.st_size != first_stat.st_size or len(content) != first_stat.st_size:
+                raise _package_error("member_changed")
+            return content
     except CollectionPackageError:
         raise
-    except Exception as exc:  # noqa: BLE001
-        raise _package_error("invalid_image") from exc
+    except (OSError, ValueError) as exc:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise _package_error("member_unreadable") from exc
+    finally:
+        if parent_descriptor is not None:
+            try:
+                os.close(parent_descriptor)
+            except OSError:
+                pass
 
 
-def preflight_archive(content: bytes, *, max_file_size: int = DEFAULT_MAX_FILE_SIZE, max_total_size: int = MAX_TOTAL_UNCOMPRESSED_BYTES) -> ValidatedCollectionPackage:
+def preflight_archive(content: bytes, *, max_file_size: int = DEFAULT_MAX_FILE_SIZE, max_total_size: int = MAX_TOTAL_UNCOMPRESSED_BYTES, max_archive_size: int = MAX_ARCHIVE_COMPRESSED_BYTES) -> ValidatedCollectionPackage:
     """完整读取并验证 ZIP 中央目录、manifest、图片指纹和解码状态。
 
     该函数只在内存中读取上传内容；只有返回成功后调用方才允许创建合集或写入图片。
     """
     if not isinstance(content, (bytes, bytearray)):
         raise _package_error("invalid_package")
+    if len(content) > max_archive_size:
+        raise _package_error("archive_too_large")
     try:
         archive = zipfile.ZipFile(BytesIO(bytes(content)))
     except (zipfile.BadZipFile, OSError, ValueError) as exc:
         raise _package_error("invalid_zip") from exc
     with archive:
-        infos = archive.infolist()
+        try:
+            declared_entry_count = _declared_zip_entry_count(bytes(content))
+            if declared_entry_count > MAX_MEMBERS + 1:
+                raise _package_error("member_count_exceeded")
+            infos = archive.infolist()
+            if len(infos) != declared_entry_count:
+                raise _package_error("invalid_zip")
+            _validate_zip_layout(bytes(content), archive, infos)
+        except CollectionPackageError:
+            raise
+        except (zipfile.BadZipFile, OSError, RuntimeError, ValueError) as exc:
+            raise _package_error("invalid_zip") from exc
         names: list[str] = []
         total_uncompressed = 0
         for info in infos:
             _validate_zip_entry_name(info.filename)
-            if info.is_dir() or _is_symlink(info):
-                raise _package_error("unsafe_zip_entry")
+            if _uses_zip64(info):
+                raise _package_error("zip64_not_supported")
+            _validate_zip_entry_type(info)
             if info.filename in names:
                 raise _package_error("duplicate_zip_entry")
             names.append(info.filename)
-            if info.file_size < 0 or info.file_size > max_total_size:
+            if info.file_size < 0 or info.compress_size < 0 or info.file_size > max_total_size or info.compress_size > max_archive_size:
                 raise _package_error("package_too_large")
+            if info.file_size and (info.compress_size == 0 or info.file_size > info.compress_size * MAX_COMPRESSION_RATIO):
+                raise _package_error("compression_ratio_exceeded")
             total_uncompressed += info.file_size
             if total_uncompressed > max_total_size:
                 raise _package_error("package_too_large")
@@ -237,8 +377,13 @@ def preflight_archive(content: bytes, *, max_file_size: int = DEFAULT_MAX_FILE_S
         if manifest_info.file_size > 1024 * 1024:
             raise _package_error("manifest_too_large")
         try:
-            manifest = parse_manifest(archive.read(manifest_info))
-        except (zipfile.BadZipFile, OSError) as exc:
+            manifest_content = archive.read(manifest_info)
+            if len(manifest_content) != manifest_info.file_size:
+                raise _package_error("size_mismatch")
+            manifest = parse_manifest(manifest_content)
+        except CollectionPackageError:
+            raise
+        except (zipfile.BadZipFile, OSError, KeyError, RuntimeError, NotImplementedError) as exc:
             raise _package_error("invalid_zip") from exc
         if len(manifest.members) > MAX_MEMBERS:
             raise _package_error("member_count_exceeded")
@@ -285,12 +430,14 @@ def preflight_archive(content: bytes, *, max_file_size: int = DEFAULT_MAX_FILE_S
                 raise _package_error("size_mismatch")
             try:
                 image = archive.read(info)
-            except (zipfile.BadZipFile, OSError) as exc:
+            except (zipfile.BadZipFile, OSError, KeyError, RuntimeError, NotImplementedError) as exc:
                 raise _package_error("invalid_zip") from exc
             if len(image) != member.size_bytes:
                 raise _package_error("size_mismatch")
             if sha256_bytes(image) != member.sha256:
                 raise _package_error("sha256_mismatch")
+            if zipfile.is_zipfile(BytesIO(image)):
+                raise _package_error("nested_archive")
             _validate_image_bytes(image, member.extension)
             validated.append(ValidatedPackageMember(manifest=member, content=image))
         return ValidatedCollectionPackage(manifest=manifest, members=tuple(validated))
@@ -328,27 +475,33 @@ def _read_export_member(member: Any, blob_store: BlobStore, *, max_file_size: in
     """读取并复核单张导出成员，避免生成不完整归档。"""
     try:
         image = blob_store.resolve(member.storage_key)
-        stat_result = image.stat()
-        if stat_result.st_size != member.size_bytes or stat_result.st_size > max_file_size:
+        if image.parent != blob_store.root:
             raise _package_error("member_changed")
-        content = image.read_bytes()
+        if member.size_bytes > max_file_size:
+            raise _package_error("member_changed")
+        content = _read_regular_file(image, max_file_size=max_file_size)
     except CollectionPackageError:
         raise
     except (DatabaseError, OSError) as exc:
         raise _package_error("member_unreadable") from exc
     if len(content) != member.size_bytes or sha256_bytes(content) != member.sha256:
         raise _package_error("member_changed")
+    _validate_image_bytes(content, str(member.extension).lower())
     if total_size + len(content) > max_total_size:
         raise _package_error("package_too_large")
     return content, total_size + len(content)
 
 
-def build_export_archive(collection_name: str, members: Sequence[Any], blob_store: BlobStore, *, temp_root: Path, max_file_size: int = DEFAULT_MAX_FILE_SIZE, max_total_size: int = MAX_TOTAL_UNCOMPRESSED_BYTES) -> Path:
+def build_export_archive(collection_name: str, members: Sequence[Any], blob_store: BlobStore, *, temp_root: Path, max_file_size: int = DEFAULT_MAX_FILE_SIZE, max_total_size: int = MAX_TOTAL_UNCOMPRESSED_BYTES, max_archive_size: int = MAX_ARCHIVE_COMPRESSED_BYTES) -> Path:
     """现场读取合集成员并先完整写入临时 ZIP，成功前绝不返回归档路径。"""
     if len(members) > MAX_MEMBERS:
         raise _package_error("member_count_exceeded")
+    if temp_root.is_symlink():
+        raise _package_error("export_path_forbidden")
     temp_root = temp_root.expanduser().resolve()
     temp_root.mkdir(parents=True, exist_ok=True)
+    if not temp_root.is_dir() or temp_root.is_symlink():
+        raise _package_error("export_path_forbidden")
     handle = tempfile.NamedTemporaryFile(prefix="collection-export-", suffix=".zip", dir=temp_root, delete=False)
     archive_path = Path(handle.name)
     handle.close()
@@ -372,18 +525,21 @@ def build_export_archive(collection_name: str, members: Sequence[Any], blob_stor
             info.compress_type = zipfile.ZIP_STORED
             info.external_attr = 0o600 << 16
             archive.writestr(info, serialize_manifest(manifest))
+            if archive_path.stat().st_size > max_archive_size:
+                raise _package_error("archive_too_large")
             for path, content in image_entries:
                 info = zipfile.ZipInfo(path)
                 info.date_time = (1980, 1, 1, 0, 0, 0)
                 info.compress_type = zipfile.ZIP_STORED
                 info.external_attr = 0o600 << 16
                 archive.writestr(info, content)
+                if archive_path.stat().st_size > max_archive_size:
+                    raise _package_error("archive_too_large")
+        if archive_path.stat().st_size > max_archive_size:
+            raise _package_error("archive_too_large")
         return archive_path
     except Exception:
-        try:
-            archive_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        cleanup_archive(archive_path)
         raise
 
 
@@ -397,8 +553,16 @@ def safe_download_filename(collection_name: str) -> str:
 
 def cleanup_archive(path: Path) -> None:
     """清理导出临时文件，响应完成或异常时均可安全调用。"""
-    if path.is_dir():
-        shutil.rmtree(path, ignore_errors=True)
+    try:
+        if path.is_symlink():
+            path.unlink(missing_ok=True)
+            return
+        if path.parent.is_symlink():
+            return
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+            return
+    except OSError:
         return
     try:
         path.unlink(missing_ok=True)

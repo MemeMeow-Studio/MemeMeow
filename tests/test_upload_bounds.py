@@ -89,6 +89,7 @@ def test_upload_stream_reads_one_spool_before_touching_the_next() -> None:
     route_source = getsource(upload_images)
     assert "preloaded" not in route_source
     assert "await _read_upload_content" in route_source
+    assert route_source.index("validate_image_content") < route_source.index("find_existing_upload")
 
 
 def test_multipart_budget_accepts_exact_file_bytes_without_content_length() -> None:
