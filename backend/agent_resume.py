@@ -26,6 +26,11 @@ _SECRET_PATTERNS = (
 )
 _PATH_PATTERN = re.compile(r"(?:/runtime|/images|/skills|/app|[A-Za-z]:\\)[^\s,;]+")
 _GENERIC_PATH_PATTERN = re.compile(r"(?<![A-Za-z0-9:/])/(?:[^\s,;:'\"()\[\]{}]+/)+[^\s,;:'\"()\[\]{}]+")
+_INTERNAL_DIAGNOSTIC_PATTERN = re.compile(
+    r"(?i)(?:scope(?:[_-]?id)?|workspace(?:[_-]?selector)?|task(?:[_-]?id)?|attempt(?:[_-]?id)?|"
+    r"session(?:[_-]?id)?|executor(?:[_-]?attempt)?|billing|quota|operation[_-]?grant)\s*[:=]\s*[^\s,;]+"
+)
+_PUBLIC_CODE_PATTERN = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}\Z")
 
 # 这些错误只描述模型网关、网络或 executor 进程级暂态故障；业务 callback、
 # 计量和结果写回一旦进入不确定状态，必须走 unknown_execution 而不能重放。
@@ -186,8 +191,9 @@ def within_total_timeout(started_at: datetime | None, *, timeout_seconds: int, n
 def sanitize_error(error: Mapping[str, Any] | None, *, fallback: str = "task_failed") -> dict[str, Any]:
     """只保留稳定错误码、短消息和 HTTP 状态，拒绝 transcript/凭据泄漏。"""
     source = error if isinstance(error, Mapping) else {}
+    safe_fallback = fallback if isinstance(fallback, str) and _PUBLIC_CODE_PATTERN.fullmatch(fallback) else "task_failed"
     code = source.get("error")
-    code = str(code)[:128] if isinstance(code, str) and code else fallback
+    code = code if isinstance(code, str) and _PUBLIC_CODE_PATTERN.fullmatch(code) else safe_fallback
     message = source.get("message")
     if isinstance(message, str):
         message = message.splitlines()[0] if message.splitlines() else code
@@ -198,12 +204,15 @@ def sanitize_error(error: Mapping[str, Any] | None, *, fallback: str = "task_fai
                 message = pattern.sub(r"\1[REDACTED]", message)
         message = _PATH_PATTERN.sub("[PATH]", message)
         message = _GENERIC_PATH_PATTERN.sub("[PATH]", message)
+        message = _INTERNAL_DIAGNOSTIC_PATTERN.sub("[REDACTED]", message)
+        # 错误消息不承担来源回查职责，完整 URL 及其中的 userinfo 都收束为占位符。
+        message = re.sub(r"\b[a-z][a-z0-9+.-]*://[^\s,;]+", "[URL]", message, flags=re.IGNORECASE)
         message = message[:MAX_ERROR_MESSAGE]
     else:
         message = code
     result: dict[str, Any] = {"error": code, "message": message}
     status = source.get("http_status")
-    if isinstance(status, int) and 100 <= status <= 599:
+    if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
         result["http_status"] = status
     return result
 
@@ -220,13 +229,13 @@ def append_error_history(
     """追加有限脱敏错误历史，并保留最早错误顺序。"""
     values = sanitize_error_history(history)
     item = sanitize_error(error)
-    if isinstance(attempt, int) and attempt > 0:
+    if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt > 0:
         item["attempt"] = attempt
     if normalize_identifier(executor_attempt_id, kind="attempt"):
         item["executor_attempt_id"] = executor_attempt_id
     if normalize_identifier(session_id, kind="session"):
         item["session_id"] = session_id
-    if isinstance(occurred_at, str) and occurred_at:
+    if isinstance(occurred_at, str) and occurred_at and _looks_like_timestamp(occurred_at):
         item["occurred_at"] = occurred_at[:64]
     # handler 先写入 attempt 诊断、fenced failure 随后写入任务终态时，二者
     # 可能描述同一次失败；按稳定身份去重，仍保留不同阶段的后续错误。
@@ -276,13 +285,24 @@ def sanitize_error_history(history: object) -> list[dict[str, Any]]:
             if not isinstance(raw, Mapping):
                 continue
             item = sanitize_error(raw)
-            if isinstance(raw.get("attempt"), int) and raw["attempt"] > 0:
+            if isinstance(raw.get("attempt"), int) and not isinstance(raw.get("attempt"), bool) and raw["attempt"] > 0:
                 item["attempt"] = raw["attempt"]
             if normalize_identifier(raw.get("executor_attempt_id"), kind="attempt"):
                 item["executor_attempt_id"] = raw["executor_attempt_id"]
             if normalize_identifier(raw.get("session_id"), kind="session"):
                 item["session_id"] = raw["session_id"]
-            if isinstance(raw.get("occurred_at"), str) and raw["occurred_at"]:
+            if isinstance(raw.get("occurred_at"), str) and raw["occurred_at"] and _looks_like_timestamp(raw["occurred_at"]):
                 item["occurred_at"] = raw["occurred_at"][:64]
             values.append(item)
     return values[-MAX_ERROR_HISTORY:]
+
+
+def _looks_like_timestamp(value: str) -> bool:
+    """只接受 ISO 风格的错误发生时间，避免旧字段携带任意文本。"""
+    if not value or len(value) > 64 or any(ord(char) < 32 for char in value) or ("T" not in value and " " not in value):
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True

@@ -80,6 +80,7 @@ from backend.callbacks import (
 from backend.image_processing import AUTO_RENAME_WARNING_ERRORS, ImageProcessingError, ImageProcessingOptions, ImageProcessingRepository, ImageProcessingSnapshot, ImageProcessingWorker, SingleImageEmbeddingService, image_file_matches, processing_config_hash, stable_input_digest
 from backend.agent_resume import ResumeDecision, classify_resume_error, normalize_identifier, within_total_timeout
 from backend.app_extensions import ApplicationExtension, extension_paths, path_is_exempt
+from backend.public_dto import PUBLIC_STAGE_STATUSES, normalize_public_filename, normalize_public_identifier, sanitize_public_timestamp, sanitize_task_result
 
 
 STORAGE_PREFLIGHT_BLOCKING_KEYS = ("non_flat_keys", "nested_images", "missing_files", "mismatched")
@@ -2169,7 +2170,7 @@ async def generate_cache(request: Request) -> dict[str, object]:
 def _activity_payload(value: object) -> dict[str, object] | None:
     """将 reader 领域值收敛为完整的三个公开活跃度字段。"""
     if isinstance(value, AgentActivity):
-        return value.as_dict()
+        value = value.as_dict()
     if not isinstance(value, Mapping):
         return None
     completed = value.get("agent_completed_turns", value.get("completed_turns"))
@@ -2177,7 +2178,8 @@ def _activity_payload(value: object) -> dict[str, object] | None:
     last_activity = value.get("agent_last_activity_at", value.get("last_activity_at"))
     if isinstance(completed, bool) or not isinstance(completed, int) or completed < 0:
         return None
-    if not isinstance(running, bool) or not isinstance(last_activity, str) or not last_activity:
+    last_activity = sanitize_public_timestamp(last_activity)
+    if not isinstance(running, bool) or last_activity is None:
         return None
     return {
         "agent_completed_turns": completed,
@@ -2211,15 +2213,19 @@ def _task_summary(request: Request, record: TaskRecord, activities: Mapping[str,
     """将任务转换为安全摘要，并按需装配完整活跃度字段。"""
     if activities is None:
         activities = _read_agent_activity(request, [record])
+    elif not isinstance(activities, Mapping):
+        activities = {}
     data = record.as_dict(include_payload=False)
-    payload = record.payload
+    payload = record.payload if isinstance(record.payload, Mapping) else {}
+    task_type = record.task_type if isinstance(record.task_type, str) else ""
+    public_submission_mode = data.get("submission_mode")
     settings = getattr(request.app.state, "settings", None)
-    if settings is not None and record.task_type == "meme_context_generation" and data.get("resume_available"):
+    if settings is not None and task_type == "meme_context_generation" and data.get("resume_available"):
         resume_enabled = bool(getattr(settings, "agent_resume_enabled", False))
         if not resume_enabled:
             data["resume_available"] = False
             data["resume_reason"] = "resume_disabled"
-        elif record.resume_attempts >= int(getattr(settings, "agent_resume_max_attempts", 2)):
+        elif isinstance(data.get("resume_attempts"), int) and data["resume_attempts"] >= int(getattr(settings, "agent_resume_max_attempts", 2)):
             data["resume_available"] = False
             data["resume_reason"] = "resume_budget_exhausted"
         elif isinstance(record.resume_started_at, str):
@@ -2233,18 +2239,18 @@ def _task_summary(request: Request, record: TaskRecord, activities: Mapping[str,
             ):
                 data["resume_available"] = False
                 data["resume_reason"] = "resume_budget_exhausted"
-    if record.task_type in {"visual_embedding_generation", "meme_context_generation", "image_auto_rename", "text_embedding_generation"}:
+    if task_type in {"visual_embedding_generation", "meme_context_generation", "image_auto_rename", "text_embedding_generation"}:
         # NULL 来源只代表旧历史无法可靠归类，不能被前端解释为 standalone。
-        data["historical_unclassified"] = record.submission_mode is None
-        data["read_only"] = record.submission_mode is None
+        data["historical_unclassified"] = public_submission_mode is None
+        data["read_only"] = public_submission_mode is None
         data["retry_allowed"] = False
-        data["image_stage"] = record.image_stage or {
+        data["image_stage"] = data.get("image_stage") or {
             "visual_embedding_generation": "visual",
             "meme_context_generation": "agent",
             "image_auto_rename": "auto_rename",
             "text_embedding_generation": "text_embedding",
-        }.get(record.task_type)
-        if record.task_type == "image_auto_rename":
+        }.get(task_type)
+        if task_type == "image_auto_rename":
             # pipeline 自动命名只有 warning 才能从专用阶段入口恢复；不可降级
             # failure/blocked/unknown_execution 必须保持停止状态。standalone
             # 终态失败则允许按当前 Meme 输入重新提交独立 Task。
@@ -2254,33 +2260,49 @@ def _task_summary(request: Request, record: TaskRecord, activities: Mapping[str,
                 "auto_rename_target_exists",
                 "auto_rename_target_changed",
             }
-            recoverable = record.submission_mode == "standalone" and record.status == "failed" and (record.error or {}).get("error") in recoverable_errors
-            if record.submission_mode == "pipeline" and record.processing_job_id:
+            record_error = record.error if isinstance(record.error, Mapping) else {}
+            recoverable = public_submission_mode == "standalone" and record.status == "failed" and record_error.get("error") in recoverable_errors
+            processing_job_id = data.get("processing_job_id")
+            if public_submission_mode == "pipeline" and isinstance(processing_job_id, str) and processing_job_id:
                 try:
-                    processing = _processing_repository(request).snapshot(record.processing_job_id)
-                    stage = next((item for item in processing.stages if item.get("stage") == "auto_rename"), None) if processing else None
+                    processing = _processing_repository(request).snapshot(processing_job_id)
+                    stage = next((item for item in processing.stages if isinstance(item, Mapping) and item.get("stage") == "auto_rename"), None) if processing else None
                     recoverable = bool(stage and stage.get("status") == "warning")
-                    data["image_stage_status"] = stage.get("status") if stage else None
+                    stage_status = stage.get("status") if stage and isinstance(stage.get("status"), str) and stage.get("status") in PUBLIC_STAGE_STATUSES else None
+                    data["image_stage_status"] = stage_status
                 except (DatabaseError, TypeError, ValueError):
                     recoverable = False
             data["image_stage_recoverable"] = recoverable
-    if record.task_type == "meme_context_generation":
+    if task_type == "meme_context_generation":
         # 只暴露可观察策略；完整 payload 仍留在后端数据库和 Worker 边界内。
-        data["reverse_image_policy"] = str(payload.get("reverse_image_policy") or "forbid")
-        activity = _activity_payload(activities.get(record.task_id))
+        policy = payload.get("reverse_image_policy")
+        data["reverse_image_policy"] = policy if isinstance(policy, str) and policy in {"forbid", "auto"} else "forbid"
+        activity = _activity_payload(activities.get(record.task_id)) if isinstance(record.task_id, str) else None
         if activity is not None:
             data.update(activity)
-    elif record.task_type == "visual_embedding_generation":
+    elif task_type == "visual_embedding_generation":
+        visual_result = sanitize_task_result(
+            "visual_embedding_generation",
+            {
+                "visual_model": payload.get("visual_model"),
+                "dimensions": payload.get("visual_dimensions"),
+                "preprocess_version": payload.get("preprocess_version"),
+            },
+        ) or {}
         data["visual"] = {
-            "model": payload.get("visual_model"),
-            "dimensions": payload.get("visual_dimensions"),
-            "preprocess_version": payload.get("preprocess_version"),
+            "model": visual_result.get("visual_model"),
+            "dimensions": visual_result.get("dimensions"),
+            "preprocess_version": visual_result.get("preprocess_version"),
         }
-    meme_id = payload.get("meme_id")
-    if isinstance(meme_id, str):
+    meme_id = normalize_public_identifier(payload.get("meme_id"))
+    if meme_id:
         try:
             _meme_record, image = _service(request, "metadata").image_for_meme(meme_id)
-            data["image"] = {"meme_id": meme_id, "media_url": f"/media/{meme_id}", "filename": image.name}
+            image_data: dict[str, object] = {"meme_id": meme_id, "media_url": f"/media/{meme_id}"}
+            filename = normalize_public_filename(getattr(image, "name", None))
+            if filename:
+                image_data["filename"] = filename
+            data["image"] = image_data
         except MetadataError:
             data["image"] = {"meme_id": meme_id}
     return data
@@ -2681,7 +2703,16 @@ async def list_images(
         item = {"meme_id": str(record.id), "filename": record.storage_key, "extension": record.extension, "size": identity["size_bytes"], "media_url": f"/media/{record.id}", "metadata": metadata_status, "embedding_status": "ready" if services.search.has_cache() and metadata_status.get("status") in {"partial", "ready"} else "blocked" if metadata_status.get("status") == "repair_required" else "pending", "visual_embedding_status": "ready" if visual_row is not None else "pending"}
         latest_processing = _processing_repository(request).latest_for_target(record.id, record.sha256)
         if latest_processing is not None:
-            item.update({"processing_job_id": latest_processing.job_id, "processing_status": latest_processing.status, "processing_auto_name": latest_processing.auto_name, "processing_has_warnings": latest_processing.has_warnings, "processing_stages": list(latest_processing.stages)})
+            processing_public = latest_processing.as_dict()
+            item.update(
+                {
+                    "processing_job_id": processing_public.get("job_id"),
+                    "processing_status": processing_public.get("status"),
+                    "processing_auto_name": processing_public.get("auto_name", False),
+                    "processing_has_warnings": processing_public.get("has_warnings", False),
+                    "processing_stages": processing_public.get("stages", []),
+                }
+            )
         items.append(item)
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 

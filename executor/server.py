@@ -36,6 +36,7 @@ from backend.opencode_workspace import (
     validate_file_path,
 )
 from executor.token import ExecutorTokenError, ensure_token_file, read_token_file
+from backend.public_dto import PublicDataError, secret_inventory_from_mapping, validate_agent_result
 
 TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,254}\Z")
@@ -1242,6 +1243,10 @@ class Executor:
             raise RuntimeError("agent_result_file_invalid_json") from exc
         if not isinstance(value, dict) or not REQUIRED_RESULT_FIELDS.issubset(value):
             raise RuntimeError("agent_result_file_schema_invalid")
+        try:
+            validate_agent_result(value, secret_inventory=secret_inventory_from_mapping(os.environ))
+        except PublicDataError as exc:
+            raise RuntimeError("agent_result_file_schema_invalid") from exc
 
     @staticmethod
     def _terminate(process: subprocess.Popen[bytes]) -> bool:

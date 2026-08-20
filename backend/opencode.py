@@ -45,6 +45,7 @@ from backend.opencode_workspace import (
     validate_directory_path,
     validate_file_path,
 )
+from backend.public_dto import PublicDataError, secret_inventory_from_settings, validate_agent_result
 
 try:
     from jsonschema import Draft202012Validator, FormatChecker
@@ -890,8 +891,12 @@ class OpenCodeRunner:
         return value
 
     def validate_candidate(self, candidate: dict[str, Any]) -> dict[str, Any]:
-        """执行输出 schema 所需字段和 Pydantic 字段约束。"""
+        """执行输出 schema、字段白名单和敏感数据边界校验。"""
         required = {"title", "summary", "subjects", "visible_text", "references", "meaning", "keywords", "search_queries", "uncertainties"}
+        try:
+            candidate = validate_agent_result(candidate, secret_inventory=secret_inventory_from_settings(self.settings))
+        except PublicDataError as exc:
+            raise OpenCodeError("agent_output_schema_invalid", "候选 JSON 超出公开结果边界") from exc
         if not required.issubset(candidate):
             raise OpenCodeError("agent_output_schema_invalid", "候选 JSON 缺少必填字段")
         schema_path = self.project_root / "skills" / "research-meme-context" / "references" / "output-schema.json"

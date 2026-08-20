@@ -19,6 +19,14 @@ from uuid import uuid4
 
 from backend.agent_resume import normalize_identifier, sanitize_error, sanitize_error_history
 from backend.opencode_workspace import SELECTOR_RE
+from backend.public_dto import (
+    PUBLIC_TASK_STATUSES,
+    normalize_public_code,
+    normalize_public_identifier,
+    sanitize_public_message,
+    sanitize_public_timestamp,
+    sanitize_task_result,
+)
 
 TERMINAL = {"succeeded", "failed"}
 STABLE_TASK_ERRORS = {
@@ -180,13 +188,13 @@ class TaskRecord:
     # 数据库任务服务内部使用；公共 ``as_dict`` 不暴露 scope 身份。
     scope_id: str | None = None
 
-    def as_dict(self, *, include_payload: bool = True) -> dict[str, Any]:
-        """返回稳定 API 结构；列表调用方可排除内部 payload。"""
+    def as_dict(self, *, include_payload: bool = False) -> dict[str, Any]:
+        """返回显式公开任务 DTO；持久化调用方可单独请求内部 payload。"""
         session_id = normalize_identifier(self.session_id, kind="session")
         executor_attempt_id = normalize_identifier(self.executor_attempt_id, kind="attempt")
         workspace_selector = self.workspace_selector if isinstance(self.workspace_selector, str) and SELECTOR_RE.fullmatch(self.workspace_selector) else None
         resume_available = bool(self.resume_available and session_id and executor_attempt_id)
-        resume_reason = self.resume_reason
+        resume_reason = normalize_public_code(self.resume_reason)
         if self.workspace_selector is not None and workspace_selector is None:
             resume_available = False
             resume_reason = "opencode_workspace_mismatch"
@@ -194,35 +202,45 @@ class TaskRecord:
             # 旧磁盘记录可能携带损坏的恢复标识；公开摘要必须 fail-closed，不能
             # 让客户端把一条无法绑定的 session 当成可续跑目标。
             resume_reason = "session_not_resumable"
+        task_id = normalize_public_identifier(self.task_id)
+        task_type = normalize_public_code(self.task_type, fallback="task") or "task"
+        status = self.status if isinstance(self.status, str) and self.status in PUBLIC_TASK_STATUSES else "failed"
+        processing_job_id = normalize_public_identifier(self.processing_job_id)
+        image_stage = self.image_stage if isinstance(self.image_stage, str) and self.image_stage in {"visual", "agent", "auto_rename", "text_embedding"} else None
+        submission_mode = self.submission_mode if isinstance(self.submission_mode, str) and self.submission_mode in {"pipeline", "standalone"} else None
+        progress = self.progress if isinstance(self.progress, (int, float)) and not isinstance(self.progress, bool) and 0 <= self.progress <= 1 else None
+        attempts = self.attempts if isinstance(self.attempts, int) and not isinstance(self.attempts, bool) and 0 <= self.attempts <= 1_000_000 else 0
+        resume_attempts = self.resume_attempts if isinstance(self.resume_attempts, int) and not isinstance(self.resume_attempts, bool) and 0 <= self.resume_attempts <= 1_000_000 else 0
+        agent_concurrency = self.agent_concurrency if isinstance(self.agent_concurrency, int) and not isinstance(self.agent_concurrency, bool) and 0 < self.agent_concurrency <= 128 else None
         result = {
-            "task_id": self.task_id,
-            "task_type": self.task_type,
-            "submission_mode": self.submission_mode,
-            "image_stage": self.image_stage,
-            "processing_job_id": self.processing_job_id,
-            "job_id": self.processing_job_id,
-            "status": self.status,
-            "progress": self.progress,
-            "message": self.message,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "completed_at": self.completed_at,
-            "attempts": self.attempts,
+            "task_id": task_id or "invalid-task",
+            "task_type": task_type,
+            "submission_mode": submission_mode,
+            "image_stage": image_stage,
+            "processing_job_id": processing_job_id,
+            "job_id": processing_job_id,
+            "status": status,
+            "progress": progress,
+            "message": sanitize_public_message(self.message),
+            "created_at": sanitize_public_timestamp(self.created_at),
+            "updated_at": sanitize_public_timestamp(self.updated_at),
+            "completed_at": sanitize_public_timestamp(self.completed_at),
+            "attempts": attempts,
             "error": sanitize_error(self.error) if isinstance(self.error, dict) else None,
             "resume_available": resume_available,
             "resume_reason": resume_reason,
             "session_id": session_id,
             "executor_attempt_id": executor_attempt_id,
             "workspace_selector": workspace_selector,
-            "resume_attempts": self.resume_attempts,
-            "resume_started_at": self.resume_started_at,
+            "resume_attempts": resume_attempts,
+            "resume_started_at": sanitize_public_timestamp(self.resume_started_at),
             "first_error": sanitize_error(self.first_error) if isinstance(self.first_error, dict) else None,
             "error_history": sanitize_error_history(self.error_history),
-            "result": self.result,
-            "settings_version": self.settings_version,
-            "agent_concurrency": self.agent_concurrency,
-            "slot_id": self.slot_id,
+            "result": sanitize_task_result(task_type, self.result),
+            "settings_version": normalize_public_code(self.settings_version),
+            "agent_concurrency": agent_concurrency,
         }
+        # slot 是调度器内部事实，不属于任务公开契约；旧调用方仍可从内部对象读取。
         if include_payload:
             result["payload"] = self.payload
         return result
@@ -247,33 +265,49 @@ class TaskRecord:
             resume_reason = "opencode_workspace_mismatch"
         if stored_resume_available and not (session_id and executor_attempt_id):
             resume_reason = "session_not_resumable"
+        raw_status = value.get("status", "queued")
+        safe_status = raw_status if isinstance(raw_status, str) and raw_status in PUBLIC_TASK_STATUSES else "failed"
+        raw_submission_mode = value.get("submission_mode")
+        submission_mode = raw_submission_mode if isinstance(raw_submission_mode, str) and raw_submission_mode in {"pipeline", "standalone"} else None
+        raw_image_stage = value.get("image_stage")
+        image_stage = raw_image_stage if isinstance(raw_image_stage, str) and raw_image_stage in {"visual", "agent", "auto_rename", "text_embedding"} else None
+        raw_processing_job_id = value.get("processing_job_id")
+        if not isinstance(raw_processing_job_id, str) or not raw_processing_job_id:
+            raw_processing_job_id = value.get("job_id")
+        processing_job_id = normalize_public_identifier(raw_processing_job_id)
+        raw_attempts = value.get("attempts", 0)
+        attempts = raw_attempts if isinstance(raw_attempts, int) and not isinstance(raw_attempts, bool) and 0 <= raw_attempts <= 1_000_000 else 0
+        raw_resume_attempts = value.get("resume_attempts", 0)
+        resume_attempts = raw_resume_attempts if isinstance(raw_resume_attempts, int) and not isinstance(raw_resume_attempts, bool) and 0 <= raw_resume_attempts <= 1_000_000 else 0
+        raw_agent_concurrency = value.get("agent_concurrency")
+        agent_concurrency = raw_agent_concurrency if isinstance(raw_agent_concurrency, int) and not isinstance(raw_agent_concurrency, bool) and 0 < raw_agent_concurrency <= 128 else None
         return cls(
             task_id=task_id,
             task_type=task_type,
-            submission_mode=value.get("submission_mode") if value.get("submission_mode") in {None, "pipeline", "standalone"} else None,
-            image_stage=value.get("image_stage") if value.get("image_stage") in {None, "visual", "agent", "auto_rename", "text_embedding"} else None,
-            processing_job_id=(value.get("processing_job_id") or value.get("job_id")) if isinstance(value.get("processing_job_id") or value.get("job_id"), str) else None,
+            submission_mode=submission_mode,
+            image_stage=image_stage,
+            processing_job_id=processing_job_id,
             payload=payload,
-            status=str(value.get("status", "queued")),
-            progress=value.get("progress"),
-            message=value.get("message"),
-            created_at=str(value.get("created_at") or now()),
-            updated_at=str(value.get("updated_at") or value.get("created_at") or now()),
-            completed_at=value.get("completed_at"),
-            attempts=int(value.get("attempts", 0)),
+            status=safe_status,
+            progress=value.get("progress") if isinstance(value.get("progress"), (int, float)) and not isinstance(value.get("progress"), bool) and 0 <= value.get("progress") <= 1 else None,
+            message=sanitize_public_message(value.get("message")),
+            created_at=sanitize_public_timestamp(value.get("created_at")) or now(),
+            updated_at=sanitize_public_timestamp(value.get("updated_at")) or sanitize_public_timestamp(value.get("created_at")) or now(),
+            completed_at=sanitize_public_timestamp(value.get("completed_at")),
+            attempts=attempts,
             error=sanitize_error(value.get("error")) if isinstance(value.get("error"), dict) else None,
             resume_available=bool(stored_resume_available and session_id and executor_attempt_id),
             resume_reason=resume_reason,
             session_id=session_id,
             executor_attempt_id=executor_attempt_id,
             workspace_selector=workspace_selector,
-            resume_attempts=max(0, int(value.get("resume_attempts", 0))),
-            resume_started_at=value.get("resume_started_at") if isinstance(value.get("resume_started_at"), str) else None,
+            resume_attempts=resume_attempts,
+            resume_started_at=sanitize_public_timestamp(value.get("resume_started_at")),
             first_error=sanitize_error(value.get("first_error")) if isinstance(value.get("first_error"), dict) else None,
             error_history=sanitize_error_history(value.get("error_history", [])),
-            result=value.get("result"),
-            settings_version=value.get("settings_version"),
-            agent_concurrency=value.get("agent_concurrency"),
+            result=sanitize_task_result(task_type, value.get("result")),
+            settings_version=normalize_public_code(value.get("settings_version")),
+            agent_concurrency=agent_concurrency,
             slot_id=value.get("slot_id"),
             scope_id=value.get("scope_id") if isinstance(value.get("scope_id"), str) else None,
         )

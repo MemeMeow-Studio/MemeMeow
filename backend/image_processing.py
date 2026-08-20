@@ -44,6 +44,17 @@ from backend.operation_policy import (
     Operations,
     require_allowed,
 )
+from backend.public_dto import (
+    PUBLIC_STAGE_NAMES,
+    PUBLIC_TASK_STATUSES,
+    normalize_public_digest,
+    normalize_public_identifier,
+    public_processing_stage,
+    public_processing_warning,
+    sanitize_public_error,
+    sanitize_public_message,
+    sanitize_public_timestamp,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -167,39 +178,42 @@ class ImageProcessingSnapshot:
 
     def as_dict(self) -> dict[str, object]:
         """返回不包含物理路径、grant 或 scope 身份的状态结构。"""
+        job_id = normalize_public_identifier(self.job_id) or "invalid-job"
+        meme_id = normalize_public_identifier(self.meme_id) or "invalid-meme"
+        revision = self.revision if isinstance(self.revision, int) and not isinstance(self.revision, bool) and 0 < self.revision <= 1_000_000 else None
+        image_sha256 = normalize_public_digest(self.image_sha256)
+        reverse_image_policy = self.reverse_image_policy if isinstance(self.reverse_image_policy, str) and self.reverse_image_policy in {"forbid", "auto"} else "forbid"
+        status = self.status if isinstance(self.status, str) and self.status in PUBLIC_TASK_STATUSES else "failed"
+        current_stage = self.current_stage if isinstance(self.current_stage, str) and self.current_stage in PUBLIC_STAGE_NAMES else None
+        progress = self.progress if isinstance(self.progress, (int, float)) and not isinstance(self.progress, bool) and 0 <= self.progress <= 1 else None
+        stages = [public_processing_stage(item, job_id=job_id) for item in self.stages if isinstance(item, Mapping)]
+        warnings = [public_processing_warning(item) for item in self.warnings if isinstance(item, Mapping)]
         return {
             # ``task_id`` 和 ``task_type`` 是旧任务轮询器需要的兼容字段；
             # job_id 仍是图片处理 API 的权威标识。
-            "task_id": self.job_id,
+            "task_id": job_id,
             "task_type": "image_processing",
-            "job_id": self.job_id,
+            "job_id": job_id,
             "submission_mode": "pipeline",
             "image_stage": None,
-            "processing_job_id": self.job_id,
-            "meme_id": self.meme_id,
-            "revision": self.revision,
-            "image_sha256": self.image_sha256,
-            "reverse_image_policy": self.reverse_image_policy,
-            "auto_name": self.auto_name,
-            "status": self.status,
-            "has_warnings": self.has_warnings,
-            "warnings": [dict(item) for item in self.warnings],
-            "progress": self.progress,
-            "message": self.message,
-            "created_at": self.created_at.isoformat() if hasattr(self.created_at, "isoformat") else self.created_at,
-            "updated_at": self.updated_at.isoformat() if hasattr(self.updated_at, "isoformat") else self.updated_at,
-            "completed_at": self.completed_at.isoformat() if hasattr(self.completed_at, "isoformat") else self.completed_at,
-            "current_stage": self.current_stage,
-            "stages": [
-                {
-                    **dict(item),
-                    "submission_mode": "pipeline",
-                    "processing_job_id": self.job_id,
-                }
-                for item in self.stages
-            ],
-            "error": self.error,
-            "retry_at": self.retry_at.isoformat() if hasattr(self.retry_at, "isoformat") else self.retry_at,
+            "processing_job_id": job_id,
+            "meme_id": meme_id,
+            "revision": revision,
+            "image_sha256": image_sha256,
+            "reverse_image_policy": reverse_image_policy,
+            "auto_name": self.auto_name if isinstance(self.auto_name, bool) else False,
+            "status": status,
+            "has_warnings": bool(warnings) or self.has_warnings is True,
+            "warnings": warnings,
+            "progress": progress,
+            "message": sanitize_public_message(self.message),
+            "created_at": sanitize_public_timestamp(self.created_at),
+            "updated_at": sanitize_public_timestamp(self.updated_at),
+            "completed_at": sanitize_public_timestamp(self.completed_at),
+            "current_stage": current_stage,
+            "stages": stages,
+            "error": sanitize_public_error(self.error, fallback="image_processing_failed"),
+            "retry_at": sanitize_public_timestamp(self.retry_at),
         }
 
 
@@ -359,13 +373,17 @@ class ImageProcessingRepository:
             if job is None:
                 return None
             stages = self._stages(session, job.id)
-            stage_names = {item.stage for item in stages}
+            stage_names = {item.stage for item in stages if isinstance(item.stage, str)}
             auto_name = bool(getattr(job, "auto_name", False))
             # 旧三阶段历史只读合成跳过阶段，不写回数据库。
             if "auto_rename" not in stage_names:
                 synthetic = ImageProcessingStage(scope_id=self.scope.scope_id, job_id=job.id, stage="auto_rename", status="skipped")
-                stages = sorted([*stages, synthetic], key=lambda row: {name: index for index, name in enumerate(STAGES)}.get(row.stage, len(STAGES)))
-            completed_stages = sum(item.status in STAGE_SETTLED for item in stages)
+                stage_order = {name: index for index, name in enumerate(STAGES)}
+                stages = sorted(
+                    [*stages, synthetic],
+                    key=lambda row: stage_order.get(row.stage, len(STAGES)) if isinstance(row.stage, str) else len(STAGES),
+                )
+            completed_stages = sum(isinstance(item.status, str) and item.status in STAGE_SETTLED for item in stages)
             progress = completed_stages / len(STAGES) if stages else None
             message = None
             if job.error and isinstance(job.error, Mapping):
@@ -408,7 +426,8 @@ class ImageProcessingRepository:
                     }
                 )
             stage_payload = tuple(stage_payload_items)
-            warning_visible = job.status not in {"failed", "blocked", "unknown_execution"}
+            job_status = job.status if isinstance(job.status, str) else "failed"
+            warning_visible = job_status not in {"failed", "blocked", "unknown_execution"}
             warnings = tuple(
                 {
                     "stage": item.stage,
@@ -419,13 +438,17 @@ class ImageProcessingRepository:
                 for item in stages
                 if warning_visible and item.stage == "auto_rename" and item.status == "warning"
             )
+            try:
+                public_policy = normalize_reverse_image_policy(job.reverse_image_policy)
+            except ImageProcessingError:
+                public_policy = "forbid"
             return ImageProcessingSnapshot(
                 job_id=str(job.id),
                 scope_id=self.scope.scope_id,
                 meme_id=str(job.meme_id),
                 revision=job.revision,
                 image_sha256=job.image_sha256,
-                reverse_image_policy=normalize_reverse_image_policy(job.reverse_image_policy),
+                reverse_image_policy=public_policy,
                 status=job.status,
                 current_stage=job.current_stage,
                 stages=stage_payload,

@@ -69,6 +69,7 @@ from backend.metadata import (
 )
 from backend.operation_policy import GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations
 from backend.opencode_workspace import SELECTOR_RE
+from backend.public_dto import sanitize_task_result
 from backend.paths import SUPPORTED_EXTENSIONS
 from backend.tasks import IMAGE_PROCESSING_TASK_TYPES, TaskRecord, TERMINAL, STABLE_TASK_ERRORS
 from backend.scope import validate_scope_services
@@ -1155,7 +1156,7 @@ class PostgresTaskService:
             resume_started_at=_iso(getattr(record, "resume_started_at", None)) if getattr(record, "resume_started_at", None) else None,
             first_error=sanitize_error(getattr(record, "first_error", None)) if isinstance(getattr(record, "first_error", None), dict) else None,
             error_history=sanitize_error_history(getattr(record, "error_history", None)),
-            result=record.result,
+            result=sanitize_task_result(record.task_type, record.result),
             settings_version=record.settings_version,
             agent_concurrency=self.agent_concurrency if record.lane == "agent" else None,
             slot_id=slot_id,
