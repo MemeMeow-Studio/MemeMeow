@@ -409,6 +409,12 @@ class WorkspaceCapabilitySigner:
         # 不一致解释，也避免把任意业务数据带入可转发的 token。
         if set(value) != set(validated):
             raise WorkspaceCapabilityError("opencode_workspace_capability_invalid", "capability claims 包含未知字段")
+        # ``sign`` 是公开的低层签发入口，不能只依赖 ``issue`` 的 TTL 计算；否则
+        # 任意内部调用方都可以把同一签名材料用于多年有效的 capability。
+        now = int(self.clock())
+        expiry = validated["exp"]
+        if not isinstance(expiry, int) or isinstance(expiry, bool) or expiry <= now or expiry > now + self.ttl_seconds:
+            raise WorkspaceCapabilityError("opencode_workspace_capability_invalid", "capability 期限超出签发窗口")
         value = validated
         raw = _b64(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
         signature = _b64(hmac.new(self.secret, raw.encode("ascii"), hashlib.sha256).digest())

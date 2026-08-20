@@ -139,6 +139,22 @@ def test_workspace_capability_binds_attempt_selector_and_resume(tmp_path: Path) 
     assert error.value.code == "opencode_workspace_capability_expired"
 
 
+def test_workspace_capability_low_level_sign_cannot_extend_ttl() -> None:
+    """低层 sign 入口也必须遵守 signer 的最大有效期。"""
+    signer = WorkspaceCapabilitySigner("workspace-secret", ttl_seconds=60, clock=lambda: 100)
+    claims = {
+        "v": 1,
+        "task_id": "task",
+        "attempt_id": "attempt",
+        "workspace_selector": "scope-a",
+        "audience": "mememeow-agent-executor",
+        "exp": 100 + 61,
+    }
+    with pytest.raises(WorkspaceCapabilityError) as error:
+        signer.sign(claims)
+    assert error.value.code == "opencode_workspace_capability_invalid"
+
+
 @pytest.mark.parametrize("relative", ["nested/./sample.png", "nested//sample.png", "C:/sample.png", "C:sample.png", "sample.png\x00"])
 def test_relative_image_paths_reject_normalized_or_control_segments(relative: str) -> None:
     """原始路径段在归一化前也必须拒绝，避免绕过相对路径契约。"""
