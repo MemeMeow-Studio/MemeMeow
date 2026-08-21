@@ -24,12 +24,16 @@ from backend.callbacks import (
     HMACCallbackCredentials,
     CallbackRegistration,
     install_body_guard,
+    callback_input_digest,
+    canonical_callback_request_id,
+    normalize_callback_input,
     validate_binding_task,
     validate_callback_headers,
     validate_input_digest,
     validate_request_id,
     validate_request_binding,
 )
+from backend.database import DatabaseError, InMemoryAgentCallbackRequestRepository
 
 
 def _binding(*, key_id: str = "active", expires_in: int = 30) -> CallbackBinding:
@@ -147,6 +151,103 @@ def test_callback_request_binding_and_metrics_are_restricted() -> None:
     assert snapshot["/internal/reverse-image/search|agent_callback_invalid_execution"] == 1
     assert binding.task_id not in str(snapshot)
     assert binding.scope_id not in str(snapshot)
+
+
+def test_callback_client_digest_is_only_a_consistency_declaration() -> None:
+    """服务端摘要覆盖客户端提示，伪造摘要在事实查找前稳定拒绝。"""
+    binding = _binding()
+    computed = "b" * 64
+    assert validate_request_binding(None, binding, input_digest=None, computed_input_digest=computed) == (None, computed)
+    with pytest.raises(CallbackError) as error:
+        validate_request_binding("request-a", binding, input_digest="c" * 64, computed_input_digest=computed)
+    assert error.value.code == "agent_callback_invalid_execution"
+
+
+def test_callback_logical_input_normalizes_equivalent_values_and_binds_refresh() -> None:
+    """规范化空白、大小写和布尔表示；refresh 仍然属于逻辑键。"""
+    values = {
+        "scope_id": " scope-a ",
+        "task_id": " task-a ",
+        "claim_generation": 4,
+        "attempt": 2,
+        "operation": "analysis.reverse_image_search",
+        "target_sha256": "A" * 64,
+        "image_sha256": "B" * 64,
+        "search_type": " ALL ",
+        "language": " ZH-CN ",
+        "country": " US ",
+        "query": " hello ",
+        "auto_crop": "false",
+        "refresh": "true",
+    }
+    equivalent = {**values, "search_type": "all", "language": "zh-cn", "country": "us", "query": "hello", "auto_crop": False, "refresh": True}
+    assert callback_input_digest(**values) == callback_input_digest(**equivalent)
+    assert callback_input_digest(**{**equivalent, "refresh": False}) != callback_input_digest(**equivalent)
+    normalized = normalize_callback_input(**values)
+    assert normalized.target_sha256 == "a" * 64
+    assert normalized.image_sha256 == "b" * 64
+    assert canonical_callback_request_id(normalized.digest()).startswith("cb-")
+
+
+def test_callback_memory_repository_reuses_authority_and_rejects_id_rebinding() -> None:
+    """内存双索引按逻辑键复用首个 ID，并在同 ID 改输入时稳定拒绝。"""
+    repository = InMemoryAgentCallbackRequestRepository("scope-a")
+    values = {
+        "request_id": "request-a",
+        "task_id": "task-a",
+        "claim_generation": 1,
+        "attempt": 1,
+        "operation": "analysis.reverse_image_search",
+        "target_sha256": "a" * 64,
+        "input_digest": "b" * 64,
+    }
+    first = repository.resolve(**values)
+    replay = repository.resolve(**{**values, "request_id": "request-b"})
+    omitted = repository.resolve(**{**values, "request_id": None})
+    assert (first.request_id, replay.request_id, omitted.request_id) == ("request-a", "request-a", "request-a")
+    with pytest.raises(DatabaseError, match="callback_request_conflict"):
+        repository.resolve(**{**values, "input_digest": "c" * 64})
+
+
+def test_callback_memory_repository_converges_concurrent_ids_and_recovers_terminal_unknown() -> None:
+    """内存事实层在并发首次提交时只选一个 ID，并支持未知到明确终态收束。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    repository = InMemoryAgentCallbackRequestRepository("scope-a")
+    values = {
+        "task_id": "task-a",
+        "claim_generation": 1,
+        "attempt": 1,
+        "operation": "analysis.reverse_image_search",
+        "target_sha256": "a" * 64,
+        "input_digest": "b" * 64,
+    }
+
+    def resolve(request_id: str):
+        """提交一个不同客户端 ID。"""
+        return repository.resolve(request_id=request_id, **values).request_id
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(resolve, ("race-a", "race-b")))
+    assert results[0] == results[1]
+    authoritative = results[0]
+    repository.finish(authoritative, state="unknown_execution", error={"error": "reverse_image_unknown_execution"})
+    assert repository.finish(authoritative, state="failed", error={"error": "reverse_image_provider_unavailable"}).state == "failed"
+
+
+def test_callback_memory_repository_rejects_incomplete_binding() -> None:
+    """内存事实层缺少完整绑定时必须和 PostgreSQL 一样 fail-closed。"""
+    repository = InMemoryAgentCallbackRequestRepository("scope-a")
+    with pytest.raises(DatabaseError, match="callback_binding_schema_unavailable"):
+        repository.resolve(
+            request_id=None,
+            task_id="task-a",
+            claim_generation=1,
+            attempt=1,
+            operation="analysis.reverse_image_search",
+            target_sha256="a" * 64,
+            input_digest=None,
+        )
 
 
 def test_callback_body_guard_stops_chunked_body_without_content_length() -> None:

@@ -223,6 +223,55 @@ def test_callback_request_binding_is_scope_bound_and_idempotent(postgres_resourc
         assert final is not None and final.state == "completed"
 
 
+def test_callback_logical_binding_converges_across_independent_sessions(postgres_resources) -> None:
+    """两个独立 Session 以不同 ID 并发首次提交时只保留一个逻辑事实。"""
+    resources = postgres_resources
+    with resources.environment("local") as environment:
+        task = environment.tasks.submit(
+            task_type="meme_context_generation",
+            payload={"image_sha256": "a" * 64},
+            lane="agent",
+            dedupe_key=f"callback-race-{uuid4().hex}",
+        )
+        claim = environment.tasks.claim(owner="callback-race-owner", task_id=task.id, lease_seconds=60)
+        assert claim is not None
+        values = {
+            "task_id": claim.id,
+            "claim_generation": claim.claim_generation,
+            "attempt": claim.attempt_count,
+            "operation": "analysis.reverse_image_search",
+            "target_sha256": "a" * 64,
+            "input_digest": "b" * 64,
+        }
+    barrier = threading.Barrier(2)
+
+    def submit(request_id: str) -> str:
+        """在独立数据库 Session 中提交一个候选 callback ID。"""
+        with resources.environment("local") as environment:
+            barrier.wait(timeout=10)
+            row = environment.callback_requests.resolve(request_id=request_id, **values)
+            environment.uow.session.commit()
+            return row.request_id
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(submit, ("race-a", "race-b")))
+    assert results[0] == results[1]
+    with resources.environment("local") as environment:
+        count = environment.uow.session.execute(
+            text(
+                """
+                SELECT count(*)
+                  FROM agent_callback_requests
+                 WHERE scope_id = 'local'
+                   AND task_id = :task_id
+                   AND input_digest = :input_digest
+                """
+            ),
+            values,
+        ).scalar_one()
+        assert count == 1
+
+
 def test_persistent_operation_grant_is_idempotent_and_does_not_refund_other_operations(postgres_resources) -> None:
     """PostgreSQL grant 事实按 scope 幂等提交，delete 不会释放 upload reservation。"""
     resources = postgres_resources

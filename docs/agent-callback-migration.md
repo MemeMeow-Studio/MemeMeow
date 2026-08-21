@@ -11,16 +11,22 @@ operation grant；它只证明一次受控 Agent 执行可以调用指定的内�
 2. 确认 Agent executor 使用独立的 `MEMEMEOW_AGENT_EXECUTOR_TOKEN` 或 named volume
    token。executor Bearer token、callback 根 secret、`SERPAPI_API_KEY`、数据库凭据和
    operation grant 不得相互复用。
-3. 先运行数据库迁移和 callback 拒绝回归，再启动 Agent 调度。Runner 只能拿到当前
+3. 先运行数据库迁移和 callback 拒绝回归，再启动 Agent 调度。`0015_bind_agent_callback_request_ids`
+   会先检测 `agent_callback_requests` 的历史重复逻辑键和不完整绑定；发现异常时停止迁移，
+   不删除、合并或猜测覆盖既有事实。Runner 只能拿到当前
    `task_id`、claim generation/attempt、目标 SHA、允许 operation 和最长两小时有效的
    callback token；每次调用仍以数据库中的当前 claim 和未过期 lease 为准。
-4. 反向图片 Agent 只通过 `/internal/reverse-image/search` 薄客户端调用。`forbid` 不
+4. 反向图片 Agent 只通过 `/internal/reverse-image/search` 薄客户端调用；`request_id` 可以
+   省略，服务端按当前 scope、Task claim、attempt、目标/实际图片 SHA 和规范化检索输入
+   返回唯一权威 ID。`input_digest` 如果由旧客户端提交只作为一致性声明，不能覆盖服务端重算值。
+   `forbid` 不
    读取缓存、不 acquire、不联系 provider；`auto` 仍须经过当前 callback 校验和
    `analysis.reverse_image_search` acquire。SerpApi 密钥只留在 API。
 
 旧的在途任务不补发宽权限 token。没有当前完整 claim 的任务应以
 `agent_callback_invalid_execution` 或稳定任务失败收束，随后由显式重试创建新的 claim；
-不能使用旧 `task_id`、旧 token 或新 request id 继续执行。
+不能使用旧 `task_id`、旧 token 或新 request ID 继续执行；不同 ID 不能把同一逻辑输入
+改绑成第二个 callback、usage、provider 或 grant。
 
 ## 密钥轮换
 
@@ -76,6 +82,6 @@ callback 版本出现故障时，回滚步骤是“禁用 callback 和新 Agent 
 ## 验收边界
 
 本地可运行的验收应至少覆盖 callback 认证前拒绝大 body、旧 claim/跨 scope/目标替换、
-同 request id 幂等、Agent 环境脱敏、反向图片 `forbid/auto` 和 provider unknown。真实
+省略 ID、同逻辑输入换 ID、同 ID 改输入、Agent 环境脱敏、反向图片 `forbid/auto` 和 provider unknown。真实
 Compose、外部模型、视觉权重及供应商调用需要在具备 Docker、凭据和模型资源的 staging/
 发布环境执行；缺少这些条件时保留对应 OpenSpec 任务未勾选。

@@ -70,9 +70,11 @@ from backend.callbacks import (
     DEFAULT_CALLBACK_REGISTRY,
     install_body_guard,
     binding_input_digest,
+    canonical_callback_request_id,
     log_callback_rejection,
     validate_binding_task,
     validate_callback_headers,
+    validate_input_digest,
     validate_request_binding,
     validate_request_id,
     verify_content_length,
@@ -1885,6 +1887,7 @@ async def internal_reverse_image_search(
     task_id: str = Form(..., min_length=1, max_length=255),
     image: UploadFile = File(...),
     request_id: str | None = Form(default=None, max_length=128),
+    input_digest: str | None = Form(default=None, max_length=64),
     search_type: str = Form(default="all"),
     language: str = Form(default="zh-cn"),
     country: str | None = Form(default=None),
@@ -1917,6 +1920,8 @@ async def internal_reverse_image_search(
             source_sha256 = hashlib.sha256(content).hexdigest()
             if source_sha256 != target_record.sha256:
                 raise CallbackError("agent_callback_invalid_execution")
+            # 目标整图已经在上方按服务端 Meme SHA 证明；受控裁剪仍由服务端执行，
+            # Agent 不能通过上传任意裁剪图或自报 SHA 改变逻辑身份。
             if auto_crop:
                 content, _derived_sha256 = derive_controlled_crop(content, filename=image.filename or "image.png")
         services = validate_scope_services(callback_scope, request.app.state.service_factory.for_scope(callback_scope))
@@ -1926,38 +1931,12 @@ async def internal_reverse_image_search(
     header_request_id = getattr(request.state, "callback_header_request_id", None)
     if request_id is not None and header_request_id is not None and request_id != header_request_id:
         raise _error(401, "agent_callback_invalid_execution", "内部执行绑定无效")
-    request_id = validate_request_id(request_id or header_request_id)
-    if request_id is None:
-        request_id = "cb-" + binding.nonce + "-" + binding_input_digest(
-            binding.task_id,
-            binding.scope_id,
-            binding.claim_generation,
-            binding.attempt,
-            binding.target_sha256,
-            hashlib.sha256(content).hexdigest(),
-            search_type,
-            language,
-            country,
-            query,
-            auto_crop,
-            refresh,
-        )[:24]
-    input_digest = binding_input_digest(
-        binding.task_id,
-        binding.scope_id,
-        binding.claim_generation,
-        binding.attempt,
-        "analysis.reverse_image_search",
-        binding.target_sha256,
-        hashlib.sha256(content).hexdigest(),
-        search_type,
-        language,
-        country,
-        query,
-        auto_crop,
-        refresh,
-    )
-    request_id, input_digest = validate_request_binding(request_id, binding, input_digest=input_digest)
+    try:
+        request_id = validate_request_id(request_id or header_request_id)
+        input_digest = validate_input_digest(input_digest)
+        request_id, input_digest = validate_request_binding(request_id, binding, input_digest=input_digest)
+    except CallbackError as exc:
+        raise _error(401, "agent_callback_invalid_execution", "内部执行绑定无效") from exc
     try:
         return service.search(
             ReverseImageRequest(
@@ -1979,7 +1958,7 @@ async def internal_reverse_image_search(
     except ReverseImageError as exc:
         raise _error(exc.status_code, exc.code, str(exc)) from exc
     except DatabaseError as exc:
-        status = 404 if exc.code == "meme_not_found" else 409 if exc.code in {"usage_request_conflict", "usage_event_conflict"} else 503
+        status = 404 if exc.code == "meme_not_found" else 409 if exc.code in {"usage_request_conflict", "usage_event_conflict", "callback_request_conflict", "callback_binding_conflict"} else 503
         raise _error(status, exc.code, "反向图片请求无法完成") from exc
 
 
@@ -2010,7 +1989,7 @@ async def internal_visual_search_match(request: Request, payload: VisualMatchReq
         payload.exclude_self,
     )
     if request_id is None:
-        request_id = "cb-" + binding.nonce + "-" + input_digest[:24]
+        request_id = canonical_callback_request_id(input_digest)
     try:
         callback_scope = ScopeContext(binding.scope_id)
         with request.app.state.database.environment(callback_scope) as environment:
@@ -2025,6 +2004,7 @@ async def internal_visual_search_match(request: Request, payload: VisualMatchReq
                 target_sha256=binding.target_sha256,
                 input_digest=input_digest,
             )
+            request_id = fact.request_id
             if fact.completed_at is not None and fact.state == "completed" and isinstance(fact.result, dict):
                 return dict(fact.result)
             # 先提交 started 事实，再调用独立 service；这样进程在查询期间退出时，

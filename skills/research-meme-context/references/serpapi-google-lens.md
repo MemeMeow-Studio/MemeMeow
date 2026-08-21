@@ -24,7 +24,10 @@ python skills/research-meme-context/scripts/serpapi_google_lens.py \
 
 脚本输出包含 `cache.status`：首次为 `miss`，复用已有快照为 `hit`，使用
 `--refresh` 强制请求。成功结果默认长期复用；空结果只复用 3 天；网络或供应商错误
-不会写入可复用快照。重复请求的计数由后端 `request_id` 幂等记录保证。
+不会写入可复用快照。脚本默认省略 `request_id`，服务端返回权威 ID；仍可用
+`--request-id` 兼容旧脚本。相同当前 claim、规范化参数和 `refresh` 的重试会复用同一
+callback/usage 事实，provider 已开始但结果未知时返回 `reverse_image_unknown_execution`
+且不会自动重放。
 
 脚本只调用携带当前任务 callback 凭据的内部 multipart 接口并输出统一 JSON；缓存、供应商访问、脱敏和 usage event 由后端负责。输出结果不包含 `image_id`、SerpApi 归档地址和其他内部标识，但会保留候选网页及图片的公开链接供 Agent 核验。
 

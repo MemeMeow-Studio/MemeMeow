@@ -108,9 +108,9 @@ app = create_app(scope_resolver=LocalScopeResolver("local"))
 
 ## 内部 Agent callback
 
-`POST /internal/reverse-image/search` 与 `POST /internal/visual-search/match` 不是公共接口。它们在读取 multipart/JSON body 前要求 Runner 注入的短期 HMAC callback token，通过 `X-MemeMeow-Callback`、`X-MemeMeow-Callback-Token` 或 Bearer 头传递；token 绑定当前 Task、scope、claim generation、owner、attempt、目标 SHA、operation、issuer/audience、key id 和过期时间。路由还会从 PostgreSQL 复核 Task 类型、运行状态、租约和目标图片，调用方不能自报 scope、策略或任意图片。发布、轮换、旧任务收束和禁用式回滚见 [`docs/agent-callback-migration.md`](docs/agent-callback-migration.md)。
+`POST /internal/reverse-image/search` 与 `POST /internal/visual-search/match` 不是公共接口。它们在读取 multipart/JSON body 前要求 Runner 注入的短期 HMAC callback token，通过 `X-MemeMeow-Callback`、`X-MemeMeow-Callback-Token` 或 Bearer 头传递；token 绑定当前 Task、scope、claim generation、owner、attempt、目标 SHA、operation、issuer/audience、key id 和过期时间。路由还会从 PostgreSQL 复核 Task 类型、运行状态、租约和目标图片，调用方不能自报 scope、策略或任意图片。反向图片请求的 `request_id` 和 `input_digest` 都可省略；服务端在 Task/目标校验和受控裁剪后规范化 search type、language、country、query、布尔值和实际图片 SHA，返回持久化的权威 request ID。Skill 薄 CLI 默认不发送 `request_id`，仍支持 `--request-id` 兼容旧脚本，并原样输出服务端 JSON。相同当前 claim、规范化输入和 `refresh` 的重试（即使更换 request ID）只恢复同一 callback、usage、provider 和 grant 事实；provider 已开始但结果未知时保持 `reverse_image_unknown_execution`，禁止自动重放。发布、轮换、旧任务收束和禁用式回滚见 [`docs/agent-callback-migration.md`](docs/agent-callback-migration.md)。
 
-Agent 只获得当前任务 token、内部地址和 executor token，不获得 callback 根 secret、`SERPAPI_API_KEY` 或数据库凭据。callback secret 由 `MEMEMEOW_AGENT_CALLBACK_SECRET` 配置，生产部署必须通过独立服务身份和网络隔离保护；`MEMEMEOW_AGENT_CALLBACK_VERIFICATION_KEYS` 可用 `kid=secret,kid=secret` 提供轮换期间的旧 key 验证窗口。根 secret 缺失、格式错误或 verifier 异常时 callback 保持不可用，不回退到无凭据保护。凭据轮换后旧 claim 应收束并显式重试。无凭据、旧 claim、租约过期、目标 SHA 变化和超限 body 都以稳定错误拒绝。
+Agent 只获得当前任务 token、内部地址和 executor token，不获得 callback 根 secret、`SERPAPI_API_KEY` 或数据库凭据，也不得绕过 callback 直接访问 provider。callback secret 由 `MEMEMEOW_AGENT_CALLBACK_SECRET` 配置，生产部署必须通过独立服务身份和网络隔离保护；`MEMEMEOW_AGENT_CALLBACK_VERIFICATION_KEYS` 可用 `kid=secret,kid=secret` 提供轮换期间的旧 key 验证窗口。根 secret 缺失、格式错误、必需 callback 复合索引未就绪或 verifier 异常时 callback 保持不可用，不回退到 request-ID-only 逻辑。凭据轮换后旧 claim 应收束并显式重试。无凭据、旧 claim、租约过期、目标 SHA 变化和超限 body 都以稳定错误拒绝。迁移会先扫描历史逻辑重复或字段缺失并 fail-closed，不删除、合并或猜测覆盖既有事实；无 callback 的 local 直连仍使用原有缓存和显式 request ID 语义。
 
 ## 配置与访问策略
 

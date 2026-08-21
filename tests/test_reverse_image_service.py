@@ -11,6 +11,7 @@ import hashlib
 import os
 import time
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
@@ -20,6 +21,7 @@ from PIL import Image
 from sqlalchemy import text
 
 from backend.config import Settings
+from backend.callbacks import CallbackBinding, callback_input_digest
 from backend.database import DatabaseError, DatabaseResources, StorageCoordinator, create_engine_for_url
 from backend.pg_services import PostgresTaskService
 from backend.reverse_image import ReverseImageError, ReverseImageRequest, ReverseImageService, _fingerprint
@@ -230,6 +232,357 @@ def test_request_id_idempotence_conflict_and_started_recovery(postgres_resources
     assert recovered["provider"]["called"] is True
     assert recovered["provider"]["outcome"] == "started"
     assert calls == [1]
+
+
+def _callback_binding(task_id: str, owner: str, generation: int, target_sha256: str) -> CallbackBinding:
+    """构造反向图片服务测试所需的当前 callback claim。"""
+    return CallbackBinding(
+        task_id=task_id,
+        scope_id="local",
+        claim_generation=generation,
+        owner=owner,
+        attempt=1,
+        operation="analysis.reverse_image_search",
+        target_sha256=target_sha256,
+        issuer="mememeow",
+        audience="mememeow-internal",
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        nonce=f"callback-{uuid4().hex}",
+    )
+
+
+def test_callback_replaces_request_id_without_second_usage_grant_or_provider(postgres_resources):
+    """同一规范化 refresh 输入换 ID 时恢复唯一 callback、usage、grant 和 provider。"""
+    resources, settings = postgres_resources
+    image = _image_bytes()
+    meme = StorageCoordinator(resources).upload(image, target_key=f"callback-{uuid4().hex}.png", extension=".png", context={}, provenance={})
+    task_id, owner, generation = _running_task(resources, "auto", extra={"meme_id": str(meme.id), "image_sha256": meme.sha256})
+    calls: list[str] = []
+
+    def provider(request: ReverseImageRequest) -> dict[str, Any]:
+        calls.append(request.request_id or "")
+        return {"visual_matches": [{"title": "callback"}]}
+
+    binding = _callback_binding(task_id, owner, generation, meme.sha256)
+    service = _service(settings, resources, provider)
+    first = service.search(
+        ReverseImageRequest(
+            image=image,
+            filename="meme.png",
+            task_id=task_id,
+            request_id="request-a",
+            language=" ZH-CN ",
+            query=" query ",
+            refresh=True,
+            source_image_sha256=meme.sha256,
+            callback_binding=binding,
+        )
+    )
+    second = service.search(
+        ReverseImageRequest(
+            image=image,
+            filename="meme.png",
+            task_id=task_id,
+            request_id="request-b",
+            language="zh-cn",
+            query="query",
+            refresh=True,
+            source_image_sha256=meme.sha256,
+            callback_binding=binding,
+        )
+    )
+    assert first["request_id"] == second["request_id"] == "request-a"
+    assert calls == ["request-a"]
+    with resources.environment("local") as environment:
+        assert len(environment.uow.session.execute(text("SELECT request_id FROM agent_callback_requests WHERE scope_id = 'local'")).all()) == 1
+        assert len(environment.uow.session.execute(text("SELECT request_id FROM reverse_image_usage_events WHERE scope_id = 'local'")).all()) == 1
+    assert len(service.grants._values) == 1
+
+
+def test_callback_cache_hit_does_not_acquire_provider_grant(postgres_resources):
+    """callback 复用有效缓存时只记录 hit usage，不创建 provider grant。"""
+    resources, settings = postgres_resources
+    image = _image_bytes("green")
+    meme = StorageCoordinator(resources).upload(image, target_key=f"callback-hit-{uuid4().hex}.png", extension=".png", context={}, provenance={})
+    task_id, owner, generation = _running_task(resources, "auto", extra={"meme_id": str(meme.id), "image_sha256": meme.sha256})
+    calls: list[int] = []
+
+    def provider(_request: ReverseImageRequest) -> dict[str, Any]:
+        calls.append(1)
+        return {"visual_matches": [{"title": "cached"}]}
+
+    service = _service(settings, resources, provider)
+    service.search(_request(task_id, "local-cache-seed", color="green"))
+    binding = _callback_binding(task_id, owner, generation, meme.sha256)
+    result = service.search(
+        ReverseImageRequest(
+            image=image,
+            filename="meme.png",
+            task_id=task_id,
+            request_id="callback-cache",
+            source_image_sha256=meme.sha256,
+            callback_binding=binding,
+        )
+    )
+    assert result["cache"]["status"] == "hit"
+    assert result["provider"]["called"] is False
+    assert calls == [1]
+    assert len(service.grants._values) == 1
+
+
+def test_callback_provider_started_unknown_never_replays_with_new_id(postgres_resources):
+    """provider started 但结果未知时，换 ID 重试只返回稳定 unknown。"""
+    resources, settings = postgres_resources
+    image = _image_bytes("blue")
+    meme = StorageCoordinator(resources).upload(image, target_key=f"callback-unknown-{uuid4().hex}.png", extension=".png", context={}, provenance={})
+    task_id, owner, generation = _running_task(resources, "auto", extra={"meme_id": str(meme.id), "image_sha256": meme.sha256})
+    binding = _callback_binding(task_id, owner, generation, meme.sha256)
+    request = ReverseImageRequest(image=image, filename="meme.png", task_id=task_id, request_id="authoritative", refresh=True, source_image_sha256=meme.sha256, callback_binding=binding).normalized()
+    image_sha = hashlib.sha256(request.image).hexdigest()
+    digest = callback_input_digest(
+        scope_id="local",
+        task_id=task_id,
+        claim_generation=generation,
+        attempt=1,
+        operation="analysis.reverse_image_search",
+        target_sha256=meme.sha256,
+        image_sha256=image_sha,
+        search_type=request.search_type,
+        language=request.language,
+        country=request.country,
+        query=request.query,
+        auto_crop=request.auto_crop,
+        refresh=True,
+    )
+    key = _fingerprint(request.identity(image_sha))
+    with resources.environment("local") as environment:
+        environment.callback_requests.create(request_id="authoritative", task_id=task_id, claim_generation=generation, attempt=1, operation="analysis.reverse_image_search", target_sha256=meme.sha256, input_digest=digest)
+        event = environment.reverse_image_usage.create(request_id="authoritative", task_id=task_id, meme_id=meme.id, cache_key=key, cache_status="refresh", provider="serpapi", claim_generation=generation, attempt=1, operation="analysis.reverse_image_search", target_sha256=meme.sha256, input_digest=digest)
+        environment.reverse_image_usage.mark_provider_started(event.request_id)
+    calls: list[int] = []
+    service = _service(settings, resources, lambda _request: calls.append(1) or pytest.fail("unknown callback must not replay provider"))
+    with pytest.raises(ReverseImageError) as error:
+        service.search(ReverseImageRequest(image=image, filename="meme.png", task_id=task_id, request_id="replacement", refresh=True, source_image_sha256=meme.sha256, callback_binding=binding))
+    assert error.value.code == "reverse_image_unknown_execution"
+    assert calls == []
+
+
+def test_callback_missing_row_does_not_alias_existing_usage_to_new_id(postgres_resources):
+    """旧 usage 已按完整绑定存在但 callback 行缺失时，不创建新权威别名。"""
+    resources, settings = postgres_resources
+    image = _image_bytes("orange")
+    meme = StorageCoordinator(resources).upload(image, target_key=f"callback-legacy-{uuid4().hex}.png", extension=".png", context={}, provenance={})
+    task_id, owner, generation = _running_task(resources, "auto", extra={"meme_id": str(meme.id), "image_sha256": meme.sha256})
+    binding = _callback_binding(task_id, owner, generation, meme.sha256)
+    request = ReverseImageRequest(
+        image=image,
+        filename="meme.png",
+        task_id=task_id,
+        request_id="replacement-legacy",
+        refresh=True,
+        source_image_sha256=meme.sha256,
+        callback_binding=binding,
+    ).normalized()
+    image_sha = hashlib.sha256(request.image).hexdigest()
+    digest = callback_input_digest(
+        scope_id="local",
+        task_id=task_id,
+        claim_generation=generation,
+        attempt=1,
+        operation="analysis.reverse_image_search",
+        target_sha256=meme.sha256,
+        image_sha256=image_sha,
+        search_type=request.search_type,
+        language=request.language,
+        country=request.country,
+        query=request.query,
+        auto_crop=request.auto_crop,
+        refresh=request.refresh,
+    )
+    key = _fingerprint(request.identity(image_sha))
+    with resources.environment("local") as environment:
+        event = environment.reverse_image_usage.create(
+            request_id="legacy-usage",
+            task_id=task_id,
+            meme_id=meme.id,
+            cache_key=key,
+            cache_status="refresh",
+            provider="serpapi",
+            claim_generation=generation,
+            attempt=1,
+            operation="analysis.reverse_image_search",
+            target_sha256=meme.sha256,
+            input_digest=digest,
+        )
+        environment.reverse_image_usage.mark_provider_started(event.request_id)
+
+    calls: list[int] = []
+    service = _service(settings, resources, lambda _request: calls.append(1) or pytest.fail("legacy usage must not replay provider"))
+    with pytest.raises(ReverseImageError) as error:
+        service.search(request)
+    assert error.value.code == "reverse_image_unknown_execution"
+    assert calls == []
+    with resources.environment("local") as environment:
+        assert environment.callback_requests.get("replacement-legacy") is None
+
+
+def test_callback_unknown_row_reconciles_when_usage_already_completed(postgres_resources):
+    """callback 写成 unknown 后 usage 已有明确终态时，只补写 callback 并恢复结果。"""
+    resources, settings = postgres_resources
+    image = _image_bytes("yellow")
+    meme = StorageCoordinator(resources).upload(image, target_key=f"callback-reconcile-{uuid4().hex}.png", extension=".png", context={}, provenance={})
+    task_id, owner, generation = _running_task(resources, "auto", extra={"meme_id": str(meme.id), "image_sha256": meme.sha256})
+    binding = _callback_binding(task_id, owner, generation, meme.sha256)
+    request = ReverseImageRequest(
+        image=image,
+        filename="meme.png",
+        task_id=task_id,
+        request_id="authoritative-reconcile",
+        refresh=True,
+        source_image_sha256=meme.sha256,
+        callback_binding=binding,
+    ).normalized()
+    image_sha = hashlib.sha256(request.image).hexdigest()
+    digest = callback_input_digest(
+        scope_id="local",
+        task_id=task_id,
+        claim_generation=generation,
+        attempt=1,
+        operation="analysis.reverse_image_search",
+        target_sha256=meme.sha256,
+        image_sha256=image_sha,
+        search_type=request.search_type,
+        language=request.language,
+        country=request.country,
+        query=request.query,
+        auto_crop=request.auto_crop,
+        refresh=request.refresh,
+    )
+    key = _fingerprint(request.identity(image_sha))
+    with resources.environment("local") as environment:
+        callback = environment.callback_requests.create(
+            request_id="authoritative-reconcile",
+            task_id=task_id,
+            claim_generation=generation,
+            attempt=1,
+            operation="analysis.reverse_image_search",
+            target_sha256=meme.sha256,
+            input_digest=digest,
+        )
+        event = environment.reverse_image_usage.create(
+            request_id=callback.request_id,
+            task_id=task_id,
+            meme_id=meme.id,
+            cache_key=key,
+            cache_status="refresh",
+            provider="serpapi",
+            claim_generation=generation,
+            attempt=1,
+            operation="analysis.reverse_image_search",
+            target_sha256=meme.sha256,
+            input_digest=digest,
+        )
+        environment.reverse_image_usage.finish(
+            event.request_id,
+            outcome="success",
+            result={"used": True, "snapshot": {"outcome": "success", "response": {"visual_matches": []}}},
+        )
+        environment.callback_requests.finish(
+            callback.request_id,
+            state="unknown_execution",
+            error={"error": "reverse_image_unknown_execution"},
+        )
+
+    calls: list[int] = []
+    result = _service(settings, resources, lambda _request: calls.append(1) or pytest.fail("completed usage must not replay provider")).search(
+        ReverseImageRequest(
+            image=image,
+            filename="meme.png",
+            task_id=task_id,
+            request_id="replacement-reconcile",
+            refresh=True,
+            source_image_sha256=meme.sha256,
+            callback_binding=binding,
+        )
+    )
+    assert result["request_id"] == "authoritative-reconcile"
+    assert result["provider"]["called"] is False
+    assert calls == []
+    with resources.environment("local") as environment:
+        recovered = environment.callback_requests.get("authoritative-reconcile")
+        assert recovered is not None and recovered.state == "completed"
+
+
+def test_callback_unknown_usage_terminal_unknown_stays_unknown(postgres_resources):
+    """usage 终态携带未知错误时，callback 不能被误收束为普通失败。"""
+    resources, settings = postgres_resources
+    image = _image_bytes("pink")
+    meme = StorageCoordinator(resources).upload(image, target_key=f"callback-terminal-unknown-{uuid4().hex}.png", extension=".png", context={}, provenance={})
+    task_id, owner, generation = _running_task(resources, "auto", extra={"meme_id": str(meme.id), "image_sha256": meme.sha256})
+    binding = _callback_binding(task_id, owner, generation, meme.sha256)
+    request = ReverseImageRequest(image=image, filename="meme.png", task_id=task_id, request_id="terminal-unknown", refresh=True, source_image_sha256=meme.sha256, callback_binding=binding).normalized()
+    image_sha = hashlib.sha256(request.image).hexdigest()
+    digest = callback_input_digest(
+        scope_id="local",
+        task_id=task_id,
+        claim_generation=generation,
+        attempt=1,
+        operation="analysis.reverse_image_search",
+        target_sha256=meme.sha256,
+        image_sha256=image_sha,
+        search_type=request.search_type,
+        language=request.language,
+        country=request.country,
+        query=request.query,
+        auto_crop=request.auto_crop,
+        refresh=request.refresh,
+    )
+    key = _fingerprint(request.identity(image_sha))
+    with resources.environment("local") as environment:
+        callback = environment.callback_requests.create(request_id="terminal-unknown", task_id=task_id, claim_generation=generation, attempt=1, operation="analysis.reverse_image_search", target_sha256=meme.sha256, input_digest=digest)
+        event = environment.reverse_image_usage.create(request_id=callback.request_id, task_id=task_id, meme_id=meme.id, cache_key=key, cache_status="refresh", provider="serpapi", claim_generation=generation, attempt=1, operation="analysis.reverse_image_search", target_sha256=meme.sha256, input_digest=digest)
+        environment.reverse_image_usage.finish(event.request_id, outcome="failed", error={"error": "reverse_image_unknown_execution"})
+        environment.callback_requests.finish(callback.request_id, state="unknown_execution", error={"error": "reverse_image_unknown_execution"})
+
+    with pytest.raises(ReverseImageError) as error:
+        _service(settings, resources, lambda _request: pytest.fail("unknown usage must not replay provider")).search(
+            ReverseImageRequest(image=image, filename="meme.png", task_id=task_id, request_id="replacement-terminal-unknown", refresh=True, source_image_sha256=meme.sha256, callback_binding=binding)
+        )
+    assert error.value.code == "reverse_image_unknown_execution"
+
+
+def test_callback_usage_binding_rejects_terminal_fact_rebinding(postgres_resources):
+    """usage 已有终态时，改 Task/attempt/digest 仍沿用完整绑定冲突。"""
+    resources, _settings = postgres_resources
+    task_id, _owner, generation = _running_task(resources, "auto")
+    request_id = "binding-terminal"
+    with resources.environment("local") as environment:
+        event = environment.reverse_image_usage.create(
+            request_id=request_id,
+            task_id=task_id,
+            meme_id=None,
+            cache_key="a" * 64,
+            cache_status="miss",
+            claim_generation=generation,
+            attempt=1,
+            operation="analysis.reverse_image_search",
+            target_sha256="b" * 64,
+            input_digest="c" * 64,
+        )
+        environment.reverse_image_usage.finish(event.request_id, outcome="failed", error={"error": "reverse_image_provider_unavailable"})
+        with pytest.raises(DatabaseError, match="usage_request_conflict"):
+            environment.reverse_image_usage.create(
+                request_id=request_id,
+                task_id=task_id,
+                meme_id=None,
+                cache_key="a" * 64,
+                cache_status="miss",
+                claim_generation=generation,
+                attempt=2,
+                operation="analysis.reverse_image_search",
+                target_sha256="b" * 64,
+                input_digest="c" * 64,
+            )
 
 
 def test_same_image_different_policy_is_rejected(postgres_resources):

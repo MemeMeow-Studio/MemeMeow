@@ -138,3 +138,41 @@ def test_concurrent_requests_share_one_provider_call(lens_module, tmp_path: Path
 
     assert len(calls) == 1
     assert {output["cache"]["status"] for output in outputs} == {"miss", "hit"}
+
+
+def test_thin_cli_omits_request_id_by_default_but_keeps_legacy_option(lens_module) -> None:
+    """薄 CLI 默认让服务端生成权威 ID，同时保留旧显式参数。"""
+    omitted = lens_module.parse_args(["image.png", "--task-id", "task-a"])
+    explicit = lens_module.parse_args(["image.png", "--task-id", "task-a", "--request-id", "legacy-id"])
+    assert omitted.request_id is None
+    assert explicit.request_id == "legacy-id"
+
+    body, _content_type = lens_module._multipart({"task_id": "task-a"}, b"image", "image.png")
+    assert b"name=\"request_id\"" not in body
+
+
+def test_thin_cli_prints_authoritative_response_without_provider_credentials(lens_module, tmp_path: Path, monkeypatch, capsys) -> None:
+    """CLI 原样输出后端权威 request ID，环境只需要 callback token。"""
+    image = tmp_path / "image.png"
+    image.write_bytes(b"image")
+    monkeypatch.setenv("MEMEMEOW_AGENT_CALLBACK_TOKEN", "task-callback-token")
+    monkeypatch.setenv("MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL", "http://internal.test/reverse-image/search")
+
+    class Response:
+        """最小 HTTP 响应替身。"""
+
+        def read(self) -> bytes:
+            """返回后端供应商无关响应。"""
+            return json.dumps({"request_id": "cb-authoritative", "provider": {"called": False}}).encode()
+
+    def fake_urlopen(request, timeout):
+        """检查 callback 请求只使用 Runner 注入的地址和凭据。"""
+        assert request.full_url == "http://internal.test/reverse-image/search"
+        assert request.get_header("X-mememeow-callback") == "task-callback-token"
+        assert timeout == 60
+        assert b'name="request_id"' not in request.data
+        return Response()
+
+    monkeypatch.setattr(lens_module, "urlopen", fake_urlopen)
+    assert lens_module.main([str(image), "--task-id", "task-a"]) == 0
+    assert json.loads(capsys.readouterr().out)["request_id"] == "cb-authoritative"

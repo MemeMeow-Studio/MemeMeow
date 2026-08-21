@@ -26,6 +26,9 @@ from backend.database import ScopeContext
 logger = logging.getLogger(__name__)
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_CALLBACK_OPERATIONS = frozenset({"analysis.reverse_image_search", "analysis.visual_search"})
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 # callback 会随当前 claim 继续做数据库复核，因此签名凭据可以覆盖最长 Agent 执行窗口。
 AGENT_CALLBACK_TOKEN_TTL_SECONDS = 2 * 60 * 60
 
@@ -330,6 +333,200 @@ def binding_input_digest(*values: object) -> str:
     return hashlib.sha256("|".join(str(value) for value in values).encode("utf-8")).hexdigest()
 
 
+@dataclass(frozen=True, slots=True)
+class CallbackLogicalInput:
+    """反向图片 callback 的服务端规范化逻辑输入。
+
+    该结构只表达执行绑定、图片事实和影响供应商结果的检索参数；文件名、客户端
+    request ID 与客户端摘要不属于逻辑身份。``payload`` 显式列出字段边界，``digest``
+    继续使用既有固定字段顺序，避免升级后把旧 callback/usage 事实误判成“未发生”。
+    """
+
+    scope_id: str
+    task_id: str
+    claim_generation: int
+    attempt: int
+    operation: str
+    target_sha256: str
+    image_sha256: str
+    search_type: str
+    language: str
+    country: str | None
+    query: str | None
+    auto_crop: bool
+    refresh: bool
+
+    def payload(self) -> dict[str, object]:
+        """返回摘要使用的固定字段集合，不包含调用方可控的兼容提示。"""
+        return {
+            "attempt": self.attempt,
+            "auto_crop": self.auto_crop,
+            "claim_generation": self.claim_generation,
+            "country": self.country,
+            "image_sha256": self.image_sha256,
+            "language": self.language,
+            "operation": self.operation,
+            "query": self.query,
+            "refresh": self.refresh,
+            "scope_id": self.scope_id,
+            "search_type": self.search_type,
+            "target_sha256": self.target_sha256,
+            "task_id": self.task_id,
+            "version": 1,
+        }
+
+    def digest(self) -> str:
+        """生成稳定的 64 位十六进制 SHA-256 输入摘要。
+
+        摘要继续使用既有 callback 的固定字段顺序和字符串序列化形状，避免升级后
+        把旧 callback/usage 事实误判成“未发生”；字段边界由该固定顺序和每项规范化
+        值共同保证，新增逻辑字段只能通过显式兼容迁移加入。
+        """
+        return binding_input_digest(
+            self.task_id,
+            self.scope_id,
+            self.claim_generation,
+            self.attempt,
+            self.operation,
+            self.target_sha256,
+            self.image_sha256,
+            self.search_type,
+            self.language,
+            self.country,
+            self.query,
+            self.auto_crop,
+            self.refresh,
+        )
+
+
+def normalize_callback_boolean(value: object, *, field: str = "boolean") -> bool:
+    """按 callback 请求规则规范化布尔值，拒绝含糊的隐式真值转换。
+
+    ``bool``、0/1 以及常见表单字符串表示等价；其它值会在副作用前转换为稳定
+    的内部执行错误。该函数同时供反向图片模型和摘要计算使用。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUE_VALUES:
+            return True
+        if normalized in _FALSE_VALUES:
+            return False
+    raise CallbackError("agent_callback_invalid_execution")
+
+
+def _normalize_callback_text(value: object, *, field: str, maximum: int, required: bool = False, lower: bool = False, truncate: bool = False) -> str | None:
+    """规范化摘要字段并拒绝控制字符、错误类型和超长输入。"""
+    if value is None:
+        if required:
+            raise CallbackError("agent_callback_invalid_execution")
+        return None
+    if not isinstance(value, str):
+        raise CallbackError("agent_callback_invalid_execution")
+    normalized = value.strip()
+    if lower:
+        normalized = normalized.lower()
+    if not normalized:
+        if required:
+            raise CallbackError("agent_callback_invalid_execution")
+        return None
+    if any(ord(char) < 32 or ord(char) == 127 for char in normalized):
+        raise CallbackError("agent_callback_invalid_execution")
+    if len(normalized) > maximum:
+        if not truncate:
+            raise CallbackError("agent_callback_invalid_execution")
+        normalized = normalized[:maximum]
+        if not normalized and required:
+            raise CallbackError("agent_callback_invalid_execution")
+    return normalized
+
+
+def _normalize_callback_sha(value: object, *, required: bool = True) -> str | None:
+    """规范化图片 SHA，并在不完整时 fail-closed。"""
+    normalized = _normalize_callback_text(value, field="sha256", maximum=64, required=required, lower=True)
+    if normalized is None:
+        return None
+    if not _DIGEST_RE.fullmatch(normalized):
+        raise CallbackError("agent_callback_invalid_execution")
+    return normalized
+
+
+def normalize_callback_input(
+    *,
+    scope_id: object,
+    task_id: object,
+    claim_generation: object,
+    attempt: object,
+    operation: object,
+    target_sha256: object,
+    image_sha256: object,
+    search_type: object = "all",
+    language: object = "zh-cn",
+    country: object | None = None,
+    query: object | None = None,
+    auto_crop: object = False,
+    refresh: object = False,
+) -> CallbackLogicalInput:
+    """构造反向图片 callback 的权威规范化输入和摘要边界。
+
+    输入必须来自已验证的当前 Task、目标图片和后端派生图片；客户端的 request ID
+    或 input digest 不应传入本函数。返回值可通过 ``digest`` 生成唯一逻辑键。
+    """
+    try:
+        scope = ScopeContext(str(scope_id)).scope_id if isinstance(scope_id, str) else ScopeContext(scope_id).scope_id
+    except (TypeError, ValueError) as exc:
+        raise CallbackError("agent_callback_invalid_execution") from exc
+    normalized_task = _normalize_callback_text(task_id, field="task_id", maximum=255, required=True)
+    normalized_operation = _normalize_callback_text(operation, field="operation", maximum=128, required=True)
+    if normalized_operation not in _CALLBACK_OPERATIONS:
+        raise CallbackError("agent_callback_invalid_execution")
+    if isinstance(claim_generation, bool) or not isinstance(claim_generation, int) or claim_generation < 1:
+        raise CallbackError("agent_callback_invalid_execution")
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        raise CallbackError("agent_callback_invalid_execution")
+    normalized_search_type = _normalize_callback_text(search_type, field="search_type", maximum=32, required=True, lower=True)
+    if normalized_search_type not in {"all", "about_this_image", "products", "exact_matches", "visual_matches"}:
+        raise CallbackError("agent_callback_invalid_execution")
+    normalized_language = _normalize_callback_text(language, field="language", maximum=32, required=False, lower=True, truncate=True) or "zh-cn"
+    normalized_country = _normalize_callback_text(country, field="country", maximum=8, required=False, lower=True, truncate=True)
+    normalized_query = _normalize_callback_text(query, field="query", maximum=200, required=False, truncate=True)
+    return CallbackLogicalInput(
+        scope_id=scope,
+        task_id=normalized_task or "",
+        claim_generation=claim_generation,
+        attempt=attempt,
+        operation=normalized_operation,
+        target_sha256=_normalize_callback_sha(target_sha256) or "",
+        image_sha256=_normalize_callback_sha(image_sha256) or "",
+        search_type=normalized_search_type or "all",
+        language=normalized_language,
+        country=normalized_country,
+        query=normalized_query,
+        auto_crop=normalize_callback_boolean(auto_crop, field="auto_crop"),
+        refresh=normalize_callback_boolean(refresh, field="refresh"),
+    )
+
+
+def callback_input_digest(**values: object) -> str:
+    """从服务端规范化字段生成 callback 逻辑请求摘要。"""
+    return normalize_callback_input(**values).digest()
+
+
+def canonical_callback_request_id(input_digest: str) -> str:
+    """从权威逻辑摘要生成省略 request ID 时使用的确定性标识。"""
+    if not isinstance(input_digest, str) or not _DIGEST_RE.fullmatch(input_digest):
+        raise CallbackError("agent_callback_invalid_execution")
+    return f"cb-{input_digest}"
+
+
+# 为宿主适配器保留更直观的别名，所有别名均指向同一摘要算法。
+callback_request_input_digest = callback_input_digest
+canonical_request_id = canonical_callback_request_id
+
+
 def validate_request_id(value: str | None) -> str | None:
     """校验 callback request id 的公开格式，拒绝空白和控制字符。"""
     if value is None:
@@ -353,14 +550,24 @@ def validate_request_binding(
     binding: CallbackBinding,
     *,
     input_digest: str | None,
+    computed_input_digest: str | None = None,
 ) -> tuple[str | None, str | None]:
     """校验 request id 与当前 claim 的摘要形状，返回规范化值。
 
     数据库 repository 负责比较已存在的完整绑定；本函数负责在进入 repository
-    前拒绝空白 request id、非十六进制摘要和不完整 callback 声明。
+    前拒绝空白 request id、非十六进制摘要和不完整 callback 声明。若调用方提供
+    ``computed_input_digest``，客户端摘要只作为一致性声明，返回值始终以服务端摘要
+    为准，不能通过伪造摘要改写逻辑身份。
     """
     del binding
-    return validate_request_id(request_id), validate_input_digest(input_digest)
+    request_id = validate_request_id(request_id)
+    supplied = validate_input_digest(input_digest)
+    computed = validate_input_digest(computed_input_digest)
+    if computed is not None:
+        if supplied is not None and not hmac.compare_digest(supplied, computed):
+            raise CallbackError("agent_callback_invalid_execution")
+        return request_id, computed
+    return request_id, supplied
 
 
 def validate_callback_headers(headers: Mapping[str, str], binding: CallbackBinding) -> str | None:
