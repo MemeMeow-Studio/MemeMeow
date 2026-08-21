@@ -94,6 +94,9 @@ class Settings(BaseSettings):
     max_request_bytes: int | None = Field(default=None, ge=1, le=4 * 1024 * 1024 * 1024, validation_alias=AliasChoices("MEMEMEOW_MAX_REQUEST_BYTES", "max_request_bytes"))
     opencode_executable: str | None = Field(default="opencode", validation_alias=AliasChoices("MEMEMEOW_OPENCODE_EXECUTABLE", "opencode_executable"))
     agent_runtime_mode: str = Field(default="auto", validation_alias=AliasChoices("MEMEMEOW_AGENT_RUNTIME_MODE", "agent_runtime_mode"))
+    public_release_profile: str = Field(default="local", validation_alias=AliasChoices("MEMEMEOW_PUBLIC_RELEASE_PROFILE", "public_release_profile"))
+    model_broker_url: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_MODEL_BROKER_URL", "model_broker_url"))
+    model_capability: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_MODEL_CAPABILITY", "model_capability"), repr=False)
     opencode_model: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_MODEL", "opencode_model"))
     opencode_base_url: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_BASE_URL", "opencode_base_url"))
     opencode_api_key: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_API_KEY", "opencode_api_key"), repr=False)
@@ -154,6 +157,9 @@ class Settings(BaseSettings):
         "llm_enhance_model",
         "opencode_executable",
         "agent_runtime_mode",
+        "public_release_profile",
+        "model_broker_url",
+        "model_capability",
         "opencode_model",
         "opencode_base_url",
         "opencode_api_key",
@@ -197,6 +203,8 @@ class Settings(BaseSettings):
             raise ValueError("postgresql_required")
         if self.agent_runtime_mode not in {"auto", "executor", "host"}:
             raise ValueError("agent_runtime_mode_invalid")
+        if self.public_release_profile.strip().casefold() not in {"local", "development", "dev", "test", "production", "public", "1", "true", "yes", "on"}:
+            raise ValueError("public_release_profile_invalid")
         return self
 
     @property

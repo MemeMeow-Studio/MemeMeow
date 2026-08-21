@@ -139,6 +139,16 @@ OpenCode 正常退出后，runner 临时启动只监听 `127.0.0.1` 的 headless
 
 ## Risks / Trade-offs
 
+### 模型连接兼容契约
+
+executor 模式的 OpenCode provider 只使用固定的 broker endpoint 与当前 Task 的
+短期 `model_capability`；`MEMEMEOW_OPENCODE_API_KEY` 等长期 provider key 不得
+进入 Agent 容器、子进程环境、任务 payload 或结果文件。local provider 为已有
+开发夹具保留旧 endpoint/key 兼容，但生产 profile 缺少 broker 或 capability 时
+必须 fail-closed。模型名称仍由服务端部署配置固定，客户端不能覆盖 upstream 或
+model；模型请求预算和 Task/claim 绑定由 Server broker 负责，公共 executor 不
+新增第二套 quota 或在途计数。
+
 - [Risk] 图片、网页和搜索结果可能包含 prompt injection。→ Agent 权限限制写入范围，后端只接受最后 assistant JSON，并执行 schema、字段来源和目标指纹校验。
 - [Risk] OpenCode 子进程超时或服务关闭后成为孤立进程。→ 为每个 job 建立独立进程组，超时和 shutdown 时终止整个进程组，再持久记录失败。
 - [Risk] 多应用进程重复消费同一 job。→ 进程内单 worker 加 runtime 文件锁，job 状态更新使用原子替换并在启动前复核。

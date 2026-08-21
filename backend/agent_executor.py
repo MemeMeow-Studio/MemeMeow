@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import quote, urlsplit
 
+from executor.model_capability import MODEL_CAPABILITY_FIELD, ModelCapabilityError, validate_model_capability
+
 
 class AgentExecutorError(RuntimeError):
     """executor 请求失败，携带稳定错误码和安全诊断。"""
@@ -63,6 +65,9 @@ _KNOWN_TASK_ERRORS = frozenset(
         "opencode_workspace_capability_expired",
         "opencode_workspace_capability_unavailable",
         "opencode_workspace_provider_missing",
+        "model_capability_invalid",
+        "model_capability_unavailable",
+        "model_broker_endpoint_invalid",
     }
 )
 
@@ -269,10 +274,16 @@ class AgentExecutorClient:
         processing_config_hash: str | None = None,
         workspace_selector: str | None = None,
         workspace_capability: str | None = None,
+        model_capability: str | None = None,
     ) -> ExecutorTaskResponse:
-        """提交业务任务的独立 executor attempt，并可按明确 session 续跑。"""
+        """提交绑定模型 capability 的独立 executor attempt，并可按明确 session 续跑。"""
         timeout_value = int(timeout_seconds)
         attempt_id = executor_attempt_id or f"attempt-{uuid4().hex}"
+        if model_capability is not None:
+            try:
+                model_capability = validate_model_capability(model_capability)
+            except ModelCapabilityError as exc:
+                raise AgentExecutorError(str(exc), "模型 capability 无效", executor_attempt_id=attempt_id) from exc
         self._attempt_ids[task_id] = attempt_id
         # 该映射只服务于取消和诊断；限制历史长度避免长期 API 进程被业务 task ID 耗尽内存。
         while len(self._attempt_ids) > _ATTEMPT_HISTORY_LIMIT:
@@ -294,6 +305,7 @@ class AgentExecutorClient:
                     **({"processing_config_hash": processing_config_hash} if processing_config_hash else {}),
                     **({"workspace_selector": workspace_selector} if workspace_selector else {}),
                     **({"workspace_capability": workspace_capability} if workspace_capability else {}),
+                    **({MODEL_CAPABILITY_FIELD: model_capability} if model_capability else {}),
                     **({"callback_token": callback_token} if callback_token else {}),
                 },
                 timeout=max(self.timeout, timeout_value + 10),

@@ -54,8 +54,8 @@ except ImportError:  # pragma: no cover - 兼容尚未同步依赖的开发环�
     FormatChecker = None
 
 
-# 此配置只定义兼容 OpenAI API 的通用 provider，不保存部署地址、密钥或模型选择。
-# 模型选择由运行命令的 --model 控制；连接信息由同名进程环境变量在 OpenCode 中展开。
+# 此配置只定义兼容 OpenAI API 的通用 provider，不保存部署地址、长期密钥或模型选择。
+# broker 地址和当前任务的短期 capability 由 executor 在子进程环境中装配。
 RUNTIME_OPENCODE_CONFIG: dict[str, Any] = {
     "$schema": "https://opencode.ai/config.json",
     "experimental": {
@@ -66,8 +66,8 @@ RUNTIME_OPENCODE_CONFIG: dict[str, Any] = {
             "npm": "@ai-sdk/openai",
             "name": "MemeMeow OpenAI Responses provider",
             "options": {
-                "baseURL": "{env:MEMEMEOW_OPENCODE_BASE_URL}",
-                "apiKey": "{env:MEMEMEOW_OPENCODE_API_KEY}",
+                "baseURL": "{env:MEMEMEOW_MODEL_BROKER_URL}",
+                "apiKey": "{env:MEMEMEOW_MODEL_CAPABILITY}",
             },
             "models": {
                 "gpt-5.6-luna": {
@@ -414,12 +414,26 @@ class OpenCodeRunner:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.symlink_to(os.path.relpath(source, target.parent), target_is_directory=True)
 
+    def _config_for_runtime(self, workspace: ResolvedWorkspace | None = None) -> dict[str, Any]:
+        """生成当前运行模式的无密钥配置。
+
+        生产 executor 只使用 broker/capability 占位符；local/host 夹具继续使用
+        旧 endpoint/key 环境引用，保证开发模式与已安装 OpenCode 的兼容回归。
+        """
+        config = _workspace_opencode_config(workspace) if workspace is not None else json.loads(json.dumps(RUNTIME_OPENCODE_CONFIG, ensure_ascii=False))
+        production_executor = str(getattr(self.settings, "public_release_profile", "local")).casefold() in {"production", "public", "1", "true", "yes", "on"} and self.executor_mode
+        if not production_executor:
+            options = config.setdefault("provider", {}).setdefault("mememeow", {}).setdefault("options", {})
+            options["baseURL"] = "{env:MEMEMEOW_OPENCODE_BASE_URL}"
+            options["apiKey"] = "{env:MEMEMEOW_OPENCODE_API_KEY}"
+        return config
+
     def _write_workspace_config(self, workspace: ResolvedWorkspace) -> None:
         """原子写入当前 workspace 的无密钥配置和外部目录权限。"""
         target = workspace.config_file
         validate_directory_path(target.parent, create=True, code="opencode_workspace_invalid")
         validate_file_path(target, allow_missing=True, code="opencode_workspace_invalid")
-        content = json.dumps(_workspace_opencode_config(workspace), ensure_ascii=False, indent=2) + "\n"
+        content = json.dumps(self._config_for_runtime(workspace), ensure_ascii=False, indent=2) + "\n"
         try:
             if target.read_text(encoding="utf-8") == content:
                 os.chmod(target, 0o600)
@@ -441,7 +455,7 @@ class OpenCodeRunner:
     def _write_runtime_config(self) -> None:
         """兼容旧诊断入口，写入既有 local workspace 基础配置。"""
         target = self.workspace / "opencode.json"
-        content = json.dumps(RUNTIME_OPENCODE_CONFIG, ensure_ascii=False, indent=2) + "\n"
+        content = json.dumps(self._config_for_runtime(), ensure_ascii=False, indent=2) + "\n"
         try:
             if target.read_text(encoding="utf-8") == content:
                 return
@@ -459,7 +473,11 @@ class OpenCodeRunner:
                 return
             if not self.settings.opencode_model:
                 raise OpenCodeError("opencode_not_configured", "未配置 OpenCode 模型")
-            if not self.settings.opencode_base_url or not self.settings.opencode_api_key:
+            production = str(getattr(self.settings, "public_release_profile", "local")).casefold() in {"production", "public", "1", "true", "yes", "on"}
+            if production and self.executor_mode:
+                if not getattr(self.settings, "model_broker_url", None):
+                    raise OpenCodeError("model_broker_endpoint_invalid", "生产模型 broker 未配置")
+            elif not self.settings.opencode_base_url or not self.settings.opencode_api_key:
                 raise OpenCodeError("opencode_not_configured", "未配置 OpenCode 服务地址或密钥")
             if self.executor_mode:
                 if not self.executor.configured:
@@ -603,8 +621,8 @@ class OpenCodeRunner:
             local=True,
         )
         if self.executor_mode:
-            # API 不启动 OpenCode 子进程；该快照仅供诊断，绝不把 executor token
-            # 或宿主环境传给 Agent。模型密钥由 executor 自身从 Compose 环境读取。
+            # API 不启动 OpenCode 子进程；该快照仅供诊断，绝不把 executor token、
+            # callback 根 secret 或长期模型凭据传给 Agent。
             values = {
                 "OPENCODE_DB": "/runtime/opencode.db",
                 "OPENCODE_CONFIG": str(active_workspace.config_file),
@@ -1346,6 +1364,7 @@ class OpenCodeRunner:
         resume_of_attempt_id: str | None = None,
         processing_config_hash: str | None = None,
         workspace_context: TrustedWorkspaceContext | None = None,
+        model_capability: str | None = None,
     ) -> tuple[dict[str, Any], str]:
         """执行单张图片研究；失败也尽力返回可验证 session 诊断。"""
         task_id = task_id or uuid.uuid4().hex
@@ -1444,6 +1463,7 @@ class OpenCodeRunner:
                         executor_attempt_id=local_executor_attempt_id,
                         workspace_selector=None if resolved_workspace.local else resolved_workspace.selector,
                         workspace_capability=capability,
+                        model_capability=model_capability,
                     )
                     if response.executor_attempt_id:
                         self._remember_executor_attempt(task_id, response.executor_attempt_id)

@@ -43,7 +43,7 @@
 
 ## 6. JSON-only embedding 与 v4 缓存
 
-- [x] 6.1 调整 metadata embedding record，使其根据 sidecar 校验、语义状态和白名单文本返回显式索引资格与稳定跳过原因，移除所有文件名文本回退。
+- [x] 6.1 调整 metadata embedding record，使其根据 sidecar 校验、语义状态和白名单文本返回显式索引资格与稳定跳过原因，移除所有文件名文本回退；executor provider 兼容契约只允许 broker endpoint 与短期模型 capability，local 模式保留旧配置夹具，生产模式缺失 capability 时 fail-closed。
 - [x] 6.2 将缓存升级到 v4；只对可索引记录调用 embedding，保存已索引/跳过总数及原因统计，并在无可索引图片时以 `no_indexable_images` 失败且不替换旧缓存。
 - [x] 6.3 调整缓存加载校验，使条目集合精确匹配当前可索引图片集合，并继续校验图片、元数据和语义文本指纹；拒绝 v3 及其他旧格式缓存。
 - [x] 6.4 让缓存生成任务将统计写入统一任务 `result`，并为混合资格、不可索引项不调用模型、sidecar 写回后失效、全量跳过保留旧缓存和模型切换补充测试。

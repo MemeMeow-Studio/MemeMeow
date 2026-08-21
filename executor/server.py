@@ -26,7 +26,19 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
-from backend.opencode import RUNTIME_OPENCODE_CONFIG
+try:
+    from backend.opencode import RUNTIME_OPENCODE_CONFIG
+except ModuleNotFoundError:  # pragma: no cover - Agent 镜像只复制 executor 公共快照
+    from executor.runtime_opencode_config import RUNTIME_OPENCODE_CONFIG
+from executor.model_capability import (
+    MODEL_BROKER_URL_ENV,
+    MODEL_CAPABILITY_FIELD,
+    MODEL_CAPABILITY_ENV,
+    ModelCapabilityError,
+    validate_model_broker_url,
+    validate_model_capability,
+    validate_model_name,
+)
 from backend.opencode_workspace import (
     SELECTOR_RE,
     WorkspaceCapabilityError,
@@ -67,6 +79,7 @@ ALLOWED_REQUEST_FIELDS = frozenset(
         "callback_token",
         "workspace_selector",
         "workspace_capability",
+        MODEL_CAPABILITY_FIELD,
     }
 )
 REQUIRED_RESULT_FIELDS = frozenset(
@@ -104,6 +117,10 @@ _EXECUTOR_ERROR_CODES = frozenset(
         "opencode_workspace_capability_invalid",
         "opencode_workspace_capability_expired",
         "opencode_workspace_capability_unavailable",
+        "model_capability_invalid",
+        "model_capability_unavailable",
+        "model_broker_endpoint_invalid",
+        "model_name_invalid",
     }
 )
 _SECRET_PATTERNS = (
@@ -241,6 +258,7 @@ class TaskState:
     callback_token: str | None = field(default=None, repr=False)
     workspace_selector: str = "local"
     workspace_capability: str | None = field(default=None, repr=False)
+    model_capability: str | None = field(default=None, repr=False)
     workspace_directory: Path | None = field(default=None, repr=False)
     images_root: Path | None = field(default=None, repr=False)
     metadata_root: Path | None = field(default=None, repr=False)
@@ -313,9 +331,14 @@ class Executor:
                 self.token = ensure_token_file(self.token_file)
             except ExecutorTokenError as exc:
                 self.token_error = str(exc)
-        self.model = os.getenv("MEMEMEOW_OPENCODE_MODEL", "")
-        self.base_url = os.getenv("MEMEMEOW_OPENCODE_BASE_URL", "")
-        self.api_key = os.getenv("MEMEMEOW_OPENCODE_API_KEY", "")
+        try:
+            self.model = validate_model_name(os.getenv("MEMEMEOW_OPENCODE_MODEL", ""))
+        except ModelCapabilityError:
+            self.model = ""
+        self.release_profile = os.getenv("MEMEMEOW_PUBLIC_RELEASE_PROFILE", "local").strip().casefold()
+        self.model_broker_url = os.getenv(MODEL_BROKER_URL_ENV, "").strip()
+        self.legacy_base_url = os.getenv("MEMEMEOW_OPENCODE_BASE_URL", "").strip()
+        self.legacy_api_key = os.getenv("MEMEMEOW_OPENCODE_API_KEY", "").strip()
         self.opencode_executable = os.getenv("MEMEMEOW_OPENCODE_EXECUTABLE", "opencode")
         self.max_workers = _env_int("MEMEMEOW_OPENCODE_CONCURRENCY", 1, 1, 8)
         self.backpressure = _env_int("MEMEMEOW_AGENT_BACKPRESSURE", 32, 1, 500)
@@ -333,6 +356,28 @@ class Executor:
         self.ready_error: str | None = None
         self._prepare_runtime()
 
+    @property
+    def model_broker_configured(self) -> bool:
+        """判断生产模型 broker endpoint 是否已配置且格式有效。"""
+        try:
+            validate_model_broker_url(self.model_broker_url)
+        except ModelCapabilityError:
+            return False
+        return True
+
+    @property
+    def model_configured(self) -> bool:
+        """判断当前 profile 是否具备模型连接材料。
+
+        生产 executor 只能使用 broker endpoint 和任务 capability；local profile
+        保留旧 endpoint/key 夹具兼容，但该兼容值不会进入生产配置。
+        """
+        if not self.model:
+            return False
+        if self.release_profile in {"production", "public", "1", "true", "yes", "on"}:
+            return self.model_broker_configured
+        return self.model_broker_configured or bool(self.legacy_base_url and self.legacy_api_key)
+
     def _prepare_runtime(self) -> None:
         """创建共享 runtime 目录并确保 executor 以非 root 可写方式启动。"""
         try:
@@ -345,6 +390,8 @@ class Executor:
                 self.ready_error = self.token_error
             elif not self.token:
                 self.ready_error = "executor_token_not_configured"
+            elif not self.model_configured:
+                self.ready_error = "model_broker_not_configured"
             elif not shutil_which(self.opencode_executable):
                 self.ready_error = "opencode_executable_missing"
         except OSError:
@@ -377,7 +424,8 @@ class Executor:
             "skills_read_only": skill_ok,
             "docker_socket_absent": socket_absent,
             "token_configured": token_ok,
-            "opencode_configured": bool(self.model and self.base_url and self.api_key),
+            "opencode_configured": self.model_configured,
+            "model_broker_configured": self.model_broker_configured,
             "capacity": self.max_workers,
             "queued": self._queued_count(),
             "error": self.ready_error,
@@ -726,6 +774,14 @@ class Executor:
         workspace_capability = payload.get("workspace_capability")
         if workspace_capability is not None and (not isinstance(workspace_capability, str) or not workspace_capability or len(workspace_capability) > 4096):
             raise ValueError("opencode_workspace_capability_invalid")
+        model_capability = payload.get(MODEL_CAPABILITY_FIELD)
+        if model_capability is not None:
+            try:
+                model_capability = validate_model_capability(model_capability)
+            except ModelCapabilityError as exc:
+                raise ValueError(str(exc)) from exc
+        elif self.release_profile in {"production", "public", "1", "true", "yes", "on"} or self.model_broker_configured:
+            raise ValueError("model_capability_unavailable")
         values = {
             "task_id": business_task_id,
             "business_task_id": business_task_id,
@@ -740,6 +796,7 @@ class Executor:
             "callback_token": callback_token,
             "workspace_selector": workspace_selector,
             "workspace_capability": workspace_capability,
+            MODEL_CAPABILITY_FIELD: model_capability,
         }
         self._verify_workspace_capability(values)
         layout = self._workspace_layout(selector=workspace_selector if isinstance(workspace_selector, str) else None, business_task_id=business_task_id)
@@ -810,7 +867,7 @@ class Executor:
             self._prune_history_locked()
             if not self.health().get("ready"):
                 raise RuntimeError("agent_runtime_unavailable")
-            if not self.model or not self.base_url or not self.api_key:
+            if not self.model_configured:
                 raise RuntimeError("opencode_not_configured")
             existing = self.tasks.get(values["executor_attempt_id"])
             if existing is not None:
@@ -842,6 +899,7 @@ class Executor:
                 session_id=values.get("session_id") if isinstance(values.get("session_id"), str) else None,
                 workspace_selector=str(values.get("workspace_selector") or "local"),
                 workspace_capability=values.get("workspace_capability") if isinstance(values.get("workspace_capability"), str) else None,
+                model_capability=values.get(MODEL_CAPABILITY_FIELD) if isinstance(values.get(MODEL_CAPABILITY_FIELD), str) else None,
                 workspace_directory=(values.get("workspace_layout").directory if isinstance(values.get("workspace_layout"), WorkspaceLayout) else None),
                 images_root=(values.get("workspace_layout").images_root if isinstance(values.get("workspace_layout"), WorkspaceLayout) else None),
                 metadata_root=(values.get("workspace_layout").metadata_root if isinstance(values.get("workspace_layout"), WorkspaceLayout) else None),
@@ -942,8 +1000,9 @@ class Executor:
             "OPENCODE_CONFIG": str(task.config_file or (task.task_scratch_root or (WORKSPACE / "tasks" / task.business_task_id)) / "opencode.json"),
             "OPENCODE_CONFIG_DIR": str(task.config_dir or (task.task_scratch_root or (WORKSPACE / "tasks" / task.business_task_id)) / ".opencode"),
             "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
-            "MEMEMEOW_OPENCODE_BASE_URL": self.base_url,
-            "MEMEMEOW_OPENCODE_API_KEY": self.api_key,
+            MODEL_BROKER_URL_ENV: self.model_broker_url or self.legacy_base_url,
+            # 生产值来自本次 task 的短期 capability；local 旧夹具才使用旧 key。
+            MODEL_CAPABILITY_ENV: task.model_capability or self.legacy_api_key,
             "MEMEMEOW_OPENCODE_SLOT": "0",
             "MEMEMEOW_AGENT_TASK_ID": task.business_task_id,
             "MEMEMEOW_AGENT_EXECUTOR_ATTEMPT_ID": task.executor_attempt_id,
@@ -1083,7 +1142,7 @@ class Executor:
                 code, http_status = self._classify_process_failure(stdout, stderr)
                 raise _ProcessFailure(
                     code,
-                    _diagnostic(stdout, stderr, secrets=(self.api_key, self.token, task.callback_token or "")),
+                    _diagnostic(stdout, stderr, secrets=(self.legacy_api_key, self.token, task.callback_token or "")),
                     http_status=http_status,
                 )
             if not task.session_id:
@@ -1103,7 +1162,7 @@ class Executor:
                 task.status = "cancelled" if code == "task_interrupted" else "failed"
                 error: dict[str, object] = {
                     "error": code,
-                    "message": _redact_diagnostic(exc.args[0], (self.api_key, self.token, task.callback_token or "")),
+                    "message": _redact_diagnostic(exc.args[0], (self.legacy_api_key, self.token, task.callback_token or "")),
                 }
                 if exc.http_status is not None:
                     error["http_status"] = exc.http_status
@@ -1127,7 +1186,7 @@ class Executor:
                     "agent_timeout": "OpenCode 执行超时",
                     "task_interrupted": "任务已取消",
                 }.get(code, "任务执行失败")
-                task.error = _json_error(code, _redact_diagnostic(detail, (self.api_key, self.token, task.callback_token or "")) if detail else fallback)
+                task.error = _json_error(code, _redact_diagnostic(detail, (self.legacy_api_key, self.token, task.callback_token or "")) if detail else fallback)
                 task.completed_at = time.time()
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             with self.lock:
@@ -1135,7 +1194,7 @@ class Executor:
                     task.process_reaped = True
                 code = "unknown_execution" if task.process_reaped is not True else "task_interrupted" if task.cancel_event.is_set() else "agent_process_failed"
                 task.status = "cancelled" if code == "task_interrupted" else "failed"
-                task.error = _json_error(code, "任务已取消" if code == "task_interrupted" else "无法确认 OpenCode 进程已终止" if code == "unknown_execution" else _redact_diagnostic(str(exc), (self.api_key, self.token, task.callback_token or "")))
+                task.error = _json_error(code, "任务已取消" if code == "task_interrupted" else "无法确认 OpenCode 进程已终止" if code == "unknown_execution" else _redact_diagnostic(str(exc), (self.legacy_api_key, self.token, task.callback_token or "")))
                 task.completed_at = time.time()
         except Exception as exc:  # noqa: BLE001 - 任务必须以终态收束，不能留下永久 running
             with self.lock:
@@ -1143,7 +1202,7 @@ class Executor:
                     task.process_reaped = True
                 code = "unknown_execution" if task.process_reaped is not True else "task_interrupted" if task.cancel_event.is_set() else "agent_process_failed"
                 task.status = "cancelled" if code == "task_interrupted" else "failed"
-                task.error = _json_error(code, "任务已取消" if code == "task_interrupted" else "无法确认 OpenCode 进程已终止" if code == "unknown_execution" else _redact_diagnostic(str(exc), (self.api_key, self.token, task.callback_token or "")))
+                task.error = _json_error(code, "任务已取消" if code == "task_interrupted" else "无法确认 OpenCode 进程已终止" if code == "unknown_execution" else _redact_diagnostic(str(exc), (self.legacy_api_key, self.token, task.callback_token or "")))
                 task.completed_at = time.time()
         finally:
             with self.lock:
@@ -1419,6 +1478,10 @@ class Handler(BaseHTTPRequestHandler):
                 "opencode_workspace_capability_invalid": "workspace capability 无效",
                 "opencode_workspace_capability_expired": "workspace capability 已过期",
                 "opencode_workspace_capability_unavailable": "workspace capability 未配置",
+                "model_capability_invalid": "模型 capability 无效",
+                "model_capability_unavailable": "模型 capability 未配置",
+                "model_broker_endpoint_invalid": "模型 broker 未配置",
+                "model_name_invalid": "模型标识无效",
             }
             if code not in messages and code not in {"invalid_task"}:
                 code = "invalid_task"
@@ -1439,6 +1502,10 @@ class Handler(BaseHTTPRequestHandler):
                 "opencode_workspace_capability_invalid",
                 "opencode_workspace_capability_expired",
                 "opencode_workspace_capability_unavailable",
+                "model_capability_invalid",
+                "model_capability_unavailable",
+                "model_broker_endpoint_invalid",
+                "model_name_invalid",
             }:
                 code = "agent_runtime_unavailable"
             status = {
