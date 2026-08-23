@@ -12,7 +12,7 @@ from typing import Final
 
 
 AGENT_BACKPRESSURE_DEFAULT: Final = 80
-# 这是资源保护上限，不是产品并发配额；Server 等部署层可以继续施加更低的门禁。
+# 这是资源保护上限，不是产品并发配额；部署适配层可以继续施加更低的门禁。
 AGENT_BACKPRESSURE_SAFETY_MAX: Final = 500
 
 
