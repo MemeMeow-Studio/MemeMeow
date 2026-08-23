@@ -55,6 +55,7 @@ from backend.agent_resume import (
     sanitize_error_history,
     within_total_timeout,
 )
+from backend.config import AGENT_BACKPRESSURE_DEFAULT, AGENT_CONCURRENCY_MAX
 from backend.metadata import (
     CONTEXT_STATUSES,
     MAX_SEMANTIC_DOCUMENT_LENGTH,
@@ -573,14 +574,14 @@ class PostgresTaskWorkerManager:
         *,
         agent_concurrency: int = 1,
         scope_concurrency: int | None = None,
-        agent_backpressure: int = 32,
+        agent_backpressure: int = AGENT_BACKPRESSURE_DEFAULT,
         settings_version: str | None = None,
         lease_seconds: int = 120,
         max_attempts: int = 3,
         executor: ThreadPoolExecutor | None = None,
     ) -> None:
         self.resources = resources
-        self.agent_concurrency = max(1, min(int(agent_concurrency), 8))
+        self.agent_concurrency = max(1, min(int(agent_concurrency), AGENT_CONCURRENCY_MAX))
         self.agent_scope_concurrency = max(1, min(int(scope_concurrency if scope_concurrency is not None else 1), self.agent_concurrency))
         self.agent_backpressure = max(1, min(int(agent_backpressure), 500))
         self.settings_version = settings_version
@@ -982,10 +983,10 @@ class PostgresTaskService:
     恢复并校验 scope，避免普通 payload 或 Worker 的历史默认值成为归属事实。
     """
 
-    def __init__(self, resources: DatabaseResources, *, scope_id: str | ScopeContext = "local", agent_concurrency: int = 1, scope_concurrency: int | None = None, agent_backpressure: int = 32, settings_version: str | None = None, lease_seconds: int = 120, max_attempts: int = 3, executor: ThreadPoolExecutor | None = None, worker_manager: PostgresTaskWorkerManager | None = None, finalize_image_tasks: bool = True, operation_policy: OperationPolicyGateway | None = None, grant_store: GrantAssociationStore | None = None, resume_enabled: bool = False, resume_max_attempts: int = 2, resume_backoff_seconds: int = 2, resume_max_backoff_seconds: int = 60, resume_timeout_seconds: int = 900):
+    def __init__(self, resources: DatabaseResources, *, scope_id: str | ScopeContext = "local", agent_concurrency: int = 1, scope_concurrency: int | None = None, agent_backpressure: int = AGENT_BACKPRESSURE_DEFAULT, settings_version: str | None = None, lease_seconds: int = 120, max_attempts: int = 3, executor: ThreadPoolExecutor | None = None, worker_manager: PostgresTaskWorkerManager | None = None, finalize_image_tasks: bool = True, operation_policy: OperationPolicyGateway | None = None, grant_store: GrantAssociationStore | None = None, resume_enabled: bool = False, resume_max_attempts: int = 2, resume_backoff_seconds: int = 2, resume_max_backoff_seconds: int = 60, resume_timeout_seconds: int = 900):
         self.resources = resources
         self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
-        self.agent_concurrency = max(1, min(int(agent_concurrency), 8))
+        self.agent_concurrency = max(1, min(int(agent_concurrency), AGENT_CONCURRENCY_MAX))
         self.agent_scope_concurrency = max(1, min(int(scope_concurrency if scope_concurrency is not None else 1), self.agent_concurrency))
         self.agent_backpressure = max(1, min(int(agent_backpressure), 500))
         self.settings_version = settings_version

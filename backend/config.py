@@ -26,6 +26,12 @@ from backend.storage_security import StorageRootError, validate_controlled_root
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONCURRENCY_ENV = "MEMEMEOW_OPENCODE_CONCURRENCY"
+# Agent lane 的部署边界；默认仍为单并发，生产环境应结合 provider、数据库和
+# executor 资源逐步调高。背压默认值必须高于全局运行槽位，避免 40 个运行中任务
+# 因活动任务计数而无法继续提交排队任务。
+AGENT_CONCURRENCY_MAX = 40
+AGENT_BACKPRESSURE_DEFAULT = 80
+AGENT_BACKPRESSURE_MAX = 500
 SETTINGS_TOKEN_ENV = "MEMEMEOW_SETTINGS_ADMIN_TOKEN"
 _ACTIVE_VISUAL_SPEC = active_visual_model_spec()
 
@@ -115,10 +121,10 @@ class Settings(BaseSettings):
     agent_result_max_bytes: int = Field(default=1024 * 1024, ge=1024, le=16 * 1024 * 1024, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESULT_MAX_BYTES", "agent_result_max_bytes"))
     agent_result_retention_days: int = Field(default=14, ge=1, le=365, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESULT_RETENTION_DAYS", "agent_result_retention_days"))
     agent_result_max_tasks: int = Field(default=500, ge=1, le=10000, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESULT_MAX_TASKS", "agent_result_max_tasks"))
-    opencode_concurrency: int = Field(default=1, ge=1, le=8, validation_alias=AliasChoices(CONCURRENCY_ENV, "opencode_concurrency"))
+    opencode_concurrency: int = Field(default=1, ge=1, le=AGENT_CONCURRENCY_MAX, validation_alias=AliasChoices(CONCURRENCY_ENV, "opencode_concurrency"))
     # 每个持久 scope 在 Agent lane 中的同时运行上限；公平调度在数据库内 enforce。
-    agent_scope_concurrency: int = Field(default=1, ge=1, le=8, validation_alias=AliasChoices("MEMEMEOW_AGENT_SCOPE_CONCURRENCY", "agent_scope_concurrency"))
-    agent_backpressure: int = Field(default=32, ge=1, le=500, validation_alias=AliasChoices("MEMEMEOW_AGENT_BACKPRESSURE", "agent_backpressure"))
+    agent_scope_concurrency: int = Field(default=1, ge=1, le=AGENT_CONCURRENCY_MAX, validation_alias=AliasChoices("MEMEMEOW_AGENT_SCOPE_CONCURRENCY", "agent_scope_concurrency"))
+    agent_backpressure: int = Field(default=AGENT_BACKPRESSURE_DEFAULT, ge=1, le=AGENT_BACKPRESSURE_MAX, validation_alias=AliasChoices("MEMEMEOW_AGENT_BACKPRESSURE", "agent_backpressure"))
     database_url: str = Field(default="postgresql+psycopg://mememeow:mememeow@127.0.0.1:5434/mememeow", validation_alias=AliasChoices("MEMEMEOW_DATABASE_URL", "database_url"), repr=False)
     database_pool_size: int = Field(default=5, ge=1, le=100, validation_alias=AliasChoices("MEMEMEOW_DATABASE_POOL_SIZE", "database_pool_size"))
     database_max_overflow: int = Field(default=10, ge=0, le=100, validation_alias=AliasChoices("MEMEMEOW_DATABASE_MAX_OVERFLOW", "database_max_overflow"))
@@ -385,7 +391,7 @@ class Settings(BaseSettings):
                 "value": self.opencode_concurrency,
                 "pending_value": pending,
                 "minimum": 1,
-                "maximum": 8,
+                "maximum": AGENT_CONCURRENCY_MAX,
                 "environment_overridden": environment_override,
                 "restart_required": restart_required,
             },
@@ -446,7 +452,7 @@ class Settings(BaseSettings):
 
 def update_dotenv_concurrency(path: str | Path, value: int) -> Path:
     """原子更新 dotenv 的并发字段，保留未知变量、注释和其他格式。"""
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 8:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= AGENT_CONCURRENCY_MAX:
         raise ValueError("opencode_concurrency_out_of_range")
     target = Path(path).expanduser()
     if target.is_symlink():

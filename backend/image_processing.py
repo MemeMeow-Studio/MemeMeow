@@ -34,6 +34,7 @@ from backend.database import (
     Task,
     utcnow,
 )
+from backend.config import AGENT_BACKPRESSURE_DEFAULT, AGENT_CONCURRENCY_MAX
 from backend.metadata import MemeContext, Provenance, SidecarMetadata
 from backend.agent_resume import normalize_identifier
 from backend.operation_policy import (
@@ -742,7 +743,7 @@ class ImageProcessingWorker:
         self.grants = grant_store or GrantAssociationStore()
         self.owner = owner or f"image-worker-{uuid4().hex}"
         self.handlers = dict(handlers or {})
-        self.executor = ThreadPoolExecutor(max_workers=max(1, min(int(max_workers), 8)), thread_name_prefix="mememeow-image-worker")
+        self.executor = ThreadPoolExecutor(max_workers=max(1, min(int(max_workers), AGENT_CONCURRENCY_MAX)), thread_name_prefix="mememeow-image-worker")
         self._task_runner = None
         if callable(getattr(resources, "factory", None)):
             # 图片叶子任务使用独立 facade，但仍复用同一 PostgreSQL claim、lane
@@ -754,7 +755,7 @@ class ImageProcessingWorker:
                 scope_id=self.scope,
                 agent_concurrency=int(getattr(task_service, "agent_concurrency", 1)),
                 scope_concurrency=int(getattr(task_service, "agent_scope_concurrency", 1)),
-                agent_backpressure=int(getattr(task_service, "agent_backpressure", 32)),
+                agent_backpressure=int(getattr(task_service, "agent_backpressure", AGENT_BACKPRESSURE_DEFAULT)),
                 settings_version=getattr(task_service, "settings_version", None),
                 lease_seconds=int(getattr(task_service, "lease_seconds", 120)),
                 max_attempts=int(getattr(task_service, "max_attempts", 3)),

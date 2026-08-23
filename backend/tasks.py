@@ -18,6 +18,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from backend.agent_resume import normalize_identifier, sanitize_error, sanitize_error_history
+from backend.config import AGENT_BACKPRESSURE_DEFAULT, AGENT_CONCURRENCY_MAX
 from backend.opencode_workspace import SELECTOR_RE
 from backend.public_dto import (
     PUBLIC_TASK_STATUSES,
@@ -326,7 +327,7 @@ class PersistentTaskService:
     仅是单 scope 的本地兼容实现，不宣称提供 PostgreSQL 跨进程公平保证。
     """
 
-    def __init__(self, task_root: Path, max_workers: int = 2, *, agent_concurrency: int = 1, agent_backpressure: int = 32, settings_version: str | None = None):
+    def __init__(self, task_root: Path, max_workers: int = 2, *, agent_concurrency: int = 1, agent_backpressure: int = AGENT_BACKPRESSURE_DEFAULT, settings_version: str | None = None):
         """创建持久任务服务，并为 Agent 任务建立独立执行 lane。"""
         self.task_root = task_root.expanduser()
         self.task_root.mkdir(parents=True, exist_ok=True)
@@ -334,7 +335,7 @@ class PersistentTaskService:
         self._handlers: dict[str, TaskHandler] = {}
         self._lock = Lock()
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="mememeow-task")
-        self.agent_concurrency = max(1, min(int(agent_concurrency), 8))
+        self.agent_concurrency = max(1, min(int(agent_concurrency), AGENT_CONCURRENCY_MAX))
         self.agent_backpressure = max(1, min(int(agent_backpressure), 500))
         self.settings_version = settings_version
         self._agent_executor = ThreadPoolExecutor(max_workers=self.agent_concurrency, thread_name_prefix="mememeow-agent")

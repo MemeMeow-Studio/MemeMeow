@@ -15,9 +15,10 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
+from pydantic import ValidationError
 from sqlalchemy import select, text
 
-from api import app
+from api import ConcurrencyUpdateRequest, app
 from backend.collection_packages import CollectionManifest, CollectionManifestCollection, CollectionManifestMember, serialize_manifest, sha256_bytes
 from backend.database import EMBEDDING_DIMENSIONS, ImageProcessingJob, Meme, MemeTextEmbedding, StorageOperation, Task, create_engine_for_url
 from backend.image_processing import ImageProcessingWorker
@@ -53,6 +54,13 @@ def _clear_test_scope() -> None:
         for statement in statements:
             connection.execute(text(statement))
     engine.dispose()
+
+
+def test_concurrency_update_request_accepts_forty_and_rejects_forty_one() -> None:
+    """设置接口请求模型接受公开最大值并拒绝越界值。"""
+    assert ConcurrencyUpdateRequest.model_validate({"value": 40}).opencode_concurrency == 40
+    with pytest.raises(ValidationError):
+        ConcurrencyUpdateRequest.model_validate({"value": 41})
 
 
 @pytest.fixture

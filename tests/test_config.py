@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from backend.config import Settings, update_dotenv_concurrency
+from backend.config import AGENT_BACKPRESSURE_DEFAULT, AGENT_CONCURRENCY_MAX, Settings, update_dotenv_concurrency
 from backend.visual import VISUAL_DIMENSIONS, VISUAL_MODEL_ID, VISUAL_PREPROCESS_VERSION
 from backend.visual_models import visual_model_spec
 
@@ -47,6 +47,19 @@ def test_upload_limits_accept_optional_total_budget() -> None:
     assert settings.status()["max_request_bytes"] == 128
 
 
+def test_agent_lane_boundary_allows_forty_and_keeps_default_backpressure_above_capacity() -> None:
+    """Agent 全局和 scope 上限接受 40，默认背压覆盖全部运行槽位。"""
+    settings = Settings(_env_file=None, opencode_concurrency=AGENT_CONCURRENCY_MAX, agent_scope_concurrency=AGENT_CONCURRENCY_MAX)
+    assert settings.opencode_concurrency == 40
+    assert settings.agent_scope_concurrency == 40
+    assert settings.agent_backpressure == AGENT_BACKPRESSURE_DEFAULT == 80
+    assert settings.backend_status()["editable"]["opencode_concurrency"]["maximum"] == AGENT_CONCURRENCY_MAX
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, opencode_concurrency=AGENT_CONCURRENCY_MAX + 1)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, agent_scope_concurrency=AGENT_CONCURRENCY_MAX + 1)
+
+
 def test_visual_known_previous_model_requires_schema_migration() -> None:
     """已归档的 DINOv3 模型不能仅靠环境变量重新启用。"""
     with pytest.raises(ValidationError, match="visual_model_migration_required"):
@@ -78,9 +91,9 @@ def test_settings_preserve_environment_priority_and_unknown_variables(tmp_path: 
     assert "UNKNOWN_VALUE" not in repr(settings)
 
 
-@pytest.mark.parametrize("value", ["0", "9", "not-an-int"])
+@pytest.mark.parametrize("value", ["0", "41", "not-an-int"])
 def test_settings_reject_invalid_concurrency(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str):
-    """并发配置必须在 1..8 范围内且为整数。"""
+    """并发配置必须在 1..40 范围内且为整数。"""
     monkeypatch.setenv("MEMEMEOW_OPENCODE_CONCURRENCY", value)
     with pytest.raises(ValidationError):
         Settings.from_env(tmp_path / ".missing-env")
@@ -111,6 +124,8 @@ def test_dotenv_update_rejects_non_integer_value(tmp_path: Path):
         update_dotenv_concurrency(tmp_path / ".env", 1.5)
     with pytest.raises(ValueError):
         update_dotenv_concurrency(tmp_path / ".env", True)
+    with pytest.raises(ValueError):
+        update_dotenv_concurrency(tmp_path / ".env", AGENT_CONCURRENCY_MAX + 1)
 
 
 def test_dotenv_symlink_is_rejected(tmp_path: Path):

@@ -122,4 +122,6 @@ Agent 只获得当前任务 token、内部地址和 executor token，不获得 c
 - Agent 运行模式只接受 `auto`、`executor` 和 `host`。`auto` 在 executor URL 与 token 同时可用时选择 executor，否则选择 host；显式 `executor` 缺少配置时失败关闭。旧 Docker runtime、容器名和运行时字段不能启用任何执行分支；回滚使用显式 host，运维诊断使用当前 project 的 `docker compose exec <service>`。
 - `MEMEMEOW_PROTECTED_MODE=true` 时仅放行 `MEMEMEOW_ALLOWED_ENDPOINTS`；限流由 `MEMEMEOW_RATE_LIMIT_*` 控制，超限返回 `429` 和 `Retry-After`。
 
+Agent lane 的 `MEMEMEOW_OPENCODE_CONCURRENCY` 和 `MEMEMEOW_AGENT_SCOPE_CONCURRENCY` 均接受 `1..40`，默认值仍为 `1`；设置页保存的全局并发值需要重启后生效。`MEMEMEOW_AGENT_BACKPRESSURE` 默认值为 `80`，用于避免 40 个运行槽位被活动任务计数提前挡住。PostgreSQL 任务服务按 Agent lane 的 `queued+running` 统计背压，executor 和本地兼容任务服务只统计 `queued`，因此相同阈值下三层的可接受排队长度不同。
+
 系统不提供注册、JWT、角色或多租户权限接口。资源包和社区同步功能已从生产入口移除。

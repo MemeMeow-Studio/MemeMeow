@@ -30,7 +30,7 @@ from urllib.request import urlopen
 
 from backend.agent_executor import AgentExecutorClient, AgentExecutorError
 from backend.agent_resume import classify_resume_error, normalize_identifier
-from backend.config import Settings
+from backend.config import AGENT_CONCURRENCY_MAX, Settings
 from backend.metadata import MemeContext
 from backend.opencode_workspace import (
     LocalWorkspaceProvider,
@@ -203,7 +203,7 @@ class OpenCodeRunner:
         self.slots_root = self.runtime_root / "slots"
         self.lock_path = self.runtime_root / "worker.lock"
         self.log_root = self.runtime_root / "logs"
-        self.concurrency = max(1, min(int(settings.opencode_concurrency), 8))
+        self.concurrency = max(1, min(int(settings.opencode_concurrency), AGENT_CONCURRENCY_MAX))
         self._slot_semaphore = Semaphore(self.concurrency)
         self._slot_ids: Queue[int] = Queue()
         for slot_id in range(self.concurrency):

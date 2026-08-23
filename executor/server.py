@@ -64,6 +64,10 @@ LOG_ROOT = RUNTIME_ROOT / "logs"
 SKILL_ROOT = Path(os.getenv("MEMEMEOW_EXECUTOR_SKILL_ROOT", "/skills/research-meme-context"))
 WORKSPACE_ROOT = Path(os.getenv("MEMEMEOW_EXECUTOR_WORKSPACE_ROOT", str(RUNTIME_ROOT / "workspaces")))
 DEFAULT_MAX_RESULT_BYTES = 1024 * 1024
+# executor 是可独立复制到 Agent 镜像的快照，不能依赖后端 Settings；这里保持
+# 与后端 Agent lane 的公开容量契约一致。
+AGENT_CONCURRENCY_MAX = 40
+AGENT_BACKPRESSURE_DEFAULT = 80
 ALLOWED_REQUEST_FIELDS = frozenset(
     {
         "task_id",
@@ -340,8 +344,8 @@ class Executor:
         self.legacy_base_url = os.getenv("MEMEMEOW_OPENCODE_BASE_URL", "").strip()
         self.legacy_api_key = os.getenv("MEMEMEOW_OPENCODE_API_KEY", "").strip()
         self.opencode_executable = os.getenv("MEMEMEOW_OPENCODE_EXECUTABLE", "opencode")
-        self.max_workers = _env_int("MEMEMEOW_OPENCODE_CONCURRENCY", 1, 1, 8)
-        self.backpressure = _env_int("MEMEMEOW_AGENT_BACKPRESSURE", 32, 1, 500)
+        self.max_workers = _env_int("MEMEMEOW_OPENCODE_CONCURRENCY", 1, 1, AGENT_CONCURRENCY_MAX)
+        self.backpressure = _env_int("MEMEMEOW_AGENT_BACKPRESSURE", AGENT_BACKPRESSURE_DEFAULT, 1, 500)
         self.max_timeout = _env_int("MEMEMEOW_AGENT_EXECUTOR_MAX_TIMEOUT_SECONDS", 1800, 1, 7200)
         self.max_result_bytes = _env_int("MEMEMEOW_AGENT_RESULT_MAX_BYTES", DEFAULT_MAX_RESULT_BYTES, 1024, 16 * 1024 * 1024)
         capability_key = os.getenv("MEMEMEOW_WORKSPACE_CAPABILITY_KEY", os.getenv("MEMEMEOW_AGENT_WORKSPACE_CAPABILITY_KEY", ""))

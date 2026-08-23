@@ -33,7 +33,7 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, StrictBool, StrictInt
 from sqlalchemy import select
 
-from backend.config import Settings, update_dotenv_concurrency
+from backend.config import AGENT_CONCURRENCY_MAX, Settings, update_dotenv_concurrency
 from backend.collection_packages import (
     CollectionPackageError,
     DEFAULT_MAX_FILE_SIZE,
@@ -307,7 +307,7 @@ class CollectionItemsRequest(StrictRequestModel):
 class ConcurrencyUpdateRequest(StrictRequestModel):
     """后端设置页唯一允许持久化的安全参数。"""
 
-    opencode_concurrency: StrictInt = Field(ge=1, le=8, validation_alias=AliasChoices("opencode_concurrency", "agent_concurrency", "concurrency", "value"))
+    opencode_concurrency: StrictInt = Field(ge=1, le=AGENT_CONCURRENCY_MAX, validation_alias=AliasChoices("opencode_concurrency", "agent_concurrency", "concurrency", "value"))
 
 
 def _error(status: int, code: str, message: str) -> HTTPException:
@@ -1461,7 +1461,7 @@ async def lifespan(app: FastAPI):
             task_service=local_services.tasks,
             policy=app.state.operation_policy_gateway,
             grant_store=app.state.operation_grants,
-            max_workers=max(1, min(int(getattr(settings, "opencode_concurrency", 1)), 4)),
+            max_workers=max(1, min(int(getattr(settings, "opencode_concurrency", 1)), AGENT_CONCURRENCY_MAX)),
             task_handlers={
                 "visual_embedding_generation": visual_handler,
                 "meme_context_generation": context_handler,
@@ -1612,7 +1612,7 @@ def _processing_worker(request: Request) -> ImageProcessingWorker | None:
             task_service=services.tasks,
             policy=getattr(request.app.state, "operation_policy_gateway", None),
             grant_store=getattr(request.app.state, "operation_grants", None),
-            max_workers=max(1, min(int(getattr(request.app.state.settings, "opencode_concurrency", 1)), 4)),
+            max_workers=max(1, min(int(getattr(request.app.state.settings, "opencode_concurrency", 1)), AGENT_CONCURRENCY_MAX)),
             task_handlers=getattr(request.app.state, "image_processing_task_handlers", None),
         )
         workers[scope.scope_id] = worker

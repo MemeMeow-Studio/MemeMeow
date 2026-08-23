@@ -102,6 +102,16 @@ def test_agent_lane_runs_different_images_in_parallel_and_keeps_cache_lane_avail
     manager.shutdown()
 
 
+def test_local_agent_lane_clamps_to_shared_forty_slot_boundary(tmp_path):
+    """本地兼容任务服务与共享 Agent lane 使用同一 40 槽边界和默认背压。"""
+    manager = PersistentTaskService(tmp_path / "tasks", agent_concurrency=41)
+    try:
+        assert manager.agent_concurrency == 40
+        assert manager.agent_backpressure == 80
+    finally:
+        manager.shutdown()
+
+
 def test_local_json_service_explicitly_reports_single_scope_compatibility(tmp_path):
     """本地 JSON 兼容服务不伪装提供跨进程公平调度。"""
     manager = PersistentTaskService(tmp_path / "tasks")

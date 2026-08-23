@@ -52,6 +52,8 @@
 ### Requirement: 并行长任务必须受公平调度和背压保护
 任务服务 MUST 对可并行的长任务施加显式全局并发上限、scope 级运行上限和排队背压，MUST 保证单一 scope 或任务类型不会无限占用所有执行资源，且 MUST 保持活动任务去重和 `queued -> running -> succeeded/failed` 状态语义。Agent lane 的跨 scope 选择 MUST 使用 PostgreSQL 持久公平状态和事务内公平 claim；公平状态不可用时 MUST 返回 `agent_fairness_unavailable`，不得退化为竞争式 claim。
 
+Agent 全局和单 scope 并发配置的公开安全范围为 `1..40`，默认值为 `1`。默认背压阈值为 `80`；PostgreSQL 实现按 `queued+running` 统计，executor 和本地兼容实现按 `queued` 统计。
+
 #### Scenario: Agent 任务不得阻塞其他任务类型
 - **WHEN** 语境生成 job 数量超过 Agent 并发上限，且存在 cache generation 或 metadata repair job
 - **THEN** 超出上限的语境 job 保持 `queued`，其他任务类型仍能获得其保留的执行资源并更新状态
