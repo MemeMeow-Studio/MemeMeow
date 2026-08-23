@@ -268,6 +268,7 @@ class ScopeServiceFactory:
             worker_manager = PostgresTaskWorkerManager(
                 resources,
                 agent_concurrency=self._task_config.get("agent_concurrency", getattr(settings, "opencode_concurrency", 1)),
+                scope_concurrency=self._task_config.get("scope_concurrency", getattr(settings, "agent_scope_concurrency", 1)),
                 agent_backpressure=self._task_config.get("agent_backpressure", getattr(settings, "agent_backpressure", 32)),
                 settings_version=self._task_config.get("settings_version", getattr(settings, "settings_version", None)),
                 lease_seconds=self._task_config.get("lease_seconds", getattr(settings, "worker_lease_seconds", 120)),
@@ -312,6 +313,7 @@ class ScopeServiceFactory:
                 self.resources,
                 scope_id=context.scope_id,
                 agent_concurrency=self._task_config.get("agent_concurrency", getattr(self.settings, "opencode_concurrency", 1)),
+                scope_concurrency=self._task_config.get("scope_concurrency", getattr(self.settings, "agent_scope_concurrency", 1)),
                 agent_backpressure=self._task_config.get("agent_backpressure", getattr(self.settings, "agent_backpressure", 32)),
                 settings_version=self._task_config.get("settings_version", getattr(self.settings, "settings_version", None)),
                 lease_seconds=self._task_config.get("lease_seconds", getattr(self.settings, "worker_lease_seconds", 120)),

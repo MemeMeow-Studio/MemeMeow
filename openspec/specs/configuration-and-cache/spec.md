@@ -3,14 +3,14 @@
 集中管理服务运行配置和检索缓存生命周期，保护模型密钥不离开后端，并让用户明确知道何时可以搜索以及何时需要重新生成缓存。
 ## Requirements
 ### Requirement: 模型配置必须来自服务端环境
-系统 MUST 从服务端 `.env` 或等价的进程环境读取嵌入模型和 VLM 的 API Key、Base URL、模型标识及路径配置。前端请求不得修改或持久化这些秘密值。Agent 模型连接所需的 Base URL 与 API Key MUST 仅作为 Agent 容器运行环境传入，不得通过挂载宿主 `.env` 提供。
+系统 MUST 从服务端 `.env` 或等价的进程环境读取嵌入模型的 API Key、Base URL 和模型标识，以及 OpenCode Agent 的 `MEMEMEOW_OPENCODE_BASE_URL`、`MEMEMEOW_OPENCODE_API_KEY`、`MEMEMEOW_OPENCODE_MODEL` 和受控 runtime 配置。前端请求不得修改或持久化这些秘密值。Agent 模型连接所需的 Base URL 与 API Key MUST 通过 Compose 环境传入 Agent executor，不得通过挂载宿主 `.env` 提供。
 
 #### Scenario: 启动时读取配置
-- **WHEN** 服务启动且环境变量存在
-- **THEN** 系统加载配置并使用对应模型服务
+- **WHEN** 服务启动且嵌入模型或 OpenCode Agent 所需环境变量存在
+- **THEN** 系统加载相应配置，分别供文本 embedding 服务或 Agent executor 使用
 
 #### Scenario: 必需配置缺失
-- **WHEN** 执行依赖某模型的操作但对应配置缺失
+- **WHEN** 执行依赖 embedding 或 Agent 的操作但对应配置缺失
 - **THEN** 系统返回明确的配置缺失错误，不输出密钥内容
 
 ### Requirement: 配置查询必须脱敏

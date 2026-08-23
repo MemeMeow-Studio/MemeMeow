@@ -102,6 +102,14 @@ def test_agent_lane_runs_different_images_in_parallel_and_keeps_cache_lane_avail
     manager.shutdown()
 
 
+def test_local_json_service_explicitly_reports_single_scope_compatibility(tmp_path):
+    """本地 JSON 兼容服务不伪装提供跨进程公平调度。"""
+    manager = PersistentTaskService(tmp_path / "tasks")
+    assert manager.supports_cross_scope_fairness is False
+    assert manager.fairness_mode == "single_scope_process_compat"
+    manager.shutdown()
+
+
 def test_batch_finalizer_submits_one_deduplicated_cache_task(tmp_path):
     """批次最后一项终态后只触发一次缓存回调。"""
     manager = PersistentTaskService(tmp_path / "tasks", agent_concurrency=2)

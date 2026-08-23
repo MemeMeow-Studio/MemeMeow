@@ -10,13 +10,13 @@ from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from backend.database import AgentCallbackRequest, AgentCallbackRequestRepository, DatabaseError, ScopeContext
+from backend.database import AgentCallbackRequest, AgentCallbackRequestRepository, DatabaseError, ScopeContext, TaskLaneFairness
 
 
 def test_single_forward_migration_head():
     """仓库只暴露一个前向 revision head，回滚由 migration 明确拒绝。"""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == ["0015_bind_agent_callback_request_ids"]
+    assert script.get_heads() == ["0016_agent_fair_scheduling"]
     assert (Path("alembic/versions/0001_postgres_scoped.py")).is_file()
 
 
@@ -51,11 +51,28 @@ def test_callback_binding_migration_is_forward_only_and_fail_closed_on_history_c
     assert "raise RuntimeError" in migration
 
 
+def test_fair_scheduling_migration_is_chained_and_forward_only():
+    """公平状态迁移必须接在 callback head 后，并拒绝危险回滚。"""
+    migration = Path("alembic/versions/0016_agent_fair_scheduling.py").read_text(encoding="utf-8")
+    assert 'down_revision = "0015_bind_agent_callback_request_ids"' in migration
+    assert "task_lane_fairness" in migration
+    assert "last_dispatch_sequence" in migration
+    assert "raise RuntimeError" in migration
+
+
 def test_callback_model_keeps_request_id_and_logic_unique_facts():
     """ORM callback 表同时保留旧 request ID 主键和新的复合逻辑唯一约束。"""
     table = AgentCallbackRequest.__table__
     assert {column.name for column in table.primary_key.columns} == {"scope_id", "request_id"}
     assert any(constraint.name == "uq_agent_callback_requests_logical" for constraint in table.constraints)
+
+
+def test_fairness_model_is_lane_scope_keyed_and_has_dispatch_index():
+    """公平事实以 lane/scope 为复合主键，并可按持久序号排序。"""
+    table = TaskLaneFairness.__table__
+    assert {column.name for column in table.primary_key.columns} == {"lane", "scope_id"}
+    assert {column.name for column in table.columns} >= {"last_dispatch_sequence", "created_at", "updated_at"}
+    assert any(index.name == "ix_task_lane_fairness_dispatch" for index in table.indexes)
 
 
 def test_callback_repository_fails_closed_without_postgres_schema():

@@ -50,6 +50,11 @@ STABLE_TASK_ERRORS = {
     "agent_executor_unauthorized",
     "agent_executor_invalid_response",
     "agent_backpressure",
+    "agent_fairness_unavailable",
+    "agent_lane_slot_inconsistent",
+    "agent_claim_owner_invalid",
+    "agent_claim_lane_invalid",
+    "agent_claim_config_invalid",
     "task_exists",
     "agent_timeout_limit_exceeded",
     "agent_image_root_mismatch",
@@ -317,7 +322,8 @@ class PersistentTaskService:
     """统一的任务存储与执行器。
 
     `task_root` 保存任务 JSON；`handlers` 由应用在启动期注册，避免把 Python closure
-    写进任务文件。所有更新在锁内持久化，保证并发读者只会看到完整记录。
+    写进任务文件。所有更新在锁内持久化，保证并发读者只会看到完整记录。该服务
+    仅是单 scope 的本地兼容实现，不宣称提供 PostgreSQL 跨进程公平保证。
     """
 
     def __init__(self, task_root: Path, max_workers: int = 2, *, agent_concurrency: int = 1, agent_backpressure: int = 32, settings_version: str | None = None):
@@ -338,6 +344,12 @@ class PersistentTaskService:
         self._started = False
         self._stopped = False
         self._load_records()
+        self.fairness_mode = "single_scope_process_compat"
+
+    @property
+    def supports_cross_scope_fairness(self) -> bool:
+        """明确本地 JSON 服务不支持跨进程、跨 scope 的公平 claim。"""
+        return False
 
     def register(self, task_type: str, handler: TaskHandler) -> None:
         """注册能从 payload 重建任务的处理器，必须在 start 前完成。"""

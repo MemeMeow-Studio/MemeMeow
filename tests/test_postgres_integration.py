@@ -11,6 +11,7 @@ import os
 import hashlib
 import threading
 import time
+from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,6 +42,7 @@ from backend.database import (
     StorageCoordinator,
     StorageOperation,
     TaskLaneSlot,
+    TaskLaneFairness,
     AgentCallbackRequest,
     ImageProcessingJob,
     ImageProcessingStage,
@@ -1164,7 +1166,7 @@ def test_search_migration_state_uses_single_epoch_and_atomic_switch(postgres_res
 def _clean_business_rows(engine: Engine) -> None:
     """清理集成测试产生的业务行，不触碰 scope、安装标记和迁移版本。"""
     with engine.begin() as connection:
-        for table in ("agent_callback_requests", "reverse_image_usage_events", "operation_grants", "image_processing_attempts", "image_processing_stages", "image_processing_jobs", "meme_text_embeddings", "search_migration_states", "task_lane_slots", "task_batch_items", "task_batches", "tasks", "meme_visual_embeddings", "meme_embeddings", "search_heads", "search_generations", "storage_operations", "meme_collection_items", "meme_collections", "memes"):
+        for table in ("agent_callback_requests", "reverse_image_usage_events", "operation_grants", "image_processing_attempts", "image_processing_stages", "image_processing_jobs", "meme_text_embeddings", "search_migration_states", "task_lane_fairness", "task_lane_slots", "task_batch_items", "task_batches", "tasks", "meme_visual_embeddings", "meme_embeddings", "search_heads", "search_generations", "storage_operations", "meme_collection_items", "meme_collections", "memes"):
             connection.execute(text(f"DELETE FROM {table} WHERE scope_id = 'local'" if table not in {"task_lane_slots"} else f"DELETE FROM {table}"))
 
 
@@ -1249,6 +1251,101 @@ def test_task_claim_fencing_and_global_lane_capacity(postgres_resources) -> None
     with postgres_resources.environment("local") as environment:
         assert environment.tasks.update_fenced(task_id, active[1] - 1, "worker-a", status="succeeded") is False
         assert environment.tasks.update_fenced(task_id, active[1], "worker-a" if active[0] else "worker-b", status="succeeded") in {True, False}
+
+
+def test_fair_claim_rotates_four_scopes_and_orders_tasks(postgres_resources, postgres_engine: Engine) -> None:
+    """公平 claim 按持久序号轮转四个 scope，且 scope 内任务顺序稳定。"""
+    suffix = uuid4().hex
+    scope_ids = [f"fair-{letter}-{suffix}" for letter in "abcd"]
+    with postgres_engine.begin() as connection:
+        for index, scope_id in enumerate(scope_ids):
+            connection.execute(
+                text("INSERT INTO scopes(id, storage_namespace, created_at) VALUES (:id, :namespace, now() + (:offset * interval '1 second'))"),
+                {"id": scope_id, "namespace": uuid4(), "offset": index},
+            )
+    try:
+        task_ids: dict[str, list[str]] = {}
+        for scope_id in scope_ids:
+            with postgres_resources.environment(scope_id) as environment:
+                first = environment.tasks.submit(task_type="fair-probe", payload={"scope": scope_id}, lane="agent", dedupe_key=f"{scope_id}-one")
+                second = environment.tasks.submit(task_type="fair-probe", payload={"scope": scope_id}, lane="agent", dedupe_key=f"{scope_id}-two")
+                task_ids[scope_id] = [first.id, second.id]
+        claimed_scopes: list[str] = []
+        claimed_ids: list[str] = []
+        for index in range(8):
+            with postgres_resources.environment("local") as environment:
+                claim = environment.tasks.claim_next(owner=f"fair-worker-{index}", lane="agent", lane_capacity=1, scope_capacity=1, lease_seconds=60)
+                assert claim is not None
+                claimed_scopes.append(claim.scope_id)
+                claimed_ids.append(claim.id)
+            with postgres_resources.environment(claim.scope_id) as environment:
+                assert environment.tasks.update_fenced(claim.id, claim.claim_generation, f"fair-worker-{index}", status="succeeded") is True
+        assert claimed_scopes == scope_ids * 2
+        for scope_id in scope_ids:
+            assert claimed_ids[claimed_scopes.index(scope_id)] == task_ids[scope_id][0]
+            assert claimed_ids[claimed_scopes.index(scope_id, claimed_scopes.index(scope_id) + 1)] == task_ids[scope_id][1]
+    finally:
+        with postgres_engine.begin() as connection:
+            connection.execute(text("DELETE FROM scopes WHERE id = ANY(:scope_ids)"), {"scope_ids": scope_ids})
+
+
+def test_fair_claim_skips_scope_limit_and_preserves_sequence_when_slot_full(postgres_resources, postgres_engine: Engine) -> None:
+    """scope 上限和全局 slot 背压只跳过候选，不推进未成功 scope 的序号。"""
+    suffix = uuid4().hex
+    scope_a, scope_b = f"fair-limit-a-{suffix}", f"fair-limit-b-{suffix}"
+    with postgres_engine.begin() as connection:
+        for index, scope_id in enumerate((scope_a, scope_b)):
+            connection.execute(
+                text("INSERT INTO scopes(id, storage_namespace, created_at) VALUES (:id, :namespace, now() + (:offset * interval '1 second'))"),
+                {"id": scope_id, "namespace": uuid4(), "offset": index},
+            )
+    try:
+        with postgres_resources.environment(scope_a) as environment:
+            first = environment.tasks.submit(task_type="fair-limit", payload={}, lane="agent", dedupe_key=f"a-{suffix}")
+            second = environment.tasks.submit(task_type="fair-limit", payload={}, lane="agent", dedupe_key=f"a2-{suffix}")
+        with postgres_resources.environment(scope_b) as environment:
+            other = environment.tasks.submit(task_type="fair-limit", payload={}, lane="agent", dedupe_key=f"b-{suffix}")
+        with postgres_resources.environment("local") as environment:
+            claim_a = environment.tasks.claim_next(owner="fair-limit-a", lane="agent", lane_capacity=2, scope_capacity=1, lease_seconds=60)
+            claim_b = environment.tasks.claim_next(owner="fair-limit-b", lane="agent", lane_capacity=2, scope_capacity=1, lease_seconds=60)
+            assert claim_a is not None and claim_a.scope_id == scope_a
+            assert claim_b is not None and claim_b.scope_id == scope_b
+            assert claim_b.id == other.id
+            assert environment.tasks.claim_next(owner="fair-limit-full", lane="agent", lane_capacity=2, scope_capacity=1, lease_seconds=60) is None
+        with postgres_resources.environment(scope_a) as environment:
+            assert environment.tasks.update_fenced(claim_a.id, claim_a.claim_generation, "fair-limit-a", status="succeeded") is True
+        with postgres_resources.environment(scope_b) as environment:
+            assert environment.tasks.update_fenced(claim_b.id, claim_b.claim_generation, "fair-limit-b", status="succeeded") is True
+        with postgres_resources.factory() as session:
+            fairness = {
+                row.scope_id: row.last_dispatch_sequence
+                for row in session.scalars(select(TaskLaneFairness).where(TaskLaneFairness.lane == "agent", TaskLaneFairness.scope_id.in_((scope_a, scope_b))))
+            }
+            queued = session.scalar(select(Task).where(Task.scope_id == scope_a, Task.id == second.id))
+            assert fairness[scope_a] == 1 and fairness[scope_b] == 2
+            assert queued is not None and queued.status == "queued"
+    finally:
+        with postgres_engine.begin() as connection:
+            connection.execute(text("DELETE FROM scopes WHERE id = ANY(:scope_ids)"), {"scope_ids": [scope_a, scope_b]})
+
+
+def test_fair_claim_recovers_expired_task_and_fences_old_worker(postgres_resources) -> None:
+    """过期租约重新进入公平队列，旧 generation 不能写回终态。"""
+    with postgres_resources.environment("local") as environment:
+        task = environment.tasks.submit(task_type="fair-recovery", payload={}, lane="agent", dedupe_key=f"recovery-{uuid4().hex}")
+        old = environment.tasks.claim_next(owner="old-fair-worker", lane="agent", lane_capacity=1, scope_capacity=1, lease_seconds=60)
+        assert old is not None
+        old_generation = old.claim_generation
+    with postgres_resources.factory() as session:
+        row = session.scalar(select(Task).where(Task.scope_id == "local", Task.id == task.id))
+        assert row is not None
+        row.lease_expires_at = utcnow() - timedelta(seconds=1)
+        session.commit()
+    with postgres_resources.environment("local") as environment:
+        fresh = environment.tasks.claim_next(owner="new-fair-worker", lane="agent", lane_capacity=1, scope_capacity=1, lease_seconds=60)
+        assert fresh is not None and fresh.id == task.id and fresh.claim_generation == old_generation + 1
+        assert environment.tasks.update_fenced(task.id, old_generation, "old-fair-worker", status="succeeded") is False
+        assert environment.tasks.update_fenced(task.id, fresh.claim_generation, "new-fair-worker", status="succeeded") is True
 
 
 def test_process_worker_manager_handles_many_scopes_and_restart_claims(postgres_resources, postgres_engine: Engine) -> None:

@@ -572,6 +572,7 @@ class PostgresTaskWorkerManager:
         resources: DatabaseResources,
         *,
         agent_concurrency: int = 1,
+        scope_concurrency: int | None = None,
         agent_backpressure: int = 32,
         settings_version: str | None = None,
         lease_seconds: int = 120,
@@ -580,6 +581,7 @@ class PostgresTaskWorkerManager:
     ) -> None:
         self.resources = resources
         self.agent_concurrency = max(1, min(int(agent_concurrency), 8))
+        self.agent_scope_concurrency = max(1, min(int(scope_concurrency if scope_concurrency is not None else 1), self.agent_concurrency))
         self.agent_backpressure = max(1, min(int(agent_backpressure), 500))
         self.settings_version = settings_version
         self.lease_seconds = lease_seconds
@@ -804,11 +806,20 @@ class PostgresTaskWorkerManager:
             service = getattr(services, "tasks", None)
             if service is None:
                 raise RuntimeError("task_scope_unavailable")
-            service._run(task_id, preclaimed=claim)
-        except Exception:
+            # fair claim 可能选择另一个 scope 的 queued Task；以实际 claim ID
+            # 执行，不能把原唤醒 token 当作持久任务归属。
+            service._run(claim.id, preclaimed=claim)
+            if claim.id != task_id:
+                # 公平 claim 可能由一个 queued 唤醒 token 认领另一个 scope 的任务；
+                # 清除原 token，避免它永久占据进程内 scheduled 集合。
+                self._task_finished(task_id, claimed=False)
+        except Exception as exc:
             if service is None:
                 # 工厂异常发生在 claim 之后时只能用完整 claim fencing 收束；
                 # 没有 claim 证据则不按裸 task_id 修改任意任务。
+                if isinstance(exc, DatabaseError) and exc.code == "agent_fairness_unavailable":
+                    logger.error("agent_fairness_unavailable task=%s", task_id)
+                    self._mark_fairness_unavailable(task_id)
                 self._fail_unresolvable(claim)
                 self._task_finished(task_id, claimed=claim is not None)
             else:
@@ -818,7 +829,8 @@ class PostgresTaskWorkerManager:
     def _claim_for_task(self, task_id: str) -> Task | None:
         """从任务控制面读取 scope 并在创建业务 facade 前完成 claim。"""
         with self.resources.factory() as session:
-            scope_id = session.scalar(select(Task.scope_id).where(Task.id == task_id))
+            queued_row = session.scalar(select(Task).where(Task.id == task_id))
+            scope_id = queued_row.scope_id if queued_row is not None else None
         if not isinstance(scope_id, str) or not scope_id:
             return None
         try:
@@ -829,16 +841,46 @@ class PostgresTaskWorkerManager:
             queued = environment.tasks.get(task_id)
             if queued is None:
                 return None
-            if queued.task_type in IMAGE_PROCESSING_TASK_TYPES:
+            if queued.task_type in IMAGE_PROCESSING_TASK_TYPES and queued.submission_mode in {"pipeline", "standalone"}:
                 # 图片任务属于专用 Worker；通用 manager 不得认领或收束它们。
                 return None
+            if queued.lane == "agent":
+                claim = environment.tasks.claim_next(
+                    owner=self.owner,
+                    lease_seconds=self.lease_seconds,
+                    lane="agent",
+                    lane_capacity=self.agent_concurrency,
+                    scope_capacity=self.agent_scope_concurrency,
+                    exclude_image_pipeline=True,
+                )
+                if claim is not None:
+                    logger.info(
+                        "agent_fair_claim task=%s scope=%s generation=%s",
+                        claim.id,
+                        claim.scope_id,
+                        claim.claim_generation,
+                    )
+                return claim
             return environment.tasks.claim(
                 owner=self.owner,
                 lease_seconds=self.lease_seconds,
                 task_id=task_id,
                 lane=queued.lane,
                 lane_capacity=self.agent_concurrency if queued.lane == "agent" else None,
+                scope_capacity=self.agent_scope_concurrency if queued.lane == "agent" else None,
             )
+
+    def _mark_fairness_unavailable(self, task_id: str) -> None:
+        """保留 queued 任务并记录稳定调度错误，禁止降级竞争式 claim。"""
+        with self.resources.factory() as session:
+            task = session.scalar(
+                select(Task).where(Task.id == task_id, Task.status == "queued").with_for_update()
+            )
+            if task is not None and task.lane == "agent":
+                task.error = {"error": "agent_fairness_unavailable", "message": "Agent 公平调度状态不可用"}
+                task.message = "Agent 公平调度不可用，任务保持排队"
+                task.updated_at = utcnow()
+            session.commit()
 
     def _fail_unresolvable(self, claim: Task | None) -> None:
         """按完整 claim 收束 scope 装配失败，旧 claim 不得终止新 Worker。"""
@@ -940,10 +982,11 @@ class PostgresTaskService:
     恢复并校验 scope，避免普通 payload 或 Worker 的历史默认值成为归属事实。
     """
 
-    def __init__(self, resources: DatabaseResources, *, scope_id: str | ScopeContext = "local", agent_concurrency: int = 1, agent_backpressure: int = 32, settings_version: str | None = None, lease_seconds: int = 120, max_attempts: int = 3, executor: ThreadPoolExecutor | None = None, worker_manager: PostgresTaskWorkerManager | None = None, finalize_image_tasks: bool = True, operation_policy: OperationPolicyGateway | None = None, grant_store: GrantAssociationStore | None = None, resume_enabled: bool = False, resume_max_attempts: int = 2, resume_backoff_seconds: int = 2, resume_max_backoff_seconds: int = 60, resume_timeout_seconds: int = 900):
+    def __init__(self, resources: DatabaseResources, *, scope_id: str | ScopeContext = "local", agent_concurrency: int = 1, scope_concurrency: int | None = None, agent_backpressure: int = 32, settings_version: str | None = None, lease_seconds: int = 120, max_attempts: int = 3, executor: ThreadPoolExecutor | None = None, worker_manager: PostgresTaskWorkerManager | None = None, finalize_image_tasks: bool = True, operation_policy: OperationPolicyGateway | None = None, grant_store: GrantAssociationStore | None = None, resume_enabled: bool = False, resume_max_attempts: int = 2, resume_backoff_seconds: int = 2, resume_max_backoff_seconds: int = 60, resume_timeout_seconds: int = 900):
         self.resources = resources
         self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
         self.agent_concurrency = max(1, min(int(agent_concurrency), 8))
+        self.agent_scope_concurrency = max(1, min(int(scope_concurrency if scope_concurrency is not None else 1), self.agent_concurrency))
         self.agent_backpressure = max(1, min(int(agent_backpressure), 500))
         self.settings_version = settings_version
         self.lease_seconds = lease_seconds
@@ -1654,6 +1697,7 @@ class PostgresTaskService:
                         task_id=task_id,
                         lane=lane,
                         lane_capacity=self.agent_concurrency if lane == "agent" else None,
+                        scope_capacity=self.agent_scope_concurrency if lane == "agent" else None,
                         # 专用 facade 必须能恢复自己的过期图片叶子；通用 manager
                         # 在更早的 ``_claim_for_task`` 边界排除这些类型。
                         exclude_task_types=None,
@@ -1944,7 +1988,7 @@ class PostgresTaskService:
     def _fenced_failure(self, task_id: str, generation: int, *, message: str, error: dict[str, Any], retry: bool, result: Any | None = None, retry_delay_seconds: int = 0, resume_available: bool | None = None, resume_reason: str | None = None, session_id: str | None = None, executor_attempt_id: str | None = None) -> bool:
         """按最大尝试次数将当前 claim 重新排队或置为失败。"""
         with self.resources.environment(self.scope.scope_id) as environment:
-            changed, should_retry = environment.tasks.fail_fenced(
+            changed, _should_retry = environment.tasks.fail_fenced(
                 task_id,
                 generation,
                 self.owner,
@@ -1958,8 +2002,10 @@ class PostgresTaskService:
                 session_id=session_id,
                 executor_attempt_id=executor_attempt_id,
             )
-        if changed and should_retry:
-            self._schedule(task_id)
+        # 当前执行线程的 ``finally`` 会在释放本地调度标记后统一扫描 queued
+        # 任务。这里不能提前按 task_id 单独提交新的 future：preclaimed 的
+        # 兼容调用可能尚未登记调度标记，会让同一任务在旧 claim 收束事务刚
+        # 完成后被重复认领，既造成恢复竞态，也让调用方无法观察到 queued 快照。
         return changed
 
     def _with_reverse_image_audit(self, task_id: str, result: Any, *, write_provenance: bool = False) -> dict[str, Any]:
@@ -2008,6 +2054,25 @@ class PostgresTaskService:
                 return None
             slot = environment.tasks.slot_for_task(record.id)
             return self._record_to_dataclass(record, slot_id=slot.slot_number if slot else None)
+
+    def claim_next(self, *, owner: str | None = None, lease_seconds: int | None = None, lane: str = "agent") -> TaskRecord | None:
+        """调用 PostgreSQL 公平 claim 并返回带可信 scope 的安全任务快照。
+
+        正常进程级 manager 直接使用同一 repository 入口；此 facade 方法只为
+        宿主适配层和诊断工具保留，不从 payload 接受 scope 或 user 字段。
+        """
+        with self.resources.environment(self.scope.scope_id) as environment:
+            claim = environment.tasks.claim_next(
+                owner=owner or self.owner,
+                lease_seconds=lease_seconds or self.lease_seconds,
+                lane=lane,
+                lane_capacity=self.agent_concurrency,
+                scope_capacity=self.agent_scope_concurrency,
+            )
+            if claim is None:
+                return None
+            slot = environment.tasks.slot_for_task(claim.id)
+            return self._record_to_dataclass(claim, slot_id=slot.slot_number if slot else None)
 
     def find_active(self, task_type: str, dedupe_key: str) -> TaskRecord | None:
         """按当前 scope、类型和活动去重键读取叶子 Task。

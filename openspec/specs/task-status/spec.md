@@ -6,7 +6,7 @@
 耗时操作 MUST 立即返回唯一任务标识和 `202` 状态，不得要求客户端保持原请求连接直到任务结束。短操作可以同步完成。
 
 #### Scenario: 创建长任务
-- **WHEN** 客户端提交缓存生成或批量 VLM 操作
+- **WHEN** 客户端提交缓存生成、图片处理或批量补齐任务
 - **THEN** 系统返回唯一 `task_id`、初始状态 `queued` 和任务类型
 
 ### Requirement: 系统必须提供统一任务状态
@@ -50,7 +50,7 @@
 - **THEN** 新任务使用新上限，既有终态任务历史不被重写，排队和运行任务遵循既有恢复语义
 
 ### Requirement: 并行长任务必须受公平调度和背压保护
-任务服务 MUST 对可并行的长任务施加显式并发上限和排队背压，MUST 保证单一任务类型不会无限占用所有执行资源，且 MUST 保持活动任务去重和 `queued -> running -> succeeded/failed` 状态语义。
+任务服务 MUST 对可并行的长任务施加显式全局并发上限、scope 级运行上限和排队背压，MUST 保证单一 scope 或任务类型不会无限占用所有执行资源，且 MUST 保持活动任务去重和 `queued -> running -> succeeded/failed` 状态语义。Agent lane 的跨 scope 选择 MUST 使用 PostgreSQL 持久公平状态和事务内公平 claim；公平状态不可用时 MUST 返回 `agent_fairness_unavailable`，不得退化为竞争式 claim。
 
 #### Scenario: Agent 任务不得阻塞其他任务类型
 - **WHEN** 语境生成 job 数量超过 Agent 并发上限，且存在 cache generation 或 metadata repair job
@@ -117,7 +117,7 @@
 - **THEN** 前端如实展示最近活动距今时间，但不据此把任务标记为失败或卡死
 
 ### Requirement: 任务认领和去重必须支持并发进程
-系统 MUST 使用数据库原子操作确保一个任务在任一时刻最多由一个有效 Worker 执行，并 MUST 在并发提交语义相同的活动任务时复用同一 `task_id`。每次认领 MUST 产生递增的 claim generation，所有进度、终态和业务副作用提交都 MUST 验证当前 claim；租约过期的旧 Worker 不得写回。Agent lane 的并发上限和等待队列背压 MUST 对所有应用进程共同生效。
+系统 MUST 使用数据库原子操作确保一个任务在任一时刻最多由一个有效 Worker 执行，并 MUST 在并发提交语义相同的活动任务时复用同一 `task_id`。每次认领 MUST 产生递增的 claim generation，所有进度、终态和业务副作用提交都 MUST 验证当前 claim；租约过期的旧 Worker 不得写回。Agent lane 的全局并发上限、scope 级运行上限、等待队列背压和公平状态 MUST 对所有应用进程共同生效。
 
 #### Scenario: 两个 Worker 同时认领
 - **WHEN** 多个 Worker 同时尝试认领同一排队任务
@@ -134,6 +134,17 @@
 #### Scenario: Agent 队列达到上限
 - **WHEN** 所有进程合计的 Agent 运行任务和排队任务达到配置上限
 - **THEN** 新任务被明确拒绝或返回现有去重任务，不因增加应用进程而绕过背压
+
+### Requirement: Agent lane 必须按持久 scope 公平调度
+Agent lane MUST 在 lane advisory lock 事务内从当前可执行 scope 中选择最久未服务者，并在同一事务内分配全局 slot、更新 Task claim/lease 和推进公平序号。公平状态表缺失、不可读或不一致时，任务 MUST 保持可恢复的排队状态并记录稳定 `agent_fairness_unavailable`，不能由旧 scope-bound 竞争入口替代。
+
+#### Scenario: 单一 scope 不得连续占满可用 slot
+- **WHEN** scope A 持续提交大量 Agent 任务，scope B、C 也持续有 queued 任务，且全局 lane 存在可用 slot
+- **THEN** 调度器按持久公平序号轮转 scope，且每个 scope 的 running 数量不超过 `MEMEMEOW_AGENT_SCOPE_CONCURRENCY`
+
+#### Scenario: 公平状态不可用
+- **WHEN** Agent claim 无法读取或更新 `task_lane_fairness`
+- **THEN** Task 保持 `queued`，返回或记录 `agent_fairness_unavailable`，不创建 running claim 或 lane slot
 
 ### Requirement: 批次收束必须恰好触发一次
 系统 MUST 将任务与批次关系持久化，并在一个批次的全部语境任务进入终态后只触发一次该批次的索引刷新收束操作。服务重启、任务复用或多个 Worker 并发检查不得导致遗漏或重复触发。

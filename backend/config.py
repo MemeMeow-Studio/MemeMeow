@@ -116,6 +116,8 @@ class Settings(BaseSettings):
     agent_result_retention_days: int = Field(default=14, ge=1, le=365, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESULT_RETENTION_DAYS", "agent_result_retention_days"))
     agent_result_max_tasks: int = Field(default=500, ge=1, le=10000, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESULT_MAX_TASKS", "agent_result_max_tasks"))
     opencode_concurrency: int = Field(default=1, ge=1, le=8, validation_alias=AliasChoices(CONCURRENCY_ENV, "opencode_concurrency"))
+    # 每个持久 scope 在 Agent lane 中的同时运行上限；公平调度在数据库内 enforce。
+    agent_scope_concurrency: int = Field(default=1, ge=1, le=8, validation_alias=AliasChoices("MEMEMEOW_AGENT_SCOPE_CONCURRENCY", "agent_scope_concurrency"))
     agent_backpressure: int = Field(default=32, ge=1, le=500, validation_alias=AliasChoices("MEMEMEOW_AGENT_BACKPRESSURE", "agent_backpressure"))
     database_url: str = Field(default="postgresql+psycopg://mememeow:mememeow@127.0.0.1:5434/mememeow", validation_alias=AliasChoices("MEMEMEOW_DATABASE_URL", "database_url"), repr=False)
     database_pool_size: int = Field(default=5, ge=1, le=100, validation_alias=AliasChoices("MEMEMEOW_DATABASE_POOL_SIZE", "database_pool_size"))
@@ -287,6 +289,7 @@ class Settings(BaseSettings):
             "agent_resume_max_backoff_seconds": self.agent_resume_max_backoff_seconds,
             "agent_resume_timeout_seconds": self.agent_resume_timeout_seconds,
             "opencode_concurrency": self.opencode_concurrency,
+            "agent_scope_concurrency": self.agent_scope_concurrency,
             "agent_backpressure": self.agent_backpressure,
             "protected_mode": self.protected_mode,
             "opencode_workspace_root_configured": bool(self.opencode_workspace_root),
@@ -335,6 +338,7 @@ class Settings(BaseSettings):
             "agent_runtime_mode": self.agent_runtime_mode,
             "data_root_configured": True,
             "opencode_concurrency": self.opencode_concurrency,
+            "agent_scope_concurrency": self.agent_scope_concurrency,
             "agent_backpressure": self.agent_backpressure,
             "settings_version": self.settings_version,
             "embedding_dimensions": self.embedding_dimensions,
@@ -399,7 +403,7 @@ class Settings(BaseSettings):
             "settings_version": self.settings_version,
             "config_version": self.settings_version,
             "restart_required": restart_required,
-            "effective": {"opencode_concurrency": self.opencode_concurrency},
+            "effective": {"opencode_concurrency": self.opencode_concurrency, "agent_scope_concurrency": self.agent_scope_concurrency},
             "pending": {"opencode_concurrency": pending},
             "effective_value": self.opencode_concurrency,
             "pending_value": pending,

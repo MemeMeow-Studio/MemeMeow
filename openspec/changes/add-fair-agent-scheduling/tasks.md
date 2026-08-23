@@ -1,0 +1,9 @@
+- [x] 1.1 在 `Task`/lane repository 边界定义公平 claim 的可信输入、返回的 scope 归属和稳定错误码。
+- [x] 1.2 新增 `task_lane_fairness` ORM 模型、唯一约束、索引和数据库 migration。
+- [x] 1.3 实现事务内 `claim_next`：候选 scope 选择、scope 运行上限、lane slot、Task claim 和公平序号必须原子提交。
+- [x] 1.4 更新 Agent lane Worker manager，使正常 Agent 调度使用公平 claim；保留兼容 scope-bound claim 的安全边界。
+- [x] 1.5 增加 scope 动态加入、无任务跳过、scope 达上限跳过、全局 slot 满载和公平状态故障的稳定错误处理。
+- [x] 1.6 保持 lease recovery、claim generation、fenced update/success/failure、cancel 和 shutdown 正确释放公平/slot 相关状态。
+- [x] 1.7 更新本地兼容任务服务或明确其仅支持单 scope 模式，禁止伪装提供跨进程公平保证。
+- [x] 1.8 增加 PostgreSQL 集成测试：多 Worker 单次 claim、四 scope 轮询、单 scope 上限、租约恢复、旧 Worker fencing、并发提交去重和 migration 回滚。
+- [x] 1.9 更新 task-status/meme-search 公共 spec、配置说明和调度诊断日志。

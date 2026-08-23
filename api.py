@@ -583,7 +583,7 @@ def _context_enqueue_error(exc: Exception) -> str:
     if isinstance(code, str) and code:
         return code
     text = str(exc).split(":", 1)[0]
-    return text if text in {"agent_backpressure", "agent_executor_not_configured", "agent_executor_unavailable", "agent_executor_unauthorized", "agent_runtime_unavailable", "generation_policy_conflict", "processing_options_conflict", "reverse_image_unavailable", "invalid_reverse_image_policy", "invalid_auto_name", "opencode_workspace_provider_missing", "opencode_workspace_invalid", "opencode_workspace_mismatch"} else "context_enqueue_failed"
+    return text if text in {"agent_backpressure", "agent_fairness_unavailable", "agent_executor_not_configured", "agent_executor_unavailable", "agent_executor_unauthorized", "agent_runtime_unavailable", "generation_policy_conflict", "processing_options_conflict", "reverse_image_unavailable", "invalid_reverse_image_policy", "invalid_auto_name", "opencode_workspace_provider_missing", "opencode_workspace_invalid", "opencode_workspace_mismatch"} else "context_enqueue_failed"
 
 
 def _collection_payload(request: Request, environment, row) -> dict[str, object]:
@@ -769,6 +769,7 @@ async def lifespan(app: FastAPI):
         worker_manager = PostgresTaskWorkerManager(
             app.state.database,
             agent_concurrency=settings.opencode_concurrency,
+            scope_concurrency=getattr(settings, "agent_scope_concurrency", 1),
             agent_backpressure=settings.agent_backpressure,
             settings_version=settings.settings_version,
             lease_seconds=settings.worker_lease_seconds,
@@ -797,6 +798,7 @@ async def lifespan(app: FastAPI):
                 app.state.database,
                 scope_id=local_scope,
                 agent_concurrency=settings.opencode_concurrency,
+                scope_concurrency=getattr(settings, "agent_scope_concurrency", 1),
                 agent_backpressure=settings.agent_backpressure,
                 settings_version=settings.settings_version,
                 lease_seconds=settings.worker_lease_seconds,
@@ -1410,6 +1412,7 @@ async def lifespan(app: FastAPI):
         settings,
         task_config={
             "agent_concurrency": settings.opencode_concurrency,
+            "scope_concurrency": getattr(settings, "agent_scope_concurrency", 1),
             "agent_backpressure": settings.agent_backpressure,
             "settings_version": settings.settings_version,
             "lease_seconds": settings.worker_lease_seconds,

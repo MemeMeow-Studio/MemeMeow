@@ -39,7 +39,7 @@ _✨ 通过自然语言检索表情包 ✨_
 - **自然语言处理**: 采用嵌入模型，实现 Q&A 式的检索，能够对给出问题自动使用表情包回应。
 - **异步语境**: OpenCode Agent 使用研究 skill 为每张图片生成结构化数据库语境，任务状态可在“处理任务”页面查看。
 - **本地视觉近邻**：上传先异步生成官方 DINOv2 ViT-B/14（768 维）视觉向量，再幂等启动 Agent；Agent 只能查询同一 scope 中已有 Agent-ready 语境的候选，视觉相似度不是出处证明。
-- **受控并发**：不同图片可在安全范围 `1..8` 内使用独立 Agent lane 并行处理，默认并发为 `1`；超出并发上限的任务保持排队，等待队列达到 `MEMEMEOW_AGENT_BACKPRESSURE`（默认 `32`）后返回稳定背压错误；缓存和 metadata repair 保留独立资源。
+- **受控并发**：Agent lane 使用 PostgreSQL 持久公平 claim；全局并发由 `MEMEMEOW_OPENCODE_CONCURRENCY` 控制，单个 scope 的同时运行数由 `MEMEMEOW_AGENT_SCOPE_CONCURRENCY` 控制（默认 `1`），超出并发上限的任务保持排队，等待队列达到 `MEMEMEOW_AGENT_BACKPRESSURE`（默认 `32`）后返回稳定背压错误；缓存和 metadata repair 保留独立资源。
 - **后端设置**：独立“后端设置”页仅允许授权操作者调整 Agent 并发数量，保存到 `.env` 后重启生效；密钥、路径和 provider 地址不会回传浏览器。
 - **便捷使用**: 提供 Vue Web 界面、统一 API 和受控媒体访问，可部署在本地单机环境。
 - **可维护**：长任务、缓存和文件边界都有明确的 API 状态与错误契约。
@@ -69,7 +69,7 @@ Mememeow 是一个基于自然语言的表情包检索工具。它能让你通�
 - `uv` 和 Python 3.12（仅在宿主机运行测试或开发工具时需要）
 - Compose 运行 PostgreSQL 16 + pgvector、视觉服务、Agent executor 和 API；宿主机只有 API 通过 `127.0.0.1:8275` 访问
 - 如启用本地视觉近邻，还需从 Meta 官方公开地址取得 DINOv2 ViT-B/14 `.pth` checkpoint，并提供固定源码提交和只读权重挂载；权重不内嵌公开镜像，缺失时视觉任务以 `visual_model_not_configured` 失败。
-- 嵌入模型 API Key；语境任务的 VLM Base URL/API Key 只通过 Compose 环境显式注入 API 与 Agent executor
+- 嵌入模型 API Key；语境任务由 OpenCode Agent executor 执行，需要在 Compose 环境中显式配置 `MEMEMEOW_OPENCODE_BASE_URL`、`MEMEMEOW_OPENCODE_API_KEY` 和 `MEMEMEOW_OPENCODE_MODEL`
 
 应用 scope、适配宿主 resolver、non-local Agent 输入、双 scope staging 和回滚约束见
 [`docs/application-scope.md`](docs/application-scope.md)；单机开源入口仍固定使用显式

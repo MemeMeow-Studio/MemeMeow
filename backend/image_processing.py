@@ -753,6 +753,7 @@ class ImageProcessingWorker:
                 resources,
                 scope_id=self.scope,
                 agent_concurrency=int(getattr(task_service, "agent_concurrency", 1)),
+                scope_concurrency=int(getattr(task_service, "agent_scope_concurrency", 1)),
                 agent_backpressure=int(getattr(task_service, "agent_backpressure", 32)),
                 settings_version=getattr(task_service, "settings_version", None),
                 lease_seconds=int(getattr(task_service, "lease_seconds", 120)),
@@ -1469,6 +1470,13 @@ class ImageProcessingWorker:
                         grant = require_allowed(self.policy.acquire(gateway_request))
                         association = self.grants.put(GrantAssociation(gateway_request, grant))
             except OperationPolicyError as exc:
+                if exc.code == "operation_policy_unavailable":
+                    # 另一个进程可能已经把同一逻辑 grant 绑定到叶子 Task，但
+                    # 当前事务尚未在活动 Task 索引中观察到；重新读取精确 dedupe
+                    # 事实后才能收敛并发提交，不能把可证明的重复误报为策略损坏。
+                    rebound_task_id = self._find_active_task(submitter, task_type, dedupe_key)
+                    if rebound_task_id is not None and self._attach_task_for_worker(job, stage, rebound_task_id):
+                        return rebound_task_id
                 self.jobs.transition(job.id, stage, owner=self.owner, claim_generation=job.claim_generation, status="blocked", error={"error": exc.code}, retry_at=exc.retry_at)
                 raise ImageProcessingError("blocked", retry_at=exc.retry_at) from exc
             if association is not None and association.state in {"unknown", "committed"}:
