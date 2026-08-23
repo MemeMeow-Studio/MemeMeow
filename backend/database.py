@@ -51,6 +51,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from backend.paths import SUPPORTED_EXTENSIONS, validate_business_storage_key
 from backend.storage_security import StorageRootError, validate_controlled_root
 from backend.agent_resume import append_error_history, append_task_error_history, normalize_identifier, sanitize_error
+from executor.agent_limits import validate_agent_concurrency
 
 
 EMBEDDING_DIMENSIONS = 1024
@@ -75,6 +76,18 @@ IMAGE_PROCESSING_LANE_TYPES = frozenset(
 def utcnow() -> datetime:
     """返回带 UTC 时区的当前时间，供数据库字段和租约计算共用。"""
     return datetime.now(UTC)
+
+
+def _validate_lane_capacities(lane_capacity: object | None, scope_capacity: object | None) -> tuple[int | None, int | None]:
+    """校验数据库公平调度的 lane/scope 容量，不对非法值做静默收敛。"""
+    if lane_capacity is None:
+        return None, None
+    try:
+        capacity = validate_agent_concurrency(lane_capacity)
+        limit = validate_agent_concurrency(scope_capacity, backpressure=capacity) if scope_capacity is not None else None
+    except ValueError as exc:
+        raise DatabaseError("agent_claim_config_invalid") from exc
+    return capacity, limit
 
 
 class DatabaseError(RuntimeError):
@@ -2311,10 +2324,10 @@ class TaskRepository:
         if not isinstance(lane, str) or not lane.strip() or len(lane) > 64:
             raise DatabaseError("agent_claim_lane_invalid")
         try:
-            capacity = max(1, min(int(lane_capacity), 128))
-            limit = capacity if scope_capacity is None else max(1, min(int(scope_capacity), capacity))
+            capacity, limit = _validate_lane_capacities(lane_capacity, scope_capacity)
+            assert capacity is not None
             lease_seconds = max(1, min(int(lease_seconds), 86400))
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, AssertionError) as exc:
             raise DatabaseError("agent_claim_config_invalid") from exc
         if scope_id is not None:
             try:
@@ -2572,7 +2585,9 @@ class TaskRepository:
         因而不能绕过全局 slot 或可选 scope 上限。
         """
         now = utcnow()
-        if lane and lane_capacity:
+        if lane and lane_capacity is not None:
+            lane_capacity, scope_capacity = _validate_lane_capacities(lane_capacity, scope_capacity)
+            assert lane_capacity is not None
             self._lock_lane(lane)
             self._ensure_lane_slots(lane, lane_capacity)
             self._recover_expired_lane_locked(lane=lane, now=now, scope_id=self.scope.scope_id, exclude_task_types=exclude_task_types)
@@ -2613,7 +2628,7 @@ class TaskRepository:
             task = self.session.scalar(statement)
         if task is None:
             return None
-        if lane and lane_capacity:
+        if lane and lane_capacity is not None:
             # task_id 过滤只缩小候选范围，不能绕过全局 lane 槽位上限。
             expires_at = now + timedelta(seconds=lease_seconds)
             if not self._claim_lane_slot(task, owner=owner, lease_expires_at=expires_at, capacity=lane_capacity):

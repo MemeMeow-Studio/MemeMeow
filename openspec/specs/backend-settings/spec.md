@@ -6,7 +6,7 @@
 ### Requirement: 后端设置必须使用统一的有效配置模型
 系统 MUST 使用统一的类型化设置模型读取进程环境变量、`.env` 和默认值，并保持进程环境变量优先于 `.env` 的现有优先级。无效的并发配置 MUST 在启动或保存时返回稳定校验错误，不得静默使用不可预测的值。
 
-当前 Agent 全局并发和单 scope 并发的可配置范围均为 `1..40`，默认值均为 `1`；该范围是共享 Agent lane、OpenCode runner 和 executor 的一致边界。
+当前 Agent 全局并发必须为正整数且不超过当前背压容量；单 scope 并发还不得超过全局并发，默认值均为 `1`。共享 Agent lane、OpenCode runner 和 executor 使用同一校验。背压默认值为 `80`，公共核心的实现级安全上限为 `500`，该上限不是产品配额。
 
 #### Scenario: 读取并发默认值
 - **WHEN** 环境变量和 `.env` 都未提供 OpenCode 并发数量

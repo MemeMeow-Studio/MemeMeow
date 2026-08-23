@@ -20,18 +20,18 @@ from pydantic import AliasChoices, Field, PrivateAttr, field_validator, model_va
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from backend.visual_models import ACTIVE_VISUAL_MODEL_ID, active_visual_model_spec, source_repository_valid, visual_model_spec
+from executor.agent_limits import (
+    AGENT_BACKPRESSURE_DEFAULT,
+    AGENT_BACKPRESSURE_SAFETY_MAX,
+    validate_agent_backpressure,
+    validate_agent_concurrency,
+)
 from executor.token import ExecutorTokenError, read_token_file
 from backend.storage_security import StorageRootError, validate_controlled_root
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONCURRENCY_ENV = "MEMEMEOW_OPENCODE_CONCURRENCY"
-# Agent lane 的部署边界；默认仍为单并发，生产环境应结合 provider、数据库和
-# executor 资源逐步调高。背压默认值必须高于全局运行槽位，避免 40 个运行中任务
-# 因活动任务计数而无法继续提交排队任务。
-AGENT_CONCURRENCY_MAX = 40
-AGENT_BACKPRESSURE_DEFAULT = 80
-AGENT_BACKPRESSURE_MAX = 500
 SETTINGS_TOKEN_ENV = "MEMEMEOW_SETTINGS_ADMIN_TOKEN"
 _ACTIVE_VISUAL_SPEC = active_visual_model_spec()
 
@@ -121,10 +121,12 @@ class Settings(BaseSettings):
     agent_result_max_bytes: int = Field(default=1024 * 1024, ge=1024, le=16 * 1024 * 1024, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESULT_MAX_BYTES", "agent_result_max_bytes"))
     agent_result_retention_days: int = Field(default=14, ge=1, le=365, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESULT_RETENTION_DAYS", "agent_result_retention_days"))
     agent_result_max_tasks: int = Field(default=500, ge=1, le=10000, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESULT_MAX_TASKS", "agent_result_max_tasks"))
-    opencode_concurrency: int = Field(default=1, ge=1, le=AGENT_CONCURRENCY_MAX, validation_alias=AliasChoices(CONCURRENCY_ENV, "opencode_concurrency"))
+    # 并发不绑定公共产品规模；启动时由背压容量提供资源预算约束。
+    opencode_concurrency: int = Field(default=1, ge=1, validation_alias=AliasChoices(CONCURRENCY_ENV, "opencode_concurrency"))
     # 每个持久 scope 在 Agent lane 中的同时运行上限；公平调度在数据库内 enforce。
-    agent_scope_concurrency: int = Field(default=1, ge=1, le=AGENT_CONCURRENCY_MAX, validation_alias=AliasChoices("MEMEMEOW_AGENT_SCOPE_CONCURRENCY", "agent_scope_concurrency"))
-    agent_backpressure: int = Field(default=AGENT_BACKPRESSURE_DEFAULT, ge=1, le=AGENT_BACKPRESSURE_MAX, validation_alias=AliasChoices("MEMEMEOW_AGENT_BACKPRESSURE", "agent_backpressure"))
+    agent_scope_concurrency: int = Field(default=1, ge=1, validation_alias=AliasChoices("MEMEMEOW_AGENT_SCOPE_CONCURRENCY", "agent_scope_concurrency"))
+    # 背压是公共核心保留的资源安全门，而不是并发产品配额。
+    agent_backpressure: int = Field(default=AGENT_BACKPRESSURE_DEFAULT, ge=1, le=AGENT_BACKPRESSURE_SAFETY_MAX, validation_alias=AliasChoices("MEMEMEOW_AGENT_BACKPRESSURE", "agent_backpressure"))
     database_url: str = Field(default="postgresql+psycopg://mememeow:mememeow@127.0.0.1:5434/mememeow", validation_alias=AliasChoices("MEMEMEOW_DATABASE_URL", "database_url"), repr=False)
     database_pool_size: int = Field(default=5, ge=1, le=100, validation_alias=AliasChoices("MEMEMEOW_DATABASE_POOL_SIZE", "database_pool_size"))
     database_max_overflow: int = Field(default=10, ge=0, le=100, validation_alias=AliasChoices("MEMEMEOW_DATABASE_MAX_OVERFLOW", "database_max_overflow"))
@@ -188,7 +190,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def derive_paths(self) -> "Settings":
-        """根据 data root 推导未显式配置的图片和 runtime 目录。"""
+        """根据 data root 推导目录，并校验 Agent 容量关系。"""
         if self.image_root is None:
             self.image_root = self.data_root / "images"
         if self.opencode_runtime_root is None:
@@ -213,6 +215,9 @@ class Settings(BaseSettings):
             raise ValueError("agent_runtime_mode_invalid")
         if self.public_release_profile.strip().casefold() not in {"local", "development", "dev", "test", "production", "public", "1", "true", "yes", "on"}:
             raise ValueError("public_release_profile_invalid")
+        validate_agent_backpressure(self.agent_backpressure)
+        validate_agent_concurrency(self.opencode_concurrency, backpressure=self.agent_backpressure)
+        validate_agent_concurrency(self.agent_scope_concurrency, backpressure=self.opencode_concurrency)
         return self
 
     @property
@@ -391,7 +396,7 @@ class Settings(BaseSettings):
                 "value": self.opencode_concurrency,
                 "pending_value": pending,
                 "minimum": 1,
-                "maximum": AGENT_CONCURRENCY_MAX,
+                "maximum": self.agent_backpressure,
                 "environment_overridden": environment_override,
                 "restart_required": restart_required,
             },
@@ -450,10 +455,18 @@ class Settings(BaseSettings):
             return False
 
 
-def update_dotenv_concurrency(path: str | Path, value: int) -> Path:
-    """原子更新 dotenv 的并发字段，保留未知变量、注释和其他格式。"""
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= AGENT_CONCURRENCY_MAX:
-        raise ValueError("opencode_concurrency_out_of_range")
+def update_dotenv_concurrency(path: str | Path, value: int, *, backpressure: int | None = None) -> Path:
+    """原子更新 dotenv 的并发字段，保留未知变量、注释和其他格式。
+
+    ``backpressure`` 由 API 调用方传入当前部署预算；独立调用不做产品规模猜测，
+    但服务重启时 Settings 仍会再次执行相同的容量校验。
+    """
+    try:
+        validate_agent_concurrency(value, backpressure=backpressure)
+    except ValueError as exc:
+        if str(exc) == "agent_concurrency_exceeds_backpressure":
+            raise
+        raise ValueError("opencode_concurrency_out_of_range") from exc
     target = Path(path).expanduser()
     if target.is_symlink():
         raise ValueError("dotenv_symlink_forbidden")

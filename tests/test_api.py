@@ -56,11 +56,11 @@ def _clear_test_scope() -> None:
     engine.dispose()
 
 
-def test_concurrency_update_request_accepts_forty_and_rejects_forty_one() -> None:
-    """设置接口请求模型接受公开最大值并拒绝越界值。"""
-    assert ConcurrencyUpdateRequest.model_validate({"value": 40}).opencode_concurrency == 40
+def test_concurrency_update_request_accepts_large_positive_value() -> None:
+    """设置接口请求模型保留大正整数，部署背压由路由结合 Settings 校验。"""
+    assert ConcurrencyUpdateRequest.model_validate({"value": 128}).opencode_concurrency == 128
     with pytest.raises(ValidationError):
-        ConcurrencyUpdateRequest.model_validate({"value": 41})
+        ConcurrencyUpdateRequest.model_validate({"value": 0})
 
 
 @pytest.fixture

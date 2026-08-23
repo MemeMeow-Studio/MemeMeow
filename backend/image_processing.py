@@ -34,7 +34,7 @@ from backend.database import (
     Task,
     utcnow,
 )
-from backend.config import AGENT_BACKPRESSURE_DEFAULT, AGENT_CONCURRENCY_MAX
+from backend.config import AGENT_BACKPRESSURE_DEFAULT, validate_agent_backpressure, validate_agent_concurrency
 from backend.metadata import MemeContext, Provenance, SidecarMetadata
 from backend.agent_resume import normalize_identifier
 from backend.operation_policy import (
@@ -743,7 +743,13 @@ class ImageProcessingWorker:
         self.grants = grant_store or GrantAssociationStore()
         self.owner = owner or f"image-worker-{uuid4().hex}"
         self.handlers = dict(handlers or {})
-        self.executor = ThreadPoolExecutor(max_workers=max(1, min(int(max_workers), AGENT_CONCURRENCY_MAX)), thread_name_prefix="mememeow-image-worker")
+        worker_backpressure = validate_agent_backpressure(
+            getattr(task_service, "agent_backpressure", AGENT_BACKPRESSURE_DEFAULT)
+        )
+        self.executor = ThreadPoolExecutor(
+            max_workers=validate_agent_concurrency(max_workers, backpressure=worker_backpressure),
+            thread_name_prefix="mememeow-image-worker",
+        )
         self._task_runner = None
         if callable(getattr(resources, "factory", None)):
             # 图片叶子任务使用独立 facade，但仍复用同一 PostgreSQL claim、lane

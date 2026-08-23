@@ -9,9 +9,10 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from backend.config import AGENT_BACKPRESSURE_DEFAULT, AGENT_CONCURRENCY_MAX, Settings, update_dotenv_concurrency
+from backend.config import AGENT_BACKPRESSURE_DEFAULT, Settings, update_dotenv_concurrency
 from backend.visual import VISUAL_DIMENSIONS, VISUAL_MODEL_ID, VISUAL_PREPROCESS_VERSION
 from backend.visual_models import visual_model_spec
+from executor.agent_limits import AGENT_BACKPRESSURE_SAFETY_MAX
 
 
 def test_visual_defaults_pin_dinov2_vitb14_identity() -> None:
@@ -47,17 +48,22 @@ def test_upload_limits_accept_optional_total_budget() -> None:
     assert settings.status()["max_request_bytes"] == 128
 
 
-def test_agent_lane_boundary_allows_forty_and_keeps_default_backpressure_above_capacity() -> None:
-    """Agent 全局和 scope 上限接受 40，默认背压覆盖全部运行槽位。"""
-    settings = Settings(_env_file=None, opencode_concurrency=AGENT_CONCURRENCY_MAX, agent_scope_concurrency=AGENT_CONCURRENCY_MAX)
-    assert settings.opencode_concurrency == 40
-    assert settings.agent_scope_concurrency == 40
-    assert settings.agent_backpressure == AGENT_BACKPRESSURE_DEFAULT == 80
-    assert settings.backend_status()["editable"]["opencode_concurrency"]["maximum"] == AGENT_CONCURRENCY_MAX
+def test_agent_lane_accepts_large_configured_capacity_with_matching_backpressure() -> None:
+    """Agent 全局和 scope 并发保留大配置值，背压提供资源预算。"""
+    configured = 128
+    settings = Settings(_env_file=None, opencode_concurrency=configured, agent_scope_concurrency=configured, agent_backpressure=configured)
+    assert settings.opencode_concurrency == configured
+    assert settings.agent_scope_concurrency == configured
+    assert settings.agent_backpressure == configured
+    assert Settings(_env_file=None, opencode_concurrency=AGENT_BACKPRESSURE_SAFETY_MAX, agent_backpressure=AGENT_BACKPRESSURE_SAFETY_MAX).opencode_concurrency == AGENT_BACKPRESSURE_SAFETY_MAX
+    assert Settings(_env_file=None).agent_backpressure == AGENT_BACKPRESSURE_DEFAULT
+    assert settings.backend_status()["editable"]["opencode_concurrency"]["maximum"] == configured
     with pytest.raises(ValidationError):
-        Settings(_env_file=None, opencode_concurrency=AGENT_CONCURRENCY_MAX + 1)
+        Settings(_env_file=None, opencode_concurrency=configured + 1, agent_backpressure=configured)
     with pytest.raises(ValidationError):
-        Settings(_env_file=None, agent_scope_concurrency=AGENT_CONCURRENCY_MAX + 1)
+        Settings(_env_file=None, agent_scope_concurrency=configured + 1, agent_backpressure=configured)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, opencode_concurrency=1, agent_scope_concurrency=2, agent_backpressure=configured)
 
 
 def test_visual_known_previous_model_requires_schema_migration() -> None:
@@ -91,9 +97,9 @@ def test_settings_preserve_environment_priority_and_unknown_variables(tmp_path: 
     assert "UNKNOWN_VALUE" not in repr(settings)
 
 
-@pytest.mark.parametrize("value", ["0", "41", "not-an-int"])
+@pytest.mark.parametrize("value", ["0", "81", "not-an-int"])
 def test_settings_reject_invalid_concurrency(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str):
-    """并发配置必须在 1..40 范围内且为整数。"""
+    """并发配置必须为正整数且不超过默认背压容量。"""
     monkeypatch.setenv("MEMEMEOW_OPENCODE_CONCURRENCY", value)
     with pytest.raises(ValidationError):
         Settings.from_env(tmp_path / ".missing-env")
@@ -125,7 +131,9 @@ def test_dotenv_update_rejects_non_integer_value(tmp_path: Path):
     with pytest.raises(ValueError):
         update_dotenv_concurrency(tmp_path / ".env", True)
     with pytest.raises(ValueError):
-        update_dotenv_concurrency(tmp_path / ".env", AGENT_CONCURRENCY_MAX + 1)
+        update_dotenv_concurrency(tmp_path / ".env", AGENT_BACKPRESSURE_SAFETY_MAX + 1)
+    with pytest.raises(ValueError, match="agent_concurrency_exceeds_backpressure"):
+        update_dotenv_concurrency(tmp_path / ".env", 81, backpressure=80)
 
 
 def test_dotenv_symlink_is_rejected(tmp_path: Path):

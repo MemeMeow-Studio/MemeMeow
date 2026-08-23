@@ -39,7 +39,7 @@ _✨ 通过自然语言检索表情包 ✨_
 - **自然语言处理**: 采用嵌入模型，实现 Q&A 式的检索，能够对给出问题自动使用表情包回应。
 - **异步语境**: OpenCode Agent 使用研究 skill 为每张图片生成结构化数据库语境，任务状态可在“处理任务”页面查看。
 - **本地视觉近邻**：上传先异步生成官方 DINOv2 ViT-B/14（768 维）视觉向量，再幂等启动 Agent；Agent 只能查询同一 scope 中已有 Agent-ready 语境的候选，视觉相似度不是出处证明。
-- **受控并发**：Agent lane 使用 PostgreSQL 持久公平 claim；全局并发由 `MEMEMEOW_OPENCODE_CONCURRENCY` 控制（范围 `1..40`），单个 scope 的同时运行数由 `MEMEMEOW_AGENT_SCOPE_CONCURRENCY` 控制（范围 `1..40`，默认 `1`），超出并发上限的任务保持排队。`MEMEMEOW_AGENT_BACKPRESSURE` 默认 `80`；PostgreSQL 按 `queued+running` 统计，executor 和本地兼容服务按 `queued` 统计。缓存和 metadata repair 保留独立资源。
+- **受控并发**：Agent lane 使用 PostgreSQL 持久公平 claim；全局并发由 `MEMEMEOW_OPENCODE_CONCURRENCY` 控制（正整数且不超过 `MEMEMEOW_AGENT_BACKPRESSURE`），单个 scope 的同时运行数由 `MEMEMEOW_AGENT_SCOPE_CONCURRENCY` 控制（正整数且不超过全局并发和背压容量，默认 `1`），超出并发上限的任务保持排队。`MEMEMEOW_AGENT_BACKPRESSURE` 默认 `80`，公共核心实现级安全上限为 `500`；PostgreSQL 按 `queued+running` 统计，executor 和本地兼容服务按 `queued` 统计。缓存和 metadata repair 保留独立资源。生产部署可以在适配层施加更低的资源门禁。
 - **后端设置**：独立“后端设置”页仅允许授权操作者调整 Agent 并发数量，保存到 `.env` 后重启生效；密钥、路径和 provider 地址不会回传浏览器。
 - **便捷使用**: 提供 Vue Web 界面、统一 API 和受控媒体访问，可部署在本地单机环境。
 - **可维护**：长任务、缓存和文件边界都有明确的 API 状态与错误契约。

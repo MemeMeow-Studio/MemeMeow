@@ -47,6 +47,11 @@ from backend.opencode_workspace import (
     validate_directory_path,
     validate_file_path,
 )
+from executor.agent_limits import (
+    AGENT_BACKPRESSURE_DEFAULT,
+    validate_agent_backpressure,
+    validate_agent_concurrency,
+)
 from executor.token import ExecutorTokenError, ensure_token_file, read_token_file
 from backend.public_dto import PublicDataError, secret_inventory_from_mapping, validate_agent_result
 
@@ -64,10 +69,6 @@ LOG_ROOT = RUNTIME_ROOT / "logs"
 SKILL_ROOT = Path(os.getenv("MEMEMEOW_EXECUTOR_SKILL_ROOT", "/skills/research-meme-context"))
 WORKSPACE_ROOT = Path(os.getenv("MEMEMEOW_EXECUTOR_WORKSPACE_ROOT", str(RUNTIME_ROOT / "workspaces")))
 DEFAULT_MAX_RESULT_BYTES = 1024 * 1024
-# executor 是可独立复制到 Agent 镜像的快照，不能依赖后端 Settings；这里保持
-# 与后端 Agent lane 的公开容量契约一致。
-AGENT_CONCURRENCY_MAX = 40
-AGENT_BACKPRESSURE_DEFAULT = 80
 ALLOWED_REQUEST_FIELDS = frozenset(
     {
         "task_id",
@@ -154,6 +155,31 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(minimum, min(value, maximum))
+
+
+def _env_agent_backpressure(name: str, default: int) -> int:
+    """读取 executor 的 Agent 背压并拒绝越过资源安全边界的配置。"""
+    raw = os.getenv(name)
+    if raw is None:
+        return validate_agent_backpressure(default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("agent_backpressure_invalid") from exc
+    return validate_agent_backpressure(value)
+
+
+def _env_agent_concurrency(name: str, default: int, *, backpressure: int) -> int:
+    """读取 executor 的 Agent 并发并要求其落在当前背压预算内。"""
+    raw = os.getenv(name)
+    if raw is None:
+        value = default
+    else:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("agent_concurrency_invalid") from exc
+    return validate_agent_concurrency(value, backpressure=backpressure)
 
 
 def _json_error(code: str, message: str) -> dict[str, object]:
@@ -344,8 +370,12 @@ class Executor:
         self.legacy_base_url = os.getenv("MEMEMEOW_OPENCODE_BASE_URL", "").strip()
         self.legacy_api_key = os.getenv("MEMEMEOW_OPENCODE_API_KEY", "").strip()
         self.opencode_executable = os.getenv("MEMEMEOW_OPENCODE_EXECUTABLE", "opencode")
-        self.max_workers = _env_int("MEMEMEOW_OPENCODE_CONCURRENCY", 1, 1, AGENT_CONCURRENCY_MAX)
-        self.backpressure = _env_int("MEMEMEOW_AGENT_BACKPRESSURE", AGENT_BACKPRESSURE_DEFAULT, 1, 500)
+        self.backpressure = _env_agent_backpressure("MEMEMEOW_AGENT_BACKPRESSURE", AGENT_BACKPRESSURE_DEFAULT)
+        self.max_workers = _env_agent_concurrency(
+            "MEMEMEOW_OPENCODE_CONCURRENCY",
+            1,
+            backpressure=self.backpressure,
+        )
         self.max_timeout = _env_int("MEMEMEOW_AGENT_EXECUTOR_MAX_TIMEOUT_SECONDS", 1800, 1, 7200)
         self.max_result_bytes = _env_int("MEMEMEOW_AGENT_RESULT_MAX_BYTES", DEFAULT_MAX_RESULT_BYTES, 1024, 16 * 1024 * 1024)
         capability_key = os.getenv("MEMEMEOW_WORKSPACE_CAPABILITY_KEY", os.getenv("MEMEMEOW_AGENT_WORKSPACE_CAPABILITY_KEY", ""))

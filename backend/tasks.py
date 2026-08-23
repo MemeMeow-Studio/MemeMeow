@@ -18,7 +18,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from backend.agent_resume import normalize_identifier, sanitize_error, sanitize_error_history
-from backend.config import AGENT_BACKPRESSURE_DEFAULT, AGENT_CONCURRENCY_MAX
+from backend.config import AGENT_BACKPRESSURE_DEFAULT, validate_agent_backpressure, validate_agent_concurrency
 from backend.opencode_workspace import SELECTOR_RE
 from backend.public_dto import (
     PUBLIC_TASK_STATUSES,
@@ -154,6 +154,14 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _public_agent_concurrency(value: object) -> int | None:
+    """清洗任务摘要中的并发值，使用公共资源安全上限且不伪造截断后的值。"""
+    try:
+        return validate_agent_concurrency(value)
+    except ValueError:
+        return None
+
+
 @dataclass
 class TaskRecord:
     """一条可序列化任务记录，承载状态、图片来源事实和有限诊断。
@@ -217,7 +225,7 @@ class TaskRecord:
         progress = self.progress if isinstance(self.progress, (int, float)) and not isinstance(self.progress, bool) and 0 <= self.progress <= 1 else None
         attempts = self.attempts if isinstance(self.attempts, int) and not isinstance(self.attempts, bool) and 0 <= self.attempts <= 1_000_000 else 0
         resume_attempts = self.resume_attempts if isinstance(self.resume_attempts, int) and not isinstance(self.resume_attempts, bool) and 0 <= self.resume_attempts <= 1_000_000 else 0
-        agent_concurrency = self.agent_concurrency if isinstance(self.agent_concurrency, int) and not isinstance(self.agent_concurrency, bool) and 0 < self.agent_concurrency <= 128 else None
+        agent_concurrency = _public_agent_concurrency(self.agent_concurrency)
         result = {
             "task_id": task_id or "invalid-task",
             "task_type": task_type,
@@ -285,8 +293,7 @@ class TaskRecord:
         attempts = raw_attempts if isinstance(raw_attempts, int) and not isinstance(raw_attempts, bool) and 0 <= raw_attempts <= 1_000_000 else 0
         raw_resume_attempts = value.get("resume_attempts", 0)
         resume_attempts = raw_resume_attempts if isinstance(raw_resume_attempts, int) and not isinstance(raw_resume_attempts, bool) and 0 <= raw_resume_attempts <= 1_000_000 else 0
-        raw_agent_concurrency = value.get("agent_concurrency")
-        agent_concurrency = raw_agent_concurrency if isinstance(raw_agent_concurrency, int) and not isinstance(raw_agent_concurrency, bool) and 0 < raw_agent_concurrency <= 128 else None
+        agent_concurrency = _public_agent_concurrency(value.get("agent_concurrency"))
         return cls(
             task_id=task_id,
             task_type=task_type,
@@ -335,8 +342,8 @@ class PersistentTaskService:
         self._handlers: dict[str, TaskHandler] = {}
         self._lock = Lock()
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="mememeow-task")
-        self.agent_concurrency = max(1, min(int(agent_concurrency), AGENT_CONCURRENCY_MAX))
-        self.agent_backpressure = max(1, min(int(agent_backpressure), 500))
+        self.agent_backpressure = validate_agent_backpressure(agent_backpressure)
+        self.agent_concurrency = validate_agent_concurrency(agent_concurrency, backpressure=self.agent_backpressure)
         self.settings_version = settings_version
         self._agent_executor = ThreadPoolExecutor(max_workers=self.agent_concurrency, thread_name_prefix="mememeow-agent")
         self._agent_task_types = {"meme_context_generation"}

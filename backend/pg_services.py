@@ -55,7 +55,7 @@ from backend.agent_resume import (
     sanitize_error_history,
     within_total_timeout,
 )
-from backend.config import AGENT_BACKPRESSURE_DEFAULT, AGENT_CONCURRENCY_MAX
+from backend.config import AGENT_BACKPRESSURE_DEFAULT, validate_agent_backpressure, validate_agent_concurrency
 from backend.metadata import (
     CONTEXT_STATUSES,
     MAX_SEMANTIC_DOCUMENT_LENGTH,
@@ -581,9 +581,9 @@ class PostgresTaskWorkerManager:
         executor: ThreadPoolExecutor | None = None,
     ) -> None:
         self.resources = resources
-        self.agent_concurrency = max(1, min(int(agent_concurrency), AGENT_CONCURRENCY_MAX))
-        self.agent_scope_concurrency = max(1, min(int(scope_concurrency if scope_concurrency is not None else 1), self.agent_concurrency))
-        self.agent_backpressure = max(1, min(int(agent_backpressure), 500))
+        self.agent_backpressure = validate_agent_backpressure(agent_backpressure)
+        self.agent_concurrency = validate_agent_concurrency(agent_concurrency, backpressure=self.agent_backpressure)
+        self.agent_scope_concurrency = validate_agent_concurrency(scope_concurrency if scope_concurrency is not None else 1, backpressure=self.agent_concurrency)
         self.settings_version = settings_version
         self.lease_seconds = lease_seconds
         self.max_attempts = max_attempts
@@ -986,9 +986,9 @@ class PostgresTaskService:
     def __init__(self, resources: DatabaseResources, *, scope_id: str | ScopeContext = "local", agent_concurrency: int = 1, scope_concurrency: int | None = None, agent_backpressure: int = AGENT_BACKPRESSURE_DEFAULT, settings_version: str | None = None, lease_seconds: int = 120, max_attempts: int = 3, executor: ThreadPoolExecutor | None = None, worker_manager: PostgresTaskWorkerManager | None = None, finalize_image_tasks: bool = True, operation_policy: OperationPolicyGateway | None = None, grant_store: GrantAssociationStore | None = None, resume_enabled: bool = False, resume_max_attempts: int = 2, resume_backoff_seconds: int = 2, resume_max_backoff_seconds: int = 60, resume_timeout_seconds: int = 900):
         self.resources = resources
         self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
-        self.agent_concurrency = max(1, min(int(agent_concurrency), AGENT_CONCURRENCY_MAX))
-        self.agent_scope_concurrency = max(1, min(int(scope_concurrency if scope_concurrency is not None else 1), self.agent_concurrency))
-        self.agent_backpressure = max(1, min(int(agent_backpressure), 500))
+        self.agent_backpressure = validate_agent_backpressure(agent_backpressure)
+        self.agent_concurrency = validate_agent_concurrency(agent_concurrency, backpressure=self.agent_backpressure)
+        self.agent_scope_concurrency = validate_agent_concurrency(scope_concurrency if scope_concurrency is not None else 1, backpressure=self.agent_concurrency)
         self.settings_version = settings_version
         self.lease_seconds = lease_seconds
         self.max_attempts = max_attempts

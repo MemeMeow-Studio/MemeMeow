@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from threading import Event, Lock
 
-from backend.tasks import PersistentTaskService, TaskManager
+from backend.tasks import PersistentTaskService, TaskManager, TaskRecord
 
 
 def wait_for_terminal(manager: TaskManager, task_id: str, timeout: float = 2.0):
@@ -102,14 +102,23 @@ def test_agent_lane_runs_different_images_in_parallel_and_keeps_cache_lane_avail
     manager.shutdown()
 
 
-def test_local_agent_lane_clamps_to_shared_forty_slot_boundary(tmp_path):
-    """本地兼容任务服务与共享 Agent lane 使用同一 40 槽边界和默认背压。"""
-    manager = PersistentTaskService(tmp_path / "tasks", agent_concurrency=41)
+def test_local_agent_lane_preserves_configured_large_capacity(tmp_path):
+    """本地兼容任务服务保留大并发值并使用显式背压预算。"""
+    manager = PersistentTaskService(tmp_path / "tasks", agent_concurrency=128, agent_backpressure=128)
     try:
-        assert manager.agent_concurrency == 40
-        assert manager.agent_backpressure == 80
+        assert manager.agent_concurrency == 128
+        assert manager.agent_backpressure == 128
     finally:
         manager.shutdown()
+
+
+def test_task_record_public_summary_preserves_large_agent_concurrency() -> None:
+    """任务公开摘要和磁盘恢复不再把并发值截断到旧的 128。"""
+    record = TaskRecord(task_id="task", task_type="meme_context_generation", agent_concurrency=256)
+    public = record.as_dict()
+    assert public["agent_concurrency"] == 256
+    restored = TaskRecord.from_dict(public)
+    assert restored.agent_concurrency == 256
 
 
 def test_local_json_service_explicitly_reports_single_scope_compatibility(tmp_path):

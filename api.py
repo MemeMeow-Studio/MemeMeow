@@ -33,7 +33,7 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, StrictBool, StrictInt
 from sqlalchemy import select
 
-from backend.config import AGENT_CONCURRENCY_MAX, Settings, update_dotenv_concurrency
+from backend.config import Settings, update_dotenv_concurrency, validate_agent_concurrency
 from backend.collection_packages import (
     CollectionPackageError,
     DEFAULT_MAX_FILE_SIZE,
@@ -307,7 +307,8 @@ class CollectionItemsRequest(StrictRequestModel):
 class ConcurrencyUpdateRequest(StrictRequestModel):
     """后端设置页唯一允许持久化的安全参数。"""
 
-    opencode_concurrency: StrictInt = Field(ge=1, le=AGENT_CONCURRENCY_MAX, validation_alias=AliasChoices("opencode_concurrency", "agent_concurrency", "concurrency", "value"))
+    # 公共请求模型只要求正整数；当前部署的背压容量由路由结合 Settings 校验。
+    opencode_concurrency: StrictInt = Field(ge=1, validation_alias=AliasChoices("opencode_concurrency", "agent_concurrency", "concurrency", "value"))
 
 
 def _error(status: int, code: str, message: str) -> HTTPException:
@@ -1461,7 +1462,10 @@ async def lifespan(app: FastAPI):
             task_service=local_services.tasks,
             policy=app.state.operation_policy_gateway,
             grant_store=app.state.operation_grants,
-            max_workers=max(1, min(int(getattr(settings, "opencode_concurrency", 1)), AGENT_CONCURRENCY_MAX)),
+            max_workers=validate_agent_concurrency(
+                getattr(settings, "opencode_concurrency", 1),
+                backpressure=getattr(settings, "agent_backpressure", None),
+            ),
             task_handlers={
                 "visual_embedding_generation": visual_handler,
                 "meme_context_generation": context_handler,
@@ -1612,7 +1616,10 @@ def _processing_worker(request: Request) -> ImageProcessingWorker | None:
             task_service=services.tasks,
             policy=getattr(request.app.state, "operation_policy_gateway", None),
             grant_store=getattr(request.app.state, "operation_grants", None),
-            max_workers=max(1, min(int(getattr(request.app.state.settings, "opencode_concurrency", 1)), AGENT_CONCURRENCY_MAX)),
+            max_workers=validate_agent_concurrency(
+                getattr(request.app.state.settings, "opencode_concurrency", 1),
+                backpressure=getattr(request.app.state.settings, "agent_backpressure", None),
+            ),
             task_handlers=getattr(request.app.state, "image_processing_task_handlers", None),
         )
         workers[scope.scope_id] = worker
@@ -2071,7 +2078,11 @@ async def _update_backend_settings(request: Request, payload: ConcurrencyUpdateR
     if os.environ.get("MEMEMEOW_OPENCODE_CONCURRENCY") is not None:
         raise _error(409, "settings_environment_override", "并发数量由进程环境变量覆盖，不能写入 .env")
     try:
-        update_dotenv_concurrency(settings.dotenv_path, payload.opencode_concurrency)
+        update_dotenv_concurrency(
+            settings.dotenv_path,
+            payload.opencode_concurrency,
+            backpressure=settings.agent_backpressure,
+        )
     except ValueError as exc:
         raise _error(400, "settings_update_invalid", str(exc)) from exc
     except OSError as exc:
