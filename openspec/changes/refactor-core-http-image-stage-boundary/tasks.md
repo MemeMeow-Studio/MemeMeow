@@ -19,4 +19,4 @@
 
 - [x] 4.1 运行 OpenSpec strict validate、`git diff --check`、完整 pytest 和 PostgreSQL marker（无连接串时显式 skip）。OpenSpec strict、compileall、`git diff --check` 通过；完整 pytest `389 passed, 92 skipped`，PostgreSQL 集成为 `39 skipped`。
 - [x] 4.2 进行对抗性复核：检查 canonical/legacy route order、scope/target binding、retry 旧 Job 不复活、payload/path 脱敏、批量部分失败和 Server policy callback；修复所有 P1/P2 后重跑验证。未发现 P1/P2；重试 malformed 标识和批量兜底错误均已 fail-closed，Server callback 仍为显式注入点。
-- [ ] 4.3 在开源仓库提交精确实现 SHA 和验证记录 SHA，核验祖先关系；用户审核授权后才允许 Server 精确 fetch/普通 merge，并记录 Server merge SHA、变更范围和测试结果。
+- [x] 4.3 在开源仓库提交精确实现 SHA 和验证记录 SHA，核验祖先关系；用户审核授权后才允许 Server 精确 fetch/普通 merge，并记录 Server merge SHA、变更范围和测试结果。实现 commit 为 `5bc4c26`（完整 SHA 由 Git 核验）；验证记录随后以独立 docs commit 提交。当前实现 commit 已通过完整测试和静态门禁，Server 尚未 fetch/merge，等待用户审核授权。
