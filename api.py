@@ -70,6 +70,17 @@ from backend.task_http import (
     retry_task as _retry_task_http,
     task_summary as _task_summary_http,
 )
+from backend.image_stage_http import (
+    ImageStageBatchItem,
+    ImageStageBatchRequest,
+    ImageStageSubmissionRequest,
+    ProcessingRetryRequest,
+    get_image_processing_job as _get_image_processing_job_http,
+    list_image_processing_jobs as _list_image_processing_jobs_http,
+    retry_image_processing_job as _retry_image_processing_job_http,
+    submit_image_stage as _submit_image_stage_http,
+    submit_image_stage_batch as _submit_image_stage_batch_http,
+)
 from backend.settings_http import (
     ConcurrencyUpdateRequest,
     _authorize_settings,
@@ -251,36 +262,6 @@ class ContextBatchRequest(StrictRequestModel):
     items: list[ContextRequest] = Field(default_factory=list, max_length=500)
     include_unready: bool = True
     reverse_image_policy: str = Field(default="forbid", pattern="^(forbid|auto)$")
-
-
-class ProcessingRetryRequest(StrictRequestModel):
-    """图片处理 job 的显式重试请求；重试策略由服务端规范化。"""
-
-    model_config = ConfigDict(extra="forbid")
-    reverse_image_policy: str | None = Field(default=None, pattern="^(forbid|auto)$")
-    auto_name: StrictBool | None = None
-
-
-class ImageStageSubmissionRequest(StrictRequestModel):
-    """受限独立图片阶段提交请求；目标输入由当前 scope 的 Meme 派生。"""
-
-    model_config = ConfigDict(extra="forbid")
-    meme_id: str = Field(min_length=1, max_length=255)
-    stage: str = Field(min_length=1, max_length=64)
-    reverse_image_policy: str = Field(default="forbid", pattern="^(forbid|auto)$")
-
-
-class ImageStageBatchItem(StrictRequestModel):
-    """图片库批量阶段重试中的单张图片标识。"""
-
-    meme_id: str = Field(min_length=1, max_length=255)
-
-
-class ImageStageBatchRequest(StrictRequestModel):
-    """图片库批量阶段重试请求，只允许三个核心阶段。"""
-
-    items: list[ImageStageBatchItem] = Field(default_factory=list, max_length=500)
-    stages: list[str] = Field(min_length=1, max_length=3)
 
 
 class ProcessingBatchRequest(StrictRequestModel):
@@ -2105,26 +2086,27 @@ async def process_unready_image_library_route(request: Request, payload: Process
     return await process_unready_image_library(request, payload)
 
 
-@app.get("/images/processing/{job_id}", tags=["images", "tasks"])
-@app.get("/image-processing/{job_id}", tags=["images", "tasks"], include_in_schema=False)
-async def get_image_processing_job(request: Request, job_id: str) -> dict[str, object]:
-    """按当前 scope 查询逐图处理 job；跨 scope 标识与不存在统一返回 404。"""
-    try:
-        snapshot = _processing_repository(request).snapshot(job_id)
-    except (TypeError, ValueError):
-        snapshot = None
-    if snapshot is None:
-        raise _error(404, "image_processing_job_not_found", "图片处理任务不存在")
-    return snapshot.as_dict()
-
-
-@app.get("/images/processing", tags=["images", "tasks"])
 @app.get("/image-processing", tags=["images", "tasks"], include_in_schema=False)
+@app.get("/images/processing", tags=["images", "tasks"])
 async def list_image_processing_jobs(request: Request, limit: int = Query(default=50, ge=1, le=200)) -> dict[str, object]:
-    """列出当前 scope 的完整 pipeline Job，供任务工作区渲染父子层级。"""
-    repository = _processing_repository(request)
-    snapshots = repository.list(limit=limit)
-    return {"items": [snapshot.as_dict() for snapshot in snapshots], "next_cursor": None}
+    """兼容图片处理 Job 列表入口，并注入当前 scope repository。"""
+    return await _list_image_processing_jobs_http(
+        request,
+        limit=limit,
+        processing_repository=_processing_repository,
+    )
+
+
+@app.get("/image-processing/{job_id}", tags=["images", "tasks"], include_in_schema=False)
+@app.get("/images/processing/{job_id}", tags=["images", "tasks"])
+async def get_image_processing_job(request: Request, job_id: str) -> dict[str, object]:
+    """兼容图片处理 Job 详情入口，并注入当前 scope repository/error。"""
+    return await _get_image_processing_job_http(
+        request,
+        job_id,
+        error=_error,
+        processing_repository=_processing_repository,
+    )
 
 
 def _core_image_ready(request: Request, record: Meme, image: Path, policy: str) -> bool:
@@ -2265,128 +2247,52 @@ async def process_unready_image_library(request: Request, payload: ProcessingBat
     return {"target_count": len(results), "submitted_count": submitted, "reused_count": reused, "conflict_count": conflicts, "failed_count": failed, "results": results}
 
 
-@app.post("/images/processing/{job_id}/retry", status_code=202, tags=["images", "tasks"])
 @app.post("/image-processing/{job_id}/retry", status_code=202, tags=["images", "tasks"], include_in_schema=False)
+@app.post("/images/processing/{job_id}/retry", status_code=202, tags=["images", "tasks"])
 async def retry_image_processing_job(request: Request, job_id: str, payload: ProcessingRetryRequest | None = None) -> dict[str, object]:
-    """显式创建新的图片处理 job revision，不重新激活旧 job。"""
-    try:
-        repository = _processing_repository(request)
-        old_job = repository.get(job_id)
-        if old_job is None:
-            raise ImageProcessingError("job_not_found")
-        # retry 请求中的省略字段继承旧 revision 的冻结选项；显式字段仍经过
-        # 与上传/scope 请求相同的严格规范化和联网能力校验。
-        options = _normalize_processing_options(
-            request,
-            reverse_image_policy=(payload.reverse_image_policy if payload and payload.reverse_image_policy is not None else old_job.reverse_image_policy),
-            auto_name=(payload.auto_name if payload and payload.auto_name is not None else old_job.auto_name),
-        )
-        job = repository.retry(job_id, policy=options.reverse_image_policy, auto_name=options.auto_name, config=_processing_config(request))
-    except ImageProcessingError as exc:
-        status = 404 if exc.code == "job_not_found" else 503 if exc.code == "reverse_image_unavailable" else 422 if exc.code in {"invalid_auto_name", "invalid_reverse_image_policy"} else 409
-        raise _error(status, exc.code, "图片处理任务当前不可重试") from exc
-    worker = _processing_worker(request)
-    if worker is not None:
-        worker.schedule(job.id)
-    snapshot = repository.snapshot(job.id)
-    if snapshot is None:
-        raise _error(503, "image_processing_job_unavailable", "图片处理任务当前不可用")
-    return snapshot.as_dict()
-
-
-@app.post("/images/stages", status_code=202, tags=["images", "tasks"])
-@app.post("/images/processing/stages", status_code=202, tags=["images", "tasks"], include_in_schema=False)
-@app.post("/image-processing/stages", status_code=202, tags=["images", "tasks"], include_in_schema=False)
-async def submit_image_stage(request: Request, payload: ImageStageSubmissionRequest) -> dict[str, object]:
-    """提交一个无父 Job 的视觉、Agent、自动重命名或文本 embedding 阶段。"""
-    try:
-        canonical = ImageProcessingWorker._canonical_stage(payload.stage)
-    except ImageProcessingError as exc:
-        raise _error(422, exc.code, "图片阶段无效") from exc
-    try:
-        record, image = _service(request, "metadata").image_for_meme(payload.meme_id)
-    except MetadataError as exc:
-        status = 404 if exc.code in {"metadata_missing", "image_unreadable"} else 409
-        code = "meme_not_found" if status == 404 else exc.code
-        raise _error(status, code, "图片不存在或内容已变化") from exc
-    try:
-        options = _normalize_processing_options(request, reverse_image_policy=payload.reverse_image_policy)
-    except ImageProcessingError as exc:
-        status = 503 if exc.code == "reverse_image_unavailable" else 400
-        raise _error(status, exc.code, "图片处理选项无效或服务不可用") from exc
-    worker = _processing_worker(request)
-    if worker is None:
-        raise _error(503, "image_processing_unavailable", "图片处理服务当前不可用")
-    try:
-        task = worker.submit_stage(
-            record.id,
-            canonical,
-            config=_processing_config(request),
-            reverse_image_policy=options.reverse_image_policy,
-            schedule=True,
-        )
-    except ImageProcessingError as exc:
-        status = 422 if exc.code == "invalid_image_stage" else 404 if exc.code == "target_changed" else 403 if exc.code == "operation_forbidden" else 429 if exc.code == "operation_limit_exceeded" else 503 if exc.code in {"operation_policy_unavailable", "image_processing_unavailable"} else 409
-        raise _error(status, exc.code, "独立图片阶段提交失败") from exc
-    if task is None:
-        raise _error(503, "image_processing_unavailable", "图片处理任务当前不可用")
-    result = _task_summary(request, task)
-    result.update(
-        {
-            "task_id": task.task_id,
-            "task_type": task.task_type,
-            "submission_mode": "standalone",
-            "image_stage": task.image_stage or canonical,
-            "processing_job_id": None,
-        }
+    """兼容图片处理 Job 重试入口，并注入当前 scope 的控制依赖。"""
+    return await _retry_image_processing_job_http(
+        request,
+        job_id,
+        payload,
+        error=_error,
+        processing_repository=_processing_repository,
+        processing_worker=_processing_worker,
+        normalize_processing_options=_normalize_processing_options,
+        processing_config=_processing_config,
     )
-    return result
+
+
+@app.post("/image-processing/stages", status_code=202, tags=["images", "tasks"], include_in_schema=False)
+@app.post("/images/processing/stages", status_code=202, tags=["images", "tasks"], include_in_schema=False)
+@app.post("/images/stages", status_code=202, tags=["images", "tasks"])
+async def submit_image_stage(request: Request, payload: ImageStageSubmissionRequest) -> dict[str, object]:
+    """兼容独立图片阶段入口，并注入当前 scope 的控制依赖。"""
+    return await _submit_image_stage_http(
+        request,
+        payload,
+        service=_service,
+        error=_error,
+        processing_worker=_processing_worker,
+        normalize_processing_options=_normalize_processing_options,
+        processing_config=_processing_config,
+        task_summary=_task_summary,
+    )
 
 
 @app.post("/images/stages/batch", status_code=202, tags=["images", "tasks"])
 async def submit_image_stage_batch(request: Request, payload: ImageStageBatchRequest) -> dict[str, object]:
-    """为选中图片提交一个或多个真实核心阶段的独立任务。"""
-    allowed_stages = {"visual", "agent", "text_embedding"}
-    if len(set(payload.stages)) != len(payload.stages) or any(stage not in allowed_stages for stage in payload.stages):
-        raise _error(422, "invalid_image_stage", "批量阶段只能选择视觉向量、图片语境或文本索引，且不能重复")
-    if not payload.items:
-        return {"target_count": 0, "submitted_count": 0, "failed_count": 0, "results": []}
-    worker = _processing_worker(request)
-    if worker is None:
-        raise _error(503, "image_processing_unavailable", "图片处理服务当前不可用")
-    results: list[dict[str, object]] = []
-    for item in payload.items:
-        for stage in payload.stages:
-            try:
-                # 复用单阶段入口的目标和 scope 校验；独立阶段始终使用安全的离线策略。
-                record, _image = _service(request, "metadata").image_for_meme(item.meme_id)
-                options = _normalize_processing_options(request, reverse_image_policy="forbid")
-                task = worker.submit_stage(
-                    record.id,
-                    stage,
-                    config=_processing_config(request),
-                    reverse_image_policy=options.reverse_image_policy,
-                    schedule=True,
-                )
-                if task is None:
-                    raise ImageProcessingError("image_processing_unavailable")
-                result = _task_summary(request, task)
-                result.update({"meme_id": item.meme_id, "stage": stage})
-                results.append(result)
-            except MetadataError as exc:
-                code = "meme_not_found" if exc.code in {"metadata_missing", "image_unreadable"} else exc.code
-                results.append({"meme_id": item.meme_id, "stage": stage, "error": code})
-            except ImageProcessingError as exc:
-                results.append({"meme_id": item.meme_id, "stage": stage, "error": exc.code})
-            except (OSError, RuntimeError) as exc:
-                results.append({"meme_id": item.meme_id, "stage": stage, "error": getattr(exc, "code", "stage_submit_failed")})
-    submitted = sum(1 for result in results if result.get("task_id"))
-    return {
-        "target_count": len(results),
-        "submitted_count": submitted,
-        "failed_count": len(results) - submitted,
-        "results": results,
-    }
+    """兼容批量独立图片阶段入口，并注入当前 scope 的控制依赖。"""
+    return await _submit_image_stage_batch_http(
+        request,
+        payload,
+        service=_service,
+        error=_error,
+        processing_worker=_processing_worker,
+        normalize_processing_options=_normalize_processing_options,
+        processing_config=_processing_config,
+        task_summary=_task_summary,
+    )
 
 
 @app.get("/images", tags=["images"])
