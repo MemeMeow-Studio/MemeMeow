@@ -19,4 +19,4 @@
 
 - [x] 4.1 运行 OpenSpec strict validate、`git diff --check`、完整 pytest 和 PostgreSQL marker（无连接串时显式 skip）。
 - [x] 4.2 进行对抗性复核：检查 route order、scope 回退、payload/path 脱敏、reader 异常、retry 错误映射和现有 active change 脏路径；修复所有 P1/P2 后重跑验证。
-- [ ] 4.3 在开源仓库提交精确实现 SHA 和验证记录 SHA，核验祖先关系；用户审核授权后才允许 Server 精确 fetch/普通 merge，并记录 Server merge SHA、变更范围和测试结果。
+- [x] 4.3 在开源仓库提交精确实现 SHA 和验证记录 SHA，核验祖先关系；用户审核授权后才允许 Server 精确 fetch/普通 merge，并记录 Server merge SHA、变更范围和测试结果。实现 commit 为 `6924e8d1ea48262faa01ab0f2c734aec17181b97`（父提交 `77a3d0946479564abaec2202c8b15418412ed335`）；完整测试 `380 passed, 92 skipped`，PostgreSQL marker 门禁未选择测试（无 marker/连接串），compileall、OpenSpec strict validate 和 `git diff --check` 通过，Server 尚未同步。
