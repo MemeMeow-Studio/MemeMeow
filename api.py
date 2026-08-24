@@ -53,7 +53,7 @@ from backend.paths import PathResolver, SUPPORTED_EXTENSIONS, validate_business_
 from backend.rate_limiter import RateLimiter
 from backend.opencode import OpenCodeError, OpenCodeRunner
 from backend.opencode_workspace import LocalWorkspaceProvider, MissingWorkspaceProvider, TrustedWorkspaceContext, WorkspaceResolutionError
-from backend.opencode_activity import AgentActivity, OpenCodeActivityReader
+from backend.opencode_activity import OpenCodeActivityReader
 from backend.reverse_image import ReverseImageError, ReverseImageRequest, ReverseImageService, derive_controlled_crop
 from backend.tasks import TaskRecord
 from backend.visual import VisualEmbeddingError, VisualInferenceClient, VisualSearchError, VisualSearchService, identity_from_settings
@@ -61,6 +61,15 @@ from backend.scope import LocalScopeResolver, ScopeResolutionError, ScopeResolve
 from backend.config_http import STORAGE_PREFLIGHT_BLOCKING_KEYS, _storage_preflight_summary, config_status as _config_status
 from backend.search_http import SearchRequest, search_images as _search_images
 from backend.cache_task_http import generate_cache as _generate_cache
+from backend.task_http import (
+    activity_payload as _task_activity_payload,
+    cancel_task as _cancel_task_http,
+    get_task as _get_task_http,
+    list_tasks as _list_tasks_http,
+    read_agent_activity as _read_agent_activity_http,
+    retry_task as _retry_task_http,
+    task_summary as _task_summary_http,
+)
 from backend.settings_http import (
     ConcurrencyUpdateRequest,
     _authorize_settings,
@@ -93,7 +102,6 @@ from backend.callbacks import (
 from backend.image_processing import AUTO_RENAME_WARNING_ERRORS, ImageProcessingError, ImageProcessingOptions, ImageProcessingRepository, ImageProcessingSnapshot, ImageProcessingWorker, SingleImageEmbeddingService, image_file_matches, processing_config_hash, stable_input_digest
 from backend.agent_resume import ResumeDecision, classify_resume_error, normalize_identifier, within_total_timeout
 from backend.app_extensions import ApplicationExtension, extension_paths, path_is_exempt
-from backend.public_dto import PUBLIC_STAGE_STATUSES, normalize_public_filename, normalize_public_identifier, sanitize_public_timestamp, sanitize_task_result
 
 
 INTERNAL_SCOPE_CALLBACK_PATHS = frozenset({"/internal/reverse-image/search", "/internal/visual-search/match"})
@@ -2006,145 +2014,32 @@ async def generate_cache(request: Request) -> dict[str, object]:
     return await _generate_cache(request, service=_service, error=_error)
 
 
+def _cancel_agent_task(request: Request, task_id: str) -> None:
+    """兼容旧任务取消入口，调用当前应用的 Agent 取消适配器。"""
+    cancel = getattr(request.app.state.opencode, "cancel", None)
+    if callable(cancel):
+        cancel(task_id)
+
+
 def _activity_payload(value: object) -> dict[str, object] | None:
-    """将 reader 领域值收敛为完整的三个公开活跃度字段。"""
-    if isinstance(value, AgentActivity):
-        value = value.as_dict()
-    if not isinstance(value, Mapping):
-        return None
-    completed = value.get("agent_completed_turns", value.get("completed_turns"))
-    running = value.get("agent_turn_running", value.get("turn_running"))
-    last_activity = value.get("agent_last_activity_at", value.get("last_activity_at"))
-    if isinstance(completed, bool) or not isinstance(completed, int) or completed < 0:
-        return None
-    last_activity = sanitize_public_timestamp(last_activity)
-    if not isinstance(running, bool) or last_activity is None:
-        return None
-    return {
-        "agent_completed_turns": completed,
-        "agent_turn_running": running,
-        "agent_last_activity_at": last_activity,
-    }
+    """兼容旧入口，委托公共任务 HTTP 模块投影活跃度。"""
+    return _task_activity_payload(value)
 
 
 def _read_agent_activity(request: Request, records: list[TaskRecord]) -> dict[str, object]:
-    """为当前任务页执行一次有界活跃度批量读取，失败时返回空映射。"""
-    task_ids = [record.task_id for record in records if record.task_type == "meme_context_generation"]
-    reader = getattr(request.app.state, "agent_activity", None)
-    if not task_ids or reader is None:
-        return {}
-    read_many = getattr(reader, "read_many", None)
-    if not callable(read_many):
-        read_many = getattr(reader, "read", None)
-    if not callable(read_many):
-        return {}
-    try:
-        values = read_many(task_ids)
-    except Exception:  # noqa: BLE001
-        # SQLite 观测不能改变任务 API 的成功/失败语义。
-        return {}
-    if not isinstance(values, Mapping):
-        return {}
-    return {str(task_id): value for task_id, value in values.items() if isinstance(task_id, str)}
+    """兼容旧入口，委托公共任务 HTTP 模块读取活跃度。"""
+    return _read_agent_activity_http(request, records)
 
 
 def _task_summary(request: Request, record: TaskRecord, activities: Mapping[str, object] | None = None) -> dict[str, object]:
-    """将任务转换为安全摘要，并按需装配完整活跃度字段。"""
-    if activities is None:
-        activities = _read_agent_activity(request, [record])
-    elif not isinstance(activities, Mapping):
-        activities = {}
-    data = record.as_dict(include_payload=False)
-    payload = record.payload if isinstance(record.payload, Mapping) else {}
-    task_type = record.task_type if isinstance(record.task_type, str) else ""
-    public_submission_mode = data.get("submission_mode")
-    settings = getattr(request.app.state, "settings", None)
-    if settings is not None and task_type == "meme_context_generation" and data.get("resume_available"):
-        resume_enabled = bool(getattr(settings, "agent_resume_enabled", False))
-        if not resume_enabled:
-            data["resume_available"] = False
-            data["resume_reason"] = "resume_disabled"
-        elif isinstance(data.get("resume_attempts"), int) and data["resume_attempts"] >= int(getattr(settings, "agent_resume_max_attempts", 2)):
-            data["resume_available"] = False
-            data["resume_reason"] = "resume_budget_exhausted"
-        elif isinstance(record.resume_started_at, str):
-            try:
-                resume_started_at = datetime.fromisoformat(record.resume_started_at.replace("Z", "+00:00"))
-            except ValueError:
-                resume_started_at = None
-            if resume_started_at is not None and not within_total_timeout(
-                resume_started_at,
-                timeout_seconds=int(getattr(settings, "agent_resume_timeout_seconds", 900)),
-            ):
-                data["resume_available"] = False
-                data["resume_reason"] = "resume_budget_exhausted"
-    if task_type in {"visual_embedding_generation", "meme_context_generation", "image_auto_rename", "text_embedding_generation"}:
-        # NULL 来源只代表旧历史无法可靠归类，不能被前端解释为 standalone。
-        data["historical_unclassified"] = public_submission_mode is None
-        data["read_only"] = public_submission_mode is None
-        data["retry_allowed"] = False
-        data["image_stage"] = data.get("image_stage") or {
-            "visual_embedding_generation": "visual",
-            "meme_context_generation": "agent",
-            "image_auto_rename": "auto_rename",
-            "text_embedding_generation": "text_embedding",
-        }.get(task_type)
-        if task_type == "image_auto_rename":
-            # pipeline 自动命名只有 warning 才能从专用阶段入口恢复；不可降级
-            # failure/blocked/unknown_execution 必须保持停止状态。standalone
-            # 终态失败则允许按当前 Meme 输入重新提交独立 Task。
-            recoverable_errors = {
-                "auto_rename_title_missing",
-                "auto_rename_invalid_filename",
-                "auto_rename_target_exists",
-                "auto_rename_target_changed",
-            }
-            record_error = record.error if isinstance(record.error, Mapping) else {}
-            recoverable = public_submission_mode == "standalone" and record.status == "failed" and record_error.get("error") in recoverable_errors
-            processing_job_id = data.get("processing_job_id")
-            if public_submission_mode == "pipeline" and isinstance(processing_job_id, str) and processing_job_id:
-                try:
-                    processing = _processing_repository(request).snapshot(processing_job_id)
-                    stage = next((item for item in processing.stages if isinstance(item, Mapping) and item.get("stage") == "auto_rename"), None) if processing else None
-                    recoverable = bool(stage and stage.get("status") == "warning")
-                    stage_status = stage.get("status") if stage and isinstance(stage.get("status"), str) and stage.get("status") in PUBLIC_STAGE_STATUSES else None
-                    data["image_stage_status"] = stage_status
-                except (DatabaseError, TypeError, ValueError):
-                    recoverable = False
-            data["image_stage_recoverable"] = recoverable
-    if task_type == "meme_context_generation":
-        # 只暴露可观察策略；完整 payload 仍留在后端数据库和 Worker 边界内。
-        policy = payload.get("reverse_image_policy")
-        data["reverse_image_policy"] = policy if isinstance(policy, str) and policy in {"forbid", "auto"} else "forbid"
-        activity = _activity_payload(activities.get(record.task_id)) if isinstance(record.task_id, str) else None
-        if activity is not None:
-            data.update(activity)
-    elif task_type == "visual_embedding_generation":
-        visual_result = sanitize_task_result(
-            "visual_embedding_generation",
-            {
-                "visual_model": payload.get("visual_model"),
-                "dimensions": payload.get("visual_dimensions"),
-                "preprocess_version": payload.get("preprocess_version"),
-            },
-        ) or {}
-        data["visual"] = {
-            "model": visual_result.get("visual_model"),
-            "dimensions": visual_result.get("dimensions"),
-            "preprocess_version": visual_result.get("preprocess_version"),
-        }
-    meme_id = normalize_public_identifier(payload.get("meme_id"))
-    if meme_id:
-        try:
-            _meme_record, image = _service(request, "metadata").image_for_meme(meme_id)
-            image_data: dict[str, object] = {"meme_id": meme_id, "media_url": f"/media/{meme_id}"}
-            filename = normalize_public_filename(getattr(image, "name", None))
-            if filename:
-                image_data["filename"] = filename
-            data["image"] = image_data
-        except MetadataError:
-            data["image"] = {"meme_id": meme_id}
-    return data
+    """兼容旧入口，委托公共任务 HTTP 模块生成安全摘要。"""
+    return _task_summary_http(
+        request,
+        record,
+        activities,
+        service=_service,
+        processing_repository=_processing_repository,
+    )
 
 
 @app.get("/tasks", tags=["tasks"])
@@ -2155,72 +2050,53 @@ async def list_tasks(
     cursor: str | None = Query(default=None, max_length=128),
     limit: int = Query(default=50, ge=1, le=100),
 ) -> dict[str, object]:
-    """按筛选条件分页列出任务安全摘要。"""
-    records, next_cursor = _service(request, "tasks").list(statuses=set(status) or None, task_types=set(task_type) or None, cursor=cursor, limit=limit)
-    activities = _read_agent_activity(request, records)
-    return {"items": [_task_summary(request, record, activities) for record in records], "next_cursor": next_cursor}
+    """兼容旧任务列表入口，并注入当前 scope 的 service/repository。"""
+    return await _list_tasks_http(
+        request,
+        status=status,
+        task_type=task_type,
+        cursor=cursor,
+        limit=limit,
+        service=_service,
+        processing_repository=_processing_repository,
+    )
 
 
 @app.get("/tasks/{task_id}", tags=["tasks"])
 async def get_task(request: Request, task_id: str) -> dict[str, object]:
-    """查询持久任务详情。"""
-    record = _service(request, "tasks").get(task_id)
-    if record is None:
-        # 图片处理 job 与叶子 Task 使用不同控制面，但旧前端只知道统一的
-        # ``/tasks/{id}`` 轮询入口；回退查询仍严格绑定当前请求 scope。
-        try:
-            snapshot = _processing_repository(request).snapshot(task_id)
-        except (TypeError, ValueError):
-            snapshot = None
-        if snapshot is not None:
-            # 上传/合集旧客户端把父 Job 当作视觉任务轮询；新客户端使用
-            # /images/processing/{job_id} 获取完整四阶段 DTO。这里只保留
-            # 旧轮询所需的任务类型兼容值，不改变父 Job 的真实状态。
-            data = snapshot.as_dict()
-            data["task_type"] = "visual_embedding_generation"
-            data["image_stage"] = "visual"
-            return data
-        raise _error(404, "task_not_found", "任务不存在")
-    return _task_summary(request, record)
+    """兼容旧任务详情入口，并注入当前 scope 的 service/repository/error。"""
+    return await _get_task_http(
+        request,
+        task_id,
+        service=_service,
+        error=_error,
+        processing_repository=_processing_repository,
+    )
 
 
 @app.post("/tasks/{task_id}/cancel", tags=["tasks"])
 async def cancel_task(request: Request, task_id: str) -> dict[str, object]:
-    """取消单个未完成任务，不停止共享 Agent 容器或其他 session。"""
-    record = _service(request, "tasks").get(task_id)
-    if record is None:
-        raise _error(404, "task_not_found", "任务不存在")
-    if record.status in {"succeeded", "failed"}:
-        return _task_summary(request, record)
-    if not _service(request, "tasks").cancel(task_id):
-        record = _service(request, "tasks").get(task_id)
-        if record is None:
-            raise _error(404, "task_not_found", "任务不存在")
-    if record.task_type == "meme_context_generation":
-        cancel = getattr(request.app.state.opencode, "cancel", None)
-        if callable(cancel):
-            cancel(task_id)
-    current = _service(request, "tasks").get(task_id)
-    return _task_summary(request, current or record)
+    """兼容旧任务取消入口，并注入当前 scope 的 service/repository/error。"""
+    return await _cancel_task_http(
+        request,
+        task_id,
+        service=_service,
+        error=_error,
+        processing_repository=_processing_repository,
+        cancel_agent=_cancel_agent_task,
+    )
 
 
 @app.post("/tasks/{task_id}/retry", status_code=202, tags=["tasks"])
 async def retry_task(request: Request, task_id: str) -> dict[str, object]:
-    """只重试当前失败阶段；视觉/Agent/文本任务不会隐式级联。"""
-    try:
-        record = _service(request, "tasks").retry(task_id)
-    except RuntimeError as exc:
-        code = str(exc).split(":", 1)[0]
-        if code == "task_not_found":
-            raise _error(404, code, "任务不存在") from exc
-        if code == "task_not_failed":
-            raise _error(409, code, "只有失败任务可以重试") from exc
-        if code == "image_stage_retry_forbidden":
-            raise _error(409, code, "图片阶段必须通过完整 Job 或专用阶段入口重试") from exc
-        if code == "agent_backpressure":
-            raise _error(429, code, "Agent 等待队列已满，请稍后重试") from exc
-        raise _error(409, code, "任务重试失败") from exc
-    return _task_summary(request, record)
+    """兼容旧任务重试入口，并注入当前 scope 的 service/repository/error。"""
+    return await _retry_task_http(
+        request,
+        task_id,
+        service=_service,
+        error=_error,
+        processing_repository=_processing_repository,
+    )
 
 
 @app.post("/images/processing/unready", status_code=202, tags=["images", "tasks"])
