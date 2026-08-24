@@ -27,5 +27,7 @@
   marker（无连接串时显式 skip）。
 - [x] 4.2 复核 scope/callback、route order、脱敏字段、兼容 import、Server sync boundary
   与 active change 脏路径；修复所有 P1/P2 后重新验证。
-- [ ] 4.3 在开源仓库形成精确 commit，记录 SHA、祖先和验证结果；仅在其后按用户已授权的
-  本地精确 SHA 流程 fetch 并同步 Server。
+- [x] 4.3 在开源仓库形成精确 commit，记录 SHA、祖先和验证结果；仅在其后按用户已授权的
+  本地精确 SHA 流程 fetch 并同步 Server。实现 commit 为 `a4b15c3`（父提交
+  `b9275ca`），验证为全套测试 `360 passed, 92 skipped`、compileall、OpenSpec strict
+  validate 和 `git diff --check`；Server 尚未同步。
