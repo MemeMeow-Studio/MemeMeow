@@ -26,5 +26,7 @@
   （无连接串时显式 skip）。
 - [x] 4.2 对抗性复核 scope callback、route order、error fallback、未知/重复媒体过滤和 active
   change 脏路径；修复所有 P1/P2 后重新验证。
-- [ ] 4.3 在开源仓库提交精确 SHA，核验祖先与测试，再按用户授权的本地精确 fetch/普通 merge
-  同步 Server，并记录两个 SHA、变更范围和验证结果。
+- [x] 4.3 在开源仓库提交精确 SHA，核验祖先与测试，再按用户授权的本地精确 fetch/普通 merge
+  同步 Server，并记录两个 SHA、变更范围和验证结果。实现 commit 为 `0a48d9e`（父提交
+  `7edc956`）；全套测试 `369 passed, 92 skipped`、compileall、OpenSpec strict validate
+  和 `git diff --check` 通过，Server 尚未同步。
