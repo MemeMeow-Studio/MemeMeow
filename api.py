@@ -59,6 +59,7 @@ from backend.tasks import TaskRecord
 from backend.visual import VisualEmbeddingError, VisualInferenceClient, VisualSearchError, VisualSearchService, identity_from_settings
 from backend.scope import LocalScopeResolver, ScopeResolutionError, ScopeResolver, ScopeServiceFactory, ScopeServices, resolve_scope, resolve_scope_async, validate_scope_services
 from backend.config_http import STORAGE_PREFLIGHT_BLOCKING_KEYS, _storage_preflight_summary, config_status as _config_status
+from backend.search_http import SearchRequest, search_images as _search_images
 from backend.settings_http import (
     ConcurrencyUpdateRequest,
     _authorize_settings,
@@ -213,14 +214,6 @@ def _callback_verification_keys(settings: Settings) -> dict[str, str] | None:
             raise CallbackError("agent_callback_unavailable")
         values[key_id.strip()] = secret.strip()
     return values
-
-
-class SearchRequest(StrictRequestModel):
-    """规范检索请求。"""
-
-    query: str = Field(min_length=1, max_length=500)
-    n_results: StrictInt = Field(default=5, ge=1, le=30)
-    llm_enhance: bool = False
 
 
 class RenameRequest(StrictRequestModel):
@@ -1996,38 +1989,14 @@ _route_template.router.routes.extend(settings_router.routes)
 
 @app.post("/search", tags=["search"])
 async def search_images(request: Request, payload: SearchRequest) -> dict[str, list[str]]:
-    """执行唯一规范语义检索入口。"""
-    query = payload.query.strip()
-    if not query:
-        raise _error(400, "invalid_query", "query 不能为空")
-    engine = _service(request, "search")
-    if engine is None:
-        raise _error(503, "service_unavailable", "检索服务未初始化")
-    if not engine.has_cache():
-        raise _error(503, "cache_not_ready", "检索缓存尚未就绪")
-    settings: Settings = request.app.state.settings
-    try:
-        results = engine.search(query, payload.n_results, api_key=settings.embedding_api_key, use_llm=payload.llm_enhance)
-    except Exception as exc:  # noqa: BLE001
-        if "embedding_not_configured" in str(exc):
-            raise _error(503, "configuration_missing", "嵌入模型配置未完成")
-        if not payload.llm_enhance:
-            raise _error(500, "search_failed", "检索失败")
-        try:
-            results = engine.search(query, payload.n_results, api_key=settings.embedding_api_key, use_llm=False)
-        except Exception as fallback_exc:  # noqa: BLE001
-            if "embedding_not_configured" in str(fallback_exc):
-                raise _error(503, "configuration_missing", "嵌入模型配置未完成")
-            raise _error(500, "search_failed", "检索失败")
-    metadata_service = _service(request, "metadata")
-    mapped: list[str] = []
-    for item in results or []:
-        media = _media_for_meme(request, str(item)) if isinstance(item, str) else None
-        if media and media not in mapped:
-            mapped.append(media)
-        if len(mapped) >= payload.n_results:
-            break
-    return {"results": mapped}
+    """兼容旧检索入口，并注入当前 scope 的 service、媒体和错误投影。"""
+    return await _search_images(
+        request,
+        payload,
+        service=_service,
+        media_for_meme=_media_for_meme,
+        error=_error,
+    )
 
 
 @app.post("/generate-cache", status_code=202, tags=["tasks"])
