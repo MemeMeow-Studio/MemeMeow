@@ -58,6 +58,7 @@ from backend.reverse_image import ReverseImageError, ReverseImageRequest, Revers
 from backend.tasks import TaskRecord
 from backend.visual import VisualEmbeddingError, VisualInferenceClient, VisualSearchError, VisualSearchService, identity_from_settings
 from backend.scope import LocalScopeResolver, ScopeResolutionError, ScopeResolver, ScopeServiceFactory, ScopeServices, resolve_scope, resolve_scope_async, validate_scope_services
+from backend.config_http import STORAGE_PREFLIGHT_BLOCKING_KEYS, _storage_preflight_summary, config_status as _config_status
 from backend.settings_http import (
     ConcurrencyUpdateRequest,
     _authorize_settings,
@@ -93,7 +94,6 @@ from backend.app_extensions import ApplicationExtension, extension_paths, path_i
 from backend.public_dto import PUBLIC_STAGE_STATUSES, normalize_public_filename, normalize_public_identifier, sanitize_public_timestamp, sanitize_task_result
 
 
-STORAGE_PREFLIGHT_BLOCKING_KEYS = ("non_flat_keys", "nested_images", "missing_files", "mismatched")
 INTERNAL_SCOPE_CALLBACK_PATHS = frozenset({"/internal/reverse-image/search", "/internal/visual-search/match"})
 OPERATION_POLICY_PATH = "/operations/availability"
 SCOPE_SELECTOR_FIELDS = frozenset({"scope_id", "scope-id", "user_id", "user-id"})
@@ -387,22 +387,6 @@ def _operation_http_error(exc: OperationPolicyError) -> HTTPException:
     """映射稳定 policy 错误，不泄露 policy 原始诊断。"""
     status = 403 if exc.code == "operation_forbidden" else 429 if exc.code == "operation_limit_exceeded" else 503
     return _error(status, exc.code, str(exc))
-
-
-def _storage_preflight_summary(report: Mapping[str, object] | None) -> dict[str, object]:
-    """生成不包含文件名的存储预检摘要，供健康检查和配置接口诊断。"""
-    report = report or {}
-    blocking = {
-        key: len(value) if isinstance(value, (list, tuple, set, dict)) else 0
-        for key in STORAGE_PREFLIGHT_BLOCKING_KEYS
-        if (value := report.get(key))
-    }
-    orphan_files = report.get("orphan_files")
-    return {
-        "status": "warning" if orphan_files else "ok",
-        "orphan_files": len(orphan_files) if isinstance(orphan_files, (list, tuple, set, dict)) else 0,
-        "blocking_errors": blocking,
-    }
 
 
 def _safe_filename(name: str) -> str:
@@ -1852,44 +1836,8 @@ async def health(request: Request) -> dict[str, object]:
 
 @app.get("/config", tags=["system"])
 async def config_status(request: Request) -> dict[str, object]:
-    """返回脱敏配置状态；上传并发字段仅是客户端调度提示，绝不返回完整密钥。"""
-    status = request.app.state.settings.status()
-    # embedding 缓存属于运行时状态，供前端判断当前是否可以直接检索。
-    services = getattr(request.state, "services", None)
-    engine = services.search if isinstance(services, ScopeServices) else getattr(request.app.state, "search_engine", None)
-    status["embedding_cache_ready"] = bool(engine and engine.has_cache())
-    status["database_ready"] = True
-    if getattr(request.app.state, "expose_scope", True):
-        status["scope_id"] = _request_scope(request).scope_id
-    status["storage_preflight"] = _storage_preflight_summary(getattr(request.app.state, "storage_preflight", None))
-    reverse_service = _service(request, "reverse_image") if hasattr(request.app.state, "reverse_image") or getattr(request, "state", None) and getattr(request.state, "services", None) is not None else None
-    status["reverse_image_available"] = bool(reverse_service and reverse_service.available)
-    visual_client = getattr(request.app.state, "visual_inference", None)
-    if visual_client is not None:
-        status["visual_available"] = bool(visual_client.health().get("available"))
-    runtime = request.app.state.opencode.runtime_probe()
-    # /config 只暴露固定标识和布尔探针，不返回宿主绝对路径、诊断原文或任何凭据。
-    status["runtime_ready"] = bool(runtime.get("verified"))
-    status["agent_runtime"] = {
-        key: runtime[key]
-        for key in (
-            "mode",
-            "executor_running",
-            "runtime_root_ready",
-            "workspace_ready",
-            "executable_ready",
-            "skills_ready",
-            "dependencies_ready",
-            "mounts_ready",
-            "non_root",
-            "network_ready",
-            "docker_socket_absent",
-            "concurrency",
-            "verified",
-        )
-        if key in runtime
-    }
-    return status
+    """兼容旧 `/config` handler，并注入当前入口的 scope/service 解析。"""
+    return await _config_status(request, request_scope=_request_scope, service=_service)
 
 
 @app.post("/internal/reverse-image/search", tags=["internal"])
