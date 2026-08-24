@@ -12,7 +12,6 @@ from pydantic import ValidationError
 from backend.config import AGENT_BACKPRESSURE_DEFAULT, Settings, update_dotenv_concurrency
 from backend.visual import VISUAL_DIMENSIONS, VISUAL_MODEL_ID, VISUAL_PREPROCESS_VERSION
 from backend.visual_models import visual_model_spec
-from executor.agent_limits import AGENT_BACKPRESSURE_SAFETY_MAX
 
 
 def test_visual_defaults_pin_dinov2_vitb14_identity() -> None:
@@ -50,12 +49,11 @@ def test_upload_limits_accept_optional_total_budget() -> None:
 
 def test_agent_lane_accepts_large_configured_capacity_with_matching_backpressure() -> None:
     """Agent 全局和 scope 并发保留大配置值，背压提供资源预算。"""
-    configured = 128
+    configured = 1024
     settings = Settings(_env_file=None, opencode_concurrency=configured, agent_scope_concurrency=configured, agent_backpressure=configured)
     assert settings.opencode_concurrency == configured
     assert settings.agent_scope_concurrency == configured
     assert settings.agent_backpressure == configured
-    assert Settings(_env_file=None, opencode_concurrency=AGENT_BACKPRESSURE_SAFETY_MAX, agent_backpressure=AGENT_BACKPRESSURE_SAFETY_MAX).opencode_concurrency == AGENT_BACKPRESSURE_SAFETY_MAX
     assert Settings(_env_file=None).agent_backpressure == AGENT_BACKPRESSURE_DEFAULT
     assert settings.backend_status()["editable"]["opencode_concurrency"]["maximum"] == configured
     with pytest.raises(ValidationError):
@@ -99,7 +97,7 @@ def test_settings_preserve_environment_priority_and_unknown_variables(tmp_path: 
 
 @pytest.mark.parametrize("value", ["0", "81", "not-an-int"])
 def test_settings_reject_invalid_concurrency(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str):
-    """并发配置必须为正整数且不超过默认背压容量。"""
+    """并发配置必须为正整数且不超过当前背压容量。"""
     monkeypatch.setenv("MEMEMEOW_OPENCODE_CONCURRENCY", value)
     with pytest.raises(ValidationError):
         Settings.from_env(tmp_path / ".missing-env")
@@ -131,7 +129,7 @@ def test_dotenv_update_rejects_non_integer_value(tmp_path: Path):
     with pytest.raises(ValueError):
         update_dotenv_concurrency(tmp_path / ".env", True)
     with pytest.raises(ValueError):
-        update_dotenv_concurrency(tmp_path / ".env", AGENT_BACKPRESSURE_SAFETY_MAX + 1)
+        update_dotenv_concurrency(tmp_path / ".env", 0)
     with pytest.raises(ValueError, match="agent_concurrency_exceeds_backpressure"):
         update_dotenv_concurrency(tmp_path / ".env", 81, backpressure=80)
 

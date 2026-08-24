@@ -155,7 +155,7 @@ def now() -> str:
 
 
 def _public_agent_concurrency(value: object) -> int | None:
-    """清洗任务摘要中的并发值，使用公共资源安全上限且不伪造截断后的值。"""
+    """清洗任务摘要中的并发值，复用公共正整数校验且不伪造截断后的值。"""
     try:
         return validate_agent_concurrency(value)
     except ValueError:

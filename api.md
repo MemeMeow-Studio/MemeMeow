@@ -122,6 +122,6 @@ Agent 只获得当前任务 token、内部地址和 executor token，不获得 c
 - Agent 运行模式只接受 `auto`、`executor` 和 `host`。`auto` 在 executor URL 与 token 同时可用时选择 executor，否则选择 host；显式 `executor` 缺少配置时失败关闭。旧 Docker runtime、容器名和运行时字段不能启用任何执行分支；回滚使用显式 host，运维诊断使用当前 project 的 `docker compose exec <service>`。
 - `MEMEMEOW_PROTECTED_MODE=true` 时仅放行 `MEMEMEOW_ALLOWED_ENDPOINTS`；限流由 `MEMEMEOW_RATE_LIMIT_*` 控制，超限返回 `429` 和 `Retry-After`。
 
-Agent lane 的 `MEMEMEOW_OPENCODE_CONCURRENCY` 必须为正整数且不超过 `MEMEMEOW_AGENT_BACKPRESSURE`；`MEMEMEOW_AGENT_SCOPE_CONCURRENCY` 还不得超过全局并发，默认值仍为 `1`。公共核心不绑定固定产品并发规模。背压默认值为 `80`，实现级安全上限为 `500`，用于防止错误配置无界扩张线程池和任务队列；部署适配层可以施加更低的生产资源门禁。设置页保存的全局并发值需要重启后生效。PostgreSQL 任务服务按 Agent lane 的 `queued+running` 统计背压，executor 和本地兼容任务服务只统计 `queued`，因此相同阈值下三层的可接受排队长度不同。
+Agent lane 的 `MEMEMEOW_OPENCODE_CONCURRENCY` 必须为正整数且不超过 `MEMEMEOW_AGENT_BACKPRESSURE`；`MEMEMEOW_AGENT_SCOPE_CONCURRENCY` 还不得超过全局并发，默认值仍为 `1`。公共核心不绑定固定产品并发规模，也不设置固定背压容量上限；部署适配层应按实际资源施加门禁。背压默认值为 `80`。设置页保存的全局并发值需要重启后生效。PostgreSQL 任务服务按 Agent lane 的 `queued+running` 统计背压，executor 和本地兼容任务服务只统计 `queued`，因此相同阈值下三层的可接受排队长度不同。
 
 系统不提供注册、JWT、角色或多租户权限接口。资源包和社区同步功能已从生产入口移除。

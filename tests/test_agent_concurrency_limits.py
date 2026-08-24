@@ -13,7 +13,7 @@ from backend.database import DatabaseError, _validate_lane_capacities
 from backend.image_processing import ImageProcessingWorker
 from backend.opencode import OpenCodeRunner
 from backend.pg_services import PostgresTaskService, PostgresTaskWorkerManager
-from executor.agent_limits import validate_agent_concurrency
+from executor.agent_limits import validate_agent_backpressure, validate_agent_concurrency
 from executor.server import _env_agent_backpressure, _env_agent_concurrency
 
 
@@ -58,9 +58,9 @@ def test_task_layers_reject_concurrency_above_backpressure() -> None:
 
 def test_database_lane_capacity_preserves_large_value_without_old_cap() -> None:
     """数据库公平 claim 保留大容量，并拒绝非法容量而不是静默截断。"""
-    assert _validate_lane_capacities(256, 256) == (256, 256)
+    assert _validate_lane_capacities(1024, 1024) == (1024, 1024)
     with pytest.raises(DatabaseError, match="agent_claim_config_invalid"):
-        _validate_lane_capacities(501, 501)
+        _validate_lane_capacities(0, 0)
 
 
 def test_opencode_and_image_workers_preserve_large_configured_capacity(tmp_path: Path) -> None:
@@ -91,9 +91,9 @@ def test_opencode_and_image_workers_preserve_large_configured_capacity(tmp_path:
         worker.shutdown()
 
 
-def test_executor_environment_parser_preserves_large_value_and_rejects_budget_overrun(monkeypatch) -> None:
-    """独立 executor 接受较大配置，并拒绝超过背压预算的值。"""
-    configured = 128
+def test_executor_environment_parser_preserves_unbounded_core_value_and_rejects_budget_overrun(monkeypatch) -> None:
+    """独立 executor 接受超过旧固定上限的配置，并拒绝超过当前背压预算的值。"""
+    configured = 1024
     monkeypatch.setenv("MEMEMEOW_AGENT_BACKPRESSURE", str(configured))
     monkeypatch.setenv("MEMEMEOW_OPENCODE_CONCURRENCY", str(configured))
     backpressure = _env_agent_backpressure("MEMEMEOW_AGENT_BACKPRESSURE", AGENT_BACKPRESSURE_DEFAULT)
@@ -103,7 +103,7 @@ def test_executor_environment_parser_preserves_large_value_and_rejects_budget_ov
         _env_agent_concurrency("MEMEMEOW_OPENCODE_CONCURRENCY", 1, backpressure=backpressure)
 
 
-def test_agent_concurrency_safety_limit_is_explicit() -> None:
-    """没有背压上下文时也拒绝超过公共资源安全上限的整数。"""
-    with pytest.raises(ValueError, match="agent_concurrency_safety_limit"):
-        validate_agent_concurrency(501)
+def test_agent_capacity_has_no_shared_fixed_safety_limit() -> None:
+    """公共核心接受超过旧固定上限的容量，部署层仍可按自身资源施加门禁。"""
+    assert validate_agent_backpressure(1024) == 1024
+    assert validate_agent_concurrency(1024) == 1024

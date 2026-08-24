@@ -22,7 +22,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from backend.visual_models import ACTIVE_VISUAL_MODEL_ID, active_visual_model_spec, source_repository_valid, visual_model_spec
 from executor.agent_limits import (
     AGENT_BACKPRESSURE_DEFAULT,
-    AGENT_BACKPRESSURE_SAFETY_MAX,
     validate_agent_backpressure,
     validate_agent_concurrency,
 )
@@ -125,8 +124,8 @@ class Settings(BaseSettings):
     opencode_concurrency: int = Field(default=1, ge=1, validation_alias=AliasChoices(CONCURRENCY_ENV, "opencode_concurrency"))
     # 每个持久 scope 在 Agent lane 中的同时运行上限；公平调度在数据库内 enforce。
     agent_scope_concurrency: int = Field(default=1, ge=1, validation_alias=AliasChoices("MEMEMEOW_AGENT_SCOPE_CONCURRENCY", "agent_scope_concurrency"))
-    # 背压是公共核心保留的资源安全门，而不是并发产品配额。
-    agent_backpressure: int = Field(default=AGENT_BACKPRESSURE_DEFAULT, ge=1, le=AGENT_BACKPRESSURE_SAFETY_MAX, validation_alias=AliasChoices("MEMEMEOW_AGENT_BACKPRESSURE", "agent_backpressure"))
+    # 背压是公共核心的资源预算；具体部署资源门禁由适配层负责。
+    agent_backpressure: int = Field(default=AGENT_BACKPRESSURE_DEFAULT, ge=1, validation_alias=AliasChoices("MEMEMEOW_AGENT_BACKPRESSURE", "agent_backpressure"))
     database_url: str = Field(default="postgresql+psycopg://mememeow:mememeow@127.0.0.1:5434/mememeow", validation_alias=AliasChoices("MEMEMEOW_DATABASE_URL", "database_url"), repr=False)
     database_pool_size: int = Field(default=5, ge=1, le=100, validation_alias=AliasChoices("MEMEMEOW_DATABASE_POOL_SIZE", "database_pool_size"))
     database_max_overflow: int = Field(default=10, ge=0, le=100, validation_alias=AliasChoices("MEMEMEOW_DATABASE_MAX_OVERFLOW", "database_max_overflow"))
