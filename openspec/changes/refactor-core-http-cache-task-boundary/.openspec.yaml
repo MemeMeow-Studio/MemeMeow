@@ -1,0 +1,3 @@
+schema: spec-driven
+created: 2026-08-24
+goal: 让缓存生成任务 HTTP 编排脱离 api.py，同时复用当前 scope task service 和统一错误投影。

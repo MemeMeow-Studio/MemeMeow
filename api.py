@@ -60,6 +60,7 @@ from backend.visual import VisualEmbeddingError, VisualInferenceClient, VisualSe
 from backend.scope import LocalScopeResolver, ScopeResolutionError, ScopeResolver, ScopeServiceFactory, ScopeServices, resolve_scope, resolve_scope_async, validate_scope_services
 from backend.config_http import STORAGE_PREFLIGHT_BLOCKING_KEYS, _storage_preflight_summary, config_status as _config_status
 from backend.search_http import SearchRequest, search_images as _search_images
+from backend.cache_task_http import generate_cache as _generate_cache
 from backend.settings_http import (
     ConcurrencyUpdateRequest,
     _authorize_settings,
@@ -2001,13 +2002,8 @@ async def search_images(request: Request, payload: SearchRequest) -> dict[str, l
 
 @app.post("/generate-cache", status_code=202, tags=["tasks"])
 async def generate_cache(request: Request) -> dict[str, object]:
-    """提交缓存生成任务；同类任务重复提交返回已有任务。"""
-    engine = _service(request, "search")
-    if engine is None:
-        raise _error(503, "service_unavailable", "检索服务未初始化")
-
-    record = _service(request, "tasks").submit("cache_generation", {})
-    return {"task_id": record.task_id, "task_type": record.task_type, "status": record.status}
+    """兼容旧缓存任务入口，并注入当前 scope 的 service/error 投影。"""
+    return await _generate_cache(request, service=_service, error=_error)
 
 
 def _activity_payload(value: object) -> dict[str, object] | None:
