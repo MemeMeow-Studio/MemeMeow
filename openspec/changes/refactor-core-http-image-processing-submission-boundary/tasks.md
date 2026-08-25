@@ -13,7 +13,7 @@
 
 - [x] 3.1 增加 route/dependency snapshot、readiness/options、service 顺序、Job reuse/retry、partial failure 和 response projection 测试。
 - [x] 3.2 运行图片处理/API/scope/security 测试、compileall 和 diff check，按失败修复；图片处理/阶段/context/API 定向回归 `26 passed, 36 skipped`，编译和 diff check 通过。
-- [x] 3.3 更新 tasks 与验证记录，固定实现 SHA、范围和门禁事实；验证记录已建立，待提交 SHA 回填。
+- [x] 3.3 更新 tasks 与验证记录，固定实现 SHA、范围和门禁事实；实现 SHA 已固定，验证记录待独立提交。
 
 ## 4. 最终验证与同步
 
