@@ -9,7 +9,8 @@ import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 
-from api import _parse_upload_form, _read_upload_content, upload_images
+from api import _parse_upload_form, _read_upload_content
+from backend import image_upload_http
 
 
 class _RecordingUpload:
@@ -86,10 +87,10 @@ def test_upload_stream_reads_one_spool_before_touching_the_next() -> None:
     assert second.read_sizes[0] == 8
 
     # 路由不应恢复 preloaded 列表式全请求缓存；顺序读取必须发生在逐文件循环内。
-    route_source = getsource(upload_images)
+    route_source = getsource(image_upload_http.upload_images)
     assert "preloaded" not in route_source
     assert "await _read_upload_content" in route_source
-    assert route_source.index("validate_image_content") < route_source.index("find_existing_upload")
+    assert route_source.index("validate_image(") < route_source.index("find_existing_upload")
 
 
 def test_multipart_budget_accepts_exact_file_bytes_without_content_length() -> None:

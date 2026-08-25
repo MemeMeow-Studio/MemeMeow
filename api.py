@@ -26,7 +26,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
-from starlette.formparsers import MultiPartException, MultiPartParser
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from sqlalchemy import select
 
@@ -144,65 +143,21 @@ from backend.callbacks import (
 from backend.image_processing import AUTO_RENAME_WARNING_ERRORS, ImageProcessingError, ImageProcessingOptions, ImageProcessingRepository, ImageProcessingSnapshot, ImageProcessingWorker, SingleImageEmbeddingService, image_file_matches, processing_config_hash, stable_input_digest
 from backend.agent_resume import ResumeDecision, classify_resume_error, normalize_identifier, within_total_timeout
 from backend.app_extensions import ApplicationExtension, extension_paths, path_is_exempt
+from backend.image_upload_http import (
+    MAX_UPLOAD_FILES_PER_REQUEST,
+    UPLOAD_READ_CHUNK_BYTES,
+    UPLOAD_RESERVATION_RELEASE_ERRORS,
+    _BoundedUploadMultipartParser,
+    _parse_upload_form,
+    _read_upload_content,
+    idempotent_upload_result as _idempotent_upload_result_http,
+    upload_images as _upload_images_http,
+)
 
 
 INTERNAL_SCOPE_CALLBACK_PATHS = frozenset({"/internal/reverse-image/search", "/internal/visual-search/match"})
 OPERATION_POLICY_PATH = "/operations/availability"
 SCOPE_SELECTOR_FIELDS = frozenset({"scope_id", "scope-id", "user_id", "user-id"})
-MAX_UPLOAD_FILES_PER_REQUEST = 20
-UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
-
-
-class _BoundedUploadMultipartParser(MultiPartParser):
-    """在 Starlette multipart parser 写入临时文件前统计上传文件字节。"""
-
-    def __init__(self, *args: Any, max_request_bytes: int | None = None, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self._max_request_bytes = max_request_bytes
-        self._request_file_bytes = 0
-
-    def on_part_data(self, data: bytes, start: int, end: int) -> None:
-        """只累计文件 part 的实际字节，拒绝超预算数据而不信任请求头。"""
-        if self._current_part.file is not None:
-            self._request_file_bytes += end - start
-            if self._max_request_bytes is not None and self._request_file_bytes > self._max_request_bytes:
-                raise MultiPartException("Upload request exceeded configured byte budget.")
-        super().on_part_data(data, start, end)
-
-
-async def _parse_upload_form(request: Request, *, max_files: int, max_request_bytes: int | None):
-    """解析上传 multipart，并在文件写入 SpooledTemporaryFile 前执行总预算。"""
-    content_type = request.headers.get("content-type", "").lower()
-    if not content_type.startswith("multipart/form-data"):
-        return await request.form(max_files=max_files, max_fields=8)
-    parser = _BoundedUploadMultipartParser(
-        request.headers,
-        request.stream(),
-        max_files=max_files,
-        max_fields=8,
-        max_part_size=1024 * 1024,
-        max_request_bytes=max_request_bytes,
-    )
-    try:
-        return await parser.parse()
-    except MultiPartException as exc:
-        message = str(exc)
-        if "Too many files" in message:
-            raise _error(413, "too_many_files", "单个上传请求最多包含 20 个文件") from exc
-        if "byte budget" in message:
-            raise _error(413, "request_too_large", "上传请求超过服务端总字节预算") from exc
-        raise _error(400, "invalid_request", "上传 multipart 请求无效") from exc
-
-
-async def _read_upload_content(upload: UploadFile, *, max_upload_size: int) -> tuple[bytes, bool]:
-    """从 multipart spool 顺序读取单个文件，返回受单文件上限截断的字节和超限标记。"""
-    content = bytearray()
-    while len(content) <= max_upload_size:
-        chunk = await upload.read(min(UPLOAD_READ_CHUNK_BYTES, max_upload_size + 1 - len(content)))
-        if not chunk:
-            break
-        content.extend(chunk)
-    return bytes(content), len(content) > max_upload_size
 
 
 class StrictRequestModel(BaseModel):
@@ -2522,231 +2477,49 @@ def _idempotent_upload_result(
     reverse_image_policy: str,
     auto_name: bool,
 ) -> dict[str, object]:
-    """构造已存在 durable 图片的幂等成功结果并复用当前处理状态。"""
-    result: dict[str, object] = {
-        "meme_id": str(record.id),
-        "filename": original,
-        "ok": True,
-        "saved_filename": Path(record.storage_key).name,
-        "media_url": f"/media/{record.id}",
-        "metadata_status": metadata_service.status(image)["status"],
-        "idempotent": True,
-        "auto_name": auto_name,
-        "reverse_image_policy": reverse_image_policy,
-    }
-    worker = _processing_worker(request)
-    snapshot = worker.jobs.latest_for_target(record.id, record.sha256) if worker is not None else None
-    if snapshot is None:
-        try:
-            snapshot = _submit_processing_job_for_image(
-                request,
-                record,
-                image,
-                reverse_image_policy=reverse_image_policy,
-                auto_name=auto_name,
-            )
-        except (ImageProcessingError, MetadataError, RuntimeError, DatabaseError) as exc:
-            result["processing_job_error"] = getattr(exc, "code", "image_processing_unavailable")
-    if snapshot is not None:
-        result.update(
-            {
-                "processing_job_id": snapshot.job_id,
-                "processing_status": snapshot.status,
-                "processing_progress": snapshot.progress,
-                "processing_message": snapshot.message,
-                "metadata_job_id": snapshot.job_id,
-            }
-        )
-    return result
+    """兼容旧 helper 名称，并委托给公共图片上传边界。"""
+    return _idempotent_upload_result_http(
+        request,
+        metadata_service,
+        record,
+        image,
+        original=original,
+        reverse_image_policy=reverse_image_policy,
+        auto_name=auto_name,
+        processing_worker=_processing_worker,
+        submit_processing_job=_submit_processing_job_for_image,
+    )
 
 
 @app.post("/images/upload", tags=["images"])
 async def upload_images(
     request: Request,
 ) -> dict[str, object]:
-    """解析扁平上传表单并逐文件校验保存，批量中的失败不会回滚成功文件。"""
-    settings: Settings = request.app.state.settings
-    configured_file_limit = int(getattr(settings, "max_files_per_request", MAX_UPLOAD_FILES_PER_REQUEST))
-    file_limit = max(1, min(configured_file_limit, MAX_UPLOAD_FILES_PER_REQUEST))
-    max_request_bytes = getattr(settings, "max_request_bytes", None)
-    if max_request_bytes is not None:
-        max_request_bytes = int(max_request_bytes)
-    try:
-        # 多解析一个文件是为了把恰好越过业务上限的请求映射为稳定错误；更大的
-        # 请求仍由框架 parser 在读取过量文件时拒绝，不进入任何 durable 写入路径。
-        form = await _parse_upload_form(request, max_files=file_limit + 1, max_request_bytes=max_request_bytes)
-    except HTTPException as exc:
-        if exc.status_code == 400 and "Too many files" in str(exc.detail):
-            raise _error(413, "too_many_files", "单个上传请求最多包含 20 个文件") from exc
-        raise
-    unknown = set(form.keys()) - {"auto_name", "files", "reverse_image_policy"}
-    if unknown:
-        raise _error(400, "invalid_request", "上传不接受已废弃的目标目录字段")
-    try:
-        auto_name = _parse_multipart_bool(form.get("auto_name"), default=False)
-        options = _normalize_processing_options(request, reverse_image_policy=form.get("reverse_image_policy"), auto_name=auto_name)
-    except ImageProcessingError as exc:
-        status = 503 if exc.code == "reverse_image_unavailable" else 400
-        raise _error(status, exc.code, "图片处理选项无效或服务不可用") from exc
-    reverse_image_policy = options.reverse_image_policy
-    auto_name = options.auto_name
-    files = [item for item in form.getlist("files") if hasattr(item, "filename") and hasattr(item, "read")]
-    if not files:
-        raise _error(400, "files_required", "必须上传图片文件")
-    if len(files) > file_limit:
-        raise _error(413, "too_many_files", "单个上传请求最多包含 20 个文件")
-    metadata_service = _service(request, "metadata")
-    # multipart parser 已在返回 form 前按所有文件 part 校验总预算；这里不再把文件
-    # 全部预读到列表，只保留当前文件的受限内容，顺序完成校验和 durable 处理。
-    results = []
-    upload_batch_id = uuid4().hex if len(files) > 1 else None
-    upload_task_ids: list[str] = []
-    unified_processing_worker_used = False
-    for upload in files:
-        # 释放上一项的内容缓冲后再触碰下一个 spool，避免请求内文件字节累积。
-        content = b""
-        content, too_large = await _read_upload_content(upload, max_upload_size=settings.max_upload_size)
-        original = upload.filename or "image"
-        clean = _safe_filename(original)
-        if Path(clean).suffix.lower() not in SUPPORTED_EXTENSIONS:
-            results.append({"filename": original, "ok": False, "error": "unsupported_format"})
-            continue
-        if too_large:
-            results.append({"filename": original, "ok": False, "error": "file_too_large"})
-            continue
-        try:
-            validate_business_storage_key(clean)
-        except ValueError:
-            results.append({"filename": original, "ok": False, "error": "invalid_filename"})
-            continue
-        try:
-            validate_image_content(content, Path(clean).suffix.lower())
-        except ImagePreflightError as exc:
-            results.append({"filename": original, "ok": False, "error": exc.code})
-            continue
-        content_digest = sha256_bytes(content)
-        try:
-            existing = metadata_service.find_existing_upload(clean, sha256=content_digest, size_bytes=len(content))
-        except MetadataError as exc:
-            if exc.code == "upload_reconciliation_required":
-                results.append({"filename": original, "ok": False, "error": exc.code})
-                continue
-            results.append({"filename": original, "ok": False, "error": "file_exists"})
-            continue
-        if existing is not None:
-            existing_record, existing_path = existing
-            results.append(_idempotent_upload_result(request, metadata_service, existing_record, existing_path, original=original, reverse_image_policy=reverse_image_policy, auto_name=auto_name))
-            continue
-        target = metadata_service.blob_store.resolve(clean, must_exist=False)
-        grant = None
-        try:
-            upload_key = f"upload:{content_digest}:{clean}"
-            grant = _acquire_operation(request, Operations.IMAGE_UPLOAD, upload_key, resource_id=clean, source="upload", input_digest=content_digest)
-        except OperationPolicyError as exc:
-            results.append({"filename": original, "ok": False, **exc.payload()})
-            continue
-        try:
-            meme_id, saved_path = metadata_service.upload_bytes(content, target_key=clean)
-        except (OSError, MetadataError) as exc:
-            if isinstance(exc, MetadataError) and exc.code == "target_exists":
-                # 并发首个提交可能已经完成 durable 落位；重新验证三方事实后
-                # 将竞争请求收束为幂等成功，不重复 acquire operation 或创建 Meme。
-                try:
-                    existing = metadata_service.find_existing_upload(clean, sha256=content_digest, size_bytes=len(content))
-                except MetadataError:
-                    existing = None
-                if existing is not None:
-                    existing_record, existing_path = existing
-                    try:
-                        _release_operation(request, grant)
-                    except OperationPolicyError:
-                        # 竞争请求可能已经由另一执行者提交同一 grant；此时
-                        # durable 事实优先，保留 policy 的未知状态供恢复器处理。
-                        pass
-                    results.append(_idempotent_upload_result(request, metadata_service, existing_record, existing_path, original=original, reverse_image_policy=reverse_image_policy, auto_name=auto_name))
-                    continue
-            # 只有明确知道 durable 写入未开始时才能 release；普通 I/O 异常保留
-            # reservation，避免把未知副作用错误地返还给宿主额度。
-            if isinstance(exc, MetadataError) and exc.code in {"target_exists", "invalid_filename", "invalid_image", "staging_conflict", "staging_write_failed"} and grant is not None:
-                try:
-                    _release_operation(request, grant)
-                except OperationPolicyError:
-                    pass
-            results.append({"filename": original, "ok": False, "error": "metadata_write_failed"})
-            continue
-        if grant is not None:
-            try:
-                _commit_operation(request, grant)
-            except OperationPolicyError:
-                # 文件和 Meme 已经 durable，不能回滚或 release；保留成功事实。
-                pass
-        meme_id = str(meme_id)
-        target = saved_path
-        result = {"meme_id": meme_id, "filename": original, "ok": True, "saved_filename": target.name, "media_url": f"/media/{meme_id}", "auto_named": False}
-        processing_worker = None
-        visual_task_id_for_processing: str | None = None
-        try:
-            processing_worker = _processing_worker(request)
-            if processing_worker is not None:
-                unified_processing_worker_used = True
-            if processing_worker is None:
-                # 没有统一图片控制面时保留旧视觉入口；生产 PostgreSQL 路径
-                # 会先建立完整 Job，再由 pipeline Worker 创建 visual 叶子。
-                task = _submit_visual_task(request, target, batch_id=upload_batch_id, reverse_image_policy=reverse_image_policy, schedule=upload_batch_id is None)
-                result["visual_task_id"] = task.task_id
-                result["visual_job_id"] = task.task_id
-                result["metadata_job_id"] = task.task_id
-                result["visual_task_status"] = task.status
-                if upload_batch_id:
-                    upload_task_ids.append(task.task_id)
-        except (OSError, RuntimeError, MetadataError) as exc:
-            # 图片和 pending Meme 记录已有效提交，视觉任务失败可由显式阶段重试恢复。
-            result["visual_task_error"] = _context_enqueue_error(exc) if isinstance(exc, RuntimeError) else "visual_enqueue_failed"
-            result["metadata_job_error"] = result["visual_task_error"]
-        result["metadata_status"] = metadata_service.status(target)["status"]
-        result["auto_name"] = auto_name
-        result["reverse_image_policy"] = reverse_image_policy
-        try:
-            worker = processing_worker
-            if worker is not None:
-                embedding_record = metadata_service.embedding_record(target)
-                processing = worker.submit(
-                    meme_id,
-                    metadata_service.image_sha256(target),
-                    metadata_hash=embedding_record.get("metadata_hash") if isinstance(embedding_record, Mapping) else None,
-                    config=_processing_config(request),
-                    reverse_image_policy=reverse_image_policy,
-                    auto_name=auto_name,
-                    schedule=False,
-                )
-                worker.schedule(processing.job_id)
-                # 上传 API 继续提供旧字段，但其值明确是完整 Job 标识；
-                # 阶段层级和真实叶子任务通过图片处理状态接口读取。
-                result.update(
-                    {
-                        "processing_job_id": processing.job_id,
-                        "submission_mode": "pipeline",
-                        "processing_status": processing.status,
-                        "auto_name": processing.auto_name,
-                        "reverse_image_policy": processing.reverse_image_policy,
-                        "visual_task_id": processing.job_id,
-                        "visual_job_id": processing.job_id,
-                        "metadata_job_id": processing.job_id,
-                        "metadata_job_status": processing.status,
-                        "visual_task_status": processing.status,
-                    }
-                )
-        except (ImageProcessingError, MetadataError, RuntimeError, DatabaseError) as exc:
-            # 图片入库事实已经完成；控制面异常只作为可重试诊断返回。
-            result["processing_job_error"] = getattr(exc, "code", "image_processing_unavailable")
-        _invalidate_search(request)
-        results.append(result)
-    # 统一图片 Worker 使用逐图增量向量，不再为上传批次创建旧 cache_generation。
-    if upload_batch_id and upload_task_ids and not unified_processing_worker_used:
-        _service(request, "tasks").seal_batch(upload_batch_id)
-        for task_id in upload_task_ids:
-            _service(request, "tasks").schedule(task_id)
-    return {"batch_id": upload_batch_id, "results": results}
+    """兼容图片上传入口，并注入当前 scope、校验、operation 和处理任务 callback。"""
+    return await _upload_images_http(
+        request,
+        settings=lambda received: received.app.state.settings,
+        metadata_service=lambda received: _service(received, "metadata"),
+        task_service=lambda received: _service(received, "tasks"),
+        normalize_processing_options=_normalize_processing_options,
+        parse_multipart_bool=_parse_multipart_bool,
+        sanitize_filename=_safe_filename,
+        validate_storage_key=validate_business_storage_key,
+        validate_image=validate_image_content,
+        calculate_sha256=sha256_bytes,
+        processing_worker=_processing_worker,
+        submit_processing_job=_submit_processing_job_for_image,
+        processing_config=_processing_config,
+        submit_visual_task=_submit_visual_task,
+        context_enqueue_error=_context_enqueue_error,
+        acquire_operation=_acquire_operation,
+        commit_operation=_commit_operation,
+        release_operation=_release_operation,
+        invalidate_search=_invalidate_search,
+        error=_error,
+        release_errors=UPLOAD_RESERVATION_RELEASE_ERRORS,
+    )
+
 
 
 @app.post("/images/context", status_code=202, tags=["images", "tasks"])
