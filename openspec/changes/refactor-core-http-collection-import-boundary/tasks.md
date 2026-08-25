@@ -13,7 +13,7 @@
 
 - [x] 3.1 增加 route/dependency snapshot、multipart/ZIP/资源上限、manifest SHA/path、scope/query 拒绝、同名复用/冲突、operation 顺序、任务告警和逐项响应投影测试。
 - [x] 3.2 运行合集导入/API/scope/security 定向测试、compileall 和 diff check，按失败修复并记录 PostgreSQL/外部门禁 skip；合集导入/合集包/CRUD/API 定向 `40 passed`，上传/operation 定向 `26 passed`，完整回归待最终门禁。
-- [x] 3.3 更新 tasks 与验证记录，固定实现 SHA、范围和测试事实；实现 SHA `13605361752792926bf2672a7dbda3283bcdf232` 已固定，验证记录待本次提交 SHA 回填。
+- [x] 3.3 更新 tasks 与验证记录，固定实现 SHA、范围和测试事实；实现 SHA `13605361752792926bf2672a7dbda3283bcdf232`、验证记录 SHA `55014b5c5b76847888feb8e28becf13c67fd983c` 已固定。
 
 ## 4. 最终验证与同步
 
