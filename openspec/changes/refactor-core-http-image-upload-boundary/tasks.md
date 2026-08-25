@@ -13,10 +13,10 @@
 
 - [x] 3.1 增加 route/dependency snapshot、multipart 总预算/单文件边界、未知字段、scope/policy 拒绝、幂等和 durable 副作用顺序测试。
 - [x] 3.2 运行上传/API/scope/security 定向测试、compileall、diff check，并按失败修复；记录 PostgreSQL marker 的 skipped/未配置说明。
-- [ ] 3.3 更新 change README、tasks 和验证记录，明确开源实现 SHA、验证/收尾 SHA、范围与对抗性复核结论。
+- [x] 3.3 更新 change README、tasks 和验证记录，明确开源实现 SHA、验证/收尾 SHA、范围与对抗性复核结论。
 
 ## 4. 最终验证与同步
 
-- [ ] 4.1 运行本 change OpenSpec strict validate 和开源全套或明确范围回归，确认其它图片/合集 route 未重复或改变。
-- [ ] 4.2 检查文件路径/symlink/race、scope/auth fail-closed、operation quota 收束、处理任务失败诊断和兼容 alias；修复所有 P1/P2 风险或记录可接受残余风险。
+- [x] 4.1 运行本 change OpenSpec strict validate 和开源全套或明确范围回归，确认其它图片/合集 route 未重复或改变。
+- [x] 4.2 检查文件路径/symlink/race、scope/auth fail-closed、operation quota 收束、处理任务失败诊断和兼容 alias；修复所有 P1/P2 风险或记录可接受残余风险。
 - [ ] 4.3 检查 Server 工作区状态后从精确开源实现/验证/收尾 SHA fetch，普通 `--no-ff` merge 并验证祖先关系；运行 Server 定向回归，记录 merge SHA、回滚点和既有 OpenSpec 失败。
