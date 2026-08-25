@@ -13,7 +13,7 @@
 
 - [x] 3.1 增加 route/dependency snapshot、query selector 拒绝、列表状态投影、metadata/meme_id、media 类型和错误映射测试。
 - [x] 3.2 运行图片库/API/scope/security 测试、compileall 和 diff check，按失败修复；图片库/API/数据库契约 `16 passed, 36 skipped`，编译和 diff check 通过。
-- [x] 3.3 更新 tasks 与验证记录，固定实现 SHA、范围和门禁事实；验证记录已建立，待提交 SHA 回填。
+- [x] 3.3 更新 tasks 与验证记录，固定实现 SHA、范围和门禁事实；实现 SHA 已固定，验证记录待独立提交。
 
 ## 4. 最终验证与同步
 
