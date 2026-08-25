@@ -17,6 +17,7 @@ from backend.persistence.models import Scope, ScopeContext
 from backend.persistence.repositories import collections as persistence_collections
 from backend.persistence.repositories import memes as persistence_memes
 from backend.persistence.repositories import search as persistence_search
+from backend.persistence.repositories import visual_embeddings as persistence_visual_embeddings
 
 
 def test_persistence_facade_reexports_one_implementation_source() -> None:
@@ -38,13 +39,15 @@ def test_persistence_facade_reexports_one_implementation_source() -> None:
     assert database.MemeRepository is persistence_memes.MemeRepository
     assert database.CollectionRepository is persistence_collections.CollectionRepository
     assert database.SearchRepository is persistence_search.SearchRepository
+    assert database.VisualEmbeddingRepository is persistence_visual_embeddings.VisualEmbeddingRepository
+    assert database.validate_visual_vector is persistence_visual_embeddings.validate_visual_vector
     assert database.SCOPE_LOCAL == persistence_engine.SCOPE_LOCAL
     assert database.CURRENT_SCHEMA_REVISION == persistence_engine.CURRENT_SCHEMA_REVISION
 
 
 def test_persistence_runtime_modules_have_no_top_level_facade_import() -> None:
     """新边界只允许在资源实际组装时延迟解析 facade，模块导入不能形成循环。"""
-    for module in (persistence_engine, persistence_unit_of_work, persistence_resources, persistence_memes, persistence_collections, persistence_search):
+    for module in (persistence_engine, persistence_unit_of_work, persistence_resources, persistence_memes, persistence_collections, persistence_search, persistence_visual_embeddings):
         source = Path(module.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)
         top_level_facade_imports = {
@@ -57,8 +60,9 @@ def test_persistence_runtime_modules_have_no_top_level_facade_import() -> None:
     assert "class MemeRepository" not in database_source
     assert "class CollectionRepository" not in database_source
     assert "class SearchRepository" not in database_source
+    assert "class VisualEmbeddingRepository" not in database_source
+    assert "def validate_visual_vector" not in database_source
     assert "class TaskRepository" in database_source
-    assert "class VisualEmbeddingRepository" in database_source
     assert "class ReverseImageUsageRepository" in database_source
     assert "class BlobStore" in database_source
     assert "class StorageCoordinator" in database_source
