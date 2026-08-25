@@ -17,6 +17,6 @@
 
 ## 4. 最终验证与同步
 
-- [ ] 4.1 运行本 change OpenSpec strict validate 与开源完整回归，确认导入/导出/CRUD route 未重复、Server 适配边界未被改动。
-- [ ] 4.2 进行对抗性复核：检查 scope/user 字段、跨 scope 复用、压缩/解压/图片资源上限、成员 SHA/path、部分写入、operation grant 收束、路径泄露和任务副作用顺序；修复 P1/P2 或记录残余风险。
-- [ ] 4.3 在开源仓库提交精确实现 SHA 和独立验证/收尾 SHA；Server 从本地精确 fetch 后普通 `--no-ff` merge，记录祖先关系、验证、回滚和未连接 PostgreSQL 事实。
+- [x] 4.1 运行本 change OpenSpec strict validate 与开源完整回归，确认导入/导出/CRUD route 未重复、Server 适配边界未被改动；strict validate 通过，完整回归 `475 passed, 92 skipped`。
+- [x] 4.2 进行对抗性复核：检查 scope/user 字段、跨 scope 复用、压缩/解压/图片资源上限、成员 SHA/path、部分写入、operation grant 收束、路径泄露和任务副作用顺序；未发现 P1/P2。
+- [x] 4.3 在开源仓库提交精确实现 SHA `13605361752792926bf2672a7dbda3283bcdf232`、验证记录 SHA `55014b5` 并完成本收尾提交；Server 后续从本地精确 fetch 后普通 `--no-ff` merge，记录祖先关系、验证、回滚和未连接 PostgreSQL 事实。
