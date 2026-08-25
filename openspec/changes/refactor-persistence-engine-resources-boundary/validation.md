@@ -5,8 +5,10 @@
 - 实现提交：`dae492ab5f33672d98614fc675bf3766f0cbe86f`
 - 兼容 facade/契约收束提交：`e955865ecf9931b82e87a3bc0f2164719c488f40`
 - 验证记录提交：`860d5a5b65f4187cccd30bd0f2148860ef7e239b`（本文件所在提交）。
-- 收尾提交：本 change 的 tasks/记录收束提交；Server 同步后在 Server 文档补记其精确 SHA
-  与 merge SHA。
+- 收尾提交：`897a1288191adb4d240d061b78299fa819f60508`（代码与开源验证收束）。
+- Server merge：`4bdd91bd06db0487df1a23a11a8ecaf71163d08d`，父提交为 Server
+  `f3df903c6a2551bfe6f9bc734ef7d8038f13d60d` 与开源收尾 SHA；开源实现、兼容、验证和收尾
+  SHA 均通过 `git merge-base --is-ancestor` 核验为 Server `HEAD` 真实祖先。
 
 ## 自动化结果
 
@@ -23,6 +25,14 @@
   `support-scope-aware-opencode-workspaces` 的公平调度场景完整性，本 change 未修改该目录。
 - `uv run python -m compileall -q backend tests alembic`：通过。
 - `git diff --check`：通过。
+- Server 定向回归：`139 passed, 52 skipped`；Server 完整回归：`735 passed, 125 skipped`，
+  52 个 warning 来自既有 Server 测试/依赖。
+- Server PostgreSQL/API/quota/反向图片 skip：未设置 `MEMEMEOW_DATABASE_URL`，未连接
+  PostgreSQL；Server Compose runtime identity 未设置 `MEMEMEOW_RUNTIME_IDENTITY_E2E=1`，
+  未启动 Compose 身份验收。
+- Server 本 change OpenSpec strict、compileall、`git diff --check`：通过；全量 OpenSpec strict
+  `66 passed, 1 failed`，唯一失败仍为既有 active change `support-scope-aware-opencode-workspaces`，
+  本 change 未修改该目录。
 
 ## 复核与回滚
 

@@ -33,7 +33,11 @@
   关系和回滚方式；实现 `dae492ab5f33672d98614fc675bf3766f0cbe86f`、兼容收束
   `e955865ecf9931b82e87a3bc0f2164719c488f40`、验证 `860d5a5b65f4187cccd30bd0f2148860ef7e239b`，
   本次为开源收尾提交。
-- [ ] 4.2 检查 Server 工作区是否存在目标重叠脏改动；在无冲突且已获授权时精确 fetch 开源
-  收尾 SHA，以普通 `--no-ff` merge 进入 Server `main`，不得绕过历史。
-- [ ] 4.3 运行 Server 定向/全量回归和静态门禁，记录 merge SHA、开源 SHA 祖先关系、
-  PostgreSQL/Compose 未运行门禁和回滚方式。
+- [x] 4.2 检查 Server 工作区是否存在目标重叠脏改动；在无冲突且已获授权时精确 fetch 开源
+  收尾 SHA，以普通 `--no-ff` merge 进入 Server `main`，不得绕过历史；Server 原有用户/active
+  change 脏文件无目标重叠，精确 fetch `897a1288191adb4d240d061b78299fa819f60508` 后
+  普通 merge 为 `4bdd91bd06db0487df1a23a11a8ecaf71163d08d`。
+- [x] 4.3 运行 Server 定向/全量回归和静态门禁，记录 merge SHA、开源 SHA 祖先关系、
+  PostgreSQL/Compose 未运行门禁和回滚方式；Server 定向 `139 passed, 52 skipped`、完整
+  `735 passed, 125 skipped`，目标 strict/compileall/diff check 通过，祖先关系与回滚记录见
+  `validation.md` 和 Server `docs/refactor-plan.md`。
