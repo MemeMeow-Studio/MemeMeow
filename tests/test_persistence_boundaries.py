@@ -15,8 +15,11 @@ from backend.persistence import resources as persistence_resources
 from backend.persistence import unit_of_work as persistence_unit_of_work
 from backend.persistence.models import Scope, ScopeContext
 from backend.persistence.repositories import collections as persistence_collections
+from backend.persistence.repositories import callbacks as persistence_callbacks
 from backend.persistence.repositories import memes as persistence_memes
+from backend.persistence.repositories import reverse_image as persistence_reverse_image
 from backend.persistence.repositories import search as persistence_search
+from backend.persistence.repositories import tasks as persistence_tasks
 from backend.persistence.repositories import visual_embeddings as persistence_visual_embeddings
 
 
@@ -41,13 +44,19 @@ def test_persistence_facade_reexports_one_implementation_source() -> None:
     assert database.SearchRepository is persistence_search.SearchRepository
     assert database.VisualEmbeddingRepository is persistence_visual_embeddings.VisualEmbeddingRepository
     assert database.validate_visual_vector is persistence_visual_embeddings.validate_visual_vector
+    assert database.TaskRepository is persistence_tasks.TaskRepository
+    assert database.ReverseImageUsageRepository is persistence_reverse_image.ReverseImageUsageRepository
+    assert database.AgentCallbackRequestRepository is persistence_callbacks.AgentCallbackRequestRepository
+    assert database.InMemoryAgentCallbackRequestRepository is persistence_callbacks.InMemoryAgentCallbackRequestRepository
+    assert database.InMemoryCallbackRequestRepository is persistence_callbacks.InMemoryCallbackRequestRepository
+    assert database._validate_lane_capacities is persistence_tasks._validate_lane_capacities
     assert database.SCOPE_LOCAL == persistence_engine.SCOPE_LOCAL
     assert database.CURRENT_SCHEMA_REVISION == persistence_engine.CURRENT_SCHEMA_REVISION
 
 
 def test_persistence_runtime_modules_have_no_top_level_facade_import() -> None:
     """新边界只允许在资源实际组装时延迟解析 facade，模块导入不能形成循环。"""
-    for module in (persistence_engine, persistence_unit_of_work, persistence_resources, persistence_memes, persistence_collections, persistence_search, persistence_visual_embeddings):
+    for module in (persistence_engine, persistence_unit_of_work, persistence_resources, persistence_memes, persistence_collections, persistence_search, persistence_visual_embeddings, persistence_tasks, persistence_reverse_image, persistence_callbacks):
         source = Path(module.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)
         top_level_facade_imports = {
@@ -62,11 +71,33 @@ def test_persistence_runtime_modules_have_no_top_level_facade_import() -> None:
     assert "class SearchRepository" not in database_source
     assert "class VisualEmbeddingRepository" not in database_source
     assert "def validate_visual_vector" not in database_source
-    assert "class TaskRepository" in database_source
-    assert "class ReverseImageUsageRepository" in database_source
+    assert "class TaskRepository" not in database_source
+    assert "class ReverseImageUsageRepository" not in database_source
+    assert "class AgentCallbackRequestRepository" not in database_source
+    assert "class InMemoryAgentCallbackRequestRepository" not in database_source
     assert "class BlobStore" in database_source
     assert "class StorageCoordinator" in database_source
     assert "from backend.persistence.repositories.search import SearchRepository" in database_source
+    assert "from backend.persistence.repositories.tasks import" in database_source
+
+
+def test_task_domain_repository_modules_have_one_implementation_each() -> None:
+    """任务持久化域的三个 canonical 模块各自只保留一个实现来源。"""
+    for module, symbol in (
+        (persistence_tasks, "TaskRepository"),
+        (persistence_reverse_image, "ReverseImageUsageRepository"),
+        (persistence_callbacks, "AgentCallbackRequestRepository"),
+    ):
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        assert source.count(f"class {symbol}:") == 1
+        assert "from backend.database" not in source
+    callback_source = Path(persistence_callbacks.__file__).read_text(encoding="utf-8")
+    assert "callback_binding_schema_unavailable" in callback_source
+    assert "uq_agent_callback_requests_logical" in callback_source
+    task_source = Path(persistence_tasks.__file__).read_text(encoding="utf-8")
+    assert "claim_generation" in task_source
+    assert "lease_expires_at" in task_source
+    assert "updated_at.desc()" in task_source
 
 
 def test_search_repository_package_exports_one_canonical_class() -> None:
