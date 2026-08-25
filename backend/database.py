@@ -38,7 +38,23 @@ from backend.storage_security import StorageRootError, validate_controlled_root
 from backend.agent_resume import append_error_history, append_task_error_history, normalize_identifier, sanitize_error
 from executor.agent_limits import validate_agent_concurrency
 from backend.persistence.models import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    DeclarativeBase,
     EMBEDDING_DIMENSIONS,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    JSON,
+    JSONB,
+    Mapped,
+    String,
+    UniqueConstraint,
+    Uuid,
+    Vector,
     VISUAL_EMBEDDING_DIMENSIONS,
     UTC,
     OPTIONAL_CONTROL_TABLES,
@@ -67,6 +83,9 @@ from backend.persistence.models import (
     TaskBatchItem,
     TaskLaneFairness,
     TaskLaneSlot,
+    mapped_column,
+    timezone,
+    unicodedata,
     utcnow,
 )
 

@@ -125,6 +125,28 @@ def test_database_facade_reexports_one_model_declaration_source():
     assert database.utcnow is models.utcnow
     assert database.OPTIONAL_CONTROL_TABLES is models.OPTIONAL_CONTROL_TABLES
     assert database.Base.metadata is models.Base.metadata
+    for name in (
+        "BigInteger",
+        "Boolean",
+        "CheckConstraint",
+        "DateTime",
+        "DeclarativeBase",
+        "ForeignKey",
+        "ForeignKeyConstraint",
+        "Index",
+        "Integer",
+        "JSON",
+        "JSONB",
+        "Mapped",
+        "String",
+        "UniqueConstraint",
+        "Uuid",
+        "Vector",
+        "mapped_column",
+        "timezone",
+        "unicodedata",
+    ):
+        assert getattr(database, name) is getattr(models, name)
 
 
 def test_model_module_does_not_reintroduce_database_or_runtime_boundaries():
