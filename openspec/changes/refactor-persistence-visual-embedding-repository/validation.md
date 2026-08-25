@@ -25,9 +25,9 @@
 
 ## 提交与同步
 
-- 开源实现 SHA：`ab9ddda`（`refactor(core): isolate visual embedding repository`）。
-- 开源验证记录 SHA：本次验证记录提交，提交后固定精确 SHA。
-- 开源代码收尾 SHA：待提交，作为 Server 精确 fetch 目标。
+- 开源实现 SHA：`ab9ddda951fdc8973da928e603ccd572dae9f74e`（`refactor(core): isolate visual embedding repository`）。
+- 开源验证记录 SHA：`feacc6f6d9401a48bab8f550d32d38571bfb58ff`（`docs: record visual embedding repository validation`）。
+- 开源代码收尾 SHA：本次收尾提交；该提交完成后作为 Server 精确 fetch 目标。
 - Server merge SHA、直接父提交和祖先关系：待精确 fetch/普通 `--no-ff` merge 后填入。
 - 开源仓库不访问 `upstream`、不 push；Server 只保留本切片新增变更，不整理其它脏文件。
 

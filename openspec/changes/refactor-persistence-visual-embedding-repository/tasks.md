@@ -17,6 +17,6 @@
 
 ## 4. 提交、精确同步与 Server 收尾
 
-- [ ] 4.1 在开源仓库提交实现、验证和收尾 artifacts，固定精确实现/验证/收尾 SHA；确认不访问 upstream、不 push。
+- [x] 4.1 在开源仓库提交实现、验证和收尾 artifacts，固定精确实现/验证/收尾 SHA；确认不访问 upstream、不 push。
 - [ ] 4.2 检查 Server 目标路径无重叠脏改动，从本地精确 fetch 开源收尾 SHA，以普通 `--no-ff` merge 进入 Server `main`，确认开源收尾 SHA 是 Server `HEAD` 真实祖先。
 - [ ] 4.3 在 Server 运行目标/完整回归和静态门禁，更新本 change validation 与 `docs/refactor-plan.md`，记录 Server merge SHA、祖先关系、验证结果、未配置 PostgreSQL/未运行 Compose 事实和回滚方式；保持其它脏文件不变。
