@@ -4,8 +4,9 @@
 
 - 实现提交：`dae492ab5f33672d98614fc675bf3766f0cbe86f`
 - 兼容 facade/契约收束提交：`e955865ecf9931b82e87a3bc0f2164719c488f40`
-- 验证记录提交：以本文件所在提交为准，收尾提交会补充精确 SHA。
-- 收尾提交：Server 同步授权链完成后补记开源收尾 SHA 与 Server merge SHA。
+- 验证记录提交：`860d5a5b65f4187cccd30bd0f2148860ef7e239b`（本文件所在提交）。
+- 收尾提交：本 change 的 tasks/记录收束提交；Server 同步后在 Server 文档补记其精确 SHA
+  与 merge SHA。
 
 ## 自动化结果
 

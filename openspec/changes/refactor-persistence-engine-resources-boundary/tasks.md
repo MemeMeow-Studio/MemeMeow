@@ -21,14 +21,18 @@
 
 - [x] 3.1 增加 engine、UoW、resources 单一实现来源、facade identity、依赖方向和生命周期
   契约测试。
-- [ ] 3.2 运行持久化、scope、任务、存储、API 相关目标测试，并根据失败修复导入兼容问题。
-- [ ] 3.3 运行开源相关全量回归、OpenSpec strict validate、compileall 与 `git diff --check`；
+- [x] 3.2 运行持久化、scope、任务、存储、API 相关目标测试，并根据失败修复导入兼容问题；
+  目标 `22 passed`，相关回归 `69 passed, 52 skipped`。
+- [x] 3.3 运行开源相关全量回归、OpenSpec strict validate、compileall 与 `git diff --check`；
+  开源完整回归 `483 passed, 92 skipped`，目标 strict/compileall/diff check 通过。
   记录 PostgreSQL/Compose 是否实际运行及既有失败/skip 原因。
 
 ## 4. 提交、同步与收尾
 
-- [ ] 4.1 在开源仓库提交实现、验证和收尾记录的精确 SHA，固定变更范围、验证结果、祖先
-  关系和回滚方式。
+- [x] 4.1 在开源仓库提交实现、验证和收尾记录的精确 SHA，固定变更范围、验证结果、祖先
+  关系和回滚方式；实现 `dae492ab5f33672d98614fc675bf3766f0cbe86f`、兼容收束
+  `e955865ecf9931b82e87a3bc0f2164719c488f40`、验证 `860d5a5b65f4187cccd30bd0f2148860ef7e239b`，
+  本次为开源收尾提交。
 - [ ] 4.2 检查 Server 工作区是否存在目标重叠脏改动；在无冲突且已获授权时精确 fetch 开源
   收尾 SHA，以普通 `--no-ff` merge 进入 Server `main`，不得绕过历史。
 - [ ] 4.3 运行 Server 定向/全量回归和静态门禁，记录 merge SHA、开源 SHA 祖先关系、
