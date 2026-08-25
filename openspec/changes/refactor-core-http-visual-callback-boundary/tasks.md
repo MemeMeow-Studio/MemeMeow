@@ -12,11 +12,11 @@
 ## 3. 契约测试与验证
 
 - [x] 3.1 增加 route/dependency snapshot、binding fail-closed、request id/header digest、completed replay、fact failure/success finish 和 legacy import 测试。
-- [ ] 3.2 运行 callback/visual/database/scope/security 测试与 compileall，按失败修复。
-- [ ] 3.3 更新本 change tasks 与验证记录，确认公共核心先行和 Server 尚未同步。
+- [x] 3.2 运行 callback/visual/database/scope/security 测试与 compileall，按失败修复；定向回归 `70 passed, 36 skipped`，完整编译通过。
+- [x] 3.3 更新本 change tasks 与验证记录，确认公共核心先行和 Server 尚未同步；验证记录固定实现 SHA、范围和门禁事实。
 
 ## 4. 最终验证与同步
 
-- [ ] 4.1 运行 OpenSpec strict validate、`git diff --check`、完整 pytest 和 PostgreSQL marker（无连接串时显式 skip）。
-- [ ] 4.2 进行对抗性复核：检查 callback body 无 scope override、旧 claim、fact 状态、幂等 replay、错误脱敏和 service 不提前调用；修复 P1/P2 后重跑验证。
-- [ ] 4.3 在开源仓库提交精确实现 SHA 和验证记录 SHA，核验祖先关系；按用户批准的精确 SHA fetch/普通 merge 到 Server，记录 merge SHA、变更范围和测试结果。
+- [x] 4.1 运行 OpenSpec strict validate、`git diff --check`、完整 pytest 和 PostgreSQL marker（无连接串时显式 skip）；完整 pytest `413 passed, 92 skipped`，直接 PostgreSQL 测试 `55 skipped`，当前 marker 命令 `55 deselected`。
+- [x] 4.2 进行对抗性复核：检查 callback body 无 scope override、旧 claim、fact 状态、幂等 replay、错误脱敏和 service 不提前调用；补充 binding/header fail-closed 检查后重跑验证，无未处理 P1/P2。
+- [x] 4.3 在开源仓库提交精确实现 SHA 和验证记录 SHA，核验祖先关系；实现 commit 为 `7c1b68d2e1dde6d129e89e6f528656c4baf8c1ff`，验证记录已独立提交；Server 待精确 fetch/普通 merge 后补记 merge SHA。
