@@ -54,8 +54,14 @@ worker-manager 四个应用服务模块、`backend.pg_services` 兼容 facade、
 
 ## 提交与同步门禁
 
-- 开源实现、测试、OpenSpec 和本验证记录尚未提交；用户审核/授权通过后才能固定收尾 SHA，
-  从本地精确 fetch 到 Server 并普通 `--no-ff` merge；不访问 upstream、不 push。
+- 开源实现、测试、OpenSpec 和主体 validation 已聚合在实现提交
+  `bb76073c3d6e807a2c688b574b588d738cb0bad3`；变更范围为四个 canonical service module、
+  `backend.pg_services` re-export facade、service identity/依赖契约测试和本 change artifacts。
+  随后的同域兼容收束提交保留旧 facade logger 对象身份并完成任务勾选；Server validation
+  将记录该最终收束 SHA 及其与主体提交的祖先关系。基线 `c100a6222f6e2dab8b3d69647a874d233a67156a`
+  是其祖先；未访问 upstream、未 push。
+- 用户任务已明确要求完成本地精确 fetch/普通 merge；Server merge 前仍必须复核目标路径 dirty
+  重叠，Server 只允许以一次普通 `--no-ff` merge 引入该精确 SHA。
 - Server merge 后需在同一 merge commit 更新本记录、`docs/refactor-plan.md` 和 Server 验证
   结果，记录精确开源/Server SHA、祖先关系、审核状态、变更范围及残余风险。
 

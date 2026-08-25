@@ -19,6 +19,10 @@ def test_pg_services_exports_canonical_service_objects() -> None:
     assert search.PostgresSearchService.__module__ == "backend.services.search"
     assert tasks.PostgresTaskService.__module__ == "backend.services.tasks"
     assert worker_manager.PostgresTaskWorkerManager.__module__ == "backend.services.worker_manager"
+    assert pg_services.logger is metadata.logger
+    assert pg_services.logger is search.logger
+    assert pg_services.logger is tasks.logger
+    assert pg_services.logger is worker_manager.logger
 
 
 def test_service_modules_have_one_implementation_and_no_facade_import() -> None:

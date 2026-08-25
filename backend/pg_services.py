@@ -5,10 +5,15 @@
 工厂、脚本、图片处理 Worker 和旧测试继续使用原导入路径。
 """
 
+import logging
+
 from backend.services.metadata import PostgresMetadataService
 from backend.services.search import PostgresSearchService
 from backend.services.tasks import PostgresTaskService
 from backend.services.worker_manager import PostgresTaskWorkerManager
+
+# 保留旧模块级 logger 对象，兼容宿主对 backend.pg_services 的日志配置和测试替身。
+logger = logging.getLogger("backend.pg_services")
 
 __all__ = [
     "PostgresMetadataService",

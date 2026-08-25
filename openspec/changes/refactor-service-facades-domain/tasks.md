@@ -22,6 +22,6 @@
 
 ## 4. 单一提交、精确同步与 Server 收尾
 
-- [ ] 4.1 在开源仓库将实现、测试、OpenSpec artifacts、validation 和收尾记录合为单一域级提交；固定 SHA、变更范围、验证结果和审核状态，不访问 upstream、不 push。
+- [x] 4.1 在开源仓库将实现、测试、OpenSpec artifacts、validation 和收尾记录合为单一域级提交；固定 SHA、变更范围、验证结果和审核状态，不访问 upstream、不 push。
 - [ ] 4.2 用户审核/授权后，从本地精确 fetch 开源收尾 SHA；检查 Server 目标路径无重叠 dirty 改动，以一次普通 `--no-ff` merge 引入并核验祖先关系。
 - [ ] 4.3 在同一 Server merge commit 中补入必要的 Server validation、OpenSpec 收束和 `docs/refactor-plan.md` 进度记录，运行 Server 定向/相关全量回归、strict、compileall 和 diff check，记录 PostgreSQL/Compose skip 与残余风险。
