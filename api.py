@@ -81,6 +81,15 @@ from backend.image_stage_http import (
     submit_image_stage as _submit_image_stage_http,
     submit_image_stage_batch as _submit_image_stage_batch_http,
 )
+from backend.image_context_http import (
+    ContextBatchRequest,
+    ContextRequest,
+    generate_context as _generate_context_http,
+    generate_context_batch as _generate_context_batch_http,
+    generate_visual_embedding as _generate_visual_embedding_http,
+    generate_visual_embedding_batch as _generate_visual_embedding_batch_http,
+    repair_metadata as _repair_metadata_http,
+)
 from backend.settings_http import (
     ConcurrencyUpdateRequest,
     _authorize_settings,
@@ -247,21 +256,6 @@ class DeleteRequest(StrictRequestModel):
     """按稳定 meme_id 删除图片的请求。"""
 
     meme_id: str | None = None
-
-
-class ContextRequest(StrictRequestModel):
-    """按稳定 meme_id 创建图片语境任务的请求。"""
-
-    meme_id: str | None = None
-    reverse_image_policy: str = Field(default="forbid", pattern="^(forbid|auto)$")
-
-
-class ContextBatchRequest(StrictRequestModel):
-    """批量补齐既有图片语境的请求。"""
-
-    items: list[ContextRequest] = Field(default_factory=list, max_length=500)
-    include_unready: bool = True
-    reverse_image_policy: str = Field(default="forbid", pattern="^(forbid|auto)$")
 
 
 class ProcessingBatchRequest(StrictRequestModel):
@@ -2983,125 +2977,59 @@ async def upload_images(
 
 @app.post("/images/context", status_code=202, tags=["images", "tasks"])
 async def generate_context(request: Request, payload: ContextRequest) -> dict[str, object]:
-    """为单张图片显式创建或复用统一图片处理 job。"""
-    if payload.meme_id:
-        try:
-            record, image = _service(request, "metadata").image_for_meme(payload.meme_id)
-        except MetadataError as exc:
-            if exc.code == "metadata_image_mismatch":
-                raise _error(409, "target_changed", "图片内容已变化") from exc
-            # 只要数据库 Meme 仍存在，排队请求必须可创建；Worker 会在 claim 后以 target_changed 失败。
-            try:
-                with _environment(request) as environment:
-                    record = environment.memes.get(payload.meme_id)
-            except Exception:
-                record = None
-            if record is None:
-                raise _error(404, "meme_not_found", "图片不存在") from exc
-            image = _service(request, "metadata").blob_store.resolve(record.storage_key)
-    else:
-        raise _error(400, "meme_id_required", "必须提供 meme_id")
-    try:
-        snapshot = _submit_processing_job_for_image(request, record, image, reverse_image_policy=payload.reverse_image_policy)
-    except ImageProcessingError as exc:
-        status = 404 if exc.code == "job_not_found" else 503 if exc.code in {"image_processing_unavailable", "reverse_image_unavailable"} else 409
-        raise _error(status, exc.code, "图片处理任务当前不可用") from exc
-    stage = next((item for item in snapshot.stages if item.get("stage") == "agent"), None)
-    return {
-        "processing_job_id": snapshot.job_id,
-        "submission_mode": "pipeline",
-        "image_stage": None,
-        "job_status": snapshot.status,
-        # Agent 叶子 Task 可能要等视觉阶段完成后才创建；旧客户端仍需要
-        # 一个可轮询的标识，因此在叶子 ID 缺失时使用同一个图片 job ID。
-        "task_id": stage.get("task_id") if stage and stage.get("task_id") else snapshot.job_id,
-        "task_type": "meme_context_generation",
-        "status": snapshot.status,
-    }
+    """兼容图片语境入口，并注入当前 scope 目标和处理 Job callback。"""
+    return await _generate_context_http(
+        request,
+        payload,
+        service=_service,
+        environment=_environment,
+        submit_processing_job=_submit_processing_job_for_image,
+        error=_error,
+    )
 
 
 @app.post("/images/context/batch", tags=["images", "tasks"])
 async def generate_context_batch(request: Request, payload: ContextBatchRequest) -> dict[str, object]:
-    """批量为缺失或未就绪图片提交独立图片处理 job，单项失败不影响其余项。"""
-    batch_id = uuid4().hex
-    if payload.items:
-        paths = [(item.meme_id, None) for item in payload.items]
-    else:
-        paths = []
-    results = []
-    for meme_id, _filename in paths:
-        try:
-            if not meme_id:
-                raise MetadataError("meme_id_required")
-            record, image = _service(request, "metadata").image_for_meme(meme_id)
-            state = _service(request, "metadata").status(image)["status"]
-            # 显式 include_unready 请求代表强制重试；仅在调用方未开启时跳过已就绪记录。
-            if not payload.include_unready and state not in {"pending", "partial", "repair_required"}:
-                results.append({"meme_id": meme_id, "skipped": "already_ready"})
-                continue
-            if state == "repair_required":
-                _service(request, "metadata").create_pending(image)
-            snapshot = _submit_processing_job_for_image(request, record, image, reverse_image_policy=payload.reverse_image_policy, explicit_retry=payload.include_unready, schedule=True)
-            stage = next((item for item in snapshot.stages if item.get("stage") == "agent"), None)
-            results.append({
-                "meme_id": meme_id,
-                "processing_job_id": snapshot.job_id,
-                "submission_mode": "pipeline",
-                "image_stage": None,
-                # Agent 叶子要在视觉阶段完成后才创建；旧客户端仍用统一 task_id
-                # 轮询，因此暂时返回同一个父 job 标识。
-                "task_id": stage.get("task_id") if stage and stage.get("task_id") else snapshot.job_id,
-                "status": snapshot.status,
-            })
-        except (HTTPException, MetadataError, OSError, RuntimeError) as exc:
-            error_code = _context_enqueue_error(exc) if isinstance(exc, RuntimeError) else getattr(exc, "code", "context_enqueue_failed")
-            results.append({"meme_id": meme_id, "error": error_code})
-    return {"batch_id": batch_id, "results": results}
+    """兼容批量图片语境入口，并注入当前 scope 任务 callback。"""
+    return await _generate_context_batch_http(
+        request,
+        payload,
+        service=_service,
+        submit_processing_job=_submit_processing_job_for_image,
+        error=_error,
+        enqueue_error=_context_enqueue_error,
+    )
 
 
 @app.post("/images/visual-embedding", status_code=202, tags=["images", "tasks"])
 async def generate_visual_embedding(request: Request, payload: ContextRequest) -> dict[str, object]:
-    """为既有图片显式提交或复用统一图片处理 job 的视觉阶段。"""
-    if not payload.meme_id:
-        raise _error(400, "meme_id_required", "必须提供 meme_id")
-    try:
-        record, image = _service(request, "metadata").image_for_meme(payload.meme_id)
-    except MetadataError as exc:
-        code = "meme_not_found" if exc.code in {"metadata_missing", "image_unreadable"} else exc.code
-        raise _error(404 if code == "meme_not_found" else 409, code, "图片不存在或内容已变化") from exc
-    try:
-        snapshot = _submit_processing_job_for_image(request, record, image, reverse_image_policy="forbid")
-    except (ImageProcessingError, MetadataError, RuntimeError) as exc:
-        code = getattr(exc, "code", None) or _context_enqueue_error(exc) if isinstance(exc, RuntimeError) else getattr(exc, "code", "visual_enqueue_failed")
-        raise _error(409, code, "视觉任务提交失败") from exc
-    stage = next((item for item in snapshot.stages if item.get("stage") == "visual"), None)
-    return {"processing_job_id": snapshot.job_id, "submission_mode": "pipeline", "image_stage": "visual", "task_id": stage.get("task_id") if stage else None, "task_type": "visual_embedding_generation", "status": snapshot.status}
+    """兼容视觉向量入口，并注入当前 scope 处理 Job callback。"""
+    return await _generate_visual_embedding_http(
+        request,
+        payload,
+        service=_service,
+        submit_processing_job=_submit_processing_job_for_image,
+        error=_error,
+        enqueue_error=_context_enqueue_error,
+    )
 
 
 @app.post("/images/visual-embedding/batch", status_code=202, tags=["images", "tasks"])
 async def generate_visual_embedding_batch(request: Request, payload: ContextBatchRequest) -> dict[str, object]:
-    """为既有图片提交可并发交错的逐图图片处理 job。"""
-    batch_id = uuid4().hex
-    results: list[dict[str, object]] = []
-    for item in payload.items:
-        if not item.meme_id:
-            results.append({"meme_id": None, "error": "meme_id_required"})
-            continue
-        try:
-            record, image = _service(request, "metadata").image_for_meme(item.meme_id)
-            snapshot = _submit_processing_job_for_image(request, record, image, reverse_image_policy=payload.reverse_image_policy, explicit_retry=True)
-            stage = next((stage for stage in snapshot.stages if stage.get("stage") == "visual"), None)
-            results.append({"meme_id": item.meme_id, "processing_job_id": snapshot.job_id, "submission_mode": "pipeline", "image_stage": "visual", "task_id": stage.get("task_id") if stage else None, "status": snapshot.status})
-        except (MetadataError, RuntimeError) as exc:
-            results.append({"meme_id": item.meme_id, "error": _context_enqueue_error(exc) if isinstance(exc, RuntimeError) else "visual_enqueue_failed"})
-    return {"batch_id": batch_id, "results": results}
+    """兼容批量视觉向量入口，并注入当前 scope 处理 Job callback。"""
+    return await _generate_visual_embedding_batch_http(
+        request,
+        payload,
+        service=_service,
+        submit_processing_job=_submit_processing_job_for_image,
+        enqueue_error=_context_enqueue_error,
+    )
 
 
 @app.post("/images/metadata/repair", status_code=202, tags=["images", "tasks"])
 async def repair_metadata(request: Request) -> dict[str, object]:
-    """提交幂等的数据库元数据完整性扫描和修复任务。"""
-    record = _service(request, "tasks").submit("metadata_repair", {})
-    return {"task_id": record.task_id, "task_type": record.task_type, "status": record.status}
+    """兼容 metadata repair 入口，并注入当前 scope task service。"""
+    return await _repair_metadata_http(request, task_service=lambda received: _service(received, "tasks"))
 
 
 def create_app(*, scope_resolver, service_factory: ScopeServiceFactory | None = None, operation_policy=None, callback_issuer=None, callback_verifier=None, agent_input_provider: Callable[[ScopeContext, Path], str | Path] | None = None, workspace_provider=None, extensions: Sequence[ApplicationExtension] | None = None) -> FastAPI:
