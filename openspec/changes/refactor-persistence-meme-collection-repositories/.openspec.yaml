@@ -1,0 +1,3 @@
+schema: spec-driven
+created: 2026-08-25
+goal: 降低 backend.database Repository 职责密度，保持 scope、事务、SQL、错误码、分页、成员和文件语义不变。
