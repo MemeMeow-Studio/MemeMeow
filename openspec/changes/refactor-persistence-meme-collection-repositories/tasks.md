@@ -17,6 +17,6 @@
 
 ## 4. 提交、同步与收尾
 
-- [ ] 4.1 在开源仓库提交实现、验证和收尾记录，固定精确 SHA、变更范围、验证结果、祖先关系和回滚方式。
+- [x] 4.1 在开源仓库提交实现、验证和收尾记录，固定精确 SHA、变更范围、验证结果、祖先关系和回滚方式。
 - [ ] 4.2 检查 Server 目标路径无重叠脏改动，从本地开源精确 fetch 收尾 SHA，以普通 `--no-ff` merge 进入 Server `main`，确认精确 SHA 为 Server `HEAD` 祖先。
 - [ ] 4.3 运行 Server 定向/完整回归及静态门禁，更新 `docs/refactor-plan.md`、本 change validation 和同步记录，确认 Server 未 push。
