@@ -147,6 +147,14 @@ from backend.callbacks import (
 from backend.image_processing import AUTO_RENAME_WARNING_ERRORS, ImageProcessingError, ImageProcessingOptions, ImageProcessingRepository, ImageProcessingSnapshot, ImageProcessingWorker, SingleImageEmbeddingService, image_file_matches, processing_config_hash, stable_input_digest
 from backend.agent_resume import ResumeDecision, classify_resume_error, normalize_identifier, within_total_timeout
 from backend.app_extensions import ApplicationExtension, extension_paths, path_is_exempt
+from backend.application import create_application
+from backend.application_lifecycle import (
+    build_scope_runtime,
+    callback_verification_keys,
+    prepare_lifecycle,
+    shutdown_lifecycle,
+    start_extensions,
+)
 from backend.image_upload_http import (
     MAX_UPLOAD_FILES_PER_REQUEST,
     UPLOAD_READ_CHUNK_BYTES,
@@ -539,174 +547,33 @@ def _collection_package_error(exc: CollectionPackageError) -> HTTPException:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """初始化一次服务依赖，并在关闭时终止未完成任务。"""
-    managed_factory = bool(getattr(app.state, "_scope_factory_managed", False))
-    configured_factory = None if managed_factory else getattr(app.state, "service_factory", None)
-    custom_factory = configured_factory is not None
-    configured_resolver = getattr(app.state, "scope_resolver", None)
-    local_mode = isinstance(configured_resolver, LocalScopeResolver) and configured_resolver.scope.scope_id == "local"
-    settings = Settings.from_env()
-    # 兼容宿主自定义 Settings 夹具；缺失的续跑字段按默认关闭处理。
+    setup = prepare_lifecycle(
+        app,
+        skill_root=Path(__file__).resolve().parent / "skills" / "research-meme-context",
+        settings_loader=Settings.from_env,
+        engine_factory=create_engine_for_settings,
+        database_checker=check_database,
+        database_resources_factory=DatabaseResources,
+        opencode_factory=OpenCodeRunner,
+        activity_factory=OpenCodeActivityReader,
+        visual_factory=VisualInferenceClient,
+    )
+    settings = setup.settings
+    local_mode = setup.local_mode
+    configured_factory = setup.configured_factory
+    custom_factory = setup.custom_factory
+    configured_agent_input_provider = setup.configured_agent_input_provider
+    # 任务 handler 通过这些闭包变量读取本轮 setup/runtime；factory 完成后再赋值。
+    factory: ScopeServiceFactory | Any | None = configured_factory
+    worker_manager: PostgresTaskWorkerManager | None = None
+    shared_worker_executor: ThreadPoolExecutor | None = None
+    local_services: ScopeServices | None = None
+    tasks: Any | None = None
     resume_enabled = bool(getattr(settings, "agent_resume_enabled", False))
     resume_max_attempts = int(getattr(settings, "agent_resume_max_attempts", 2))
     resume_backoff_seconds = int(getattr(settings, "agent_resume_backoff_seconds", 2))
     resume_max_backoff_seconds = int(getattr(settings, "agent_resume_max_backoff_seconds", 60))
     resume_timeout_seconds = int(getattr(settings, "agent_resume_timeout_seconds", 900))
-    configured_policy = getattr(app.state, "operation_policy", None)
-    if configured_policy is None and configured_factory is not None:
-        configured_policy = getattr(configured_factory, "operation_policy", None)
-    if configured_policy is None:
-        configured_policy = AllowAllOperationPolicy() if local_mode else UnavailableOperationPolicy()
-    if not all(callable(getattr(configured_policy, name, None)) for name in ("probe", "acquire", "commit", "release")):
-        raise DatabaseError("operation_policy_unavailable")
-    app.state.operation_policy = configured_policy
-    app.state.operation_policy_gateway = OperationPolicyGateway(configured_policy, allow_all=isinstance(configured_policy, AllowAllOperationPolicy))
-    app.state.operation_grants = GrantAssociationStore()
-    callback_verifier = getattr(app.state, "callback_verifier", None)
-    callback_issuer = getattr(app.state, "callback_issuer", None)
-    if callback_verifier is None and configured_factory is not None:
-        callback_verifier = getattr(configured_factory, "callback_verifier", None)
-    if callback_issuer is None and configured_factory is not None:
-        callback_issuer = getattr(configured_factory, "callback_issuer", None)
-    if local_mode and callback_verifier is None and callback_issuer is None:
-        try:
-            # callback 根 secret 必须由部署显式提供；随机运行时凭据无法交给已启动
-            # 的 Agent，也会让重启后的验证边界不可预测，因此不再自动生成。
-            callback_credentials = HMACCallbackCredentials(
-                getattr(settings, "agent_callback_secret", None),
-                verification_keys=_callback_verification_keys(settings),
-            )
-        except CallbackError:
-            callback_credentials = None
-        if callback_credentials is not None:
-            callback_verifier = callback_credentials
-            callback_issuer = callback_credentials
-    app.state.callback_verifier = callback_verifier
-    app.state.callback_issuer = callback_issuer
-    app.state.callback_registry = getattr(app.state, "callback_registry", DEFAULT_CALLBACK_REGISTRY)
-    configured_agent_input_provider = getattr(app.state, "agent_input_provider", None)
-    if configured_agent_input_provider is None and configured_factory is not None:
-        configured_agent_input_provider = getattr(configured_factory, "agent_input_provider", None)
-    settings.ensure_directories()
-    configured_workspace_provider = getattr(app.state, "workspace_provider", None)
-    if configured_workspace_provider is None and configured_factory is not None:
-        configured_workspace_provider = getattr(configured_factory, "workspace_provider", None)
-    if local_mode:
-        if configured_workspace_provider is None:
-            configured_workspace_provider = LocalWorkspaceProvider(
-                settings.opencode_runtime_root,
-                image_root=settings.image_root,
-                skill_root=Path(__file__).resolve().parent / "skills" / "research-meme-context",
-            )
-    elif configured_workspace_provider is None:
-        # 先允许 non-local 应用完成无业务副作用的生命周期装配；真正任务执行时
-        # 由占位 provider 稳定拒绝，绝不静默回退 local。
-        configured_workspace_provider = MissingWorkspaceProvider()
-    app.state.workspace_provider = configured_workspace_provider
-    try:
-        engine = create_engine_for_settings(settings)
-        expected_revision = getattr(app.state, "expected_schema_revision", settings.expected_database_revision)
-        check_database(engine, expected_revision=expected_revision, require_local_installation=local_mode)
-    except DatabaseError:
-        # 启动门禁拒绝任何可能回退到旧 JSON 的业务请求；测试和生产都必须显式准备 PostgreSQL。
-        raise
-    app.state.settings = settings
-    app.state.database = DatabaseResources(
-        engine,
-        image_root=settings.image_root,
-        data_root=settings.data_root,
-        settings=settings,
-        require_local_scope=local_mode,
-    )
-    # grant 关联以 PostgreSQL 为跨进程事实来源；内存层只做同进程热点缓存。
-    app.state.operation_grants = PersistentGrantAssociationStore(app.state.database)
-    if local_mode:
-        app.state.resolver = PathResolver(settings.image_root)
-        preflight = app.state.database.flat_preflight(ScopeContext("local"))
-        # 根目录孤立图片不会进入数据库图片库，完整性任务会报告它们；它们本身不应阻断主服务启动。
-        # 非扁平记录、嵌套图片和已登记文件的不一致仍然阻断，避免受控媒体接口读到错误对象。
-        app.state.storage_preflight = preflight
-        if any(preflight.get(key) for key in STORAGE_PREFLIGHT_BLOCKING_KEYS):
-            raise DatabaseError("flat_meme_storage_preflight_failed")
-    else:
-        # 适配宿主由自己的 resolver/factory 管理 scope，不探测或创建 local namespace。
-        app.state.storage_preflight = None
-    # 先按旧构造方式创建 runner，再安装 provider，兼容宿主测试夹具和旧扩展工厂。
-    app.state.opencode = OpenCodeRunner(settings)
-    app.state.opencode.workspace_provider = configured_workspace_provider
-    try:
-        app.state.agent_activity = OpenCodeActivityReader(settings.opencode_runtime_root)
-    except Exception:  # noqa: BLE001
-        # 活跃度是可选观测，runtime 配置异常不能阻止任务服务启动。
-        app.state.agent_activity = None
-    # 后端只保存推理客户端和 scope-bound 查询服务；视觉模型本体位于独立 CPU 容器。
-    app.state.visual_inference = VisualInferenceClient(settings)
-    factory: ScopeServiceFactory | Any | None = configured_factory
-    shared_worker_executor: ThreadPoolExecutor | None = None
-    worker_manager: PostgresTaskWorkerManager | None = None
-    local_services: ScopeServices | None = None
-    if factory is not None:
-        # 适配宿主可以提供自有 factory；启动时只校验协议，不调用 for_scope(local)。
-        required_methods = ("for_scope", "for_task", "start_all", "shutdown")
-        if any(not callable(getattr(factory, name, None)) for name in required_methods):
-            raise DatabaseError("scope_service_factory_invalid")
-    else:
-        shared_worker_executor = ThreadPoolExecutor(
-            max_workers=max(2, settings.opencode_concurrency + 1),
-            thread_name_prefix="mememeow-scope-worker",
-        )
-        worker_manager = PostgresTaskWorkerManager(
-            app.state.database,
-            agent_concurrency=settings.opencode_concurrency,
-            scope_concurrency=getattr(settings, "agent_scope_concurrency", 1),
-            agent_backpressure=settings.agent_backpressure,
-            settings_version=settings.settings_version,
-            lease_seconds=settings.worker_lease_seconds,
-            max_attempts=settings.worker_max_attempts,
-            executor=shared_worker_executor,
-        )
-        if local_mode:
-            local_scope = ScopeContext("local")
-            local_metadata = PostgresMetadataService(app.state.database, scope_id=local_scope)
-            local_search = PostgresSearchService(settings, app.state.database, local_metadata, scope_id=local_scope)
-            try:
-                local_reverse_image = ReverseImageService(
-                    settings,
-                    app.state.database,
-                    scope_id=local_scope,
-                    operation_policy=app.state.operation_policy_gateway,
-                    grant_store=app.state.operation_grants,
-                )
-            except TypeError as exc:
-                if "operation_policy" not in str(exc) and "grant_store" not in str(exc):
-                    raise
-                # 兼容适配宿主尚未升级的轻量 facade 夹具；真实服务支持 policy 参数。
-                local_reverse_image = ReverseImageService(settings, app.state.database, scope_id=local_scope)
-            local_visual_search = VisualSearchService(settings, app.state.database, scope_id=local_scope)
-            local_tasks = PostgresTaskService(
-                app.state.database,
-                scope_id=local_scope,
-                agent_concurrency=settings.opencode_concurrency,
-                scope_concurrency=getattr(settings, "agent_scope_concurrency", 1),
-                agent_backpressure=settings.agent_backpressure,
-                settings_version=settings.settings_version,
-                lease_seconds=settings.worker_lease_seconds,
-                max_attempts=settings.worker_max_attempts,
-                resume_enabled=resume_enabled,
-                resume_max_attempts=resume_max_attempts,
-                resume_backoff_seconds=resume_backoff_seconds,
-                resume_max_backoff_seconds=resume_max_backoff_seconds,
-                resume_timeout_seconds=resume_timeout_seconds,
-                worker_manager=worker_manager,
-            )
-            local_services = ScopeServices(
-                local_scope,
-                local_metadata,
-                local_search,
-                local_tasks,
-                local_reverse_image,
-                local_visual_search,
-            )
-    tasks = local_services.tasks if local_services is not None else None
 
     def services_for_task(payload: dict[str, object]) -> ScopeServices:
         """只从当前 claim 注入的 Task.scope_id 恢复后台服务环境。"""
@@ -1274,9 +1141,9 @@ async def lifespan(app: FastAPI):
             progress(1.0, "单图文本向量已保存")
         return {"meme_id": meme_id, "metadata_hash": frozen_metadata_hash, "embedding_model": app.state.settings.embedding_model}
 
-    def register_handlers(services: ScopeServices | None = None) -> None:
+    def register_handlers(services: ScopeServices | None = None, *, manager: PostgresTaskWorkerManager | None = None) -> None:
         """向进程级 manager 注册处理器，并为 scope facade 安装批次收束回调。"""
-        register = services.tasks.register if services is not None else getattr(worker_manager, "register", None)
+        register = services.tasks.register if services is not None else getattr(manager or worker_manager, "register", None)
         if not callable(register):
             return
         register("cache_generation", cache_handler)
@@ -1295,100 +1162,36 @@ async def lifespan(app: FastAPI):
         services.metadata.recover_storage(limit=500)
         services.tasks.start()
 
-    factory = ScopeServiceFactory(
-        app.state.database,
-        settings,
-        task_config={
-            "agent_concurrency": settings.opencode_concurrency,
-            "scope_concurrency": getattr(settings, "agent_scope_concurrency", 1),
-            "agent_backpressure": settings.agent_backpressure,
-            "settings_version": settings.settings_version,
-            "lease_seconds": settings.worker_lease_seconds,
-            "max_attempts": settings.worker_max_attempts,
-            "resume_enabled": resume_enabled,
-            "resume_max_attempts": resume_max_attempts,
-            "resume_backoff_seconds": resume_backoff_seconds,
-            "resume_max_backoff_seconds": resume_max_backoff_seconds,
-            "resume_timeout_seconds": resume_timeout_seconds,
-            "executor": shared_worker_executor,
-            "operation_policy": app.state.operation_policy_gateway,
-            "grant_store": app.state.operation_grants,
-            "register_handlers": register_handlers,
-            "start_services": start_services,
-        },
-        preloaded={"local": local_services} if local_services is not None else None,
-        worker_manager=worker_manager,
-    ) if factory is None else factory
-    if worker_manager is not None:
-        # 非 local 默认 factory 不预加载 scope；先注册全局 handler，避免启动恢复任务时
-        # 在首次按 Task.scope_id 创建 facade 前被误判为 task_handler_missing。
-        register_handlers()
-    if local_services is not None:
-        app.state.metadata = local_services.metadata
-        app.state.search_engine = local_services.search
-        app.state.reverse_image = local_services.reverse_image
-        app.state.visual_search = local_services.visual_search
-        register_handlers(local_services)
-        local_services.metadata.recover_storage(limit=500)
-    app.state.service_factory = factory
-    app.state._scope_factory_managed = not custom_factory
-    app.state.agent_input_provider = configured_agent_input_provider
-    app.state.image_processing_task_handlers = {
+    task_handlers = {
         "visual_embedding_generation": visual_handler,
         "meme_context_generation": context_handler,
         "image_auto_rename": auto_rename_handler,
         "text_embedding_generation": text_embedding_handler,
     }
-    app.state.image_processing_workers = {}
-    app.state.image_processing_workers_lock = RLock()
-    if local_services is not None:
-        # local 入口显式启动逐图控制面；叶子 Task 仍由共享任务 Worker 执行。
-        app.state.image_processing_workers[local_services.scope.scope_id] = ImageProcessingWorker(
-            app.state.database,
-            scope_id=local_services.scope,
-            task_service=local_services.tasks,
-            policy=app.state.operation_policy_gateway,
-            grant_store=app.state.operation_grants,
-            max_workers=validate_agent_concurrency(
-                getattr(settings, "opencode_concurrency", 1),
-                backpressure=getattr(settings, "agent_backpressure", None),
-            ),
-            task_handlers={
-                "visual_embedding_generation": visual_handler,
-                "meme_context_generation": context_handler,
-                "image_auto_rename": auto_rename_handler,
-                "text_embedding_generation": text_embedding_handler,
-            },
-        )
-        if callable(getattr(app.state.database, "factory", None)):
-            app.state.image_processing_workers[local_services.scope.scope_id].start()
-    if tasks is not None:
-        app.state.tasks = tasks
-    app.state.task_scope_diagnostics = factory.start_all()
+    runtime = None
     started_extensions: list[ApplicationExtension] = []
     try:
-        # 扩展启动发生在公共数据库、factory 和 Worker 全部就绪之后，适配器可以
-        # 在这里绑定自己的运行时资源，而不让公共核心知道其具体业务语义。
-        for extension in _extension_list(app):
-            await _invoke_extension_hook(extension, "on_startup", app)
-            started_extensions.append(extension)
+        runtime = build_scope_runtime(
+            setup,
+            register_handlers=register_handlers,
+            start_services=start_services,
+            task_handlers=task_handlers,
+            worker_manager_factory=PostgresTaskWorkerManager,
+            metadata_factory=PostgresMetadataService,
+            search_factory=PostgresSearchService,
+            task_service_factory=PostgresTaskService,
+            reverse_image_factory=ReverseImageService,
+            visual_search_factory=VisualSearchService,
+        )
+        factory = runtime.factory
+        worker_manager = runtime.worker_manager
+        shared_worker_executor = runtime.shared_worker_executor
+        local_services = runtime.local_services
+        tasks = runtime.tasks
+        started_extensions = await start_extensions(app)
         yield
     finally:
-        for extension in reversed(started_extensions):
-            await _invoke_extension_hook(extension, "on_shutdown", app)
-        app.state.opencode.shutdown()
-        for image_worker in list(getattr(app.state, "image_processing_workers", {}).values()):
-            image_worker.shutdown()
-        factory.shutdown()
-        if worker_manager is not None:
-            worker_manager.shutdown()
-        if not custom_factory and getattr(app.state, "service_factory", None) is factory:
-            # 默认工厂绑定本轮 engine；不能在下次 lifespan 中被误当作宿主注入对象复用。
-            delattr(app.state, "service_factory")
-        if shared_worker_executor is not None:
-            # 共享任务线程仍可能持有数据库 session，连接池必须最后释放。
-            shared_worker_executor.shutdown(wait=True, cancel_futures=True)
-        engine.dispose()
+        await shutdown_lifecycle(setup, runtime, started_extensions)
 
 
 _route_template = FastAPI(
@@ -2438,47 +2241,18 @@ def create_app(*, scope_resolver, service_factory: ScopeServiceFactory | None = 
     service factory 和 non-local Agent 输入 provider。未传 resolver 直接抛出稳定错误，
     绝不静默安装 local fallback。
     """
-    if scope_resolver is None:
-        raise ScopeResolutionError("应用必须显式配置 scope resolver")
-    if not any(callable(getattr(scope_resolver, name, None)) for name in ("resolve", "resolve_scope")) and not callable(scope_resolver):
-        raise ScopeResolutionError("scope resolver 不可调用")
-    if isinstance(scope_resolver, LocalScopeResolver) and scope_resolver.scope.scope_id != "local":
-        raise ScopeResolutionError("local resolver 只能绑定 local scope")
-    if operation_policy is not None and not all(callable(getattr(operation_policy, name, None)) for name in ("probe", "acquire", "commit", "release")):
-        raise OperationPolicyError("operation_policy_unavailable")
-    configured_extensions = tuple(extensions or ())
-    created = FastAPI(
-        title=_route_template.title,
-        version=_route_template.version,
-        description=_route_template.description,
+    return create_application(
+        route_template=_route_template,
         lifespan=lifespan,
-        responses={400: {"model": ErrorBody}, 403: {"model": ErrorBody}, 404: {"model": ErrorBody}, 409: {"model": ErrorBody}, 422: {"model": ErrorBody}, 503: {"model": ErrorBody}},
+        scope_resolver=scope_resolver,
+        service_factory=service_factory,
+        operation_policy=operation_policy,
+        callback_issuer=callback_issuer,
+        callback_verifier=callback_verifier,
+        agent_input_provider=agent_input_provider,
+        workspace_provider=workspace_provider,
+        extensions=extensions,
     )
-    # APIRoute/StaticFiles 对象只保存不可变路由元数据，复制引用不会共享 scope 状态。
-    created.router.routes.extend(_route_template.router.routes)
-    created.exception_handlers.update(_route_template.exception_handlers)
-    for middleware in reversed(_route_template.user_middleware):
-        created.add_middleware(middleware.cls, *middleware.args, **middleware.kwargs)
-    created.state.extensions = configured_extensions
-    created.state.expose_scope = True
-    for extension in configured_extensions:
-        register_routes = getattr(extension, "register_routes", None)
-        if callable(register_routes):
-            register_routes(created)
-    created.state.scope_resolver = scope_resolver
-    # policy、callback issuer/verifier 与 scope resolver 分属不同信任边界，均只从
-    # 同一个 keyword-only factory 进入应用，不使用模块级可变依赖。
-    created.state.operation_policy = operation_policy if operation_policy is not None else (AllowAllOperationPolicy() if isinstance(scope_resolver, LocalScopeResolver) else None)
-    created.state.callback_issuer = callback_issuer
-    created.state.callback_verifier = callback_verifier
-    if service_factory is not None:
-        created.state.service_factory = service_factory
-        created.state._scope_factory_managed = False
-    if agent_input_provider is not None:
-        created.state.agent_input_provider = agent_input_provider
-    if workspace_provider is not None:
-        created.state.workspace_provider = workspace_provider
-    return created
 
 
 # 开源模块级入口显式安装 local；其他宿主必须调用 create_app 并提供自己的 resolver。

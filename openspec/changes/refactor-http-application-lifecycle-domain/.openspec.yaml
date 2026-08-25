@@ -1,0 +1,3 @@
+schema: spec-driven
+created: 2026-08-26
+goal: 形成可测试、可复用且兼容现有入口的 HTTP 应用生命周期职责域
