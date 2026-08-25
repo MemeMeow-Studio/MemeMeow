@@ -2985,6 +2985,7 @@ async def generate_context(request: Request, payload: ContextRequest) -> dict[st
         environment=_environment,
         submit_processing_job=_submit_processing_job_for_image,
         error=_error,
+        operation_error=_operation_http_error,
     )
 
 

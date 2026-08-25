@@ -14,6 +14,15 @@
 - **THEN** `/images/context`、`/images/visual-embedding`、`/images/visual-embedding/batch` 和 `/images/metadata/repair` 继续使用原 method 与 `202` status，`/images/context/batch` 保持原 `200` status
 - **AND** route handler 名称和 `api` 中的旧请求模型 import 继续可用
 
+### Requirement: Operation policy errors keep host projection
+
+图片语境 Job 提交遇到 operation policy 拒绝时 MUST 通过可选宿主 callback 投影；未提供 callback 的公共调用仍返回既有稳定错误 code/status，Server 入口 MUST 注入自己的 `Retry-After`/`retry_at` 适配。
+
+#### Scenario: Context policy limit keeps retry metadata
+
+- **WHEN** 图片语境提交收到 `operation_limit_exceeded` 且宿主提供 operation error callback
+- **THEN** callback 收到同一 code 与 retry_at，响应保留宿主定义的 `Retry-After`
+
 ### Requirement: Targets stay scope-bound
 
 单图和批量入口 MUST 只通过当前 scope metadata service 派生 Meme 与受控图片，不接受路径、scope、用户或目标文件名字段。缺少 meme_id、图片不存在、目标指纹变化和处理选项不可用 MUST 保持稳定错误 code。

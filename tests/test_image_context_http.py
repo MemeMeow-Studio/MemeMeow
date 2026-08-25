@@ -13,7 +13,9 @@ from fastapi import HTTPException
 
 import api
 import backend.image_context_http as image_context_http
+from backend.image_processing import ImageProcessingError
 from backend.metadata import MetadataError
+from backend.operation_policy import OperationPolicyError
 
 
 def _request() -> SimpleNamespace:
@@ -271,3 +273,31 @@ def test_api_context_wrapper_forwards_scope_callbacks() -> None:
     assert calls[0]["service"] is api._service
     assert calls[0]["environment"] is api._environment
     assert calls[0]["submit_processing_job"] is api._submit_processing_job_for_image
+    assert calls[0]["operation_error"] is api._operation_http_error
+
+
+def test_context_operation_policy_uses_host_projection_callback() -> None:
+    """语境 Job 的策略错误必须保留宿主 Retry-After 投影。"""
+    request = _request()
+    projected: list[OperationPolicyError] = []
+
+    def operation_error(exc: OperationPolicyError) -> HTTPException:
+        """构造带 Retry-After 的宿主错误。"""
+        projected.append(exc)
+        return HTTPException(status_code=429, detail={"error": exc.code}, headers={"Retry-After": "60"})
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(
+            image_context_http.generate_context(
+                request,
+                image_context_http.ContextRequest(meme_id="meme-1"),
+                service=lambda _request, _name: SimpleNamespace(image_for_meme=lambda _meme_id: (SimpleNamespace(id="record-1"), "/image.webp")),
+                environment=lambda _request: None,
+                submit_processing_job=lambda *_args, **_kwargs: (_ for _ in ()).throw(ImageProcessingError("operation_limit_exceeded", retry_at="2030-01-01T00:00:00+00:00")),
+                error=_error,
+                operation_error=operation_error,
+            )
+        )
+    assert caught.value.status_code == 429
+    assert caught.value.headers["Retry-After"] == "60"
+    assert projected[0].code == "operation_limit_exceeded"

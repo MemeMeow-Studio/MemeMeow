@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from backend.image_processing import ImageProcessingError
 from backend.metadata import MetadataError
+from backend.operation_policy import OperationPolicyError
 
 
 class _StrictRequestModel(BaseModel):
@@ -45,6 +46,7 @@ Environment = Callable[[Request], AbstractContextManager[Any]]
 ErrorFactory = Callable[[int, str, str], HTTPException]
 SubmitProcessingJob = Callable[..., Any]
 EnqueueError = Callable[[Exception], str]
+OperationError = Callable[[OperationPolicyError], HTTPException]
 
 
 def _target_from_scope(
@@ -112,6 +114,7 @@ async def generate_context(
     environment: Environment,
     submit_processing_job: SubmitProcessingJob,
     error: ErrorFactory,
+    operation_error: OperationError | None = None,
 ) -> dict[str, object]:
     """为单张图片创建或复用统一图片处理 Job。
 
@@ -121,6 +124,8 @@ async def generate_context(
     try:
         snapshot = submit_processing_job(request, record, image, reverse_image_policy=payload.reverse_image_policy)
     except ImageProcessingError as exc:
+        if exc.code in {"operation_forbidden", "operation_limit_exceeded", "operation_policy_unavailable"} and operation_error is not None:
+            raise operation_error(OperationPolicyError(exc.code, retry_at=exc.retry_at)) from exc
         status = 404 if exc.code == "job_not_found" else 503 if exc.code in {"image_processing_unavailable", "reverse_image_unavailable"} else 409
         raise error(status, exc.code, "图片处理任务当前不可用") from exc
     return _job_result(snapshot, include_job_status=True, include_task_type=True)

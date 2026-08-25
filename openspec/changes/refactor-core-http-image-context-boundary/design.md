@@ -24,7 +24,7 @@
 
 ### 2. 目标解析和异步提交通过 callback 注入
 
-模块接收 `service`、`environment`、`submit_processing_job`、`task_service`、`error` 和 `enqueue_error` callback。目标解析仍只读取当前 scope metadata service；数据库 fallback 只用于保留原 Meme 存在但 sidecar 读取失败时的排队语义，明确的指纹不一致仍返回 `target_changed`。
+模块接收 `service`、`environment`、`submit_processing_job`、`task_service`、`error`、`enqueue_error` 和可选 `operation_error` callback。目标解析仍只读取当前 scope metadata service；数据库 fallback 只用于保留原 Meme 存在但 sidecar 读取失败时的排队语义，明确的指纹不一致仍返回 `target_changed`。宿主可通过 `operation_error` 保留 `Retry-After` 等策略投影。
 
 ### 3. 批量保持逐项隔离
 
