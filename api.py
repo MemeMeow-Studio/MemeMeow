@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import mimetypes
 import hashlib
 import inspect
 import json
@@ -89,6 +88,11 @@ from backend.image_context_http import (
     generate_visual_embedding as _generate_visual_embedding_http,
     generate_visual_embedding_batch as _generate_visual_embedding_batch_http,
     repair_metadata as _repair_metadata_http,
+)
+from backend.image_library_http import (
+    image_metadata as _image_metadata_http,
+    list_images as _list_images_http,
+    media as _media_http,
 )
 from backend.visual_callback_http import (
     VisualMatchRequest,
@@ -2204,39 +2208,17 @@ async def list_images(
     page_size: int = Query(default=50, ge=1, le=200),
 ) -> dict[str, object]:
     """按文件名筛选并分页列出当前 scope 的扁平图片。"""
-    unknown = set(request.query_params) - {"search", "page", "page_size"}
-    if unknown:
-        raise _error(400, "invalid_request", "图片列表不接受已废弃的目录参数")
-    services = _request_services(request)
-    with _environment(request) as environment:
-        records = environment.memes.list(search=search, page=page, page_size=page_size)
-        total = environment.memes.count(search=search)
-    items = []
-    visual_identity = identity_from_settings(request.app.state.settings)
-    for record in records:
-        try:
-            image = services.metadata.blob_store.resolve(record.storage_key)
-            identity = services.metadata._identity(image)
-        except (DatabaseError, MetadataError):
-            continue
-        metadata_status = services.metadata.status(image)
-        with _environment(request) as environment:
-            visual_row = environment.visual.get(record.id, model=visual_identity.model, preprocess_version=visual_identity.preprocess_version, dimensions=visual_identity.dimensions, image_sha256=record.sha256)
-        item = {"meme_id": str(record.id), "filename": record.storage_key, "extension": record.extension, "size": identity["size_bytes"], "media_url": f"/media/{record.id}", "metadata": metadata_status, "embedding_status": "ready" if services.search.has_cache() and metadata_status.get("status") in {"partial", "ready"} else "blocked" if metadata_status.get("status") == "repair_required" else "pending", "visual_embedding_status": "ready" if visual_row is not None else "pending"}
-        latest_processing = _processing_repository(request).latest_for_target(record.id, record.sha256)
-        if latest_processing is not None:
-            processing_public = latest_processing.as_dict()
-            item.update(
-                {
-                    "processing_job_id": processing_public.get("job_id"),
-                    "processing_status": processing_public.get("status"),
-                    "processing_auto_name": processing_public.get("auto_name", False),
-                    "processing_has_warnings": processing_public.get("has_warnings", False),
-                    "processing_stages": processing_public.get("stages", []),
-                }
-            )
-        items.append(item)
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+    return await _list_images_http(
+        request,
+        search=search,
+        page=page,
+        page_size=page_size,
+        services=_request_services,
+        environment=_environment,
+        processing_repository=_processing_repository,
+        visual_identity=lambda received: identity_from_settings(received.app.state.settings),
+        error=_error,
+    )
 
 
 @app.post("/images/processing", status_code=202, tags=["images", "tasks"])
@@ -2287,30 +2269,13 @@ async def image_metadata(
     meme_id: str | None = Query(default=None),
 ) -> dict[str, object]:
     """按稳定 ``meme_id`` 返回当前 scope 的数据库语境记录。"""
-    if not meme_id:
-        raise _error(400, "meme_id_required", "必须提供 meme_id")
-    try:
-        _record, image = _service(request, "metadata").image_for_meme(meme_id)
-        metadata = _service(request, "metadata").load(image)
-    except MetadataError as exc:
-        status = 404 if exc.code == "metadata_missing" else 409
-        code = "meme_not_found" if exc.code == "metadata_missing" else exc.code
-        message = "图片不存在" if exc.code == "metadata_missing" else "图片元数据无法读取"
-        raise _error(status, code, message) from exc
-    payload = metadata.model_dump(mode="json", exclude_none=False)
-    payload["meme_id"] = meme_id
-    return payload
+    return await _image_metadata_http(request, meme_id=meme_id, services=_request_services, error=_error)
 
 
 @app.get("/media/{meme_id}", tags=["images"])
 async def media(request: Request, meme_id: str):
     """按当前 scope 的稳定 meme_id 读取经过指纹校验的图片。"""
-    try:
-        _record, path = _service(request, "metadata").image_for_meme(meme_id)
-    except MetadataError as exc:
-        raise _error(404, "meme_not_found", "图片不存在") from exc
-    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    return FileResponse(path, media_type=media_type)
+    return await _media_http(request, meme_id=meme_id, services=_request_services, error=_error)
 
 
 @app.get("/collections", tags=["collections"])
