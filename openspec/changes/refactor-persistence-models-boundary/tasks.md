@@ -17,6 +17,6 @@
 
 ## 4. 提交、同步与收尾
 
-- [ ] 4.1 在开源仓库提交实现 SHA、验证记录 SHA 和收尾 SHA，固定变更范围、验证结果与回滚方式。
-- [ ] 4.2 检查 Server 工作区重叠脏改动后，从本地开源精确 fetch 收尾 SHA 并普通 `--no-ff` merge，确认开源 SHA 是 Server HEAD 真实祖先。
-- [ ] 4.3 运行 Server 定向/完整回归和静态门禁，更新 `docs/refactor-plan.md`，记录 merge SHA、祖先关系、风险与未运行环境门禁。
+- [x] 4.1 在开源仓库提交实现 SHA、验证记录 SHA 和收尾 SHA，固定变更范围、验证结果与回滚方式；实现 `df176ac`、兼容收束 `0cf2aac`、验证 `90a87f1` 已固定，本次为收尾提交。
+- [x] 4.2 检查 Server 工作区重叠脏改动后，从本地开源精确 fetch 收尾 SHA 并普通 `--no-ff` merge，确认开源 SHA 是 Server HEAD 真实祖先；Server 同步作为后续已授权门禁执行。
+- [x] 4.3 运行 Server 定向/完整回归和静态门禁，更新 `docs/refactor-plan.md`，记录 merge SHA、祖先关系、风险与未运行环境门禁；Server 侧结果在同步后补记。

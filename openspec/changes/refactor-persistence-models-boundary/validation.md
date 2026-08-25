@@ -4,7 +4,8 @@
 
 - 实现提交：`df176acf6db9765f1ad5debb4e2e9355a0520c51`
 - 兼容导出收束提交：`0cf2aac86bdde1aabd9ae5a5cb3e091e03395abb`
-- 验证记录提交：以本文件所在提交为准，收尾提交会补充精确 SHA。
+- 验证记录提交：`90a87f1`（本文件所在提交）。
+- 收尾提交：本次 tasks/记录收束提交；Server 同步后在 `docs/refactor-plan.md` 补记精确 merge SHA。
 
 ## 自动化结果
 
