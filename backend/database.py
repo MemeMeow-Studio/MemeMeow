@@ -16,12 +16,11 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock, RLock
+from threading import RLock
 from typing import Any, Iterator, Sequence
 from uuid import UUID
 
 from sqlalchemy import (
-    create_engine,
     delete,
     event,
     func,
@@ -29,14 +28,24 @@ from sqlalchemy import (
     text,
     update,
 )
-from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session
 
 from backend.paths import SUPPORTED_EXTENSIONS, validate_business_storage_key
 from backend.storage_security import StorageRootError, validate_controlled_root
 from backend.agent_resume import append_error_history, append_task_error_history, normalize_identifier, sanitize_error
 from executor.agent_limits import validate_agent_concurrency
+from backend.persistence.engine import (
+    CURRENT_SCHEMA_REVISION,
+    DatabaseError,
+    SCOPE_LOCAL,
+    check_database,
+    create_engine_for_settings,
+    create_engine_for_url,
+    database_url_from_env,
+    ensure_optional_control_schema,
+    initialize_local,
+)
 from backend.persistence.models import (
     BigInteger,
     Boolean,
@@ -88,11 +97,10 @@ from backend.persistence.models import (
     unicodedata,
     utcnow,
 )
+from backend.persistence.resources import DataEnvironment, DatabaseResources
+from backend.persistence.unit_of_work import UnitOfWork
 
 
-SCOPE_LOCAL = "local"
-# 当前代码要求的 Alembic head；数据库初始化脚本会显式传入同一 revision。
-CURRENT_SCHEMA_REVISION = "0016_agent_fair_scheduling"
 # 图片 pipeline 的显式阶段任务由专用控制面推进；通用 Agent fair claim 不应抢走
 # 这些带可信 submission_mode 的叶子任务。这里复制稳定协议集合，避免 database.py
 # 与任务执行模块互相导入。
@@ -116,225 +124,6 @@ def _validate_lane_capacities(lane_capacity: object | None, scope_capacity: obje
     except ValueError as exc:
         raise DatabaseError("agent_claim_config_invalid") from exc
     return capacity, limit
-
-
-class DatabaseError(RuntimeError):
-    """数据库边界错误，携带不会泄露连接凭据的稳定错误码。"""
-
-    def __init__(self, code: str, message: str | None = None):
-        super().__init__(message or code)
-        self.code = code
-def database_url_from_env() -> str:
-    """读取 PostgreSQL URL；明确拒绝 SQLite 等非目标数据库。"""
-    value = os.getenv("MEMEMEOW_DATABASE_URL", "postgresql+psycopg://mememeow:mememeow@127.0.0.1:5434/mememeow")
-    if not value.startswith("postgresql"):
-        raise DatabaseError("postgresql_required")
-    return value
-
-
-def create_engine_for_url(url: str | None = None, **kwargs: Any) -> Engine:
-    """创建进程级 SQLAlchemy Engine 与连接池。"""
-    try:
-        engine = create_engine(url or database_url_from_env(), pool_pre_ping=True, future=True, **kwargs)
-    except SQLAlchemyError as exc:
-        raise DatabaseError("database_engine_failed") from exc
-    return engine
-
-
-def create_engine_for_settings(settings: Any) -> Engine:
-    """按 Settings 的池参数创建共享 Engine。"""
-    return create_engine_for_url(
-        settings.database_url,
-        pool_size=settings.database_pool_size,
-        max_overflow=settings.database_max_overflow,
-        pool_timeout=settings.database_pool_timeout,
-        pool_recycle=settings.database_pool_recycle,
-    )
-
-
-def ensure_optional_control_schema(engine: Engine) -> None:
-    """幂等创建图片处理与 operation grant 控制面表。
-
-    该兼容保证只处理新增 ORM 表，既不推进也不回退 Alembic revision；生产部署仍
-    应先运行标准 migration，启动期只负责让控制面安全可用；约束升级必须显式重建，
-    不能把旧的三阶段同名 CHECK 当作已经兼容。
-    """
-    try:
-        with engine.begin() as connection:
-            connection.execute(text("SELECT pg_advisory_xact_lock(hashtext('mememeow:optional-control-schema'))"))
-            connection.execute(text("ALTER TABLE task_lane_slots ADD COLUMN IF NOT EXISTS claim_generation BIGINT"))
-            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS submission_mode VARCHAR(16)"))
-            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS image_stage VARCHAR(32)"))
-            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS processing_job_id UUID"))
-            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_available BOOLEAN NOT NULL DEFAULT FALSE"))
-            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_reason VARCHAR(64)"))
-            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_session_id VARCHAR(255)"))
-            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS executor_attempt_id VARCHAR(255)"))
-            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS workspace_selector VARCHAR(128)"))
-            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_attempt_count INTEGER NOT NULL DEFAULT 0"))
-            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_started_at TIMESTAMPTZ"))
-            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS first_error JSONB"))
-            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS error_history JSONB NOT NULL DEFAULT '[]'::jsonb"))
-            connection.execute(text("UPDATE tasks SET resume_attempt_count = COALESCE(resume_attempt_count, 0), error_history = COALESCE(error_history, '[]'::jsonb)"))
-            connection.execute(text("ALTER TABLE tasks ALTER COLUMN resume_available SET DEFAULT FALSE, ALTER COLUMN resume_available SET NOT NULL, ALTER COLUMN resume_attempt_count SET DEFAULT 0, ALTER COLUMN resume_attempt_count SET NOT NULL, ALTER COLUMN error_history SET DEFAULT '[]'::jsonb, ALTER COLUMN error_history SET NOT NULL"))
-            connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS executor_attempt_id VARCHAR(255)"))
-            connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS resume_of_attempt_id VARCHAR(255)"))
-            connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS workspace_selector VARCHAR(128)"))
-            connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS processing_config_hash VARCHAR(64)"))
-            connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS resume_available BOOLEAN NOT NULL DEFAULT FALSE"))
-            connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS resume_reason VARCHAR(64)"))
-            connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS error JSONB"))
-            connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_image_processing_attempt_executor_id ON image_processing_attempts(executor_attempt_id) WHERE executor_attempt_id IS NOT NULL"))
-            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_image_processing_attempts_resume ON image_processing_attempts(scope_id, task_id, resume_available, updated_at)"))
-            connection.execute(text("ALTER TABLE image_processing_jobs ADD COLUMN IF NOT EXISTS auto_name BOOLEAN NOT NULL DEFAULT FALSE"))
-            # 旧兼容表可能已经有可空列；不能让 NULL 继续绕过 Job 选项契约。
-            connection.execute(text("UPDATE image_processing_jobs SET auto_name = FALSE WHERE auto_name IS NULL"))
-            connection.execute(text("ALTER TABLE image_processing_jobs ALTER COLUMN auto_name SET DEFAULT FALSE"))
-            connection.execute(text("ALTER TABLE image_processing_jobs ALTER COLUMN auto_name SET NOT NULL"))
-            connection.execute(text("ALTER TABLE storage_operations ADD COLUMN IF NOT EXISTS expected_revision BIGINT"))
-            connection.execute(text("ALTER TABLE storage_operations ADD COLUMN IF NOT EXISTS claim_generation BIGINT"))
-            connection.execute(text("ALTER TABLE storage_operations ADD COLUMN IF NOT EXISTS attempt INTEGER"))
-            connection.execute(text("ALTER TABLE storage_operations ADD COLUMN IF NOT EXISTS task_id VARCHAR(255)"))
-            connection.execute(text("ALTER TABLE storage_operations ADD COLUMN IF NOT EXISTS expected_title_fingerprint VARCHAR(64)"))
-            Base.metadata.create_all(connection, tables=list(OPTIONAL_CONTROL_TABLES), checkfirst=True)
-            # 旧安装可能已经存在同名三阶段约束。先删后建，确保启动兼容路径和
-            # Alembic migration 对阶段/Task 映射使用完全相同的集合。
-            connection.execute(text("""
-                ALTER TABLE tasks DROP CONSTRAINT IF EXISTS fk_tasks_processing_job;
-                ALTER TABLE tasks DROP CONSTRAINT IF EXISTS ck_task_submission_mode;
-                ALTER TABLE tasks DROP CONSTRAINT IF EXISTS ck_task_image_stage;
-                ALTER TABLE tasks DROP CONSTRAINT IF EXISTS ck_task_submission_job_exclusivity;
-                ALTER TABLE tasks DROP CONSTRAINT IF EXISTS ck_task_image_stage_type;
-                ALTER TABLE tasks ADD CONSTRAINT fk_tasks_processing_job
-                    FOREIGN KEY (scope_id, processing_job_id)
-                    REFERENCES image_processing_jobs(scope_id, id) ON DELETE CASCADE;
-                ALTER TABLE tasks ADD CONSTRAINT ck_task_submission_mode
-                    CHECK (submission_mode IS NULL OR submission_mode IN ('pipeline','standalone'));
-                ALTER TABLE tasks ADD CONSTRAINT ck_task_image_stage
-                    CHECK (image_stage IS NULL OR image_stage IN ('visual','agent','auto_rename','text_embedding'));
-                ALTER TABLE tasks ADD CONSTRAINT ck_task_submission_job_exclusivity
-                    CHECK (submission_mode IS NULL OR (submission_mode = 'standalone' AND processing_job_id IS NULL) OR (submission_mode = 'pipeline' AND processing_job_id IS NOT NULL));
-                ALTER TABLE tasks ADD CONSTRAINT ck_task_image_stage_type
-                    CHECK (task_type NOT IN ('visual_embedding_generation','meme_context_generation','image_auto_rename','text_embedding_generation') OR submission_mode IS NULL OR (image_stage IS NOT NULL AND ((task_type = 'visual_embedding_generation' AND image_stage = 'visual') OR (task_type = 'meme_context_generation' AND image_stage = 'agent') OR (task_type = 'image_auto_rename' AND image_stage = 'auto_rename') OR (task_type = 'text_embedding_generation' AND image_stage = 'text_embedding'))));
-                ALTER TABLE image_processing_stages DROP CONSTRAINT IF EXISTS ck_image_processing_stage_name;
-                ALTER TABLE image_processing_stages DROP CONSTRAINT IF EXISTS ck_image_processing_stage_status;
-                ALTER TABLE image_processing_stages ADD CONSTRAINT ck_image_processing_stage_name
-                    CHECK (stage IN ('visual','agent','auto_rename','text_embedding'));
-                ALTER TABLE image_processing_stages ADD CONSTRAINT ck_image_processing_stage_status
-                    CHECK (status IN ('queued','running','succeeded','failed','blocked','unknown_execution','skipped','warning'));
-                ALTER TABLE image_processing_jobs DROP CONSTRAINT IF EXISTS ck_image_processing_policy;
-                ALTER TABLE image_processing_jobs ADD CONSTRAINT ck_image_processing_policy
-                    CHECK (reverse_image_policy IN ('forbid','auto'));
-                ALTER TABLE storage_operations DROP CONSTRAINT IF EXISTS ck_storage_operation_expected_revision;
-                ALTER TABLE storage_operations DROP CONSTRAINT IF EXISTS ck_storage_operation_claim_generation;
-                ALTER TABLE storage_operations DROP CONSTRAINT IF EXISTS ck_storage_operation_attempt;
-                ALTER TABLE storage_operations DROP CONSTRAINT IF EXISTS ck_storage_operation_title_fingerprint;
-                ALTER TABLE storage_operations ADD CONSTRAINT ck_storage_operation_expected_revision
-                    CHECK (expected_revision IS NULL OR expected_revision >= 1);
-                ALTER TABLE storage_operations ADD CONSTRAINT ck_storage_operation_claim_generation
-                    CHECK (claim_generation IS NULL OR claim_generation > 0);
-                ALTER TABLE storage_operations ADD CONSTRAINT ck_storage_operation_attempt
-                    CHECK (attempt IS NULL OR attempt > 0);
-                ALTER TABLE storage_operations ADD CONSTRAINT ck_storage_operation_title_fingerprint
-                    CHECK (expected_title_fingerprint IS NULL OR length(expected_title_fingerprint) = 64);
-            """))
-            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_image_submission ON tasks(scope_id, submission_mode, image_stage, processing_job_id, created_at)"))
-            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_storage_operations_task ON storage_operations(scope_id, task_id, updated_at)"))
-            connection.execute(text("ALTER TABLE image_processing_jobs ADD COLUMN IF NOT EXISTS processing_config JSONB NOT NULL DEFAULT '{}'::jsonb"))
-            connection.execute(text("ALTER TABLE reverse_image_usage_events ADD COLUMN IF NOT EXISTS claim_generation BIGINT"))
-            connection.execute(text("ALTER TABLE reverse_image_usage_events ADD COLUMN IF NOT EXISTS attempt INTEGER"))
-            connection.execute(text("ALTER TABLE reverse_image_usage_events ADD COLUMN IF NOT EXISTS operation VARCHAR(128)"))
-            connection.execute(text("ALTER TABLE reverse_image_usage_events ADD COLUMN IF NOT EXISTS target_sha256 VARCHAR(64)"))
-            connection.execute(text("ALTER TABLE reverse_image_usage_events ADD COLUMN IF NOT EXISTS input_digest VARCHAR(64)"))
-            connection.execute(text("ALTER TABLE search_migration_states ADD COLUMN IF NOT EXISTS model VARCHAR(255)"))
-            connection.execute(text("ALTER TABLE operation_grants ADD COLUMN IF NOT EXISTS source VARCHAR(64)"))
-            connection.execute(text("ALTER TABLE operation_grants ADD COLUMN IF NOT EXISTS units INTEGER"))
-            connection.execute(text("ALTER TABLE operation_grants ADD COLUMN IF NOT EXISTS request_fingerprint VARCHAR(64)"))
-            connection.execute(text("""
-                DO $$ BEGIN
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_operation_grant_source') THEN
-                        ALTER TABLE operation_grants ADD CONSTRAINT ck_operation_grant_source
-                            CHECK(source IS NULL OR (length(source) > 0 AND length(source) <= 64));
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_operation_grant_units') THEN
-                        ALTER TABLE operation_grants ADD CONSTRAINT ck_operation_grant_units
-                            CHECK(units IS NULL OR units > 0);
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_operation_grant_fingerprint') THEN
-                        ALTER TABLE operation_grants ADD CONSTRAINT ck_operation_grant_fingerprint
-                            CHECK(request_fingerprint IS NULL OR length(request_fingerprint) = 64);
-                    END IF;
-                END $$;
-            """))
-    except SQLAlchemyError as exc:
-        raise DatabaseError("control_schema_unavailable") from exc
-
-
-def check_database(engine: Engine, *, expected_revision: str | None = None, require_local_installation: bool = True) -> dict[str, Any]:
-    """执行连接、pgvector 和 Alembic revision 检查，并按部署模式校验 local 安装标记。"""
-    try:
-        with engine.connect() as connection:
-            connection.execute(text("SELECT 1"))
-            vector_enabled = bool(connection.execute(text("SELECT 1 FROM pg_extension WHERE extname='vector'")).scalar())
-            revision = connection.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).scalar()
-            installed = connection.execute(text("SELECT schema_revision FROM installation_state WHERE key='local'")).scalar() if require_local_installation else None
-    except SQLAlchemyError as exc:
-        raise DatabaseError("database_unavailable") from exc
-    if not vector_enabled:
-        raise DatabaseError("pgvector_missing")
-    if revision is None:
-        raise DatabaseError("schema_revision_missing")
-    if expected_revision and revision != expected_revision:
-        raise DatabaseError("schema_revision_mismatch")
-    if require_local_installation:
-        if installed is None:
-            raise DatabaseError("installation_required")
-        if installed != revision or (expected_revision and installed != expected_revision):
-            raise DatabaseError("installation_revision_mismatch")
-    return {"revision": revision, "installed": installed, "pgvector": True}
-
-
-def initialize_local(engine: Engine, *, revision: str = CURRENT_SCHEMA_REVISION) -> None:
-    """幂等创建 ``local`` scope 与安装标记，不扫描图片或扩展业务归属。"""
-    try:
-        with Session(engine) as session, session.begin():
-            scope = session.scalar(select(Scope).where(Scope.id == SCOPE_LOCAL))
-            if scope is None:
-                session.add(Scope(id=SCOPE_LOCAL))
-                session.flush()
-            marker = session.get(InstallationState, "local")
-            if marker is None:
-                session.add(InstallationState(key="local", schema_revision=revision))
-            elif marker.schema_revision != revision:
-                raise DatabaseError("installation_conflict")
-    except IntegrityError as exc:
-        raise DatabaseError("installation_conflict") from exc
-
-
-class UnitOfWork:
-    """同步事务边界；成功退出提交，异常退出回滚并关闭 Session。"""
-
-    def __init__(self, factory: sessionmaker[Session], scope: ScopeContext):
-        if not isinstance(scope, ScopeContext):
-            raise ValueError("scope_required")
-        self.scope = scope
-        self.session = factory()
-
-    def __enter__(self) -> "UnitOfWork":
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        try:
-            if exc_type:
-                self.session.rollback()
-            else:
-                self.session.commit()
-        finally:
-            self.session.close()
-
-    def rollback(self) -> None:
-        """显式回滚当前事务，供跨存储补偿路径使用。"""
-        self.session.rollback()
 
 
 class MemeRepository:
@@ -2813,30 +2602,6 @@ class InMemoryAgentCallbackRequestRepository:
 InMemoryCallbackRequestRepository = InMemoryAgentCallbackRequestRepository
 
 
-class DataEnvironment:
-    """请求或任务级 scope-bound Session、repository 和 BlobStore 组合。"""
-
-    def __init__(self, factory: sessionmaker[Session], scope: ScopeContext):
-        self.uow = UnitOfWork(factory, scope)
-        self.scope = scope
-        self.memes = MemeRepository(self.uow.session, scope)
-        self.collections = CollectionRepository(self.uow.session, scope)
-        self.search = SearchRepository(self.uow.session, scope)
-        self.visual = VisualEmbeddingRepository(self.uow.session, scope)
-        # 兼容领域层较直白的命名，调用方不得绕过 scope-bound repository。
-        self.visual_embeddings = self.visual
-        self.tasks = TaskRepository(self.uow.session, scope)
-        self.reverse_image_usage = ReverseImageUsageRepository(self.uow.session, scope)
-        self.callback_requests = AgentCallbackRequestRepository(self.uow.session, scope)
-
-    def __enter__(self) -> "DataEnvironment":
-        self.uow.__enter__()
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        self.uow.__exit__(exc_type, exc, tb)
-
-
 class BlobStore:
     """绑定 scope 的文件存储；local 使用现有图片根目录，其他 scope 独立命名空间。"""
 
@@ -3773,52 +3538,3 @@ class StorageCoordinator:
             report["active_operations"] = [str(item.id) for item in session.scalars(select(StorageOperation).where(StorageOperation.scope_id == self.scope.scope_id, StorageOperation.status.in_(tuple(self._ACTIVE))))]
             session.commit()
         return report
-
-
-class DatabaseResources:
-    """生命周期共享 Engine、Session 工厂和按 scope 创建的 BlobStore。"""
-
-    def __init__(self, engine: Engine, *, image_root: Path, data_root: Path, settings: Any | None = None, require_local_scope: bool = True):
-        self.engine = engine
-        self.factory = sessionmaker(engine, expire_on_commit=False, class_=Session)
-        self.image_root = image_root
-        self.data_root = data_root
-        self._scope_cache: dict[str, Scope] = {}
-        self._lock = Lock()
-        ensure_optional_control_schema(engine)
-        with self.factory() as session:
-            scope = session.scalar(select(Scope).where(Scope.id == SCOPE_LOCAL))
-            if scope is None and require_local_scope:
-                raise DatabaseError("installation_required")
-            if scope is not None:
-                self._scope_cache[SCOPE_LOCAL] = scope
-            namespace = scope.storage_namespace if scope else None
-        # 适配宿主未必部署 local scope；此时保留 None，任何误用 local 都会稳定失败。
-        self.blob_store = BlobStore(root=image_root, scope=ScopeContext(SCOPE_LOCAL), storage_namespace=namespace, local=True) if scope is not None or require_local_scope else None
-
-    def environment(self, scope_id: str | ScopeContext | None = None) -> DataEnvironment:
-        """创建指定 scope 的请求级环境；缺失 scope 时 fail-closed。"""
-        if scope_id is None:
-            raise DatabaseError("scope_required")
-        context = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
-        return DataEnvironment(self.factory, context)
-
-    def flat_preflight(self, scope_id: str | ScopeContext | None = None) -> dict[str, Any]:
-        """执行指定 scope 的扁平图片库只读预检；缺失 scope 时 fail-closed。"""
-        if scope_id is None:
-            raise DatabaseError("scope_required")
-        return StorageCoordinator(self, scope_id=scope_id).flat_preflight()
-
-    def blob_store_for_scope(self, scope_id: str | ScopeContext) -> BlobStore:
-        """读取 scope 的不可变 storage_namespace 并创建绑定 BlobStore。"""
-        context = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
-        scope_id = context.scope_id
-        if scope_id == SCOPE_LOCAL:
-            if self.blob_store is None:
-                raise DatabaseError("scope_not_found")
-            return self.blob_store
-        with self.factory() as session:
-            scope = session.scalar(select(Scope).where(Scope.id == scope_id))
-            if scope is None:
-                raise DatabaseError("scope_not_found")
-            return BlobStore(root=self.data_root, scope=ScopeContext(scope_id), storage_namespace=scope.storage_namespace, local=False)
