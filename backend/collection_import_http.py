@@ -7,7 +7,7 @@ operation policy 收束和异步处理投递。路由注册、当前请求的服
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +23,7 @@ from backend.collection_packages import (
 )
 from backend.database import DatabaseError
 from backend.image_processing import ImageProcessingError
-from backend.image_upload_http import _parse_upload_form, _read_upload_content
+from backend.image_upload_http import UPLOAD_RESERVATION_RELEASE_ERRORS, _parse_upload_form, _read_upload_content
 from backend.metadata import MetadataError
 from backend.operation_policy import OperationPolicyError, Operations
 
@@ -120,6 +120,7 @@ async def import_collection(
     preflight: ArchivePreflight | None = None,
     resolve_filename: FilenameResolver | None = None,
     package_error: PackageErrorProjector | None = None,
+    release_errors: Collection[str] | None = None,
 ) -> dict[str, object]:
     """预检合集 ZIP 后在当前 scope 内逐图片导入并投递处理任务。
 
@@ -133,6 +134,7 @@ async def import_collection(
     preflight_package = preflight or preflight_archive
     resolve_target = resolve_filename or resolve_import_filename
     project_package_error = package_error or (lambda exc: collection_package_error(exc, error=error))
+    allowed_release_errors = release_errors if release_errors is not None else UPLOAD_RESERVATION_RELEASE_ERRORS
     try:
         form = await parse_form(request, max_files=2, max_request_bytes=MAX_ARCHIVE_COMPRESSED_BYTES)
     except HTTPException as exc:
@@ -231,13 +233,7 @@ async def import_collection(
                     )
                 except (MetadataError, OSError) as exc:
                     # 只有明确知道 durable 写入尚未开始时才能归还上传 reservation。
-                    if isinstance(exc, MetadataError) and exc.code in {
-                        "target_exists",
-                        "invalid_filename",
-                        "invalid_image",
-                        "staging_conflict",
-                        "staging_write_failed",
-                    }:
+                    if isinstance(exc, MetadataError) and exc.code in allowed_release_errors:
                         try:
                             release_operation(request, import_grant)
                         except OperationPolicyError:

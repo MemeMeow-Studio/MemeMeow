@@ -2219,6 +2219,7 @@ async def import_collection(request: Request) -> dict[str, object]:
         preflight=preflight_archive,
         resolve_filename=resolve_import_filename,
         package_error=_collection_package_error,
+        release_errors=UPLOAD_RESERVATION_RELEASE_ERRORS,
     )
 
 
