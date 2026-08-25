@@ -19,4 +19,4 @@
 
 - [x] 4.1 运行本 change OpenSpec strict validate 和开源完整回归，确认导入/导出 route 未重复、Server 覆盖边界未被改动。
 - [x] 4.2 进行对抗性复核：检查客户端 scope/user 字段、跨 scope 资源、成员批次部分写入、路径泄露和导出覆盖；修复 P1/P2 或记录风险。
-- [ ] 4.3 在开源仓库提交精确实现 SHA 与验证记录 SHA，停在用户审核门禁，未经批准不 fetch/merge 到 Server。
+- [x] 4.3 在开源仓库提交精确实现 SHA 与验证记录 SHA，停在用户审核门禁，未经批准不 fetch/merge 到 Server。
