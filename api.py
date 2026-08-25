@@ -95,6 +95,7 @@ from backend.image_library_http import (
     media as _media_http,
 )
 from backend.image_processing_submission_http import process_image_library as _process_image_library_http
+from backend.image_mutation_http import delete_image as _delete_image_http, rename_image as _rename_image_http
 from backend.collection_http import (
     add_collection_items as _add_collection_items_http,
     collection_error as _collection_error_http,
@@ -2483,65 +2484,32 @@ async def remove_collection_item(request: Request, collection_id: str, meme_id: 
 
 @app.post("/images/rename", tags=["images"])
 async def rename_image(request: Request, payload: RenameRequest) -> dict[str, str]:
-    """按稳定 meme_id 重命名图片并同步数据库 storage_key。"""
-    metadata_service = _service(request, "metadata")
-    if not payload.meme_id:
-        raise _error(400, "meme_id_required", "必须提供 meme_id")
-    try:
-        _record, source = metadata_service.image_for_meme(payload.meme_id)
-    except MetadataError as exc:
-        raise _error(404, "meme_not_found", "图片不存在") from exc
-    clean = _safe_filename(payload.new_name)
-    if Path(clean).suffix.lower() != source.suffix.lower():
-        clean = f"{Path(clean).stem}{source.suffix.lower()}"
-    if any(char in payload.new_name for char in "/\\") or any(ord(char) < 32 for char in payload.new_name):
-        raise _error(400, "invalid_filename", "文件名非法")
-    try:
-        validate_business_storage_key(clean)
-    except ValueError as exc:
-        raise _error(400, "invalid_filename", "文件名非法") from exc
-    target = metadata_service.blob_store.resolve(clean, must_exist=False)
-    if target.exists() and target != source:
-        raise _error(409, "file_exists", "目标文件已存在")
-    try:
-        metadata = metadata_service.rename_by_id(payload.meme_id, target)
-    except MetadataError as exc:
-        if exc.code == "target_exists":
-            raise _error(409, "file_exists", "目标文件已存在")
-        raise _error(500, "metadata_rename_failed", "图片元数据同步失败")
-    _invalidate_search(request)
-    return {"meme_id": payload.meme_id, "filename": Path(metadata.image.relative_path).name, "media_url": f"/media/{payload.meme_id}"}
+    """兼容图片重命名入口，并注入当前 scope 与文件/检索边界。"""
+    return await _rename_image_http(
+        request,
+        payload,
+        metadata_service=lambda received: _service(received, "metadata"),
+        sanitize_filename=_safe_filename,
+        validate_storage_key=validate_business_storage_key,
+        invalidate_search=_invalidate_search,
+        error=_error,
+    )
 
 
 @app.post("/images/delete", tags=["images"])
 async def delete_image(request: Request, payload: DeleteRequest) -> dict[str, object]:
-    """按稳定 meme_id 隔离文件后删除数据库记录。"""
-    if not payload.meme_id:
-        raise _error(400, "meme_id_required", "必须提供 meme_id")
-    try:
-        record, image = _service(request, "metadata").image_for_meme(payload.meme_id)
-    except MetadataError as exc:
-        raise _error(404, "meme_not_found", "图片不存在") from exc
-    try:
-        delete_grant = _acquire_operation(request, Operations.IMAGE_DELETE, f"delete:{payload.meme_id}:{getattr(record, 'revision', 0)}", resource_id=payload.meme_id, source="api")
-    except OperationPolicyError as exc:
-        raise _operation_http_error(exc) from exc
-    try:
-        _service(request, "metadata").remove_by_id(payload.meme_id)
-    except MetadataError as exc:
-        if exc.code in {"meme_not_found", "file_not_found", "target_exists", "invalid_storage_key"}:
-            try:
-                _release_operation(request, delete_grant)
-            except OperationPolicyError:
-                pass
-        raise _error(500, exc.code, "图片及其元数据删除失败") from exc
-    try:
-        _commit_operation(request, delete_grant)
-    except OperationPolicyError:
-        # 删除已经完成，未知 policy 状态交由宿主恢复，不反向报告为未删除。
-        pass
-    _invalidate_search(request)
-    return {"meme_id": payload.meme_id, "deleted": True}
+    """兼容图片删除入口，并注入当前 scope 与 operation policy 边界。"""
+    return await _delete_image_http(
+        request,
+        payload,
+        metadata_service=lambda received: _service(received, "metadata"),
+        acquire_operation=_acquire_operation,
+        commit_operation=_commit_operation,
+        release_operation=_release_operation,
+        operation_error=_operation_http_error,
+        invalidate_search=_invalidate_search,
+        error=_error,
+    )
 
 
 def _idempotent_upload_result(

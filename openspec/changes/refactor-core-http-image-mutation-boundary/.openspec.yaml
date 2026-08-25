@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-08-25
+goal: 提取 /images/rename 与 /images/delete 的 HTTP 入口编排，保留 scope、operation
+  policy、文件和 metadata 契约。
