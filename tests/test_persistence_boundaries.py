@@ -1,4 +1,4 @@
-"""持久化 engine、事务单元、资源装配和旧 facade 的边界契约测试。"""
+"""持久化 engine、事务单元、Repository、资源装配和旧 facade 的边界契约测试。"""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from backend.persistence import unit_of_work as persistence_unit_of_work
 from backend.persistence.models import Scope, ScopeContext
 from backend.persistence.repositories import collections as persistence_collections
 from backend.persistence.repositories import memes as persistence_memes
+from backend.persistence.repositories import search as persistence_search
 
 
 def test_persistence_facade_reexports_one_implementation_source() -> None:
@@ -36,13 +37,14 @@ def test_persistence_facade_reexports_one_implementation_source() -> None:
     assert database.DatabaseResources is persistence_resources.DatabaseResources
     assert database.MemeRepository is persistence_memes.MemeRepository
     assert database.CollectionRepository is persistence_collections.CollectionRepository
+    assert database.SearchRepository is persistence_search.SearchRepository
     assert database.SCOPE_LOCAL == persistence_engine.SCOPE_LOCAL
     assert database.CURRENT_SCHEMA_REVISION == persistence_engine.CURRENT_SCHEMA_REVISION
 
 
 def test_persistence_runtime_modules_have_no_top_level_facade_import() -> None:
     """新边界只允许在资源实际组装时延迟解析 facade，模块导入不能形成循环。"""
-    for module in (persistence_engine, persistence_unit_of_work, persistence_resources, persistence_memes, persistence_collections):
+    for module in (persistence_engine, persistence_unit_of_work, persistence_resources, persistence_memes, persistence_collections, persistence_search):
         source = Path(module.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)
         top_level_facade_imports = {
@@ -54,8 +56,22 @@ def test_persistence_runtime_modules_have_no_top_level_facade_import() -> None:
     database_source = Path(database.__file__).read_text(encoding="utf-8")
     assert "class MemeRepository" not in database_source
     assert "class CollectionRepository" not in database_source
-    assert "class SearchRepository" in database_source
+    assert "class SearchRepository" not in database_source
     assert "class TaskRepository" in database_source
+    assert "class VisualEmbeddingRepository" in database_source
+    assert "class ReverseImageUsageRepository" in database_source
+    assert "class BlobStore" in database_source
+    assert "class StorageCoordinator" in database_source
+    assert "from backend.persistence.repositories.search import SearchRepository" in database_source
+
+
+def test_search_repository_package_exports_one_canonical_class() -> None:
+    """Repository 子包和 facade 必须共同指向唯一 SearchRepository 实现。"""
+    from backend.persistence.repositories import SearchRepository
+
+    assert SearchRepository is persistence_search.SearchRepository
+    source = Path(persistence_search.__file__).read_text(encoding="utf-8")
+    assert source.count("class SearchRepository:") == 1
 
 
 def test_unit_of_work_keeps_commit_and_rollback_lifecycle() -> None:
