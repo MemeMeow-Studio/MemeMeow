@@ -1,0 +1,3 @@
+schema: spec-driven
+created: 2026-08-25
+goal: 建立应用服务模块边界并保持既有行为
