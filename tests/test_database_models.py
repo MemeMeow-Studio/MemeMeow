@@ -38,7 +38,7 @@ def test_image_processing_migration_is_chained_and_rebuilds_legacy_checks():
 
 def test_startup_compatibility_ddl_closes_nullable_auto_name():
     """启动兼容路径必须把旧可空列收束为安全的非空默认值。"""
-    database = Path("backend/database.py").read_text(encoding="utf-8")
+    database = Path("backend/persistence/engine.py").read_text(encoding="utf-8")
     assert "UPDATE image_processing_jobs SET auto_name = FALSE WHERE auto_name IS NULL" in database
     assert "ALTER TABLE image_processing_jobs ALTER COLUMN auto_name SET NOT NULL" in database
 
