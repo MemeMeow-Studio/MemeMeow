@@ -13,7 +13,7 @@
 
 - [x] 3.1 增加类身份、唯一实现来源、依赖方向、资源装配和周边边界契约测试。
 - [x] 3.2 增加/更新 generation/head、migration epoch、legacy/incremental source dispatch、embedding 错误和稳定排序回归测试。
-- [ ] 3.3 运行开源目标测试、PostgreSQL marker、完整回归、OpenSpec strict、compileall、`git diff --check`，新增 validation.md 记录实际结果和未运行门禁。
+- [x] 3.3 运行开源目标测试、PostgreSQL marker、完整回归、OpenSpec strict、compileall、`git diff --check`，新增 validation.md 记录实际结果和未运行门禁。
 
 ## 4. 提交、精确同步与 Server 收尾
 

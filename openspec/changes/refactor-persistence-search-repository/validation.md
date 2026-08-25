@@ -27,7 +27,7 @@
 
 ## 提交与同步
 
-- 开源实现 SHA：待首次实现提交后填入。
+- 开源实现 SHA：`adc9b9612d2712b226dc0a36de327fb973d15eb2`（`refactor(core): isolate search repository`）。
 - 开源验证记录 SHA：待验证记录提交后填入。
 - 开源代码收尾 SHA：待收尾提交后填入，作为 Server 精确 fetch 目标。
 - Server merge SHA、直接父提交和祖先关系：待精确 fetch/普通 `--no-ff` merge 后填入。
