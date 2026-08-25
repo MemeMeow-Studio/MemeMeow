@@ -28,7 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from starlette.formparsers import MultiPartException, MultiPartParser
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from sqlalchemy import select
 
 from backend.config import Settings, validate_agent_concurrency
@@ -56,7 +56,7 @@ from backend.opencode_workspace import LocalWorkspaceProvider, MissingWorkspaceP
 from backend.opencode_activity import OpenCodeActivityReader
 from backend.reverse_image import ReverseImageError, ReverseImageRequest, ReverseImageService, derive_controlled_crop
 from backend.tasks import TaskRecord
-from backend.visual import VisualEmbeddingError, VisualInferenceClient, VisualSearchError, VisualSearchService, identity_from_settings
+from backend.visual import VisualEmbeddingError, VisualInferenceClient, VisualSearchService, identity_from_settings
 from backend.scope import LocalScopeResolver, ScopeResolutionError, ScopeResolver, ScopeServiceFactory, ScopeServices, resolve_scope, resolve_scope_async, validate_scope_services
 from backend.config_http import STORAGE_PREFLIGHT_BLOCKING_KEYS, _storage_preflight_summary, config_status as _config_status
 from backend.search_http import SearchRequest, search_images as _search_images
@@ -89,6 +89,10 @@ from backend.image_context_http import (
     generate_visual_embedding as _generate_visual_embedding_http,
     generate_visual_embedding_batch as _generate_visual_embedding_batch_http,
     repair_metadata as _repair_metadata_http,
+)
+from backend.visual_callback_http import (
+    VisualMatchRequest,
+    internal_visual_search_match as _internal_visual_search_match_http,
 )
 from backend.settings_http import (
     ConcurrencyUpdateRequest,
@@ -264,15 +268,6 @@ class ProcessingBatchRequest(StrictRequestModel):
     model_config = ConfigDict(extra="forbid")
     reverse_image_policy: str = Field(default="forbid", pattern="^(forbid|auto)$")
     auto_name: StrictBool = False
-
-
-class VisualMatchRequest(StrictRequestModel):
-    """Agent 视觉匹配请求；scope 和查询图片只能由 task_id 推导。"""
-
-    task_id: str = Field(min_length=1, max_length=255)
-    request_id: str | None = Field(default=None, max_length=128)
-    top_k: StrictInt = Field(default=20, ge=1, le=50)
-    exclude_self: bool = True
 
 
 class CollectionRequest(StrictRequestModel):
@@ -1900,70 +1895,20 @@ async def internal_reverse_image_search(
 
 @app.post("/internal/visual-search/match", tags=["internal"])
 async def internal_visual_search_match(request: Request, payload: VisualMatchRequest) -> dict[str, object]:
-    """按运行中 Agent 任务推导 scope 和查询图片的本地视觉匹配接口。"""
-    binding = getattr(request.state, "callback_binding", None)
-    registry = getattr(request.app.state, "callback_registry", DEFAULT_CALLBACK_REGISTRY)
-    registration = registry.get(request.url.path) if registry else None
-    if binding is None or registration is None or binding.task_id != payload.task_id:
-        raise _error(401, "agent_callback_unauthorized", "内部执行凭据无效")
-    header_request_id = getattr(request.state, "callback_header_request_id", None)
-    try:
-        body_request_id = validate_request_id(payload.request_id)
-    except CallbackError as exc:
-        raise _error(401, "agent_callback_invalid_execution", "内部执行绑定无效") from exc
-    if body_request_id is not None and header_request_id is not None and body_request_id != header_request_id:
-        raise _error(401, "agent_callback_invalid_execution", "内部执行绑定无效")
-    request_id: str | None = body_request_id or header_request_id
-    input_digest = binding_input_digest(
-        binding.task_id,
-        binding.scope_id,
-        binding.claim_generation,
-        binding.attempt,
-        "analysis.visual_search",
-        binding.target_sha256,
-        payload.top_k,
-        payload.exclude_self,
+    """兼容内部视觉匹配 callback，并注入 binding、scope database 与 service。"""
+    return await _internal_visual_search_match_http(
+        request,
+        payload,
+        binding=lambda received: getattr(received.state, "callback_binding", None),
+        registration=lambda received: (
+            getattr(received.app.state, "callback_registry", DEFAULT_CALLBACK_REGISTRY).get(received.url.path)
+            if getattr(received.app.state, "callback_registry", DEFAULT_CALLBACK_REGISTRY)
+            else None
+        ),
+        database=lambda received: received.app.state.database,
+        scope_services=lambda received, scope: validate_scope_services(scope, received.app.state.service_factory.for_scope(scope)),
+        error=_error,
     )
-    if request_id is None:
-        request_id = canonical_callback_request_id(input_digest)
-    try:
-        callback_scope = ScopeContext(binding.scope_id)
-        with request.app.state.database.environment(callback_scope) as environment:
-            task = environment.tasks.get(payload.task_id)
-            validate_binding_task(binding, task, registration)
-            fact = environment.callback_requests.create(
-                request_id=request_id,
-                task_id=binding.task_id,
-                claim_generation=binding.claim_generation,
-                attempt=binding.attempt,
-                operation="analysis.visual_search",
-                target_sha256=binding.target_sha256,
-                input_digest=input_digest,
-            )
-            request_id = fact.request_id
-            if fact.completed_at is not None and fact.state == "completed" and isinstance(fact.result, dict):
-                return dict(fact.result)
-            # 先提交 started 事实，再调用独立 service；这样进程在查询期间退出时，
-            # 同一 request id 仍能证明原始绑定已经被使用。
-            environment.uow.session.commit()
-        services = validate_scope_services(callback_scope, request.app.state.service_factory.for_scope(callback_scope))
-        service: VisualSearchService = services.visual_search
-    except (CallbackError, ScopeResolutionError, DatabaseError, ValueError, RuntimeError) as exc:
-        raise _error(401, "agent_callback_invalid_execution", "内部执行绑定无效") from exc
-    try:
-        result = service.match(task_id=payload.task_id, top_k=payload.top_k, exclude_self=payload.exclude_self)
-    except VisualSearchError as exc:
-        with request.app.state.database.environment(callback_scope) as environment:
-            environment.callback_requests.finish(request_id, state="failed", error={"error": exc.code})
-        raise _error(exc.status_code, exc.code, str(exc)) from exc
-    except DatabaseError as exc:
-        with request.app.state.database.environment(callback_scope) as environment:
-            environment.callback_requests.finish(request_id, state="failed", error={"error": exc.code})
-        status = 409 if exc.code in {"query_embedding_not_ready", "visual_model_identity_mismatch"} else 404 if exc.code in {"meme_not_found", "task_not_found"} else 503
-        raise _error(status, exc.code, "视觉匹配无法完成") from exc
-    with request.app.state.database.environment(callback_scope) as environment:
-        environment.callback_requests.finish(request_id, state="completed", result=result)
-    return result
 
 
 # Settings HTTP 路由独立注册到模板应用；直接展开 APIRouter 路由以保持既有路由表顺序，
