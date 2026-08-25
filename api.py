@@ -95,6 +95,17 @@ from backend.image_library_http import (
     media as _media_http,
 )
 from backend.image_processing_submission_http import process_image_library as _process_image_library_http
+from backend.collection_http import (
+    add_collection_items as _add_collection_items_http,
+    collection_error as _collection_error_http,
+    collection_payload as _collection_payload_http,
+    create_collection as _create_collection_http,
+    delete_collection as _delete_collection_http,
+    get_collection as _get_collection_http,
+    list_collections as _list_collections_http,
+    remove_collection_item as _remove_collection_item_http,
+    rename_collection as _rename_collection_http,
+)
 from backend.visual_callback_http import (
     VisualMatchRequest,
     internal_visual_search_match as _internal_visual_search_match_http,
@@ -551,29 +562,13 @@ def _context_enqueue_error(exc: Exception) -> str:
 
 
 def _collection_payload(request: Request, environment, row) -> dict[str, object]:
-    """构造不暴露 scope 的合集列表摘要。"""
-    cover = environment.collections.cover(row.id)
-    return {
-        "collection_id": str(row.id),
-        "name": row.name,
-        "member_count": environment.collections.member_count(row.id),
-        "cover_media_url": f"/media/{cover.id}" if cover else None,
-        "created_at": row.created_at.isoformat(),
-        "updated_at": row.updated_at.isoformat(),
-    }
+    """保留旧合集摘要 helper，并委托给公共合集 HTTP 边界。"""
+    return _collection_payload_http(request, environment, row)
 
 
 def _collection_error(exc: DatabaseError) -> HTTPException:
-    """将合集 repository 错误映射为稳定 HTTP 契约。"""
-    mapping = {
-        "collection_not_found": (404, "collection_not_found", "合集不存在"),
-        "collection_exists": (409, "collection_exists", "合集名称已存在"),
-        "invalid_collection_name": (422, "invalid_collection_name", "合集名称必须为 1 至 100 个字符"),
-        "meme_not_found": (404, "meme_not_found", "图片不存在"),
-        "empty_members": (422, "empty_members", "至少选择一张图片"),
-    }
-    status, code, message = mapping.get(exc.code, (400, exc.code, "合集请求无效"))
-    return _error(status, code, message)
+    """保留旧合集错误 helper，并委托给公共合集 HTTP 边界。"""
+    return _collection_error_http(exc, error=_error)
 
 
 def _collection_package_error(exc: CollectionPackageError) -> HTTPException:
@@ -2262,24 +2257,14 @@ async def media(request: Request, meme_id: str):
 
 @app.get("/collections", tags=["collections"])
 async def list_collections(request: Request, page: int = Query(default=1, ge=1), page_size: int = Query(default=50, ge=1, le=100)) -> dict[str, object]:
-    """分页列出当前请求 scope 的合集。"""
-    unknown = set(request.query_params) - {"page", "page_size"}
-    if unknown:
-        raise _error(400, "invalid_request", "合集列表不接受 scope 或 user 参数")
-    with _environment(request) as environment:
-        rows = environment.collections.list(page=page, page_size=page_size)
-        return {"items": [_collection_payload(request, environment, row) for row in rows], "total": environment.collections.count(), "page": page, "page_size": page_size}
+    """兼容合集列表入口，并注入当前 scope environment 与错误工厂。"""
+    return await _list_collections_http(request, page=page, page_size=page_size, environment=_environment, error=_error)
 
 
 @app.post("/collections", status_code=201, tags=["collections"])
 async def create_collection(request: Request, payload: CollectionRequest) -> dict[str, object]:
-    """创建当前请求 scope 的空合集。"""
-    try:
-        with _environment(request) as environment:
-            row = environment.collections.create(payload.name)
-            return _collection_payload(request, environment, row)
-    except DatabaseError as exc:
-        raise _collection_error(exc) from exc
+    """兼容合集创建入口，并注入当前 scope environment 与错误工厂。"""
+    return await _create_collection_http(request, payload, environment=_environment, error=_error)
 
 
 @app.post("/collections/import", tags=["collections"])
@@ -2433,28 +2418,16 @@ async def import_collection(request: Request) -> dict[str, object]:
 
 @app.get("/collections/{collection_id}", tags=["collections"])
 async def get_collection(request: Request, collection_id: str, page: int = Query(default=1, ge=1), page_size: int = Query(default=50, ge=1, le=100)) -> dict[str, object]:
-    """返回合集元数据和当前文件信息的分页成员。"""
-    unknown = set(request.query_params) - {"page", "page_size"}
-    if unknown:
-        raise _error(400, "invalid_request", "合集详情不接受 scope 或 user 参数")
-    try:
-        with _environment(request) as environment:
-            row = environment.collections.get(collection_id)
-            if row is None:
-                raise DatabaseError("collection_not_found")
-            members = []
-            for item, meme in environment.collections.members(row.id, page=page, page_size=page_size):
-                metadata_service = _service(request, "metadata")
-                metadata_status = metadata_service.status(metadata_service.blob_store.resolve(meme.storage_key))
-                members.append({"meme_id": str(meme.id), "filename": meme.storage_key, "extension": meme.extension, "size": meme.size_bytes, "media_url": f"/media/{meme.id}", "metadata": metadata_status})
-            payload = _collection_payload(request, environment, row)
-            payload["members"] = members
-            payload["total"] = environment.collections.member_count(row.id)
-            payload["page"] = page
-            payload["page_size"] = page_size
-            return payload
-    except DatabaseError as exc:
-        raise _collection_error(exc) from exc
+    """兼容合集详情入口，并注入当前 scope environment、metadata service 与错误工厂。"""
+    return await _get_collection_http(
+        request,
+        collection_id,
+        page=page,
+        page_size=page_size,
+        environment=_environment,
+        metadata_service=lambda received: _service(received, "metadata"),
+        error=_error,
+    )
 
 
 @app.get("/collections/{collection_id}/export", tags=["collections"])
@@ -2486,46 +2459,26 @@ async def export_collection(request: Request, collection_id: str):
 
 @app.patch("/collections/{collection_id}", tags=["collections"])
 async def rename_collection(request: Request, collection_id: str, payload: CollectionRequest) -> dict[str, object]:
-    """重命名合集，不改变成员关系。"""
-    try:
-        with _environment(request) as environment:
-            row = environment.collections.rename(collection_id, payload.name)
-            return _collection_payload(request, environment, row)
-    except DatabaseError as exc:
-        raise _collection_error(exc) from exc
+    """兼容合集重命名入口，并注入当前 scope environment 与错误工厂。"""
+    return await _rename_collection_http(request, collection_id, payload, environment=_environment, error=_error)
 
 
 @app.delete("/collections/{collection_id}", tags=["collections"])
 async def delete_collection(request: Request, collection_id: str) -> dict[str, object]:
-    """删除合集及关系，不删除图片文件。"""
-    try:
-        with _environment(request) as environment:
-            environment.collections.delete(collection_id)
-            return {"collection_id": collection_id, "deleted": True}
-    except DatabaseError as exc:
-        raise _collection_error(exc) from exc
+    """兼容合集删除入口，并注入当前 scope environment 与错误工厂。"""
+    return await _delete_collection_http(request, collection_id, environment=_environment, error=_error)
 
 
 @app.post("/collections/{collection_id}/items", tags=["collections"])
 async def add_collection_items(request: Request, collection_id: str, payload: CollectionItemsRequest) -> dict[str, object]:
-    """原子批量加入图片并返回幂等计数。"""
-    try:
-        with _environment(request) as environment:
-            added, existing, total = environment.collections.add_members(collection_id, payload.meme_ids)
-            return {"collection_id": collection_id, "added_count": added, "existing_count": existing, "member_count": total}
-    except DatabaseError as exc:
-        raise _collection_error(exc) from exc
+    """兼容合集成员批量入口，并注入当前 scope environment 与错误工厂。"""
+    return await _add_collection_items_http(request, collection_id, payload, environment=_environment, error=_error)
 
 
 @app.delete("/collections/{collection_id}/items/{meme_id}", tags=["collections"])
 async def remove_collection_item(request: Request, collection_id: str, meme_id: str) -> dict[str, object]:
-    """幂等移除合集成员。"""
-    try:
-        with _environment(request) as environment:
-            total = environment.collections.remove_member(collection_id, meme_id)
-            return {"collection_id": collection_id, "meme_id": meme_id, "removed": True, "member_count": total}
-    except DatabaseError as exc:
-        raise _collection_error(exc) from exc
+    """兼容合集成员移除入口，并注入当前 scope environment 与错误工厂。"""
+    return await _remove_collection_item_http(request, collection_id, meme_id, environment=_environment, error=_error)
 
 
 @app.post("/images/rename", tags=["images"])
