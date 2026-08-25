@@ -13,10 +13,10 @@
 
 - [x] 3.1 增加 route/dependency snapshot、multipart/ZIP/资源上限、manifest SHA/path、scope/query 拒绝、同名复用/冲突、operation 顺序、任务告警和逐项响应投影测试。
 - [x] 3.2 运行合集导入/API/scope/security 定向测试、compileall 和 diff check，按失败修复并记录 PostgreSQL/外部门禁 skip；合集导入/合集包/CRUD/API 定向 `40 passed`，上传/operation 定向 `26 passed`，完整回归待最终门禁。
-- [x] 3.3 更新 tasks 与验证记录，固定实现 SHA、范围和测试事实；实现 commits `13605361752792926bf2672a7dbda3283bcdf232`、`8b39a0b` 已固定，验证记录更新提交待本次提交 SHA 回填。
+- [x] 3.3 更新 tasks 与验证记录，固定实现 SHA、范围和测试事实；实现 commits `13605361752792926bf2672a7dbda3283bcdf232`、`8b39a0b762c9173feacc0c856ce8e9965cab4e0c`、验证记录 SHA `a4df076` 已固定。
 
 ## 4. 最终验证与同步
 
 - [x] 4.1 运行本 change OpenSpec strict validate 与开源完整回归，确认导入/导出/CRUD route 未重复、Server 适配边界未被改动；strict validate 通过，完整回归 `475 passed, 92 skipped`。
 - [x] 4.2 进行对抗性复核：检查 scope/user 字段、跨 scope 复用、压缩/解压/图片资源上限、成员 SHA/path、部分写入、operation grant 收束、路径泄露和任务副作用顺序；未发现 P1/P2。
-- [x] 4.3 在开源仓库提交精确实现 commits `13605361752792926bf2672a7dbda3283bcdf232`、`8b39a0b` 与验证记录，收尾 SHA 待更新；Server 后续从本地精确 fetch 后普通 `--no-ff` merge，记录祖先关系、验证、回滚和未连接 PostgreSQL 事实。
+- [x] 4.3 在开源仓库提交精确实现 commits `13605361752792926bf2672a7dbda3283bcdf232`、`8b39a0b762c9173feacc0c856ce8e9965cab4e0c` 与验证记录，完成本收尾提交；Server 后续从本地精确 fetch 后普通 `--no-ff` merge，记录祖先关系、验证、回滚和未连接 PostgreSQL 事实。
