@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-08-25
+goal: 降低 database.py 职责密度而不改变 schema、迁移、Repository、BlobStore、StorageCoordinator
+  或资源装配行为

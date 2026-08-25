@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from backend.database import AgentCallbackRequest, AgentCallbackRequestRepository, DatabaseError, ScopeContext, TaskLaneFairness
+from backend import database
+from backend.persistence import models
 
 
 def test_single_forward_migration_head():
@@ -82,3 +85,64 @@ def test_callback_repository_fails_closed_without_postgres_schema():
         repository = AgentCallbackRequestRepository(session, ScopeContext("local"))
         with pytest.raises(DatabaseError, match="callback_binding_schema_unavailable"):
             repository.ensure_schema_ready()
+
+
+def test_database_facade_reexports_one_model_declaration_source():
+    """旧 database 导入路径必须指向持久化模型模块的同一组对象。"""
+    model_names = (
+        "Base",
+        "ScopeContext",
+        "Scope",
+        "InstallationState",
+        "Meme",
+        "MemeCollection",
+        "MemeCollectionItem",
+        "StorageOperation",
+        "SearchGeneration",
+        "SearchHead",
+        "MemeEmbedding",
+        "MemeVisualEmbedding",
+        "Task",
+        "ReverseImageUsageEvent",
+        "AgentCallbackRequest",
+        "OperationGrant",
+        "ImageProcessingJob",
+        "ImageProcessingStage",
+        "ImageProcessingAttempt",
+        "MemeTextEmbedding",
+        "SearchMigrationState",
+        "TaskBatch",
+        "TaskBatchItem",
+        "TaskLaneSlot",
+        "TaskLaneFairness",
+    )
+    for name in model_names:
+        assert getattr(database, name) is getattr(models, name)
+        assert getattr(models, name).__module__ == models.__name__
+    assert database.EMBEDDING_DIMENSIONS == models.EMBEDDING_DIMENSIONS
+    assert database.VISUAL_EMBEDDING_DIMENSIONS == models.VISUAL_EMBEDDING_DIMENSIONS
+    assert database.UTC is models.UTC
+    assert database.utcnow is models.utcnow
+    assert database.OPTIONAL_CONTROL_TABLES is models.OPTIONAL_CONTROL_TABLES
+    assert database.Base.metadata is models.Base.metadata
+
+
+def test_model_module_does_not_reintroduce_database_or_runtime_boundaries():
+    """模型模块不能反向依赖 facade、Repository 或文件存储装配。"""
+    source = Path(models.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imported_modules = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    imported_modules.update(
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+    )
+    assert "backend.database" not in imported_modules
+    assert "StorageCoordinator" not in source
+    assert "BlobStore" not in source
+    assert "class Scope(" not in Path(database.__file__).read_text(encoding="utf-8")
