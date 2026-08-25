@@ -54,7 +54,7 @@ from backend.rate_limiter import RateLimiter
 from backend.opencode import OpenCodeError, OpenCodeRunner
 from backend.opencode_workspace import LocalWorkspaceProvider, MissingWorkspaceProvider, TrustedWorkspaceContext, WorkspaceResolutionError
 from backend.opencode_activity import OpenCodeActivityReader
-from backend.reverse_image import ReverseImageError, ReverseImageRequest, ReverseImageService, derive_controlled_crop
+from backend.reverse_image import ReverseImageService
 from backend.tasks import TaskRecord
 from backend.visual import VisualEmbeddingError, VisualInferenceClient, VisualSearchService, identity_from_settings
 from backend.scope import LocalScopeResolver, ScopeResolutionError, ScopeResolver, ScopeServiceFactory, ScopeServices, resolve_scope, resolve_scope_async, validate_scope_services
@@ -94,6 +94,7 @@ from backend.visual_callback_http import (
     VisualMatchRequest,
     internal_visual_search_match as _internal_visual_search_match_http,
 )
+from backend.reverse_image_http import internal_reverse_image_search as _internal_reverse_image_search_http
 from backend.settings_http import (
     ConcurrencyUpdateRequest,
     _authorize_settings,
@@ -1828,69 +1829,29 @@ async def internal_reverse_image_search(
 ) -> dict[str, object]:
     """验证当前 Agent claim 后执行供应商无关的内部反向图片检索。"""
     content = await image.read()
-    binding = getattr(request.state, "callback_binding", None)
-    registry = getattr(request.app.state, "callback_registry", DEFAULT_CALLBACK_REGISTRY)
-    registration = registry.get(request.url.path) if registry else None
-    if registration is None or len(content) > registration.max_body_bytes:
-        raise _error(413, "agent_callback_body_too_large", "内部请求体超过限制")
-    if binding is None or registration is None or binding.task_id != task_id:
-        raise _error(401, "agent_callback_unauthorized", "内部执行凭据无效")
-    try:
-        # 先在 token 声明的 scope 内复核持久 Task，再装配 BlobStore/provider
-        # 等业务服务；旧 claim 或跨 scope 标识不能先触发文件副作用。
-        callback_scope = ScopeContext(binding.scope_id)
-        with request.app.state.database.environment(callback_scope) as environment:
-            task = environment.tasks.get(task_id)
-            validate_binding_task(binding, task, registration)
-            target_meme = (task.payload or {}).get("meme_id") if task is not None else None
-            target_record = environment.memes.get(target_meme) if isinstance(target_meme, str) else None
-            if target_record is None:
-                raise CallbackError("agent_callback_invalid_execution")
-            # 先证明上传的是任务目标整图；随后 auto_crop 才能在后端从该源图生成
-            # 确定性派生图，Agent 无法借参数替换任意图片。
-            source_sha256 = hashlib.sha256(content).hexdigest()
-            if source_sha256 != target_record.sha256:
-                raise CallbackError("agent_callback_invalid_execution")
-            # 目标整图已经在上方按服务端 Meme SHA 证明；受控裁剪仍由服务端执行，
-            # Agent 不能通过上传任意裁剪图或自报 SHA 改变逻辑身份。
-            if auto_crop:
-                content, _derived_sha256 = derive_controlled_crop(content, filename=image.filename or "image.png")
-        services = validate_scope_services(callback_scope, request.app.state.service_factory.for_scope(callback_scope))
-        service = services.reverse_image
-    except (CallbackError, ScopeResolutionError, DatabaseError, ValueError, RuntimeError) as exc:
-        raise _error(401, "agent_callback_invalid_execution", "内部执行绑定无效") from exc
-    header_request_id = getattr(request.state, "callback_header_request_id", None)
-    if request_id is not None and header_request_id is not None and request_id != header_request_id:
-        raise _error(401, "agent_callback_invalid_execution", "内部执行绑定无效")
-    try:
-        request_id = validate_request_id(request_id or header_request_id)
-        input_digest = validate_input_digest(input_digest)
-        request_id, input_digest = validate_request_binding(request_id, binding, input_digest=input_digest)
-    except CallbackError as exc:
-        raise _error(401, "agent_callback_invalid_execution", "内部执行绑定无效") from exc
-    try:
-        return service.search(
-            ReverseImageRequest(
-                image=content,
-                filename=image.filename or "image",
-                task_id=task_id,
-                request_id=request_id,
-                search_type=search_type,
-                language=language,
-                country=country,
-                query=query,
-                auto_crop=auto_crop,
-                refresh=refresh,
-                source_image_sha256=target_record.sha256,
-                callback_binding=binding,
-                input_digest=input_digest,
-            )
-        )
-    except ReverseImageError as exc:
-        raise _error(exc.status_code, exc.code, str(exc)) from exc
-    except DatabaseError as exc:
-        status = 404 if exc.code == "meme_not_found" else 409 if exc.code in {"usage_request_conflict", "usage_event_conflict", "callback_request_conflict", "callback_binding_conflict"} else 503
-        raise _error(status, exc.code, "反向图片请求无法完成") from exc
+    return await _internal_reverse_image_search_http(
+        request,
+        task_id=task_id,
+        content=content,
+        filename=image.filename,
+        request_id=request_id,
+        input_digest=input_digest,
+        search_type=search_type,
+        language=language,
+        country=country,
+        query=query,
+        auto_crop=auto_crop,
+        refresh=refresh,
+        binding=lambda received: getattr(received.state, "callback_binding", None),
+        registration=lambda received: (
+            getattr(received.app.state, "callback_registry", DEFAULT_CALLBACK_REGISTRY).get(received.url.path)
+            if getattr(received.app.state, "callback_registry", DEFAULT_CALLBACK_REGISTRY)
+            else None
+        ),
+        database=lambda received: received.app.state.database,
+        scope_services=lambda received, scope: validate_scope_services(scope, received.app.state.service_factory.for_scope(scope)),
+        error=_error,
+    )
 
 
 @app.post("/internal/visual-search/match", tags=["internal"])

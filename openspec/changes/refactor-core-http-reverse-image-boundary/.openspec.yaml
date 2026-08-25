@@ -1,0 +1,3 @@
+schema: spec-driven
+created: 2026-08-25
+goal: 降低 api.py 内部 callback 路由职责密度
