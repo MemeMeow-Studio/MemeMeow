@@ -19,4 +19,4 @@
 
 - [x] 4.1 运行 OpenSpec strict validate 与完整相关回归；完整回归 `431 passed, 92 skipped`，PostgreSQL marker `55 deselected` 且未连接数据库。
 - [x] 4.2 进行对抗性复核：检查路径/scope 选择器、指纹 fail-closed、状态脱敏和无重复 route；未发现 P1/P2。
-- [ ] 4.3 在开源仓库提交精确实现 SHA 与验证记录 SHA，供 Server 精确 fetch/普通 merge。
+- [x] 4.3 在开源仓库提交精确实现 SHA `251d377e3e47a33b455dc83c22d8e717f95018a9` 与验证记录 SHA `59b4a93ad0ef84d0421005213bcf1788df47c4b6`，供 Server 精确 fetch/普通 merge。
