@@ -349,3 +349,25 @@ def test_single_stage_operation_policy_error_uses_host_projection_callback() -> 
     assert len(projection_calls) == 1
     assert projection_calls[0].code == "operation_limit_exceeded"
     assert projection_calls[0].retry_at == retry_at
+
+
+def test_api_single_stage_forwards_operation_policy_projection() -> None:
+    """入口必须把 Server policy 错误投影 callback 传给公共阶段模块。"""
+    request = _request()
+    payload = image_stage_http.ImageStageSubmissionRequest(meme_id="meme-1", stage="agent")
+    calls: list[object] = []
+
+    async def delegated(*args: object, **kwargs: object) -> dict[str, object]:
+        """记录入口注入的宿主 callback。"""
+        del args
+        calls.append(kwargs.get("operation_error"))
+        return {"ok": True}
+
+    original = api._submit_image_stage_http
+    api._submit_image_stage_http = delegated
+    try:
+        result = asyncio.run(api.submit_image_stage(request, payload))
+    finally:
+        api._submit_image_stage_http = original
+    assert result == {"ok": True}
+    assert calls == [api._operation_http_error]

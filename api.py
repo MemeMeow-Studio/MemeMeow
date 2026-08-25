@@ -2277,6 +2277,7 @@ async def submit_image_stage(request: Request, payload: ImageStageSubmissionRequ
         normalize_processing_options=_normalize_processing_options,
         processing_config=_processing_config,
         task_summary=_task_summary,
+        operation_error=_operation_http_error,
     )
 
 
