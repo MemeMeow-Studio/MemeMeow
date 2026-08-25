@@ -14,9 +14,9 @@
 
 ## 验证
 
-- 新增模块测试：`8 passed`
+- 新增模块测试：`9 passed`
 - API/图片处理/scope 定向回归：`31 passed, 36 skipped`
-- 完整非外部门禁：`398 passed, 92 skipped`
+- 完整非外部门禁：`399 passed, 92 skipped`
 - PostgreSQL 命令：`uv run pytest tests/test_postgres_integration.py -m postgres -q`，当前
   开源仓库无 `postgres` marker 选择，结果为 `39 deselected`；未设置连接串，未连接默认数据库。
 - `openspec validate refactor-core-http-image-context-boundary --strict`：通过
@@ -31,6 +31,9 @@
   scope service 派生，单图 sidecar 读取失败时才使用当前 scope Meme fallback。
 - 批量语境/视觉结果逐项隔离，旧 response key 集合、ready skip 和稳定 enqueue error 保持；
   metadata repair 只提交固定的 `metadata_repair` 空 payload。
+- 图片语境提交的 operation policy 错误通过宿主 callback 保留 `retry_at`/`Retry-After`；修复
+  commit 为 `8b7ce10878e6069950de63116ba331ebf0282a1d`，父提交为验证记录
+  `b305bfc53c6569836d8427905238cdc32348fe7b`。
 - 新模块静态依赖不包含 `api` 或 `server_api`；未发现 P1/P2。
 
 ## 同步门禁
