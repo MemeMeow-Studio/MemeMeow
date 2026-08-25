@@ -19,4 +19,4 @@
 
 - [x] 4.1 运行 OpenSpec strict validate、`git diff --check`、完整 pytest 和 PostgreSQL marker（无连接串时显式 skip）；strict validate、compileall 和 diff-check 通过，完整 pytest `398 passed, 92 skipped`，PostgreSQL 命令在当前仓库无 marker 选择时为 `39 deselected`。
 - [x] 4.2 进行对抗性复核：检查 canonical route order、scope target、path/scope payload 拒绝、批量 fail-closed、repair scope、旧 response key 和错误脱敏；发现并修复批量 response 额外字段与 route status 误判，重跑全部门禁无 P1/P2。
-- [ ] 4.3 在开源仓库提交精确实现 SHA 和验证记录 SHA，核验祖先关系；按用户批准的精确 SHA fetch/普通 merge 到 Server，记录 merge SHA、变更范围和测试结果。
+- [x] 4.3 在开源仓库提交精确实现 SHA 和验证记录 SHA，核验祖先关系；实现 commit 为 `f7120d219f0b227b43c805a5505bbe6697561279`，验证记录随后以独立 docs commit 提交；Server 尚未同步，等待精确 fetch/普通 merge。
