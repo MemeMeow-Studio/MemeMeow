@@ -2,8 +2,8 @@
 
 该模块位于事务单元和既有 Repository/文件存储实现之间。它负责为请求或任务创建
 共享 Session 的 repository 组合，并维护 Engine、Session 工厂和按 scope 创建的
-BlobStore 生命周期。Repository、BlobStore 与 StorageCoordinator 仍以原实现为准，
-只在调用点延迟导入以避免兼容 facade 的循环依赖。
+BlobStore 和 StorageCoordinator 生命周期。Repository 仍在环境创建时延迟装配，文件
+一致性实现直接来自 persistence.storage，避免兼容 facade 参与运行时依赖。
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from backend.persistence.engine import DatabaseError, SCOPE_LOCAL, ensure_optional_control_schema
 from backend.persistence.models import Scope, ScopeContext
+from backend.persistence.storage import BlobStore, StorageCoordinator
 from backend.persistence.unit_of_work import UnitOfWork
 
 
@@ -72,8 +73,6 @@ class DatabaseResources:
         非 local scope 的数据根目录；`require_local_scope` 控制宿主是否必须已安装 local
         scope。构造期间会幂等补齐可选控制面表，但不会推进 migration revision。
         """
-        from backend.database import BlobStore
-
         self.engine = engine
         self.factory = sessionmaker(engine, expire_on_commit=False, class_=Session)
         self.image_root = image_root
@@ -100,16 +99,12 @@ class DatabaseResources:
 
     def flat_preflight(self, scope_id: str | ScopeContext | None = None) -> dict[str, Any]:
         """执行指定 scope 的扁平图片库只读预检；缺失 scope 时 fail-closed。"""
-        from backend.database import StorageCoordinator
-
         if scope_id is None:
             raise DatabaseError("scope_required")
         return StorageCoordinator(self, scope_id=scope_id).flat_preflight()
 
     def blob_store_for_scope(self, scope_id: str | ScopeContext) -> BlobStore:
         """读取 scope 的不可变 storage_namespace 并创建绑定 BlobStore。"""
-        from backend.database import BlobStore
-
         context = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
         scope_id = context.scope_id
         if scope_id == SCOPE_LOCAL:

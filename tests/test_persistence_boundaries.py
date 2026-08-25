@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from backend import database
 from backend.persistence import engine as persistence_engine
 from backend.persistence import resources as persistence_resources
+from backend.persistence import storage as persistence_storage
 from backend.persistence import unit_of_work as persistence_unit_of_work
 from backend.persistence.models import Scope, ScopeContext
 from backend.persistence.repositories import collections as persistence_collections
@@ -50,13 +51,15 @@ def test_persistence_facade_reexports_one_implementation_source() -> None:
     assert database.InMemoryAgentCallbackRequestRepository is persistence_callbacks.InMemoryAgentCallbackRequestRepository
     assert database.InMemoryCallbackRequestRepository is persistence_callbacks.InMemoryCallbackRequestRepository
     assert database._validate_lane_capacities is persistence_tasks._validate_lane_capacities
+    assert database.BlobStore is persistence_storage.BlobStore
+    assert database.StorageCoordinator is persistence_storage.StorageCoordinator
     assert database.SCOPE_LOCAL == persistence_engine.SCOPE_LOCAL
     assert database.CURRENT_SCHEMA_REVISION == persistence_engine.CURRENT_SCHEMA_REVISION
 
 
 def test_persistence_runtime_modules_have_no_top_level_facade_import() -> None:
     """新边界只允许在资源实际组装时延迟解析 facade，模块导入不能形成循环。"""
-    for module in (persistence_engine, persistence_unit_of_work, persistence_resources, persistence_memes, persistence_collections, persistence_search, persistence_visual_embeddings, persistence_tasks, persistence_reverse_image, persistence_callbacks):
+    for module in (persistence_engine, persistence_unit_of_work, persistence_resources, persistence_storage, persistence_memes, persistence_collections, persistence_search, persistence_visual_embeddings, persistence_tasks, persistence_reverse_image, persistence_callbacks):
         source = Path(module.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)
         top_level_facade_imports = {
@@ -75,8 +78,12 @@ def test_persistence_runtime_modules_have_no_top_level_facade_import() -> None:
     assert "class ReverseImageUsageRepository" not in database_source
     assert "class AgentCallbackRequestRepository" not in database_source
     assert "class InMemoryAgentCallbackRequestRepository" not in database_source
-    assert "class BlobStore" in database_source
-    assert "class StorageCoordinator" in database_source
+    storage_source = Path(persistence_storage.__file__).read_text(encoding="utf-8")
+    assert "class BlobStore" not in database_source
+    assert "class StorageCoordinator" not in database_source
+    assert storage_source.count("class BlobStore:") == 1
+    assert storage_source.count("class StorageCoordinator:") == 1
+    assert "from backend.database" not in storage_source
     assert "from backend.persistence.repositories.search import SearchRepository" in database_source
     assert "from backend.persistence.repositories.tasks import" in database_source
 
@@ -174,8 +181,8 @@ def test_database_resources_preserves_scope_storage_and_preflight_boundaries(mon
         def flat_preflight(self):
             return {"scope_id": self.scope_id}
 
-    monkeypatch.setattr(database, "BlobStore", FakeBlobStore)
-    monkeypatch.setattr(database, "StorageCoordinator", FakeStorageCoordinator)
+    monkeypatch.setattr(persistence_resources, "BlobStore", FakeBlobStore)
+    monkeypatch.setattr(persistence_resources, "StorageCoordinator", FakeStorageCoordinator)
     resources = persistence_resources.DatabaseResources(
         engine,
         image_root=tmp_path / "images",
