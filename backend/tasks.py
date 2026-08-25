@@ -19,6 +19,11 @@ from uuid import uuid4
 
 from backend.agent_resume import normalize_identifier, sanitize_error, sanitize_error_history
 from backend.config import AGENT_BACKPRESSURE_DEFAULT, validate_agent_backpressure, validate_agent_concurrency
+from backend.image_stage_plan import (
+    IMAGE_PROCESSING_MAX_ATTEMPTS,
+    IMAGE_PROCESSING_TASK_TYPES,
+    image_task_requires_single_attempt,
+)
 from backend.opencode_workspace import SELECTOR_RE
 from backend.public_dto import (
     PUBLIC_TASK_STATUSES,
@@ -138,14 +143,8 @@ STABLE_TASK_ERRORS = {
 }
 # 这四类任务由逐图图片处理 Worker 独占扫描、认领和执行；通用任务 Worker
 # 只能处理其它系统任务，避免旧调度器把图片链误判为缺少 handler。
-IMAGE_PROCESSING_TASK_TYPES = frozenset(
-    {
-        "visual_embedding_generation",
-        "meme_context_generation",
-        "image_auto_rename",
-        "text_embedding_generation",
-    }
-)
+# 图片叶子任务的执行控制面和最大尝试次数由 stage plan 统一声明；旧模块继续
+# re-export 这些名称，避免 API/脚本的历史 import 失效。
 TaskHandler = Callable[[dict[str, Any], Callable[[float | None, str | None], None]], Any]
 
 

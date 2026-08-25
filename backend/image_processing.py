@@ -35,6 +35,13 @@ from backend.database import (
     utcnow,
 )
 from backend.config import AGENT_BACKPRESSURE_DEFAULT, validate_agent_backpressure, validate_agent_concurrency
+from backend.image_stage_plan import (
+    IMAGE_STAGE_ORDER,
+    SETTLED_STAGE_STATUSES,
+    STAGE_TASK_TYPES,
+    ImageStagePlan,
+    normalize_stage,
+)
 from backend.metadata import MemeContext, Provenance, SidecarMetadata
 from backend.agent_resume import normalize_identifier
 from backend.operation_policy import (
@@ -59,14 +66,9 @@ from backend.public_dto import (
 
 
 logger = logging.getLogger(__name__)
-STAGES = ("visual", "agent", "auto_rename", "text_embedding")
-STAGE_TASK_TYPES = {
-    "visual": "visual_embedding_generation",
-    "agent": "meme_context_generation",
-    "auto_rename": "image_auto_rename",
-    "text_embedding": "text_embedding_generation",
-}
-STAGE_SETTLED = frozenset({"succeeded", "skipped", "warning"})
+# 固定阶段计划由无状态模块维护；本 facade 保留历史常量名称供旧调用方使用。
+STAGES = IMAGE_STAGE_ORDER
+STAGE_SETTLED = SETTLED_STAGE_STATUSES
 # 这些自动命名错误只表示候选名称不可用，叶子 Task 仍失败但父 Job 可以继续。
 AUTO_RENAME_WARNING_ERRORS = frozenset({
     "auto_rename_title_missing",
@@ -735,10 +737,13 @@ class ImageProcessingWorker:
     """按 job scope 调度四阶段叶子 Task 的有界 Worker。"""
 
     def __init__(self, resources: Any, *, scope_id: ScopeContext | str, task_service: Any, policy: OperationPolicyGateway | None = None, grant_store: GrantAssociationStore | None = None, owner: str | None = None, max_workers: int = 2, handlers: Mapping[str, Callable[[dict[str, object]], object]] | None = None, task_handlers: Mapping[str, Callable[..., object]] | None = None, reconcile_interval: float = 2.0):
+        """装配图片 Job repository、固定 stage plan 与叶子 task runner。"""
         self.resources = resources
         self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
         self.tasks = task_service
         self.jobs = ImageProcessingRepository(resources, self.scope)
+        # stage plan 只描述顺序；具体 Job 的 auto_name 选项在 reconcile 时冻结。
+        self.stage_plan = ImageStagePlan()
         self.policy = policy or OperationPolicyGateway(None)
         self.grants = grant_store or GrantAssociationStore()
         self.owner = owner or f"image-worker-{uuid4().hex}"
@@ -797,7 +802,7 @@ class ImageProcessingWorker:
 
     @staticmethod
     def _canonical_stage(stage: str) -> str:
-        """把公开阶段名或任务类型收敛为四种内部阶段。"""
+        """把公开阶段名或任务类型收敛为固定 stage plan 的内部阶段。"""
         aliases = {
             "visual": "visual",
             "visual_embedding_generation": "visual",
@@ -810,7 +815,9 @@ class ImageProcessingWorker:
         }
         if not isinstance(stage, str) or aliases.get(stage) is None:
             raise ImageProcessingError("invalid_image_stage")
-        return aliases[stage]
+        canonical = aliases[stage]
+        normalize_stage(canonical)
+        return canonical
 
     def _fail_unclaimed_task(self, task_id: str, code: str) -> None:
         """将尚未认领的独立任务收束为稳定失败，避免 policy 拒绝留下假排队项。"""
@@ -1170,13 +1177,21 @@ class ImageProcessingWorker:
                 job = self.jobs.claim(job_id, owner=self.owner)
             if job is None:
                 return
-            stages = self.jobs.snapshot(job.id)
-            if stages is None:
+            snapshot = self.jobs.snapshot(job.id)
+            if snapshot is None:
                 return
-            stage = next((item for item in stages.stages if item["status"] not in STAGE_SETTLED), None)
+            statuses = {str(item["stage"]): str(item["status"]) for item in snapshot.stages if isinstance(item, Mapping)}
+            plan = ImageStagePlan(auto_name=bool(getattr(job, "auto_name", False)))
+            # 失败/阻止/未知阶段必须等待显式重试；不能因 reconcile 扫描再次创建
+            # 同一图片版本的 provider Task，避免重复外部副作用和重复计量。
+            if plan.blocked(statuses):
+                return
+            name = plan.next_stage(statuses)
+            if name is None:
+                return
+            stage = next((item for item in snapshot.stages if item.get("stage") == name), None)
             if stage is None:
                 return
-            name = str(stage["stage"])
             task_id = stage.get("task_id")
             if name == "text_embedding":
                 # Agent 写回后即使自动命名被跳过，也必须以当前实际 Meme

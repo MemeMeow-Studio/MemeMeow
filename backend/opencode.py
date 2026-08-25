@@ -32,6 +32,8 @@ from backend.agent_executor import AgentExecutorClient, AgentExecutorError
 from backend.agent_resume import classify_resume_error, normalize_identifier
 from backend.config import Settings, validate_agent_concurrency
 from backend.metadata import MemeContext
+from backend.opencode_result_store import OpenCodeResultStore
+from backend.runtime_execution import AttemptFence, ExecutionBinding, ExecutionBindingError, stable_input_digest
 from backend.opencode_workspace import (
     LocalWorkspaceProvider,
     ResolvedWorkspace,
@@ -233,6 +235,14 @@ class OpenCodeRunner:
         self._workspace_by_task: dict[str, ResolvedWorkspace] = {}
         self._workspace_selectors: dict[str, str] = {}
         self._workspace_capabilities: dict[str, str] = {}
+        # 进程内 fencing 只做旧回调快速拒绝；跨进程 claim 仍由任务数据库负责。
+        self._attempt_fence = AttemptFence()
+        self.result_store = OpenCodeResultStore(
+            self.runtime_root / "task-results",
+            result_name=RESULT_FILE_NAME,
+            draft_name=RESULT_DRAFT_NAME,
+            max_bytes=int(getattr(settings, "agent_result_max_bytes", RESULT_DEFAULT_MAX_BYTES)),
+        )
         self.executor = AgentExecutorClient(
             getattr(settings, "agent_executor_url", None),
             getattr(settings, "agent_executor_token", None),
@@ -1147,6 +1157,13 @@ class OpenCodeRunner:
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", task_id or ""):
                 raise OpenCodeError("agent_result_path_invalid", "任务结果标识非法")
             root = workspace.task_results_root.parent if workspace is not None else self.runtime_root / "task-results"
+            store = OpenCodeResultStore(
+                root,
+                result_name=RESULT_FILE_NAME,
+                draft_name=RESULT_DRAFT_NAME,
+                max_bytes=int(getattr(self.settings, "agent_result_max_bytes", RESULT_DEFAULT_MAX_BYTES)),
+            )
+            expected_draft, expected_result = store.paths(task_id)
             self._ensure_no_symlink_path(self.runtime_root.parent, create=True)
             self._ensure_no_symlink_path(self.runtime_root, create=True)
             self._ensure_no_symlink_path(root, create=True)
@@ -1154,7 +1171,9 @@ class OpenCodeRunner:
             self._ensure_no_symlink_path(directory, create=True)
             self._ensure_no_symlink_path(directory / RESULT_DRAFT_NAME, allow_file=True)
             self._ensure_no_symlink_path(directory / RESULT_FILE_NAME, allow_file=True)
-            return directory / RESULT_DRAFT_NAME, directory / RESULT_FILE_NAME
+            if (directory / RESULT_DRAFT_NAME, directory / RESULT_FILE_NAME) != (expected_draft, expected_result):
+                raise OpenCodeError("agent_result_path_invalid", "结果文件路径不受支持")
+            return expected_draft, expected_result
 
     @staticmethod
     def _ensure_no_symlink_path(path: Path, *, create: bool = False, allow_file: bool = False) -> None:
@@ -1394,6 +1413,24 @@ class OpenCodeRunner:
         if context.task_id != task_id:
             raise OpenCodeError("opencode_workspace_mismatch", "workspace 上下文与任务不一致", executor_attempt_id=local_executor_attempt_id)
         resolved_workspace = self.resolve_workspace(context)
+        try:
+            binding = ExecutionBinding(
+                task_id=task_id,
+                attempt_id=local_executor_attempt_id,
+                scope_id=context.scope_id,
+                workspace_selector=resolved_workspace.selector,
+                input_digest=stable_input_digest(
+                    task_id,
+                    str(image),
+                    reverse_image_policy,
+                    processing_config_hash,
+                    resume_session_id,
+                ),
+                session_id=resume_session_id,
+            )
+        except ExecutionBindingError as exc:
+            raise OpenCodeError(exc.code, "OpenCode 执行绑定无效", executor_attempt_id=local_executor_attempt_id) from exc
+        self._attempt_fence.bind(binding)
         with self._process_lock:
             # 即使 capability 签发失败，也保留已解析的 opaque selector 供失败诊断和
             # claim fencing 写回；目录与 OpenCode 进程仍不会在此处创建。
@@ -1615,6 +1652,7 @@ class OpenCodeRunner:
             progress(0.9, "正在校验并写入语境")
             return candidate, session_id
         finally:
+            self._attempt_fence.release(task_id, local_executor_attempt_id)
             self.cleanup_task_results(keep_task_id=task_id)
             self._unmark_task_active(task_id)
             with self._process_lock:

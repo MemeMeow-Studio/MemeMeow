@@ -19,7 +19,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
@@ -52,6 +52,9 @@ from executor.agent_limits import (
     validate_agent_backpressure,
     validate_agent_concurrency,
 )
+from executor.process_supervisor import ProcessSupervisor
+from executor.result_store import ExecutorResultStore, ExecutorResultStoreError
+from executor.task_queue import ExecutionQueue
 from executor.token import ExecutorTokenError, ensure_token_file, read_token_file
 from backend.public_dto import PublicDataError, secret_inventory_from_mapping, validate_agent_result
 
@@ -385,7 +388,10 @@ class Executor:
         self.workspace_root = Path(os.getenv("MEMEMEOW_EXECUTOR_WORKSPACE_ROOT", str(WORKSPACE_ROOT)))
         self.lock = threading.RLock()
         self.tasks: dict[str, TaskState] = {}
-        self.pool = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="mememeow-opencode")
+        # queue 只负责线程池生命周期；任务状态、attempt 和结果事实仍由 Executor
+        # 控制面维护，避免 HTTP 入口直接持有线程池细节。
+        self.pool = ExecutionQueue(self.max_workers, thread_name_prefix="mememeow-opencode")
+        self.process_supervisor = ProcessSupervisor()
         self.futures: dict[str, Future[None]] = {}
         self.ready_error: str | None = None
         self._prepare_runtime()
@@ -1143,14 +1149,14 @@ class Executor:
                 deadline = time.monotonic() + task.timeout_seconds
                 while process.poll() is None:
                     if task.cancel_event.is_set():
-                        reaped = self._terminate(process)
+                        reaped = self.process_supervisor.terminate(process).reaped
                         with self.lock:
                             task.process_reaped = reaped
                         if not reaped:
                             raise _ProcessFailure("unknown_execution", "无法确认 OpenCode 进程已终止")
                         break
                     if time.monotonic() >= deadline:
-                        reaped = self._terminate(process)
+                        reaped = self.process_supervisor.terminate(process).reaped
                         with self.lock:
                             task.process_reaped = reaped
                         if not reaped:
@@ -1283,82 +1289,19 @@ class Executor:
 
     def _validate_result_file(self, path: Path) -> None:
         """验证结果文件位置、大小和基本 JSON 结构；完整 schema 由后端复核。"""
-        current = RESULT_ROOT
         try:
-            root_metadata = RESULT_ROOT.lstat()
-            if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
-                raise RuntimeError("agent_result_path_invalid")
-            relative = path.relative_to(RESULT_ROOT)
-        except ValueError as exc:
-            raise RuntimeError("agent_result_path_invalid") from exc
-        except OSError as exc:
-            raise RuntimeError("agent_result_path_invalid") from exc
-        if len(relative.parts) != 2 or relative.name != RESULT_FILE_NAME:
-            raise RuntimeError("agent_result_path_invalid")
-        for part in relative.parts:
-            current = current / part
-            if current.is_symlink():
-                raise RuntimeError("agent_result_path_invalid")
-        try:
-            metadata = path.lstat()
-        except FileNotFoundError as exc:
-            raise RuntimeError("agent_result_file_missing") from exc
-        except OSError as exc:
-            raise RuntimeError("agent_result_file_unreadable") from exc
-        if stat.S_ISLNK(metadata.st_mode):
-            raise RuntimeError("agent_result_path_invalid")
-        if not stat.S_ISREG(metadata.st_mode):
-            raise RuntimeError("agent_result_file_unreadable")
-        if metadata.st_size > self.max_result_bytes:
-            raise RuntimeError("agent_result_file_too_large")
-        try:
-            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(path, flags)
-            try:
-                chunks: list[bytes] = []
-                total = 0
-                while total <= self.max_result_bytes:
-                    chunk = os.read(descriptor, min(64 * 1024, self.max_result_bytes + 1 - total))
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    total += len(chunk)
-                if total > self.max_result_bytes:
-                    raise RuntimeError("agent_result_file_too_large")
-            finally:
-                os.close(descriptor)
-            value = json.loads(b"".join(chunks).decode("utf-8"))
-        except FileNotFoundError as exc:
-            raise RuntimeError("agent_result_file_missing") from exc
-        except RuntimeError:
-            raise
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
-            raise RuntimeError("agent_result_file_invalid_json") from exc
-        if not isinstance(value, dict) or not REQUIRED_RESULT_FIELDS.issubset(value):
-            raise RuntimeError("agent_result_file_schema_invalid")
-        try:
-            validate_agent_result(value, secret_inventory=secret_inventory_from_mapping(os.environ))
-        except PublicDataError as exc:
-            raise RuntimeError("agent_result_file_schema_invalid") from exc
+            ExecutorResultStore(RESULT_ROOT, filename=RESULT_FILE_NAME, max_bytes=self.max_result_bytes).read(
+                path,
+                required_fields=set(REQUIRED_RESULT_FIELDS),
+                validator=lambda value: validate_agent_result(value, secret_inventory=secret_inventory_from_mapping(os.environ)),
+            )
+        except ExecutorResultStoreError as exc:
+            raise RuntimeError(exc.code) from exc
 
     @staticmethod
     def _terminate(process: subprocess.Popen[bytes]) -> bool:
         """终止任务进程组并返回父进程是否已被 waitpid 确认回收。"""
-        if process.poll() is not None:
-            return True
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=2)
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=2)
-            except OSError:
-                return process.poll() is not None
-            except subprocess.TimeoutExpired:
-                # 进程组仍未收束时不阻塞 executor；调用方会把任务标记为失败。
-                return process.poll() is not None
-        return process.poll() is not None
+        return ProcessSupervisor().terminate(process).reaped
 
     def cancel(self, task_id: str) -> TaskState:
         """取消指定任务；只终止该任务进程，不影响 executor 或其他任务。"""
@@ -1377,7 +1320,7 @@ class Executor:
             if process is None and was_queued:
                 task.done.set()
         if process is not None:
-            reaped = self._terminate(process)
+            reaped = self.process_supervisor.terminate(process).reaped
             with self.lock:
                 task.process_reaped = reaped
                 if not reaped:
