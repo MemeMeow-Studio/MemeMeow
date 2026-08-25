@@ -94,6 +94,7 @@ from backend.image_library_http import (
     list_images as _list_images_http,
     media as _media_http,
 )
+from backend.image_processing_submission_http import process_image_library as _process_image_library_http
 from backend.visual_callback_http import (
     VisualMatchRequest,
     internal_visual_search_match as _internal_visual_search_match_http,
@@ -2229,38 +2230,19 @@ async def process_image_library(
     page_size: int = Query(default=100, ge=1, le=200),
 ) -> dict[str, object]:
     """分页枚举当前 scope 图片并显式重试可恢复的逐图处理 job。"""
-    worker = _processing_worker(request)
-    if worker is None:
-        raise _error(503, "image_processing_unavailable", "图片处理服务当前不可用")
-    try:
-        options = _normalize_processing_options(request, reverse_image_policy=payload.reverse_image_policy, auto_name=payload.auto_name)
-    except ImageProcessingError as exc:
-        raise _error(503 if exc.code == "reverse_image_unavailable" else 400, exc.code, "图片处理选项无效或服务不可用") from exc
-    repository = _processing_repository(request)
-    results: list[dict[str, object]] = []
-    with _environment(request) as environment:
-        memes = environment.memes.list(page=page, page_size=page_size)
-        total = environment.memes.count()
-    for meme in memes:
-        try:
-            latest = repository.latest_for_target(meme.id, meme.sha256)
-            image = _service(request, "metadata").blob_store.resolve(meme.storage_key)
-            embedding_record = _service(request, "metadata").embedding_record(image)
-            snapshot = worker.submit(
-                meme.id,
-                meme.sha256,
-                metadata_hash=embedding_record.get("metadata_hash") if isinstance(embedding_record, Mapping) else None,
-                config=_processing_config(request),
-                reverse_image_policy=options.reverse_image_policy,
-                auto_name=options.auto_name,
-                explicit_retry=latest is not None and latest.status in {"failed", "blocked", "unknown_execution"},
-            )
-            results.append({"meme_id": str(meme.id), "job_id": snapshot.job_id, "processing_job_id": snapshot.job_id, "submission_mode": "pipeline", "status": snapshot.status, "reused": latest is not None and snapshot.job_id == latest.job_id})
-        except ImageProcessingError as exc:
-            results.append({"meme_id": str(meme.id), "error": exc.code})
-        except (DatabaseError, MetadataError, RuntimeError):
-            results.append({"meme_id": str(meme.id), "error": "image_processing_failed"})
-    return {"results": results, "count": len(results), "total": total, "page": page, "page_size": page_size}
+    return await _process_image_library_http(
+        request,
+        payload,
+        page=page,
+        page_size=page_size,
+        processing_worker=_processing_worker,
+        normalize_processing_options=_normalize_processing_options,
+        processing_repository=_processing_repository,
+        metadata_service=lambda received: _service(received, "metadata"),
+        environment=_environment,
+        processing_config=_processing_config,
+        error=_error,
+    )
 
 
 @app.get("/images/metadata", tags=["images"])

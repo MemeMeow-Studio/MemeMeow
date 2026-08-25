@@ -1,0 +1,3 @@
+schema: spec-driven
+created: 2026-08-25
+goal: 降低 api.py 图片处理提交路由职责密度
