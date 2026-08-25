@@ -13,7 +13,7 @@
 
 - [x] 3.1 增加 route/dependency snapshot、meme_id/scope 拒绝、文件名/扩展名/冲突、metadata 错误、operation 顺序和响应投影测试。
 - [x] 3.2 运行图片变更/API/scope/security 定向测试、compileall 和 diff check，按失败修复并记录未运行的外部门禁；图片变更/API 定向 `13 passed, 36 skipped`，全套回归 `461 passed, 92 skipped`，PostgreSQL marker `553 deselected`。
-- [x] 3.3 更新 tasks 与验证记录，固定实现 SHA、范围和测试事实；验证记录已建立，待提交 SHA 回填。
+- [x] 3.3 更新 tasks 与验证记录，固定实现 SHA、范围和测试事实；实现 SHA 已固定，验证记录待独立提交。
 
 ## 4. 最终验证与同步
 
