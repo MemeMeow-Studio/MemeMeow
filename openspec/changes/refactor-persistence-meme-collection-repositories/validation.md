@@ -1,5 +1,12 @@
 # 验证记录
 
+## 提交
+
+- 实现提交：`50aebd204dc77042c9fa6a9bd79536989705033f`。
+- 兼容收束：没有独立补丁；实现提交同时保留 `MemeCollection`、`MemeCollectionItem` 等历史模型导出，并让两个 Repository 旧/新路径保持对象身份一致。
+- 验证记录提交：本文件所在提交。
+- 收尾提交：待 Server 同步前补齐。
+
 ## 开源实现范围
 
 - 新增 `backend/persistence/repositories/{__init__,memes,collections}.py`，分别实现 `MemeRepository` 与 `CollectionRepository`。
@@ -25,4 +32,4 @@
 
 ## 待同步
 
-开源实现、验证和收尾 commit SHA 在提交后补齐；用户授权的同步路径为从本地开源仓库精确 fetch 收尾 SHA，在 Server `main` 以普通 `--no-ff` merge 引入，随后记录 Server merge SHA 与祖先关系。Server 不 push。
+用户授权的同步路径为从本地开源仓库精确 fetch 收尾 SHA，在 Server `main` 以普通 `--no-ff` merge 引入，随后记录 Server merge SHA 与祖先关系。Server 不 push。
