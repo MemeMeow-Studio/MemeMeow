@@ -6,6 +6,7 @@
 ## 来源
 
 - 实现 commit：`13605361752792926bf2672a7dbda3283bcdf232`
+- 安全收束修复 commit：`8b39a0b762c9173feacc0c856ce8e9965cab4e0c`（通过 callback 保留 Server/宿主可收紧的 upload reservation release 错误集合；Server 适配不会因公共模块迁移而放宽）。
 - 变更范围：新增 `backend/collection_import_http.py`、`tests/test_collection_import_http.py`、
   本 change proposal/design/spec/tasks；`api.py` 删除 `/collections/import` 重复业务编排，
   保留 canonical route、旧 handler/helper、上传 parser/包 helper 兼容导出和显式宿主 callback。
