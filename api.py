@@ -95,6 +95,10 @@ from backend.image_library_http import (
 )
 from backend.image_processing_submission_http import process_image_library as _process_image_library_http
 from backend.image_mutation_http import delete_image as _delete_image_http, rename_image as _rename_image_http
+from backend.collection_import_http import (
+    collection_package_error as _collection_package_error_http,
+    import_collection as _import_collection_http,
+)
 from backend.collection_http import (
     add_collection_items as _add_collection_items_http,
     collection_error as _collection_error_http,
@@ -528,39 +532,8 @@ def _collection_error(exc: DatabaseError) -> HTTPException:
 
 
 def _collection_package_error(exc: CollectionPackageError) -> HTTPException:
-    """将合集 ZIP 预检和导出错误映射为稳定 HTTP 响应。"""
-    status = 413 if exc.code in {"archive_too_large", "file_too_large", "package_too_large", "member_count_exceeded", "manifest_too_large", "compression_ratio_exceeded", "image_frame_count_exceeded", "image_frame_pixels_exceeded", "image_total_pixels_exceeded"} else 409 if exc.code in {"collection_exists", "member_unreadable", "member_changed"} else 400
-    messages = {
-        "archive_too_large": "合集 ZIP 压缩包超过 64 MiB 限制",
-        "invalid_zip": "合集 ZIP 无法读取",
-        "manifest_missing": "合集 ZIP 缺少 manifest.json",
-        "manifest_invalid": "合集 manifest 无效",
-        "unsupported_package_version": "不支持的合集包格式版本",
-        "manifest_entries_mismatch": "合集 manifest 与 ZIP 文件不一致",
-        "sha256_mismatch": "图片 SHA-256 校验失败",
-        "size_mismatch": "图片大小校验失败",
-        "invalid_zip_path": "ZIP 路径非法",
-        "unsafe_zip_entry": "ZIP 包含不安全条目",
-        "zip64_not_supported": "不支持 ZIP64 合集包",
-        "compression_ratio_exceeded": "ZIP 压缩放大比超过限制",
-        "nested_archive": "ZIP 不允许嵌套归档",
-        "duplicate_zip_entry": "ZIP 包含重复条目",
-        "invalid_image": "包内图片无法解码",
-        "unsupported_format": "包内图片格式不受支持",
-        "image_frame_count_exceeded": "包内图片动画帧数超过限制",
-        "image_frame_pixels_exceeded": "包内图片单帧像素超过限制",
-        "image_total_pixels_exceeded": "包内图片累计帧像素超过限制",
-        "image_preflight_timeout": "包内图片预检超时",
-        "image_preflight_failed": "包内图片预检失败",
-        "member_unreadable": "合集成员图片无法读取",
-        "member_changed": "合集成员图片在导出期间发生变化",
-        "package_too_large": "合集包解压后超过大小限制",
-        "member_count_exceeded": "合集图片数量超过限制",
-        "collection_exists": "合集名称已存在",
-        "invalid_filename": "包内文件名非法",
-        "filename_conflict": "包内文件名无法安全解决冲突",
-    }
-    return _error(status, exc.code, messages.get(exc.code, "合集 ZIP 请求无效"))
+    """保留旧合集包错误 helper，并委托给公共导入 HTTP 边界。"""
+    return _collection_package_error_http(exc, error=_error)
 
 
 @asynccontextmanager
@@ -2225,151 +2198,28 @@ async def create_collection(request: Request, payload: CollectionRequest) -> dic
 
 @app.post("/collections/import", tags=["collections"])
 async def import_collection(request: Request) -> dict[str, object]:
-    """预检单个合集 ZIP 后创建新合集，并逐图片报告导入结果。"""
-    try:
-        form = await _parse_upload_form(request, max_files=2, max_request_bytes=MAX_ARCHIVE_COMPRESSED_BYTES)
-    except HTTPException as exc:
-        if isinstance(exc.detail, dict) and exc.detail.get("error") == "request_too_large":
-            raise _collection_package_error(CollectionPackageError("archive_too_large")) from exc
-        if isinstance(exc.detail, dict) and exc.detail.get("error") == "too_many_files":
-            raise _error(400, "file_required", "必须上传一个合集 ZIP 文件") from exc
-        raise
-    if set(form.keys()) - {"file"}:
-        raise _error(400, "invalid_request", "合集导入只接受一个 file ZIP 字段")
-    values = form.getlist("file")
-    uploads = [item for item in values if hasattr(item, "filename") and hasattr(item, "read")]
-    if len(values) != 1 or len(uploads) != 1:
-        raise _error(400, "file_required", "必须上传一个合集 ZIP 文件")
-    upload = uploads[0]
-    if not str(upload.filename or "").lower().endswith(".zip"):
-        raise _error(400, "unsupported_package", "合集导入只接受 ZIP 文件")
-    try:
-        content, too_large = await _read_upload_content(upload, max_upload_size=MAX_ARCHIVE_COMPRESSED_BYTES)
-        if too_large:
-            raise CollectionPackageError("archive_too_large")
-        package = preflight_archive(content, max_file_size=min(int(request.app.state.settings.max_upload_size), DEFAULT_MAX_FILE_SIZE), max_total_size=MAX_TOTAL_UNCOMPRESSED_BYTES)
-    except CollectionPackageError as exc:
-        raise _collection_package_error(exc) from exc
-    finally:
-        await upload.close()
-    collection_name = package.manifest.collection.name
-    try:
-        with _environment(request) as environment:
-            if environment.collections.by_name(collection_name) is not None:
-                raise CollectionPackageError("collection_exists")
-    except CollectionPackageError as exc:
-        raise _collection_package_error(exc) from exc
-    try:
-        with _environment(request) as environment:
-            collection = environment.collections.create(collection_name)
-            collection_id = collection.id
-            existing_by_name: dict[str, object] = {}
-            for record in environment.memes.list_all():
-                valid = _service(request, "metadata").blob_store.exists_with_identity(record.storage_key, sha256=record.sha256, size_bytes=record.size_bytes)
-                existing_by_name[record.storage_key] = {"meme": record, "sha256": record.sha256 if valid else "__changed__"}
-    except DatabaseError as exc:
-        raise _collection_error(exc) from exc
-
-    results: list[dict[str, object]] = []
-    meme_id_map: dict[str, str] = {}
-    created_count = 0
-    for package_member in package.members:
-        member = package_member.manifest
-        result: dict[str, object] = {"source_meme_id": member.source_meme_id, "filename": member.filename_at_export, "ok": False}
-        try:
-            target = resolve_import_filename(member.filename_at_export, member.sha256, existing_by_name)
-            if target.existing_meme is not None:
-                target_id = str(getattr(target.existing_meme, "id", target.existing_meme))
-                with _environment(request) as environment:
-                    environment.collections.add_members(collection_id, [target_id])
-                result.update({"ok": True, "status": "reused", "target_meme_id": target_id, "saved_filename": target.filename})
-            else:
-                try:
-                    import_grant = _acquire_operation(
-                        request,
-                        Operations.IMAGE_UPLOAD,
-                        f"upload:{member.sha256}:{target.filename}",
-                        resource_id=target.filename,
-                        source="collection_import",
-                        input_digest=member.sha256,
-                    )
-                except OperationPolicyError as exc:
-                    result.update(exc.payload())
-                    results.append(result)
-                    meme_id_map[member.source_meme_id] = ""
-                    continue
-                try:
-                    target_id, target_path = _service(request, "metadata").upload_bytes(package_member.content, target_key=target.filename)
-                except (MetadataError, OSError) as exc:
-                    # 只有明确知道 durable 写入尚未开始时才能归还上传 reservation。
-                    if isinstance(exc, MetadataError) and exc.code in {"target_exists", "invalid_filename", "invalid_image", "staging_conflict", "staging_write_failed"}:
-                        try:
-                            _release_operation(request, import_grant)
-                        except OperationPolicyError:
-                            pass
-                    raise
-                try:
-                    _commit_operation(request, import_grant)
-                except OperationPolicyError:
-                    # 文件和 Meme 已经提交，不能把未知计量状态误报为导入失败。
-                    pass
-                target_id = str(target_id)
-                created_count += 1
-                with _environment(request) as environment:
-                    environment.collections.add_members(collection_id, [target_id])
-                existing_by_name[target.filename] = {"meme": target_id, "sha256": member.sha256}
-                result.update({"ok": True, "status": "imported", "target_meme_id": target_id, "saved_filename": target_path.name})
-                processing_worker = None
-                try:
-                    processing_worker = _processing_worker(request)
-                    if processing_worker is None:
-                        task = _submit_visual_task(request, target_path, expected_sha256=member.sha256, schedule=True)
-                        result.update({"visual_task_id": task.task_id, "visual_job_id": task.task_id, "metadata_job_id": task.task_id, "metadata_job_status": task.status, "visual_task_status": task.status})
-                except (OSError, RuntimeError, MetadataError) as exc:
-                    # Meme、文件和合集关系已有效提交，任务失败只能作为可重试的逐项告警。
-                    error = _context_enqueue_error(exc) if isinstance(exc, RuntimeError) else "visual_enqueue_failed"
-                    result["visual_task_error"] = error
-                    result["metadata_job_error"] = error
-                try:
-                    worker = processing_worker
-                    if worker is not None:
-                        processing = worker.submit(
-                            target_id,
-                            member.sha256,
-                            config=_processing_config(request),
-                            reverse_image_policy="forbid",
-                            schedule=False,
-                        )
-                        worker.schedule(processing.job_id)
-                        # 旧合集客户端把视觉任务和语境任务都作为一个可轮询
-                        # 标识读取；统一控制面现在返回父 Job，因此这些字段
-                        # 兼容地指向同一个 Job，不再伪造额外叶子任务。
-                        result.update(
-                            {
-                                "processing_job_id": processing.job_id,
-                                "submission_mode": "pipeline",
-                                "processing_status": processing.status,
-                                "visual_task_id": processing.job_id,
-                                "visual_job_id": processing.job_id,
-                                "metadata_job_id": processing.job_id,
-                                "metadata_job_status": processing.status,
-                                "visual_task_status": processing.status,
-                            }
-                        )
-                except (ImageProcessingError, DatabaseError, MetadataError, RuntimeError) as exc:
-                    result["processing_job_error"] = getattr(exc, "code", "image_processing_unavailable")
-            meme_id_map[member.source_meme_id] = str(result["target_meme_id"])
-        except CollectionPackageError as exc:
-            result["error"] = exc.code
-        except (DatabaseError, MetadataError, OSError, RuntimeError) as exc:
-            result["error"] = getattr(exc, "code", "import_failed")
-        results.append(result)
-    if created_count:
-        _invalidate_search(request)
-    failed_count = sum(1 for item in results if not item.get("ok"))
-    warning_count = sum(1 for item in results if item.get("metadata_job_error"))
-    status = "succeeded" if not failed_count and not warning_count else "partial"
-    return {"collection_id": str(collection_id), "name": collection_name, "status": status, "partial": status == "partial", "results": results, "meme_id_map": meme_id_map}
+    """兼容合集导入入口，并注入当前 scope、存储、计量和处理任务边界。"""
+    return await _import_collection_http(
+        request,
+        environment=_environment,
+        metadata_service=lambda received: _service(received, "metadata"),
+        settings=lambda received: received.app.state.settings,
+        processing_worker=_processing_worker,
+        processing_config=_processing_config,
+        submit_visual_task=_submit_visual_task,
+        context_enqueue_error=_context_enqueue_error,
+        acquire_operation=_acquire_operation,
+        commit_operation=_commit_operation,
+        release_operation=_release_operation,
+        invalidate_search=_invalidate_search,
+        error=_error,
+        database_error=_collection_error,
+        parse_upload_form=_parse_upload_form,
+        read_upload_content=_read_upload_content,
+        preflight=preflight_archive,
+        resolve_filename=resolve_import_filename,
+        package_error=_collection_package_error,
+    )
 
 
 @app.get("/collections/{collection_id}", tags=["collections"])
