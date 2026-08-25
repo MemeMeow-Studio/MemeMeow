@@ -19,4 +19,4 @@
 
 - [x] 4.1 运行本 change OpenSpec strict validate 和开源完整回归，确认上传与只读 route 未重复或改变；strict validate 通过，完整回归 `461 passed, 92 skipped`。
 - [x] 4.2 进行对抗性复核：检查 scope/路径选择器、文件边界、grant 拒绝/释放/commit 失败、缓存失效时机和无重复 route；未发现 P1/P2。
-- [ ] 4.3 在开源仓库提交精确实现 SHA 与验证记录 SHA，停在用户审核门禁，未经批准不 fetch/merge 到 Server。
+- [x] 4.3 在开源仓库提交精确实现 SHA `0f384299864c9b9937c66d7032857a3cd3073302` 与验证记录 SHA `db860e1ab8c626bd0030908ed84af45283a62ef1`，供 Server 精确 fetch/普通 merge。
