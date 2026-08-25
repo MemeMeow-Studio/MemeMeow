@@ -1190,7 +1190,11 @@ async def lifespan(app: FastAPI):
         tasks = runtime.tasks
         started_extensions = await start_extensions(app)
         yield
-    finally:
+    except BaseException as primary:
+        # 启动或请求阶段已有原始错误时，关闭失败只作为 note 附加，不能掩盖根因。
+        await shutdown_lifecycle(setup, runtime, started_extensions, primary_error=primary)
+        raise
+    else:
         await shutdown_lifecycle(setup, runtime, started_extensions)
 
 

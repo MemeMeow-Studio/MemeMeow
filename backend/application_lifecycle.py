@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import inspect
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock
 from typing import Any, Awaitable, Callable, Mapping, Sequence
@@ -76,6 +76,71 @@ class ScopeRuntime:
     tasks: Any | None
 
 
+@dataclass
+class _PreparationOwnership:
+    """记录 prepare 阶段已创建的外部资源，供中途失败时回收。"""
+
+    engine: Any | None = None
+    opencode: Any | None = None
+
+
+@dataclass
+class _ScopeBuildOwnership:
+    """记录 scope runtime 构造期间已取得的后台资源。"""
+
+    executor: ThreadPoolExecutor | None = None
+    worker_manager: Any | None = None
+    local_services: ScopeServices | None = None
+    runtime_factory: Any | None = None
+    image_workers: list[Any] = field(default_factory=list)
+    factory_started: bool = False
+
+
+def _close_resource(resource: Any | None, method_name: str, errors: list[tuple[str, Exception]], phase: str) -> None:
+    """调用一个资源的关闭方法并记录异常，保证同阶段后续资源仍能继续收束。"""
+    method = getattr(resource, method_name, None)
+    if not callable(method):
+        return
+    try:
+        method()
+    except Exception as exc:  # noqa: BLE001 - 关闭阶段必须继续收束其它资源
+        errors.append((f"{phase}.{method_name}", exc))
+
+
+def _add_cleanup_notes(primary: BaseException, errors: Sequence[tuple[str, Exception]]) -> None:
+    """把关闭失败的稳定类型和错误码附加到原始异常，不泄露路径或凭据。"""
+    for phase, error in errors:
+        code = getattr(error, "code", None) or type(error).__name__
+        primary.add_note(f"生命周期资源收束失败: {phase} ({code})")
+
+
+def _clear_lifecycle_state(app: FastAPI, *, managed_factory: bool) -> None:
+    """删除本轮已关闭的运行时 state，避免下一轮 lifespan 复用失效资源。"""
+    if managed_factory and hasattr(app.state, "service_factory"):
+        delattr(app.state, "service_factory")
+    for name in (
+        "database",
+        "settings",
+        "resolver",
+        "storage_preflight",
+        "opencode",
+        "agent_activity",
+        "visual_inference",
+        "operation_policy_gateway",
+        "operation_grants",
+        "tasks",
+        "metadata",
+        "search_engine",
+        "reverse_image",
+        "visual_search",
+        "task_scope_diagnostics",
+        "image_processing_workers",
+        "image_processing_workers_lock",
+    ):
+        if hasattr(app.state, name):
+            delattr(app.state, name)
+
+
 def extension_list(app: FastAPI) -> tuple[ApplicationExtension, ...]:
     """读取应用创建时冻结的扩展列表；缺失时返回空元组。"""
     value = getattr(app.state, "extensions", ())
@@ -120,6 +185,43 @@ def prepare_lifecycle(
     opencode_factory: Callable[[Settings], OpenCodeRunner] | None = None,
     activity_factory: Callable[[Path], Any] | None = None,
     visual_factory: Callable[[Settings], Any] | None = None,
+) -> LifecycleSetup:
+    """按阶段创建公共运行时，并在任何中途失败时释放已取得的资源。"""
+    ownership = _PreparationOwnership()
+    try:
+        return _prepare_lifecycle(
+            app,
+            skill_root=skill_root,
+            settings_loader=settings_loader,
+            engine_factory=engine_factory,
+            database_checker=database_checker,
+            database_resources_factory=database_resources_factory,
+            opencode_factory=opencode_factory,
+            activity_factory=activity_factory,
+            visual_factory=visual_factory,
+            ownership=ownership,
+        )
+    except Exception as primary:
+        errors: list[tuple[str, Exception]] = []
+        _close_resource(ownership.opencode, "shutdown", errors, "prepare.opencode")
+        _close_resource(ownership.engine, "dispose", errors, "prepare.engine")
+        _clear_lifecycle_state(app, managed_factory=bool(getattr(app.state, "_scope_factory_managed", False)))
+        _add_cleanup_notes(primary, errors)
+        raise
+
+
+def _prepare_lifecycle(
+    app: FastAPI,
+    *,
+    skill_root: Path | None = None,
+    settings_loader: Callable[[], Settings] | None = None,
+    engine_factory: Callable[[Any], Any] | None = None,
+    database_checker: Callable[..., Any] | None = None,
+    database_resources_factory: Callable[..., DatabaseResources] | None = None,
+    opencode_factory: Callable[[Settings], OpenCodeRunner] | None = None,
+    activity_factory: Callable[[Path], Any] | None = None,
+    visual_factory: Callable[[Settings], Any] | None = None,
+    ownership: _PreparationOwnership,
 ) -> LifecycleSetup:
     """按 Settings、策略、凭据、数据库和客户端阶段初始化公共资源。
 
@@ -183,6 +285,7 @@ def prepare_lifecycle(
         configured_workspace_provider = MissingWorkspaceProvider()
     app.state.workspace_provider = configured_workspace_provider
     engine = (engine_factory or create_engine_for_settings)(settings)
+    ownership.engine = engine
     expected_revision = getattr(app.state, "expected_schema_revision", settings.expected_database_revision)
     # 启动门禁拒绝任何可能回退到旧 JSON 的业务请求。
     (database_checker or check_database)(engine, expected_revision=expected_revision, require_local_installation=local_mode)
@@ -206,6 +309,7 @@ def prepare_lifecycle(
         # 宿主由自己的 resolver/factory 管理 scope，不探测或创建 local namespace。
         app.state.storage_preflight = None
     app.state.opencode = (opencode_factory or OpenCodeRunner)(settings)
+    ownership.opencode = app.state.opencode
     app.state.opencode.workspace_provider = configured_workspace_provider
     try:
         app.state.agent_activity = (activity_factory or OpenCodeActivityReader)(settings.opencode_runtime_root)
@@ -225,6 +329,19 @@ def prepare_lifecycle(
     )
 
 
+def _cleanup_scope_build(ownership: _ScopeBuildOwnership, setup: LifecycleSetup) -> list[tuple[str, Exception]]:
+    """收束 scope runtime 构造失败时已经创建的 Worker、factory 和线程池。"""
+    errors: list[tuple[str, Exception]] = []
+    for image_worker in reversed(ownership.image_workers):
+        _close_resource(image_worker, "shutdown", errors, "build.image_worker")
+    if ownership.runtime_factory is not None and (not setup.custom_factory or ownership.factory_started):
+        _close_resource(ownership.runtime_factory, "shutdown", errors, "build.factory")
+    _close_resource(ownership.worker_manager, "shutdown", errors, "build.worker_manager")
+    _close_resource(ownership.executor, "shutdown", errors, "build.executor")
+    _clear_lifecycle_state(setup.app, managed_factory=setup.configured_factory is None)
+    return errors
+
+
 def build_scope_runtime(
     setup: LifecycleSetup,
     *,
@@ -237,6 +354,41 @@ def build_scope_runtime(
     task_service_factory: Callable[..., Any] | None = None,
     reverse_image_factory: Callable[..., Any] | None = None,
     visual_search_factory: Callable[..., Any] | None = None,
+) -> ScopeRuntime:
+    """创建 scope runtime；失败时继续释放已取得的后台资源并保留原始错误。"""
+    ownership = _ScopeBuildOwnership()
+    try:
+        return _build_scope_runtime(
+            setup,
+            register_handlers=register_handlers,
+            start_services=start_services,
+            task_handlers=task_handlers,
+            worker_manager_factory=worker_manager_factory,
+            metadata_factory=metadata_factory,
+            search_factory=search_factory,
+            task_service_factory=task_service_factory,
+            reverse_image_factory=reverse_image_factory,
+            visual_search_factory=visual_search_factory,
+            ownership=ownership,
+        )
+    except Exception as primary:
+        _add_cleanup_notes(primary, _cleanup_scope_build(ownership, setup))
+        raise
+
+
+def _build_scope_runtime(
+    setup: LifecycleSetup,
+    *,
+    register_handlers: Callable[..., Any],
+    start_services: Callable[[ScopeServices], Any],
+    task_handlers: Mapping[str, Callable[..., Any]],
+    worker_manager_factory: Callable[..., PostgresTaskWorkerManager] | None = None,
+    metadata_factory: Callable[..., Any] | None = None,
+    search_factory: Callable[..., Any] | None = None,
+    task_service_factory: Callable[..., Any] | None = None,
+    reverse_image_factory: Callable[..., Any] | None = None,
+    visual_search_factory: Callable[..., Any] | None = None,
+    ownership: _ScopeBuildOwnership,
 ) -> ScopeRuntime:
     """创建 scope service factory、进程级 Worker 和 local 图片 Worker。
 
@@ -258,6 +410,7 @@ def build_scope_runtime(
             max_workers=max(2, settings.opencode_concurrency + 1),
             thread_name_prefix="mememeow-scope-worker",
         )
+        ownership.executor = shared_worker_executor
         worker_manager = (worker_manager_factory or PostgresTaskWorkerManager)(
             app.state.database,
             agent_concurrency=settings.opencode_concurrency,
@@ -268,6 +421,7 @@ def build_scope_runtime(
             max_attempts=settings.worker_max_attempts,
             executor=shared_worker_executor,
         )
+        ownership.worker_manager = worker_manager
         if setup.local_mode:
             local_scope = ScopeContext("local")
             local_metadata = (metadata_factory or PostgresMetadataService)(app.state.database, scope_id=local_scope)
@@ -312,6 +466,7 @@ def build_scope_runtime(
                 local_reverse_image,
                 local_visual_search,
             )
+            ownership.local_services = local_services
     runtime_factory: Any
     if factory is None:
         # 回调本身只由公共 scope factory 调用，不保存 HTTP 入口模块引用。
@@ -344,6 +499,7 @@ def build_scope_runtime(
         )
     else:
         runtime_factory = factory
+    ownership.runtime_factory = runtime_factory
     if worker_manager is not None:
         # 非 local 默认 factory 不预加载 scope；先注册全局 handler 再恢复队列。
         register_handlers(manager=worker_manager)
@@ -376,11 +532,13 @@ def build_scope_runtime(
             ),
             task_handlers=dict(task_handlers),
         )
+        ownership.image_workers.append(app.state.image_processing_workers[local_services.scope.scope_id])
         if callable(getattr(app.state.database, "factory", None)):
             app.state.image_processing_workers[local_services.scope.scope_id].start()
     tasks = local_services.tasks if local_services is not None else None
     if tasks is not None:
         app.state.tasks = tasks
+    ownership.factory_started = True
     app.state.task_scope_diagnostics = runtime_factory.start_all()
     setup.factory = runtime_factory
     setup.worker_manager = worker_manager
@@ -397,28 +555,43 @@ async def start_extensions(app: FastAPI) -> list[ApplicationExtension]:
     return started
 
 
-async def shutdown_lifecycle(setup: LifecycleSetup | None, runtime: ScopeRuntime | None, started_extensions: Sequence[ApplicationExtension] = ()) -> None:
-    """按依赖顺序关闭扩展、后台 Worker、线程池和数据库 Engine。"""
+async def shutdown_lifecycle(
+    setup: LifecycleSetup | None,
+    runtime: ScopeRuntime | None,
+    started_extensions: Sequence[ApplicationExtension] = (),
+    *,
+    primary_error: BaseException | None = None,
+) -> None:
+    """按依赖顺序关闭资源，并在单步失败时继续收束后续资源。"""
     if setup is None:
         return
     app = setup.app
+    errors: list[tuple[str, Exception]] = []
     for extension in reversed(tuple(started_extensions)):
-        await invoke_extension_hook(extension, "on_shutdown", app)
+        try:
+            await invoke_extension_hook(extension, "on_shutdown", app)
+        except Exception as exc:  # noqa: BLE001 - 扩展失败不能跳过核心资源关闭
+            errors.append(("shutdown.extension", exc))
     opencode = getattr(app.state, "opencode", None)
-    if callable(getattr(opencode, "shutdown", None)):
-        opencode.shutdown()
-    for image_worker in list(getattr(app.state, "image_processing_workers", {}).values()):
-        image_worker.shutdown()
+    _close_resource(opencode, "shutdown", errors, "shutdown.opencode")
+    for image_worker in reversed(list(getattr(app.state, "image_processing_workers", {}).values())):
+        _close_resource(image_worker, "shutdown", errors, "shutdown.image_worker")
     if runtime is not None:
-        runtime.factory.shutdown()
-        if runtime.worker_manager is not None:
-            runtime.worker_manager.shutdown()
-        if not setup.custom_factory and getattr(app.state, "service_factory", None) is runtime.factory:
-            delattr(app.state, "service_factory")
+        _close_resource(runtime.factory, "shutdown", errors, "shutdown.factory")
+        _close_resource(runtime.worker_manager, "shutdown", errors, "shutdown.worker_manager")
         if runtime.shared_worker_executor is not None:
-            runtime.shared_worker_executor.shutdown(wait=True, cancel_futures=True)
-    if setup.engine is not None:
-        setup.engine.dispose()
+            try:
+                runtime.shared_worker_executor.shutdown(wait=True, cancel_futures=True)
+            except Exception as exc:  # noqa: BLE001 - 线程池失败不能阻止 Engine 收束
+                errors.append(("shutdown.executor", exc))
+    _close_resource(setup.engine, "dispose", errors, "shutdown.engine")
+    _clear_lifecycle_state(app, managed_factory=not setup.custom_factory)
+    if primary_error is not None:
+        _add_cleanup_notes(primary_error, errors)
+        return
+    if errors:
+        _add_cleanup_notes(errors[0][1], errors[1:])
+        raise errors[0][1]
 
 
 __all__ = [
