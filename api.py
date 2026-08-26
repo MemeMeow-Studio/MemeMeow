@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import re
 import tempfile
@@ -23,7 +22,7 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
@@ -48,14 +47,13 @@ from backend.metadata import MetadataError
 from backend.database import DatabaseError, DatabaseResources, Meme, MemeTextEmbedding, ScopeContext, check_database, create_engine_for_settings, utcnow
 from backend.pg_services import PostgresMetadataService, PostgresSearchService, PostgresTaskService, PostgresTaskWorkerManager
 from backend.paths import PathResolver, SUPPORTED_EXTENSIONS, validate_business_storage_key
-from backend.rate_limiter import RateLimiter
 from backend.opencode import OpenCodeError, OpenCodeRunner
 from backend.opencode_workspace import LocalWorkspaceProvider, MissingWorkspaceProvider, TrustedWorkspaceContext, WorkspaceResolutionError
 from backend.opencode_activity import OpenCodeActivityReader
 from backend.reverse_image import ReverseImageService
 from backend.tasks import TaskRecord
 from backend.visual import VisualEmbeddingError, VisualInferenceClient, VisualSearchService, identity_from_settings
-from backend.scope import LocalScopeResolver, ScopeResolutionError, ScopeResolver, ScopeServiceFactory, ScopeServices, resolve_scope, resolve_scope_async, validate_scope_services
+from backend.scope import LocalScopeResolver, ScopeResolutionError, ScopeResolver, ScopeServiceFactory, ScopeServices, resolve_scope, validate_scope_services
 from backend.config_http import STORAGE_PREFLIGHT_BLOCKING_KEYS, _storage_preflight_summary, config_status as _config_status
 from backend.search_http import SearchRequest, search_images as _search_images
 from backend.cache_task_http import generate_cache as _generate_cache
@@ -146,7 +144,7 @@ from backend.callbacks import (
 )
 from backend.image_processing import AUTO_RENAME_WARNING_ERRORS, ImageProcessingError, ImageProcessingOptions, ImageProcessingRepository, ImageProcessingSnapshot, ImageProcessingWorker, SingleImageEmbeddingService, image_file_matches, processing_config_hash, stable_input_digest
 from backend.agent_resume import ResumeDecision, classify_resume_error, normalize_identifier, within_total_timeout
-from backend.app_extensions import ApplicationExtension, extension_paths, path_is_exempt
+from backend.app_extensions import ApplicationExtension
 from backend.application import create_application
 from backend.application_lifecycle import (
     build_scope_runtime,
@@ -165,57 +163,40 @@ from backend.image_upload_http import (
     idempotent_upload_result as _idempotent_upload_result_http,
     upload_images as _upload_images_http,
 )
+from backend.internal_capability_http import (
+    callback_registration as _callback_registration,
+    internal_reverse_image_search as _internal_capability_reverse_image_search,
+    internal_visual_search_match as _internal_capability_visual_search_match,
+    operation_availability as _operation_availability_http,
+)
+from backend.system_http import (
+    FRONTEND_DIST,
+    INTERNAL_SCOPE_CALLBACK_PATHS,
+    SCOPE_SELECTOR_FIELDS,
+    access_policy,
+    access_rate_limit,
+    authenticate_callback_request as _authenticate_callback_request,
+    bind_request_scope,
+    error as _error,
+    extension_list as _extension_list,
+    extension_scope_exempt as _extension_scope_exempt,
+    health as _health_http,
+    http_error_handler,
+    invoke_extension_hook as _invoke_extension_hook,
+    request_declares_scope as _request_declares_scope,
+    root as _root_http,
+    scope_field_name as _scope_field_name,
+    validation_error_handler,
+)
 
 
-INTERNAL_SCOPE_CALLBACK_PATHS = frozenset({"/internal/reverse-image/search", "/internal/visual-search/match"})
 OPERATION_POLICY_PATH = "/operations/availability"
-SCOPE_SELECTOR_FIELDS = frozenset({"scope_id", "scope-id", "user_id", "user-id"})
 
 
 class StrictRequestModel(BaseModel):
     """公共业务 JSON 请求基类，拒绝客户端提交范围选择字段。"""
 
     model_config = ConfigDict(extra="forbid")
-
-
-def _extension_list(app: FastAPI) -> tuple[ApplicationExtension, ...]:
-    """读取应用创建时冻结的扩展列表，缺失时返回空元组。"""
-    value = getattr(app.state, "extensions", ())
-    return tuple(value) if isinstance(value, (tuple, list)) else ()
-
-
-def _extension_scope_exempt(app: FastAPI, path: str) -> bool:
-    """判断路径是否由任一宿主扩展声明为不需要业务 scope。"""
-    paths: list[str] = []
-    for extension in _extension_list(app):
-        paths.extend(extension_paths(extension))
-    return path_is_exempt(path, paths)
-
-
-def _scope_field_name(value: str) -> bool:
-    """判断请求字段名是否为客户端提交的范围选择器。"""
-    lowered = value.strip().lower()
-    if lowered in SCOPE_SELECTOR_FIELDS:
-        return True
-    return lowered.startswith("x-") and lowered[2:] in SCOPE_SELECTOR_FIELDS
-
-
-def _request_declares_scope(request: Request) -> bool:
-    """只检查 query/header 的范围字段，不读取可能包含文件的请求体。"""
-    query_params = getattr(request, "query_params", {})
-    headers = getattr(request, "headers", {})
-    return any(_scope_field_name(str(key)) for key in query_params.keys()) or any(_scope_field_name(str(key)) for key in headers.keys())
-
-
-async def _invoke_extension_hook(extension: ApplicationExtension, name: str, *args: Any) -> Any:
-    """调用可选扩展钩子并兼容同步和异步实现。"""
-    hook = getattr(extension, name, None)
-    if not callable(hook):
-        return None
-    result = hook(*args)
-    if inspect.isawaitable(result):
-        return await result
-    return result
 
 
 def _callback_verification_keys(settings: Settings) -> dict[str, str] | None:
@@ -267,11 +248,6 @@ class CollectionItemsRequest(StrictRequestModel):
 
     model_config = ConfigDict(extra="forbid")
     meme_ids: list[str] = Field(min_length=1, max_length=500)
-
-
-def _error(status: int, code: str, message: str) -> HTTPException:
-    """构造统一错误异常。"""
-    return HTTPException(status_code=status, detail={"error": code, "message": message})
 
 
 def _operation_gateway(request: Request) -> OperationPolicyGateway:
@@ -1341,206 +1317,31 @@ def _processing_config(request: Request) -> dict[str, object]:
     }
 
 
-def _authenticate_callback_request(request: Request) -> None:
-    """在 ASGI body 读取前验证 callback 服务凭据和注册路由声明。"""
-    registry: CallbackRegistry | None = getattr(request.app.state, "callback_registry", DEFAULT_CALLBACK_REGISTRY)
-    registration = registry.get(request.url.path) if registry is not None else None
-    verifier = getattr(request.app.state, "callback_verifier", None)
-    if registration is None or verifier is None or not callable(getattr(verifier, "verify", None)):
-        raise CallbackError("agent_callback_unavailable")
-    token = request.headers.get("x-mememeow-callback") or request.headers.get("x-mememeow-callback-token")
-    if not token:
-        authorization = request.headers.get("authorization", "")
-        token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else None
-    if not token:
-        raise CallbackError()
-    try:
-        verify = verifier.verify
-        try:
-            parameters = inspect.signature(verify).parameters
-        except (TypeError, ValueError) as exc:
-            raise CallbackError("agent_callback_unavailable") from exc
-        accepts_path = "path" in parameters or any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
-        # 只有签名明确支持 path 时才走兼容分支；verifier 内部的 TypeError
-        # 必须被视为验证故障，不能被误当成旧接口重试。
-        binding = verify(token, path=request.url.path) if accepts_path else verify(token)
-    except CallbackError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - verifier 故障必须 fail-closed
-        raise CallbackError("agent_callback_unavailable") from exc
-    if not isinstance(binding, CallbackBinding) or not binding.allows_any(registration.operations):
-        raise CallbackError("agent_callback_invalid_execution")
-    verify_content_length(request.headers, limit=registration.max_body_bytes)
-    request.state.callback_header_request_id = validate_callback_headers(request.headers, binding)
-    request.state.callback_binding = binding
-    install_body_guard(request, limit=registration.max_body_bytes)
-
-
-@app.middleware("http")
-async def bind_request_scope(request: Request, call_next):
-    """在任何数据库、文件或业务服务访问前解析一次可信 request scope。"""
-    # Agent callback 没有用户 request scope；它们由既有服务间信任边界保护，并在路由
-    # 内通过 task_id 从持久 Task.scope_id 恢复服务环境。公共路由仍必须走 resolver。
-    if request.url.path in INTERNAL_SCOPE_CALLBACK_PATHS:
-        # 轻量领域测试 stub 没有 ASGI headers；真实 Request 必须在解析 multipart
-        # 之前通过 callback 服务身份验证。
-        if hasattr(request, "headers"):
-            try:
-                _authenticate_callback_request(request)
-            except CallbackError as exc:
-                log_callback_rejection(request.url.path, exc, binding=getattr(request.state, "callback_binding", None))
-                status = 413 if exc.code == "agent_callback_body_too_large" else 503 if exc.code == "agent_callback_unavailable" else 401
-                return JSONResponse(status_code=status, content={"error": exc.code, "message": "内部执行凭据无效"})
-        factory = getattr(request.app.state, "service_factory", None)
-        if not callable(getattr(factory, "for_task", None)):
-            return JSONResponse(status_code=503, content={"error": "scope_unavailable", "message": "请求 scope 当前不可用"})
-        try:
-            return await call_next(request)
-        except CallbackError as exc:
-            log_callback_rejection(request.url.path, exc, binding=getattr(request.state, "callback_binding", None))
-            status = 413 if exc.code == "agent_callback_body_too_large" else 401
-            return JSONResponse(status_code=status, content={"error": exc.code, "message": "内部执行凭据无效"})
-    if _request_declares_scope(request):
-        return JSONResponse(status_code=400, content={"error": "scope_selector_forbidden", "message": "请求不得提交范围选择字段"})
-    if _extension_scope_exempt(request.app, request.url.path):
-        try:
-            for extension in _extension_list(request.app):
-                await _invoke_extension_hook(extension, "authorize_exempt_request", request)
-        except HTTPException as exc:
-            detail = exc.detail if isinstance(exc.detail, dict) and "error" in exc.detail else {"error": "request_forbidden", "message": "请求未获授权"}
-            return JSONResponse(status_code=exc.status_code, content=detail, headers=exc.headers)
-        except Exception as exc:  # noqa: BLE001 - 宿主可声明身份失败或可用性边界
-            status = getattr(exc, "status_code", None)
-            code = getattr(exc, "code", None)
-            if status in {401, 403, 429, 503} and isinstance(code, str) and code:
-                message = "需要有效会话" if status == 401 else "请求未获授权" if status in {403, 429} else "请求授权服务当前不可用"
-                return JSONResponse(status_code=status, content={"error": code, "message": message})
-            if not isinstance(exc, (DatabaseError, ValueError, RuntimeError)):
-                raise
-            return JSONResponse(status_code=503, content={"error": "request_authorization_unavailable", "message": "请求授权服务当前不可用"})
-        return await call_next(request)
-    try:
-        scope = await resolve_scope_async(request)
-        factory = getattr(request.app.state, "service_factory", None)
-        if factory is None or not callable(getattr(factory, "for_scope", None)):
-            raise ScopeResolutionError("应用未配置 scope service factory")
-        services = validate_scope_services(scope, factory.for_scope(scope))
-        for extension in _extension_list(request.app):
-            await _invoke_extension_hook(extension, "authorize_request", request, scope, services)
-    except HTTPException as exc:
-        detail = exc.detail if isinstance(exc.detail, dict) and "error" in exc.detail else {"error": "request_forbidden", "message": "请求未获授权"}
-        return JSONResponse(status_code=exc.status_code, content=detail, headers=exc.headers)
-    except ScopeResolutionError as exc:
-        return JSONResponse(status_code=exc.status_code, content={"error": exc.code, "message": "请求 scope 无法解析"})
-    except Exception as exc:  # noqa: BLE001 - 适配器可声明稳定的身份/可用性边界
-        status = getattr(exc, "status_code", None)
-        code = getattr(exc, "code", None)
-        if status in {401, 503} and isinstance(code, str) and code:
-            message = "需要有效会话" if status == 401 else "请求 scope 当前不可用"
-            return JSONResponse(status_code=status, content={"error": code, "message": message})
-        if not isinstance(exc, (DatabaseError, ValueError, RuntimeError)):
-            raise
-        code = code if isinstance(code, str) and code else "scope_unavailable"
-        return JSONResponse(status_code=503, content={"error": code, "message": "请求 scope 当前不可用"})
-    request.state.scope = scope
-    request.state.services = services
-    return await call_next(request)
-
-FRONTEND_DIST = Path(__file__).resolve().parent / "frontend" / "dist"
 if (FRONTEND_DIST / "assets").is_dir():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="frontend-assets")
 
+app.middleware("http")(bind_request_scope)
 
-@app.exception_handler(RequestValidationError)
-async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-    """将 FastAPI 默认 422 统一转换为可识别的请求错误。"""
-    status = 422 if request.url.path == "/collections" or request.url.path.startswith("/collections/") else 400
-    code = "invalid_collection_request" if status == 422 else "invalid_request"
-    return JSONResponse(status_code=status, content={"error": code, "message": "请求参数校验失败"})
-
-
-@app.exception_handler(HTTPException)
-async def http_error_handler(request: Request, exc: HTTPException) -> JSONResponse:
-    """保证业务异常都使用 `{error, message}` 结构。"""
-    if isinstance(exc.detail, dict) and "error" in exc.detail:
-        content = exc.detail
-    else:
-        content = {"error": "http_error", "message": str(exc.detail)}
-    return JSONResponse(status_code=exc.status_code, content=content, headers=exc.headers)
+app.exception_handler(RequestValidationError)(validation_error_handler)
+app.exception_handler(HTTPException)(http_error_handler)
 
 
 @app.get(OPERATION_POLICY_PATH, tags=["capabilities"])
 async def operation_availability(request: Request, operation: str | None = Query(default=None)) -> dict[str, object]:
     """返回当前 scope 的 operation 可用性提示；该查询不建立 reservation。"""
-    names = [operation] if operation else sorted(Operations.ALL)
-    if any(name not in Operations.ALL for name in names):
-        raise _error(400, "operation_unknown", "操作类型无效")
-    gateway = _operation_gateway(request)
-    values: list[dict[str, object]] = []
-    for name in names:
-        try:
-            decision = gateway.probe(gateway.request(_request_scope(request), name, f"probe:{name}"))
-        except OperationPolicyError as exc:
-            item = {"operation": name, "available": False, "reason": exc.code}
-            if exc.retry_at is not None:
-                item["retry_at"] = exc.retry_at.isoformat() if isinstance(exc.retry_at, datetime) else str(exc.retry_at)
-            values.append(item)
-            continue
-        item = {"operation": name, "available": bool(decision.allowed)}
-        if not decision.allowed:
-            item["reason"] = decision.reason if decision.reason in {"operation_forbidden", "operation_limit_exceeded", "operation_policy_unavailable"} else "operation_policy_unavailable"
-        if decision.retry_at is not None:
-            item["retry_at"] = decision.retry_at.isoformat() if isinstance(decision.retry_at, datetime) else str(decision.retry_at)
-        values.append(item)
-    return {"items": values}
+    return await _operation_availability_http(request, operation, request_scope=_request_scope, operation_gateway=_operation_gateway, error=_error)
 
 
-@app.middleware("http")
-async def access_policy(request: Request, call_next):
-    """按环境配置执行白名单保护模式。"""
-    settings: Settings | None = getattr(request.app.state, "settings", None)
-    if settings and settings.protected_mode:
-        path = request.url.path.rstrip("/") or "/"
-        allowed = {p.rstrip("/") or "/" for p in settings.allowed_endpoints}
-        if not any(path == p or (p and p != "/" and path.startswith(p + "/")) for p in allowed):
-            return JSONResponse(status_code=403, content={"error": "protected", "message": "接口未在保护模式白名单中"})
-    return await call_next(request)
+app.middleware("http")(access_policy)
+app.middleware("http")(access_rate_limit)
 
 
-@app.middleware("http")
-async def access_rate_limit(request: Request, call_next):
-    """按客户端 IP 执行简单内存限流。"""
-    settings: Settings | None = getattr(request.app.state, "settings", None)
-    if settings and settings.rate_limit_enabled:
-        limiter = getattr(request.app.state, "limiter", None)
-        if limiter is None:
-            limiter = request.app.state.limiter = RateLimiter()
-        client = request.client.host if request.client else "unknown"
-        if not limiter.check(client, settings.rate_limit_requests, settings.rate_limit_window):
-            return JSONResponse(status_code=429, content={"error": "rate_limited", "message": "请求过于频繁"}, headers={"Retry-After": str(settings.rate_limit_window)})
-    return await call_next(request)
+app.get("/", tags=["system"])(_root_http)
+root = _root_http
 
 
-@app.get("/", tags=["system"])
-async def root(request: Request):
-    """返回服务基本状态。"""
-    if (FRONTEND_DIST / "index.html").is_file() and "text/html" in request.headers.get("accept", ""):
-        return FileResponse(FRONTEND_DIST / "index.html", media_type="text/html")
-    return {"name": "MemeMeow", "version": app.version, "status": "ok"}
-
-
-@app.get("/health", tags=["system"])
-async def health(request: Request) -> dict[str, object]:
-    """返回可用于容器探活的状态。"""
-    settings = getattr(request.app.state, "settings", None)
-    visual_client = getattr(request.app.state, "visual_inference", None)
-    visual_status = visual_client.health() if visual_client is not None else {"available": False}
-    return {
-        "status": "ok" if getattr(request.app.state, "service_factory", None) is not None else "degraded",
-        "visual_available": bool(visual_status.get("available")),
-        "agent_resume_enabled": bool(getattr(settings, "agent_resume_enabled", False)),
-        "storage_preflight": _storage_preflight_summary(getattr(request.app.state, "storage_preflight", None)),
-    }
+app.get("/health", tags=["system"])(_health_http)
+health = _health_http
 
 
 @app.get("/config", tags=["system"])
@@ -1564,12 +1365,10 @@ async def internal_reverse_image_search(
     refresh: bool = Form(default=False),
 ) -> dict[str, object]:
     """验证当前 Agent claim 后执行供应商无关的内部反向图片检索。"""
-    content = await image.read()
-    return await _internal_reverse_image_search_http(
+    return await _internal_capability_reverse_image_search(
         request,
         task_id=task_id,
-        content=content,
-        filename=image.filename,
+        image=image,
         request_id=request_id,
         input_digest=input_digest,
         search_type=search_type,
@@ -1579,32 +1378,26 @@ async def internal_reverse_image_search(
         auto_crop=auto_crop,
         refresh=refresh,
         binding=lambda received: getattr(received.state, "callback_binding", None),
-        registration=lambda received: (
-            getattr(received.app.state, "callback_registry", DEFAULT_CALLBACK_REGISTRY).get(received.url.path)
-            if getattr(received.app.state, "callback_registry", DEFAULT_CALLBACK_REGISTRY)
-            else None
-        ),
+        registration=_callback_registration,
         database=lambda received: received.app.state.database,
         scope_services=lambda received, scope: validate_scope_services(scope, received.app.state.service_factory.for_scope(scope)),
         error=_error,
+        delegate=_internal_reverse_image_search_http,
     )
 
 
 @app.post("/internal/visual-search/match", tags=["internal"])
 async def internal_visual_search_match(request: Request, payload: VisualMatchRequest) -> dict[str, object]:
     """兼容内部视觉匹配 callback，并注入 binding、scope database 与 service。"""
-    return await _internal_visual_search_match_http(
+    return await _internal_capability_visual_search_match(
         request,
         payload,
         binding=lambda received: getattr(received.state, "callback_binding", None),
-        registration=lambda received: (
-            getattr(received.app.state, "callback_registry", DEFAULT_CALLBACK_REGISTRY).get(received.url.path)
-            if getattr(received.app.state, "callback_registry", DEFAULT_CALLBACK_REGISTRY)
-            else None
-        ),
+        registration=_callback_registration,
         database=lambda received: received.app.state.database,
         scope_services=lambda received, scope: validate_scope_services(scope, received.app.state.service_factory.for_scope(scope)),
         error=_error,
+        delegate=_internal_visual_search_match_http,
     )
 
 
