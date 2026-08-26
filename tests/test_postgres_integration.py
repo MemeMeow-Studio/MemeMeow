@@ -406,6 +406,33 @@ def test_persistent_legacy_grant_without_metering_units_remains_readable(postgre
     assert store.transition(association.grant, "committed") is True
 
 
+def test_persistent_grant_with_metering_units_remains_idempotently_readable(postgres_resources) -> None:
+    """持久化的新计量 grant 必须按完整请求事实幂等读取。"""
+    resources = postgres_resources
+    key = "metering:persistent-readable"
+    gateway = OperationPolicyGateway(AllowAllOperationPolicy(), allow_all=True)
+    request = gateway.request(
+        "local",
+        Operations.ANALYSIS_AGENT,
+        key,
+        source="image-processing",
+        units=1,
+        metering_units=1000,
+    )
+    store = PersistentGrantAssociationStore(resources)
+    association = store.acquire(request, gateway)
+
+    with resources.factory() as session:
+        row = session.get(OperationGrant, ("local", Operations.ANALYSIS_AGENT, key))
+        assert row is not None
+        assert row.metering_units == 1000
+
+    loaded = store.get(request)
+    assert loaded is not None
+    assert loaded.grant == association.grant
+    assert loaded.request.metering_units == 1000
+
+
 def test_image_processing_repository_enforces_stage_order_claim_fencing_and_retry(postgres_resources) -> None:
     """图片 Job 固定四阶段、旧 claim 写回拒绝，失败重试只创建新 revision。"""
     resources = postgres_resources

@@ -668,6 +668,7 @@ class PersistentGrantRepository:
             request.task_id,
             request.source,
             request.units,
+            request.metering_units,
             request.input_digest,
         ) or fingerprint != (
             request.request_fingerprint
