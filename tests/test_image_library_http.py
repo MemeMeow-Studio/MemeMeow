@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -131,6 +132,69 @@ def test_image_list_projects_status_and_processing_summary(tmp_path: Path) -> No
     assert item["visual_embedding_status"] == "ready"
     assert item["processing_job_id"] == "job-1"
     assert payload["total"] == 1
+
+
+def test_image_list_reuses_source_identity_for_thumbnail_projection_and_metadata(tmp_path: Path) -> None:
+    """图片列表对同一原图只计算一次 SHA，并把身份传给缩略图和 metadata。"""
+    image = tmp_path / "meme.png"
+    image.write_bytes(b"image-content")
+    record = SimpleNamespace(
+        id=uuid4(),
+        storage_key="meme.png",
+        extension=".png",
+        sha256=hashlib.sha256(b"image-content").hexdigest(),
+    )
+
+    class CountingMetadata(_Metadata):
+        """记录列表请求中的原图身份计算与复用。"""
+
+        def __init__(self, source):
+            """初始化身份读取计数。"""
+            super().__init__(source)
+            self.identity_calls = 0
+            self.received_identity = None
+
+        def _identity(self, _image):
+            """返回完整文件身份并记录调用次数。"""
+            self.identity_calls += 1
+            return {"size_bytes": 13, "sha256": record.sha256, "extension": ".png", "relative_path": "meme.png"}
+
+        def status(self, _image, *, identity=None):
+            """接收列表已验证的身份，避免再次读取文件。"""
+            self.received_identity = identity
+            return {"status": "ready", "title": "标题"}
+
+    metadata = CountingMetadata(image)
+    projections: list[dict[object, tuple[int, str]]] = []
+    services = SimpleNamespace(
+        metadata=metadata,
+        search=SimpleNamespace(has_cache=lambda: True),
+        thumbnails=SimpleNamespace(
+            projections=lambda _records, *, source_identities: projections.append(source_identities) or {record.id: {"status": "pending", "media_url": None}}
+        ),
+    )
+    payload = _call_list(_request(), [record], _Environment([record], visual=None), services)
+    assert payload["items"][0]["thumbnail"]["status"] == "pending"
+    assert metadata.identity_calls == 1
+    assert metadata.received_identity is not None
+    assert projections == [{record.id: (13, record.sha256)}]
+
+
+def test_image_list_supports_legacy_thumbnail_projection_signature(tmp_path: Path) -> None:
+    """图片列表仍可调用只接受 records positional 参数的旧缩略图 facade。"""
+    image = tmp_path / "meme.png"
+    image.write_bytes(b"image-content")
+    record = SimpleNamespace(id=uuid4(), storage_key="meme.png", extension=".png", sha256="a" * 64)
+    calls: list[list[object]] = []
+    services = _services(image)
+    services.thumbnails = SimpleNamespace(
+        projections=lambda records: calls.append(records) or {record.id: {"status": "pending", "media_url": None}}
+    )
+
+    payload = _call_list(_request(), [record], _Environment([record], visual=None), services)
+
+    assert payload["items"][0]["thumbnail"]["status"] == "pending"
+    assert calls == [[record]]
 
 
 @pytest.mark.parametrize("selector", ["directory", "scope_id", "user_id"])

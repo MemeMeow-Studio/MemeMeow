@@ -327,6 +327,93 @@ def test_generate_removes_new_output_when_fact_finalize_fails(tmp_path: Path, mo
     assert not (thumbnail_store.root / service._output_key(meme, service.config.profile)).exists()
 
 
+def test_generate_treats_same_fingerprint_target_race_as_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """两个 Worker 同时安装同一输出时，后到者不会把成功事实标成 failed。"""
+    content = _image_bytes((16, 8))
+    service, meme, repository, _source_store, thumbnail_store = _service(tmp_path, content)
+    monkeypatch.setattr("backend.services.thumbnails.validate_image_content", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("backend.services.thumbnails._render_thumbnail", lambda *_args, **_kwargs: RenderedThumbnail(b"rendered", 16, 8))
+    key = service._output_key(meme, service.config.profile)
+    (thumbnail_store.root / key).write_bytes(b"rendered")
+    original_exists = thumbnail_store.exists_with_identity
+    first_target_check = True
+
+    def race_exists(check_key: str, **kwargs: object) -> bool:
+        """让首次目标检查看到空目录，随后模拟另一 Worker 已落位。"""
+        nonlocal first_target_check
+        if check_key == key and first_target_check:
+            first_target_check = False
+            return False
+        return original_exists(check_key, **kwargs)
+
+    monkeypatch.setattr(thumbnail_store, "exists_with_identity", race_exists)
+    projection = service.generate(meme.id)
+    assert projection["status"] == "available"
+    assert repository.row is not None and repository.row.status == "available"
+    assert not list((thumbnail_store.root / ".staging").glob("*"))
+
+
+def test_failure_does_not_preserve_corrupt_available_fact(tmp_path: Path) -> None:
+    """损坏的 available 事实不能阻止失败路径改写为可重试的 failed。"""
+    content = _image_bytes((16, 8))
+    service, meme, repository, _source_store, thumbnail_store = _service(tmp_path, content)
+    key = service._output_key(meme, service.config.profile)
+    output = b"corrupt-output"
+    (thumbnail_store.root / key).write_bytes(output)
+    repository.row = SimpleNamespace(
+        meme_id=meme.id,
+        source_sha256=meme.sha256,
+        source_size_bytes=meme.size_bytes,
+        profile=service.config.profile,
+        output_key=key,
+        output_sha256=hashlib.sha256(b"different-output").hexdigest(),
+        output_size_bytes=len(b"different-output"),
+        width=16,
+        height=8,
+        media_type="image/png",
+        status="available",
+    )
+
+    service._mark_failure(meme, "thumbnail_generation_failed")
+
+    assert repository.row.status == "failed"
+
+
+def test_projection_reuses_verified_source_identity_without_rereading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """列表已完成原图身份校验时，缩略图投影不重复读取 SHA。"""
+    content = _image_bytes((16, 8))
+    service, meme, _repository, _source_store, _thumbnail_store = _service(tmp_path, content)
+    monkeypatch.setattr(service, "_identity", lambda _path: (_ for _ in ()).throw(AssertionError("identity should be reused")))
+    projection = service.projection(meme, source_identity=(meme.size_bytes, meme.sha256))
+    assert projection == {"status": "pending", "media_url": None}
+
+
+def test_media_path_only_validates_source_identity_and_does_not_use_generation_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """媒体读取只校验原图身份，不调用会加载原图字节的生成读取路径。"""
+    content = _image_bytes((16, 8))
+    service, meme, repository, _source_store, thumbnail_store = _service(tmp_path, content)
+    output = b"thumbnail"
+    key = service._output_key(meme, service.config.profile)
+    (thumbnail_store.root / key).write_bytes(output)
+    repository.row = SimpleNamespace(
+        meme_id=meme.id,
+        source_sha256=meme.sha256,
+        source_size_bytes=meme.size_bytes,
+        profile=service.config.profile,
+        output_key=key,
+        output_sha256=hashlib.sha256(output).hexdigest(),
+        output_size_bytes=len(output),
+        width=16,
+        height=8,
+        media_type="image/png",
+        status="available",
+    )
+    monkeypatch.setattr(service, "_meme_and_source", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("generation reader must not run")))
+    path, media_type = service.media_path(meme.id)
+    assert path.name == key
+    assert media_type == "image/png"
+
+
 def test_cleanup_rejects_invalid_uuid_and_preserves_facts_on_file_failure(tmp_path: Path) -> None:
     """清理入口统一返回领域错误，物理失败时不先删除数据库事实。"""
     service, meme, repository, _source_store, thumbnail_store = _service(tmp_path, _image_bytes((8, 8)))

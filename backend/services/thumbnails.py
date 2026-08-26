@@ -12,6 +12,7 @@ import json
 import multiprocessing
 import re
 import time
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from io import BytesIO
@@ -224,42 +225,82 @@ class DerivedThumbnailService:
             raise ThumbnailError("thumbnail_source_unavailable") from exc
         return size, digest.hexdigest()
 
-    def _meme_and_source(self, meme_id: UUID | str) -> tuple[Meme, Path, bytes]:
-        """按当前 scope 解析并严格校验 Meme 原图，拒绝路径输入。"""
+    @staticmethod
+    def _read_identity(path: Path) -> tuple[int, str, bytes]:
+        """单次读取原图并同时返回字节、大小和 SHA-256，供生成流程复用。"""
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    chunks.append(chunk)
+                    digest.update(chunk)
+        except OSError as exc:
+            raise ThumbnailError("thumbnail_source_unavailable") from exc
+        content = b"".join(chunks)
+        return len(content), digest.hexdigest(), content
+
+    def _meme(self, meme_id: UUID | str, *, for_update: bool = False) -> Meme:
+        """按当前 scope 读取 Meme；生成、媒体和投影都只接受稳定 ID。"""
         with self.resources.environment(self.scope) as environment:
-            meme = environment.memes.get(meme_id)
+            meme = environment.memes.get(meme_id, for_update=for_update)
         if meme is None:
             raise ThumbnailError("meme_not_found")
+        return meme
+
+    def _mark_source_stale(self, meme: Meme, error: str) -> None:
+        """在原图不可验证时阻断旧派生访问，并保留可恢复诊断。"""
+        with self.resources.environment(self.scope) as environment:
+            environment.thumbnails.mark_stale(meme.id, self.config.profile, diagnostic={"error": error})
+
+    def _meme_and_source(self, meme_id: UUID | str) -> tuple[Meme, Path, bytes]:
+        """按当前 scope 解析并严格校验 Meme 原图，且只读取原图一次。"""
+        meme = self._meme(meme_id)
+        try:
+            source_store = self.resources.blob_store_for_scope(self.scope)
+            path = source_store.resolve(meme.storage_key, must_exist=True)
+            size, digest, content = self._read_identity(path)
+        except (DatabaseError, ThumbnailError) as exc:
+            self._mark_source_stale(meme, "source_unavailable")
+            raise ThumbnailError("thumbnail_source_unavailable") from exc
+        if size != meme.size_bytes or digest.lower() != str(meme.sha256).lower():
+            self._mark_source_stale(meme, "source_version_changed")
+            raise ThumbnailError("thumbnail_source_changed")
+        return meme, path, content
+
+    def _meme_and_source_identity(self, meme_id: UUID | str) -> tuple[Meme, Path]:
+        """只解析并验证原图身份，媒体读取路径不加载原图字节。"""
+        meme = self._meme(meme_id)
         try:
             source_store = self.resources.blob_store_for_scope(self.scope)
             path = source_store.resolve(meme.storage_key, must_exist=True)
             size, digest = self._identity(path)
         except (DatabaseError, ThumbnailError) as exc:
-            with self.resources.environment(self.scope) as environment:
-                environment.thumbnails.mark_stale(meme.id, self.config.profile, diagnostic={"error": "source_unavailable"})
+            self._mark_source_stale(meme, "source_unavailable")
             raise ThumbnailError("thumbnail_source_unavailable") from exc
         if size != meme.size_bytes or digest.lower() != str(meme.sha256).lower():
-            with self.resources.environment(self.scope) as environment:
-                environment.thumbnails.mark_stale(meme.id, self.config.profile, diagnostic={"error": "source_version_changed"})
+            self._mark_source_stale(meme, "source_version_changed")
             raise ThumbnailError("thumbnail_source_changed")
-        try:
-            content = path.read_bytes()
-        except OSError as exc:
-            raise ThumbnailError("thumbnail_source_unavailable") from exc
-        return meme, path, content
+        return meme, path
 
-    def _source_identity_error(self, meme: Meme) -> str | None:
+    def _source_identity_error(self, meme: Meme, source_identity: tuple[int, str] | None = None) -> str | None:
         """只读取当前原图身份，返回不可公开的失效原因或 ``None``。
 
         投影和媒体解析不能信任数据库保存的旧 SHA/大小；该轻量校验不读取完整
-        内容，生成流程仍由 ``_meme_and_source`` 负责取得字节。
+        内容，生成流程仍由 ``_meme_and_source`` 负责取得字节。列表调用可传入已经
+        验证过的同一请求身份，避免为同一原图重复计算 SHA。
         """
-        try:
-            source_store = self.resources.blob_store_for_scope(self.scope)
-            path = source_store.resolve(meme.storage_key, must_exist=True)
-            size, digest = self._identity(path)
-        except (DatabaseError, ThumbnailError):
-            return "source_unavailable"
+        if source_identity is None:
+            try:
+                source_store = self.resources.blob_store_for_scope(self.scope)
+                path = source_store.resolve(meme.storage_key, must_exist=True)
+                size, digest = self._identity(path)
+            except (DatabaseError, ThumbnailError):
+                return "source_unavailable"
+        else:
+            size, digest = source_identity
+            if type(size) is not int or not isinstance(digest, str) or re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None:
+                return "source_unavailable"
         if size != meme.size_bytes or digest.lower() != str(meme.sha256).lower():
             return "source_version_changed"
         return None
@@ -284,6 +325,20 @@ class DerivedThumbnailService:
             return False
         return self.store.exists_with_identity(row.output_key, sha256=output_sha.lower(), size_bytes=output_size)
 
+    def _thumbnail_file_keys(self, meme: Meme) -> list[str]:
+        """收集指定 Meme 同源但尚未落库的派生输出，供删除收尾使用。"""
+        prefix = f"{meme.id.hex}-{str(meme.sha256).lower()}-"
+        try:
+            return [
+                path.name
+                for path in self.store.root.iterdir()
+                if path.is_file() and not path.is_symlink() and path.name.startswith(prefix)
+            ]
+        except OSError as exc:
+            # 未完成扫描时无法证明没有孤立输出；清理调用方应保留事实并让恢复任务
+            # 在派生存储恢复后重试，而不是提交一个不完整的清理结果。
+            raise ThumbnailError("thumbnail_cleanup_failed") from exc
+
     @staticmethod
     def _mark_row_stale(row: DerivedImageThumbnail, error: str) -> None:
         """将当前派生事实置为不可访问的 stale，并保留输出 key 供清理器回收。"""
@@ -305,13 +360,22 @@ class DerivedThumbnailService:
             payload["media_type"] = row.media_type or THUMBNAIL_OUTPUT_MEDIA_TYPE
         return payload
 
-    def projection(self, meme: Meme, *, ensure: bool = True) -> dict[str, object]:
+    def projection(self, meme: Meme, *, ensure: bool = True, source_identity: tuple[int, str] | None = None) -> dict[str, object]:
         """返回当前 Meme 的有限缩略图状态，必要时持久化 pending。"""
         with self.resources.environment(self.scope) as environment:
             row = environment.thumbnails.current(meme, self.config.profile)
-            source_error = self._source_identity_error(meme)
-            if row is None and ensure:
-                row = environment.thumbnails.ensure_pending(meme, self.config.profile)
+            source_error = self._source_identity_error(meme, source_identity)
+            if row is None and ensure and source_error is None:
+                try:
+                    row = environment.thumbnails.ensure_pending(meme, self.config.profile)
+                except DatabaseError as exc:
+                    # 列表或合集拿到已删除 Meme 的快照时，FK 竞态只应使该投影
+                    # 不可用，不应把读请求升级为 500。
+                    if exc.code == "meme_not_found":
+                        return {"status": "stale", "media_url": None}
+                    if exc.code == "thumbnail_pending_conflict":
+                        return {"status": "pending", "media_url": None}
+                    raise
             if source_error is not None:
                 if row is not None:
                     self._mark_row_stale(row, source_error)
@@ -331,19 +395,35 @@ class DerivedThumbnailService:
             return {"status": "stale", "media_url": None}
         return self.projection(meme)
 
-    def projections(self, memes: list[Meme]) -> dict[UUID, dict[str, object]]:
+    def projections(
+        self,
+        memes: list[Meme],
+        *,
+        source_identities: Mapping[UUID, tuple[int, str]] | None = None,
+    ) -> dict[UUID, dict[str, object]]:
         """按一页 Meme 批量投影并为缺失事实建立 pending 状态。"""
         result: dict[UUID, dict[str, object]] = {}
         with self.resources.environment(self.scope) as environment:
             rows = environment.thumbnails.list_current(memes, self.config.profile)
             for meme in memes:
                 row = rows.get(meme.id)
-                source_error = self._source_identity_error(meme)
-                if row is None:
-                    row = environment.thumbnails.ensure_pending(meme, self.config.profile)
+                source_identity = source_identities.get(meme.id) if source_identities is not None else None
+                source_error = self._source_identity_error(meme, source_identity)
+                if row is None and source_error is None:
+                    try:
+                        row = environment.thumbnails.ensure_pending(meme, self.config.profile)
+                    except DatabaseError as exc:
+                        if exc.code == "meme_not_found":
+                            result[meme.id] = {"status": "stale", "media_url": None}
+                            continue
+                        if exc.code == "thumbnail_pending_conflict":
+                            result[meme.id] = {"status": "pending", "media_url": None}
+                            continue
+                        raise
                 if source_error is not None:
-                    self._mark_row_stale(row, source_error)
-                elif row.status == "available" and not self._output_is_valid(meme, row):
+                    if row is not None:
+                        self._mark_row_stale(row, source_error)
+                elif row is not None and row.status == "available" and not self._output_is_valid(meme, row):
                     self._mark_row_stale(row, "thumbnail_output_unavailable")
                 result[meme.id] = self._projection(row, meme_id=meme.id)
             environment.uow.session.flush()
@@ -354,8 +434,13 @@ class DerivedThumbnailService:
         if meme is None:
             return
         with self.resources.environment(self.scope) as environment:
-            current = environment.memes.get(meme.id)
+            current = environment.memes.get(meme.id, for_update=True)
             if current is None or current.sha256.lower() != str(meme.sha256).lower() or current.size_bytes != meme.size_bytes:
+                return
+            existing = environment.thumbnails.current(current, self.config.profile, for_update=True)
+            # 另一 Worker 可能已经以同一确定输出完成；失败 Worker 不能把成功事实
+            # 回写成 failed。输出身份通过同一严格校验，损坏的 available 仍可重建。
+            if existing is not None and existing.status == "available" and self._output_is_valid(current, existing):
                 return
             diagnostic: dict[str, object] = {"error": code, "updated_at": utcnow().isoformat()}
             if elapsed_ms is not None:
@@ -391,6 +476,9 @@ class DerivedThumbnailService:
                 row = environment.thumbnails.current(meme, self.config.profile, for_update=True)
                 if row is not None and row.status == "available" and self._output_is_valid(meme, row):
                     return self._projection(row, meme_id=meme.id)
+                if row is not None and row.status == "available":
+                    self._mark_row_stale(row, "thumbnail_output_unavailable")
+                    environment.uow.session.flush()
                 environment.thumbnails.mark_pending(meme, self.config.profile)
             try:
                 validate_image_content(content, meme.extension, timeout_seconds=self.config.timeout_seconds)
@@ -398,7 +486,7 @@ class DerivedThumbnailService:
             except ImagePreflightError as exc:
                 raise ThumbnailError(exc.code) from exc
             # 生成可能跨越原图重命名；再次以 SHA/大小复核即可保留同一派生身份。
-            current_meme, _current_path, _current_content = self._meme_and_source(meme.id)
+            current_meme, _current_path = self._meme_and_source_identity(meme.id)
             if current_meme.sha256.lower() != str(meme.sha256).lower() or current_meme.size_bytes != meme.size_bytes:
                 raise ThumbnailError("thumbnail_source_changed")
             if type(rendered.width) is not int or type(rendered.height) is not int or rendered.width < 1 or rendered.height < 1 or max(rendered.width, rendered.height) > self.config.max_edge:
@@ -407,29 +495,40 @@ class DerivedThumbnailService:
                 raise ThumbnailError("thumbnail_output_invalid")
             output_key = self._output_key(current_meme, self.config.profile)
             output_sha = hashlib.sha256(rendered.content).hexdigest()
-            if not self.store.exists_with_identity(output_key, sha256=output_sha, size_bytes=len(rendered.content)):
-                token = uuid4()
-                staged_key = self.store.stage_bytes(rendered.content, token=token)
-                target = self.store._key_path(output_key, must_exist=False)
-                if target.exists() or target.is_symlink():
-                    if not self.store.exists_with_identity(output_key, sha256=output_sha, size_bytes=len(rendered.content)):
-                        # 数据库提交失败或外部损坏可能留下同一确定 key；该 key
-                        # 不再代表合法输出时可安全替换，不能让一次失败永久阻塞重建。
-                        self.store.unlink(output_key)
-                        target = self.store._key_path(output_key, must_exist=False)
-                    else:
-                        self.store.unlink(staged_key)
-                        staged_key = None
-                if staged_key is not None:
-                    self.store.link_move(staged_key, output_key)
-                    staged_key = None
-                    installed_output_key = output_key
-                    installed_output_sha = output_sha
-                    installed_output_size = len(rendered.content)
             with self.resources.environment(self.scope) as environment:
+                # 生成 Worker 在安装文件前锁住父 Meme，并一直持锁到派生事实提交；
+                # 删除事务因此能在最终快照中看到本次输出，避免留下 orphan 文件。
                 final_meme = environment.memes.get(current_meme.id, for_update=True)
                 if final_meme is None or final_meme.sha256.lower() != str(meme.sha256).lower() or final_meme.size_bytes != meme.size_bytes:
                     raise ThumbnailError("thumbnail_source_changed")
+                if not self.store.exists_with_identity(output_key, sha256=output_sha, size_bytes=len(rendered.content)):
+                    token = uuid4()
+                    staged_key = self.store.stage_bytes(rendered.content, token=token)
+                    if staged_key is not None:
+                        try:
+                            self.store.link_move(staged_key, output_key)
+                        except DatabaseError as exc:
+                            if exc.code != "target_exists":
+                                raise
+                            # link_move 的目标检查和链接之间仍存在窗口；同一
+                            # 指纹已经原子落位时，后到者直接复用成功输出。
+                            if self.store.exists_with_identity(output_key, sha256=output_sha, size_bytes=len(rendered.content)):
+                                self.store.unlink(staged_key)
+                                staged_key = None
+                            else:
+                                # 目标是旧损坏文件，允许本次重建替换；若另一个 Worker
+                                # 同时修复，下一次 target_exists 会重新按指纹判定。
+                                self.store.unlink(output_key)
+                                self.store.link_move(staged_key, output_key)
+                                staged_key = None
+                                installed_output_key = output_key
+                                installed_output_sha = output_sha
+                                installed_output_size = len(rendered.content)
+                        else:
+                            staged_key = None
+                            installed_output_key = output_key
+                            installed_output_sha = output_sha
+                            installed_output_size = len(rendered.content)
                 environment.thumbnails.mark_available(
                     final_meme,
                     self.config.profile,
@@ -450,7 +549,19 @@ class DerivedThumbnailService:
                         self.store.unlink(staged_key)
             if installed_output_key is not None:
                 with suppress(DatabaseError):
-                    if self.store.exists_with_identity(installed_output_key, sha256=installed_output_sha, size_bytes=installed_output_size):
+                    keep_output = False
+                    with self.resources.environment(self.scope) as environment:
+                        current = environment.memes.get(meme.id) if meme is not None else None
+                        if current is not None:
+                            row = environment.thumbnails.current(current, self.config.profile)
+                            keep_output = (
+                                row is not None
+                                and row.status == "available"
+                                and row.output_key == installed_output_key
+                                and row.output_sha256 == installed_output_sha
+                                and row.output_size_bytes == installed_output_size
+                            )
+                    if not keep_output and self.store.exists_with_identity(installed_output_key, sha256=installed_output_sha, size_bytes=installed_output_size):
                         self.store.unlink(installed_output_key)
             if exc.code == "thumbnail_source_changed" and meme is not None:
                 with self.resources.environment(self.scope) as environment:
@@ -545,7 +656,7 @@ class DerivedThumbnailService:
     def media_path(self, meme_id: UUID | str) -> tuple[Path, str]:
         """按可信 scope 与稳定 Meme ID 返回可访问缩略图路径和媒体类型。"""
         try:
-            meme, _path, _content = self._meme_and_source(meme_id)
+            meme, _path = self._meme_and_source_identity(meme_id)
         except ThumbnailError as exc:
             raise ThumbnailError("thumbnail_not_found") from exc
         with self.resources.environment(self.scope) as environment:
@@ -566,6 +677,7 @@ class DerivedThumbnailService:
             raise ThumbnailError("meme_not_found") from exc
         keys: list[str] = []
         with self.resources.environment(self.scope) as environment:
+            meme = environment.memes.get(identifier)
             rows = list(
                 environment.uow.session.scalars(
                     select(DerivedImageThumbnail).where(
@@ -575,6 +687,8 @@ class DerivedThumbnailService:
                 )
             )
             keys = [row.output_key for row in rows if row.output_key]
+            if meme is not None:
+                keys.extend(self._thumbnail_file_keys(meme))
             for row in rows:
                 self._mark_row_stale(row, "meme_cleanup_in_progress")
             environment.uow.session.flush()
@@ -589,7 +703,32 @@ class DerivedThumbnailService:
                 raise ThumbnailError("thumbnail_cleanup_failed") from exc
         try:
             with self.resources.environment(self.scope) as environment:
+                # 文件清理期间生成 Worker 可能已把新事实提交；锁住父 Meme 后重读
+                # 全部 key，覆盖首次收集与最终删除之间的窗口。
+                meme = environment.memes.get(identifier, for_update=True)
+                final_rows = list(
+                    environment.uow.session.scalars(
+                        select(DerivedImageThumbnail).where(
+                            DerivedImageThumbnail.scope_id == self.scope.scope_id,
+                            DerivedImageThumbnail.meme_id == identifier,
+                        ).with_for_update()
+                    )
+                )
+                keys.extend(row.output_key for row in final_rows if row.output_key)
+                if meme is not None:
+                    keys.extend(self._thumbnail_file_keys(meme))
+                for row in final_rows:
+                    self._mark_row_stale(row, "meme_cleanup_in_progress")
                 environment.thumbnails.delete_for_meme(identifier)
+                environment.uow.session.flush()
+            for key in dict.fromkeys(keys):
+                try:
+                    path = self.store._key_path(key, must_exist=False)
+                    if path.exists() or path.is_symlink():
+                        self.store.unlink(key)
+                        removed += 1
+                except DatabaseError as exc:
+                    raise ThumbnailError("thumbnail_cleanup_failed") from exc
         except (DatabaseError, OSError) as exc:
             raise ThumbnailError("thumbnail_cleanup_failed") from exc
         return removed

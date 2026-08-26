@@ -99,7 +99,7 @@ def _request() -> SimpleNamespace:
     return SimpleNamespace(query_params={})
 
 
-def _call_import(monkeypatch: pytest.MonkeyPatch, *, package: SimpleNamespace, environment: _Environment, events: list[object], acquire=None, metadata=None, worker=None):
+def _call_import(monkeypatch: pytest.MonkeyPatch, *, package: SimpleNamespace, environment: _Environment, events: list[object], acquire=None, metadata=None, worker=None, thumbnail_enqueue=None):
     """注入最小宿主边界并调用合集导入 handler。"""
     upload = _Upload()
 
@@ -130,6 +130,7 @@ def _call_import(monkeypatch: pytest.MonkeyPatch, *, package: SimpleNamespace, e
             processing_worker=lambda _request: worker,
             processing_config=lambda _request: {"model": "test"},
             submit_visual_task=lambda _request, path, **kwargs: events.append(("visual", path, kwargs)) or SimpleNamespace(task_id="visual-1", status="queued"),
+            thumbnail_enqueue=thumbnail_enqueue,
             context_enqueue_error=lambda exc: "context_enqueue_failed",
             acquire_operation=acquire,
             commit_operation=lambda _request, grant: events.append(("commit", grant)),
@@ -271,6 +272,56 @@ def test_collection_import_reuses_identity_checked_meme_without_operation(monkey
     assert result["meme_id_map"] == {"source-1": str(existing.id)}
     assert not any(isinstance(event, tuple) and event[0] == "acquire" for event in events)
     assert "invalidate" not in events
+
+
+@pytest.mark.parametrize("reused", [False, True])
+def test_collection_import_enqueues_thumbnail_for_imported_and_reused_meme(monkeypatch: pytest.MonkeyPatch, reused: bool) -> None:
+    """新导入和同名复用都必须走同一个幂等缩略图 enqueue callback。"""
+    collection = SimpleNamespace(id=uuid4())
+    existing = [SimpleNamespace(id=uuid4(), storage_key="cat.png", sha256="a" * 64, size_bytes=9)] if reused else []
+    environment = _Environment(_Collections(collection), existing)
+    events: list[object] = []
+    metadata = SimpleNamespace(
+        blob_store=SimpleNamespace(exists_with_identity=lambda *_args, **_kwargs: reused),
+        upload_bytes=lambda content, *, target_key: events.append(("upload", content, target_key)) or ("target-1", Path("/scope") / target_key),
+    )
+    result, _upload = _call_import(
+        monkeypatch,
+        package=_package(),
+        environment=environment,
+        events=events,
+        metadata=metadata,
+        thumbnail_enqueue=lambda _request, meme_id: events.append(("thumbnail", meme_id)),
+    )
+    item = result["results"][0]
+    expected_id = str(existing[0].id) if reused else "target-1"
+    assert item["target_meme_id"] == expected_id
+    assert ("thumbnail", expected_id) in events
+
+
+def test_collection_import_thumbnail_enqueue_failure_is_a_warning_after_import(monkeypatch: pytest.MonkeyPatch) -> None:
+    """缩略图任务失败只记录 warning，不回滚已导入 Meme 和合集关系。"""
+    collection = SimpleNamespace(id=uuid4())
+    collections = _Collections(collection)
+    environment = _Environment(collections, [])
+    events: list[object] = []
+
+    def fail_enqueue(_request, _meme_id):
+        """模拟 durable 导入后缩略图任务不可用。"""
+        raise RuntimeError("thumbnail_task_unavailable")
+
+    result, _upload = _call_import(
+        monkeypatch,
+        package=_package(),
+        environment=environment,
+        events=events,
+        thumbnail_enqueue=fail_enqueue,
+    )
+    item = result["results"][0]
+    assert result["status"] == "partial"
+    assert item["ok"] is True
+    assert item["thumbnail_enqueue_error"] == "thumbnail_task_unavailable"
+    assert any(event[0] == "add_members" for event in collections.calls if isinstance(event, tuple))
 
 
 def test_collection_import_uses_sha_suffix_for_same_name_different_identity(monkeypatch: pytest.MonkeyPatch) -> None:

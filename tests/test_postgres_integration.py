@@ -19,7 +19,7 @@ from uuid import uuid4
 from collections.abc import Iterator
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -54,11 +54,12 @@ from backend.database import (
 )
 from backend.config import Settings
 from backend.image_processing import ImageProcessingError, ImageProcessingRepository, ImageProcessingWorker, STAGES
-from backend.metadata import MemeContext
+from backend.metadata import MetadataError, MemeContext
 from backend.operation_policy import AllowAllOperationPolicy, GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations, PersistentGrantAssociationStore
 from backend.visual import VisualSearchError, VisualSearchService
 from backend.scope import ScopeServiceFactory
 from backend.pg_services import PostgresTaskService, PostgresTaskWorkerManager
+from backend.services.metadata import PostgresMetadataService
 
 
 class _CountingAllowAllPolicy(AllowAllOperationPolicy):
@@ -1268,6 +1269,302 @@ def test_storage_recovery_removes_meme_after_file_applied_before_delete_commit(p
         assert operation is not None
         assert operation.status == "completed"
         assert operation.meme_id is None
+
+
+def test_storage_recovery_does_not_delete_changed_meme_after_prepared_quarantine(postgres_resources) -> None:
+    """prepared 删除隔离后若 Meme 身份已变化，恢复器必须阻断而不能误删。"""
+    resources = postgres_resources
+    coordinator = StorageCoordinator(resources)
+    source_key = f"prepared-delete-changed-{uuid4().hex}.png"
+    meme = coordinator.upload(b"prepared-delete-changed", target_key=source_key, extension=".png", context={}, provenance={})
+    token = uuid4()
+    quarantine_key = resources.blob_store.quarantine(source_key, token=token)
+    changed_key = f"prepared-delete-replacement-{uuid4().hex}.png"
+    with resources.factory() as session:
+        record = session.get(Meme, meme.id)
+        assert record is not None
+        record.storage_key = changed_key
+        record.revision += 1
+        session.add(
+            StorageOperation(
+                scope_id="local",
+                meme_id=meme.id,
+                operation_type="delete",
+                operation_token=token,
+                source_key=source_key,
+                target_key=quarantine_key,
+                before_sha256=meme.sha256,
+                before_size=meme.size_bytes,
+                thumbnail_keys=[],
+                error={
+                    "meme_id": str(meme.id),
+                    "source_sha256": meme.sha256,
+                    "source_size_bytes": meme.size_bytes,
+                },
+                status="prepared",
+            )
+        )
+        session.commit()
+
+    counts = coordinator.recover()
+
+    assert counts == {"completed": 0, "compensated": 0, "blocked": 1, "retried": 0}
+    with resources.factory() as session:
+        record = session.get(Meme, meme.id)
+        operation = session.scalar(select(StorageOperation).where(StorageOperation.operation_token == token))
+        assert record is not None and record.storage_key == changed_key
+        assert operation is not None and operation.status == "blocked"
+        assert operation.error["error"] == "delete_target_changed"
+
+
+def test_metadata_load_rejects_explicit_malformed_identity(postgres_resources) -> None:
+    """显式 malformed identity 不能被当作原图不一致证据写入 repair_required。"""
+    resources = postgres_resources
+    meme = StorageCoordinator(resources).upload(b"metadata-identity", target_key=f"metadata-identity-{uuid4().hex}.png", extension=".png", context={}, provenance={})
+    service = PostgresMetadataService(resources)
+    image = resources.blob_store.resolve(meme.storage_key)
+
+    with pytest.raises(MetadataError, match="metadata_invalid"):
+        service.load(image, identity={"relative_path": meme.storage_key, "extension": ".png", "size_bytes": "not-an-int", "sha256": meme.sha256})
+
+    with resources.factory() as session:
+        record = session.get(Meme, meme.id)
+        assert record is not None and record.context_status == "pending"
+
+
+def test_thumbnail_pending_is_race_safe_for_concurrent_first_projection(postgres_resources) -> None:
+    """并发首次投影只保留一条复合主键事实，且两个调用都能正常返回。"""
+    resources = postgres_resources
+    meme = StorageCoordinator(resources).upload(b"thumbnail-race", target_key=f"thumbnail-race-{uuid4().hex}.png", extension=".png", context={}, provenance={})
+    barrier = threading.Barrier(2)
+
+    def ensure_pending() -> tuple[str, str]:
+        """在独立数据库事务中首次建立 pending 派生事实。"""
+        barrier.wait(timeout=10)
+        with resources.environment("local") as environment:
+            row = environment.thumbnails.ensure_pending(meme, "thumbnail-v1")
+            return row.status, row.source_sha256
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: ensure_pending(), range(2)))
+    assert results == [("pending", meme.sha256), ("pending", meme.sha256)]
+    with resources.factory() as session:
+        assert session.scalar(select(func.count()).select_from(DerivedImageThumbnail).where(DerivedImageThumbnail.meme_id == meme.id)) == 1
+
+
+def test_storage_delete_collects_thumbnail_written_after_initial_snapshot(postgres_resources, monkeypatch: pytest.MonkeyPatch) -> None:
+    """删除第一阶段后才提交的派生输出也必须进入最终清理集合。"""
+    resources = postgres_resources
+    coordinator = StorageCoordinator(resources)
+    source_key = f"thumbnail-delete-window-{uuid4().hex}.png"
+    meme = coordinator.upload(b"delete-window", target_key=source_key, extension=".png", context={}, provenance={})
+    thumbnail_store = resources.thumbnail_store_for_scope("local")
+    output = b"late-derived"
+    output_key = f"{meme.id.hex}-{meme.sha256}-thumbnail-v1.png"
+    original_quarantine = coordinator.blob_store.quarantine
+
+    def quarantine_then_write_thumbnail(source: str, *, token):
+        """在原图隔离和删除提交之间模拟晚到的生成 Worker。"""
+        result = original_quarantine(source, token=token)
+        thumbnail_store._key_path(output_key).write_bytes(output)
+        with resources.environment("local") as environment:
+            current = environment.memes.get(meme.id)
+            assert current is not None
+            environment.thumbnails.mark_available(
+                current,
+                "thumbnail-v1",
+                output_key=output_key,
+                output_sha256=hashlib.sha256(output).hexdigest(),
+                output_size_bytes=len(output),
+                width=4,
+                height=4,
+                media_type="image/png",
+            )
+        return result
+
+    monkeypatch.setattr(coordinator.blob_store, "quarantine", quarantine_then_write_thumbnail)
+    coordinator.delete(meme.id)
+    assert not thumbnail_store._key_path(output_key, must_exist=False).exists()
+
+
+def test_storage_recovery_collects_unregistered_thumbnail_output(postgres_resources) -> None:
+    """恢复 file_applied 删除时按 Meme 身份扫描并清理未登记派生文件。"""
+    resources = postgres_resources
+    coordinator = StorageCoordinator(resources)
+    source_key = f"thumbnail-recovery-window-{uuid4().hex}.png"
+    meme = coordinator.upload(b"recovery-window", target_key=source_key, extension=".png", context={}, provenance={})
+    thumbnail_store = resources.thumbnail_store_for_scope("local")
+    output = b"unregistered-derived"
+    output_key = f"{meme.id.hex}-{meme.sha256}-thumbnail-v1.png"
+    thumbnail_store._key_path(output_key).write_bytes(output)
+    token = uuid4()
+    quarantine_key = resources.blob_store.quarantine(source_key, token=token)
+    with resources.factory() as session:
+        session.add(
+            StorageOperation(
+                scope_id="local",
+                meme_id=meme.id,
+                operation_type="delete",
+                operation_token=token,
+                source_key=source_key,
+                target_key=quarantine_key,
+                before_sha256=meme.sha256,
+                before_size=meme.size_bytes,
+                thumbnail_keys=[],
+                status="file_applied",
+            )
+        )
+        session.commit()
+    counts = coordinator.recover()
+    assert counts["completed"] == 1
+    assert not thumbnail_store._key_path(output_key, must_exist=False).exists()
+
+
+def test_storage_recovery_uses_delete_marker_after_meme_detached(postgres_resources) -> None:
+    """Meme 外键已解除后，恢复器仍按 durable marker 清理未登记派生输出。"""
+    resources = postgres_resources
+    coordinator = StorageCoordinator(resources)
+    source_key = f"thumbnail-marker-recovery-{uuid4().hex}.png"
+    meme = coordinator.upload(b"marker-recovery", target_key=source_key, extension=".png", context={}, provenance={})
+    thumbnail_store = resources.thumbnail_store_for_scope("local")
+    output = b"marker-derived"
+    output_key = f"{meme.id.hex}-{meme.sha256}-thumbnail-v1.png"
+    thumbnail_store._key_path(output_key).write_bytes(output)
+    token = uuid4()
+    quarantine_key = resources.blob_store.quarantine(source_key, token=token)
+    with resources.factory() as session:
+        detached = session.get(Meme, meme.id)
+        assert detached is not None
+        session.delete(detached)
+        session.flush()
+        session.add(
+            StorageOperation(
+                scope_id="local",
+                meme_id=None,
+                operation_type="delete",
+                operation_token=token,
+                source_key=source_key,
+                target_key=quarantine_key,
+                before_sha256=meme.sha256,
+                before_size=meme.size_bytes,
+                thumbnail_keys=[],
+                error={
+                    "meme_id": str(meme.id),
+                    "source_sha256": meme.sha256,
+                    "source_size_bytes": meme.size_bytes,
+                },
+                status="file_applied",
+            )
+        )
+        session.commit()
+    counts = coordinator.recover()
+    assert counts["completed"] == 1
+    assert not thumbnail_store._key_path(output_key, must_exist=False).exists()
+    with resources.factory() as session:
+        operation = session.scalar(select(StorageOperation).where(StorageOperation.operation_token == token))
+        assert operation is not None and operation.status == "completed"
+
+
+def test_storage_recovery_keeps_delete_active_when_thumbnail_scan_is_unavailable(postgres_resources, monkeypatch: pytest.MonkeyPatch) -> None:
+    """恢复无法扫描派生目录时必须保留 file_applied 事实等待重试。"""
+    resources = postgres_resources
+    coordinator = StorageCoordinator(resources)
+    source_key = f"thumbnail-scan-unavailable-{uuid4().hex}.png"
+    meme = coordinator.upload(b"scan-unavailable", target_key=source_key, extension=".png", context={}, provenance={})
+    token = uuid4()
+    quarantine_key = resources.blob_store.quarantine(source_key, token=token)
+    with resources.factory() as session:
+        detached = session.get(Meme, meme.id)
+        assert detached is not None
+        session.delete(detached)
+        session.flush()
+        session.add(
+            StorageOperation(
+                scope_id="local",
+                meme_id=None,
+                operation_type="delete",
+                operation_token=token,
+                source_key=source_key,
+                target_key=quarantine_key,
+                before_sha256=meme.sha256,
+                before_size=meme.size_bytes,
+                thumbnail_keys=[],
+                error={
+                    "meme_id": str(meme.id),
+                    "source_sha256": meme.sha256,
+                    "source_size_bytes": meme.size_bytes,
+                },
+                status="file_applied",
+            )
+        )
+        session.commit()
+
+    def fail_scan(_meme_id, _source_sha256):
+        """模拟派生存储暂时不可扫描。"""
+        raise DatabaseError("thumbnail_storage_unavailable")
+
+    monkeypatch.setattr(coordinator, "_thumbnail_file_keys", fail_scan)
+    counts = coordinator.recover()
+
+    assert counts == {"completed": 0, "compensated": 0, "blocked": 0, "retried": 1}
+    with resources.factory() as session:
+        operation = session.scalar(select(StorageOperation).where(StorageOperation.operation_token == token))
+        assert operation is not None
+        assert operation.status == "file_applied"
+        assert operation.error["error"] == "storage_cleanup_pending"
+
+
+def test_storage_delete_keeps_recoverable_fact_when_final_thumbnail_scan_fails(postgres_resources, monkeypatch: pytest.MonkeyPatch) -> None:
+    """删除最终派生目录扫描失败时不能提交 completed。"""
+    resources = postgres_resources
+    coordinator = StorageCoordinator(resources)
+    source_key = f"thumbnail-final-scan-failure-{uuid4().hex}.png"
+    meme = coordinator.upload(b"final-scan-failure", target_key=source_key, extension=".png", context={}, provenance={})
+    original_scan = coordinator._thumbnail_file_keys
+    calls = 0
+
+    def fail_final_scan(meme_id, source_sha256):
+        """仅让删除第三阶段的最终扫描失败。"""
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise DatabaseError("thumbnail_storage_unavailable")
+        return original_scan(meme_id, source_sha256)
+
+    monkeypatch.setattr(coordinator, "_thumbnail_file_keys", fail_final_scan)
+    with pytest.raises(DatabaseError, match="storage_cleanup_pending"):
+        coordinator.delete(meme.id)
+
+    assert calls == 3
+    with resources.factory() as session:
+        operation = session.scalar(select(StorageOperation).where(StorageOperation.operation_type == "delete"))
+        assert operation is not None
+        assert operation.status == "file_applied"
+        assert operation.meme_id is None
+        assert operation.error["error"] == "storage_cleanup_pending"
+
+
+def test_storage_delete_database_cleanup_failure_is_recoverable(postgres_resources, monkeypatch: pytest.MonkeyPatch) -> None:
+    """durable 删除后的第三阶段异常统一转为 cleanup pending 并保留 marker。"""
+    resources = postgres_resources
+    coordinator = StorageCoordinator(resources)
+    source_key = f"thumbnail-cleanup-db-failure-{uuid4().hex}.png"
+    meme = coordinator.upload(b"cleanup-db-failure", target_key=source_key, extension=".png", context={}, provenance={})
+
+    def fail_cleanup(_keys: list[str]) -> list[str]:
+        """模拟文件清理阶段的数据库/存储协调异常。"""
+        raise DatabaseError("thumbnail_cleanup_unavailable")
+
+    monkeypatch.setattr(coordinator, "_cleanup_thumbnail_files", fail_cleanup)
+    with pytest.raises(DatabaseError, match="storage_cleanup_pending"):
+        coordinator.delete(meme.id)
+    with resources.factory() as session:
+        operation = session.scalar(select(StorageOperation).where(StorageOperation.operation_type == "delete"))
+        assert operation is not None
+        assert operation.status == "file_applied"
+        assert operation.meme_id is None
+        assert operation.error is not None
+        assert operation.error["meme_id"] == str(meme.id)
 
 
 def test_collection_export_query_is_ordered_and_excludes_active_storage_operations(postgres_resources) -> None:

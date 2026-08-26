@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event, Lock
 from typing import Any, Callable, Sequence
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import threading
 from sqlalchemy import select

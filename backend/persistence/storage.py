@@ -261,6 +261,114 @@ class StorageCoordinator:
         return list(dict.fromkeys(raw))
 
     @staticmethod
+    def _delete_identity_marker(meme_id: UUID, source_sha256: str, source_size_bytes: int) -> dict[str, object]:
+        """构造删除提交后仍可识别 Meme 与同源派生文件的内部 marker。"""
+        return {
+            "meme_id": str(meme_id),
+            "source_sha256": str(source_sha256).lower(),
+            "source_size_bytes": source_size_bytes,
+        }
+
+    @staticmethod
+    def _delete_identity(operation: StorageOperation) -> tuple[UUID, str, int] | None:
+        """读取删除 operation 的身份 marker；旧 operation 没有 marker 时返回空。"""
+        raw = getattr(operation, "error", None)
+        if not isinstance(raw, dict):
+            return None
+        marker_fields = {"meme_id", "source_sha256", "source_size_bytes"}
+        present = marker_fields.intersection(raw)
+        if not present:
+            return None
+        if present != marker_fields:
+            raise DatabaseError("delete_identity_invalid")
+        try:
+            meme_id = UUID(str(raw["meme_id"]))
+        except (TypeError, ValueError) as exc:
+            raise DatabaseError("delete_identity_invalid") from exc
+        source_sha256 = raw["source_sha256"]
+        source_size_bytes = raw["source_size_bytes"]
+        if (
+            not isinstance(source_sha256, str)
+            or len(source_sha256) != 64
+            or any(char not in "0123456789abcdefABCDEF" for char in source_sha256)
+            or not isinstance(source_size_bytes, int)
+            or isinstance(source_size_bytes, bool)
+            or source_size_bytes < 0
+        ):
+            raise DatabaseError("delete_identity_invalid")
+        return meme_id, source_sha256.lower(), source_size_bytes
+
+    @staticmethod
+    def _merge_delete_error(
+        marker: dict[str, object] | None,
+        *,
+        error: str,
+        original_pending: bool | None = None,
+        thumbnail_count: int | None = None,
+    ) -> dict[str, object]:
+        """合并删除 marker 与清理诊断，避免待恢复状态覆盖身份事实。"""
+        diagnostic = dict(marker or {})
+        diagnostic["error"] = error
+        if original_pending is not None:
+            diagnostic["original_pending"] = original_pending
+        if thumbnail_count is not None:
+            diagnostic["thumbnail_count"] = thumbnail_count
+        return diagnostic
+
+    def _record_delete_cleanup_pending(
+        self,
+        operation_token: UUID,
+        thumbnail_keys: list[str],
+        marker: dict[str, object],
+        *,
+        original_pending: bool,
+        error: str,
+    ) -> None:
+        """在删除已 durable 后尽力保存可重试的清理事实，不重新打开已完成操作。"""
+        try:
+            with self._transaction() as session:
+                current = session.scalar(
+                    select(StorageOperation)
+                    .where(
+                        StorageOperation.scope_id == self.scope.scope_id,
+                        StorageOperation.operation_token == operation_token,
+                    )
+                    .with_for_update()
+                )
+                if current is None or current.status == "completed" or current.status not in self._ACTIVE:
+                    return
+                keys = list(dict.fromkeys([*thumbnail_keys, *self._thumbnail_keys(current)]))
+                current.thumbnail_keys = keys
+                current.error = self._merge_delete_error(
+                    marker,
+                    error=error,
+                    original_pending=original_pending,
+                    thumbnail_count=len(keys),
+                )
+                current.updated_at = utcnow()
+                session.flush()
+        except Exception:  # noqa: BLE001 - 原始清理异常仍由恢复扫描依据 durable marker 处理
+            return
+
+    def _mark_delete_scan_pending(
+        self,
+        operation: StorageOperation,
+        thumbnail_keys: list[str],
+        counts: dict[str, int],
+    ) -> None:
+        """记录派生目录暂不可扫描的可重试删除状态，保持 operation 活跃。"""
+        identity = self._delete_identity(operation)
+        marker = self._delete_identity_marker(*identity) if identity is not None else None
+        operation.thumbnail_keys = list(dict.fromkeys(thumbnail_keys))
+        operation.error = self._merge_delete_error(
+            marker,
+            error="storage_cleanup_pending",
+            thumbnail_count=len(operation.thumbnail_keys),
+        )
+        operation.updated_at = utcnow()
+        counts["retried"] += 1
+
+    @staticmethod
     def _path_present(store: BlobStore, key: str) -> bool:
         """检查受控 key 是否仍有物理对象，包含悬空符号链接等异常状态。"""
         path = store._key_path(key, must_exist=False)
@@ -282,6 +390,38 @@ class StorageCoordinator:
             except DatabaseError:
                 remaining.append(key)
         return remaining
+
+    def _thumbnail_rows(self, session: Session, meme_id: UUID, *, for_update: bool = True) -> list[DerivedImageThumbnail]:
+        """读取当前 Meme 的全部派生事实，删除屏障和恢复器共用。"""
+        statement = select(DerivedImageThumbnail).where(
+            DerivedImageThumbnail.scope_id == self.scope.scope_id,
+            DerivedImageThumbnail.meme_id == meme_id,
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return list(session.scalars(statement))
+
+    def _thumbnail_file_keys(self, meme_id: UUID, source_sha256: str) -> list[str]:
+        """按稳定 Meme 和源指纹收集未登记的派生文件 key。"""
+        prefix = f"{meme_id.hex}-{str(source_sha256).lower()}-"
+        try:
+            thumbnail_store = self.resources.thumbnail_store_for_scope(self.scope)
+            return [
+                path.name
+                for path in thumbnail_store.root.iterdir()
+                if path.is_file() and not path.is_symlink() and path.name.startswith(prefix)
+            ]
+        except (DatabaseError, OSError) as exc:
+            # 没有完成目录扫描就无法证明不存在孤立派生文件；调用方必须留下可重试
+            # 的删除事实，不能把存储不可用误判成“没有文件”。
+            raise DatabaseError("thumbnail_storage_unavailable") from exc
+
+    def _thumbnail_keys_for_record(self, session: Session, record: Meme, *, rows: list[DerivedImageThumbnail] | None = None) -> list[str]:
+        """收集数据库事实及同源孤立输出，避免删除窗口遗留派生文件。"""
+        rows = rows if rows is not None else self._thumbnail_rows(session, record.id)
+        keys = [row.output_key for row in rows if row.output_key]
+        keys.extend(self._thumbnail_file_keys(record.id, str(record.sha256)))
+        return list(dict.fromkeys(keys))
 
     def upload(self, content: bytes, *, target_key: str, extension: str, context: dict[str, Any], provenance: dict[str, Any], meme_id: UUID | None = None) -> Meme:
         """暂存上传字节、创建 pending Meme，并在文件落位后完成 durable operation。"""
@@ -727,30 +867,29 @@ class StorageCoordinator:
         """先阻断派生访问并隔离原图，再删除 Meme 记录和派生对象。"""
         token = uuid.uuid4()
         thumbnail_keys: list[str] = []
+        delete_marker: dict[str, object] | None = None
+        delete_identity: tuple[UUID, str, int] | None = None
+        before_sha256: str | None = None
+        before_size: int | None = None
         with self._transaction() as session:
             record = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == UUID(str(meme_id))).with_for_update())
             if record is None:
                 raise DatabaseError("meme_not_found")
             if not self.blob_store.exists_with_identity(record.storage_key, sha256=record.sha256, size_bytes=record.size_bytes):
                 raise DatabaseError("target_changed")
-            thumbnail_rows = list(
-                session.scalars(
-                    select(DerivedImageThumbnail)
-                    .where(
-                        DerivedImageThumbnail.scope_id == self.scope.scope_id,
-                        DerivedImageThumbnail.meme_id == record.id,
-                    )
-                    .with_for_update()
-                )
-            )
-            thumbnail_keys = [row.output_key for row in thumbnail_rows if row.output_key]
+            before_sha256 = str(record.sha256).lower()
+            before_size = record.size_bytes
+            delete_identity = (record.id, before_sha256, before_size)
+            delete_marker = self._delete_identity_marker(*delete_identity)
+            thumbnail_rows = self._thumbnail_rows(session, record.id)
+            thumbnail_keys = self._thumbnail_keys_for_record(session, record, rows=thumbnail_rows)
             for row in thumbnail_rows:
                 # 删除操作进入 durable prepared 后，任何旧缩略图都必须立即失效；
                 # output_key 保留到事务完成后供清理器回收物理文件。
                 row.status = "stale"
                 row.diagnostic = {"error": "meme_delete_in_progress"}
                 row.updated_at = utcnow()
-            operation = StorageOperation(scope_id=self.scope.scope_id, meme_id=record.id, operation_type="delete", operation_token=token, source_key=record.storage_key, target_key=f".quarantine/{token.hex}.blob", before_sha256=record.sha256, before_size=record.size_bytes, thumbnail_keys=thumbnail_keys, status="prepared")
+            operation = StorageOperation(scope_id=self.scope.scope_id, meme_id=record.id, operation_type="delete", operation_token=token, source_key=record.storage_key, target_key=f".quarantine/{token.hex}.blob", before_sha256=before_sha256, before_size=before_size, thumbnail_keys=thumbnail_keys, error=delete_marker, status="prepared")
             session.add(operation)
             session.flush()
             source_key = record.storage_key
@@ -767,43 +906,87 @@ class StorageCoordinator:
             record = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == UUID(str(meme_id))).with_for_update())
             if operation is None or record is None:
                 raise DatabaseError("storage_operation_missing")
+            # 生成 Worker 可能在第一次收集后完成输出；同一父行锁保证它不能在
+            # 这里提交之后继续写入，最终收集覆盖该窗口内的全部派生 key。
+            thumbnail_rows = self._thumbnail_rows(session, record.id)
+            thumbnail_keys = list(dict.fromkeys([*self._thumbnail_keys_for_record(session, record, rows=thumbnail_rows), *self._thumbnail_keys(operation)]))
+            operation.thumbnail_keys = thumbnail_keys
+            for row in thumbnail_rows:
+                row.status = "stale"
+                row.diagnostic = {"error": "meme_delete_in_progress"}
+                row.updated_at = utcnow()
             self._session = session
             self._set_status(operation, "file_applied", session=session)
+            # Meme 外键解除后仍保留稳定身份；生成 Worker 崩溃时恢复器可按 marker
+            # 扫描首次快照后才落位、且未写入派生表的物理输出。
+            operation.error = delete_marker
+            operation.updated_at = utcnow()
             # 删除 Meme 前解除关联，保留 file_applied operation 作为未完成清理的恢复事实。
             operation.meme_id = None
             session.delete(record)
             session.flush()
         cleanup_target = f".quarantine/{token.hex}.blob"
-        original_pending = not self.blob_store.exists_with_identity(cleanup_target, sha256=operation.before_sha256, size_bytes=operation.before_size)
-        if not original_pending:
+        original_pending = False
+        remaining = list(thumbnail_keys)
+        cleanup_already_completed = False
+        try:
+            assert delete_identity is not None and before_sha256 is not None and before_size is not None and delete_marker is not None
+            original_pending = not self.blob_store.exists_with_identity(cleanup_target, sha256=before_sha256, size_bytes=before_size)
+            if not original_pending:
+                try:
+                    self.blob_store.unlink(cleanup_target)
+                except DatabaseError:
+                    original_pending = True
+            remaining = self._cleanup_thumbnail_files(thumbnail_keys)
             try:
-                self.blob_store.unlink(cleanup_target)
+                late_thumbnail_keys = self._thumbnail_file_keys(delete_identity[0], delete_identity[1])
             except DatabaseError:
-                original_pending = True
-        remaining = self._cleanup_thumbnail_files(thumbnail_keys)
-        with self._transaction() as session:
-            current = session.scalar(
-                select(StorageOperation)
-                .where(
-                    StorageOperation.scope_id == self.scope.scope_id,
-                    StorageOperation.operation_token == token,
+                # 目录扫描失败时由下面的异常收束路径保留 marker 和已知 key；恢复器
+                # 下一次运行会在存储可用后重新扫描同一源版本。
+                raise
+            if late_thumbnail_keys:
+                remaining = self._cleanup_thumbnail_files(list(dict.fromkeys([*remaining, *late_thumbnail_keys])))
+            with self._transaction() as session:
+                current = session.scalar(
+                    select(StorageOperation)
+                    .where(
+                        StorageOperation.scope_id == self.scope.scope_id,
+                        StorageOperation.operation_token == token,
+                    )
+                    .with_for_update()
                 )
-                .with_for_update()
+                if current is None:
+                    raise DatabaseError("storage_operation_missing")
+                if current.status == "completed":
+                    cleanup_already_completed = True
+                elif current.status not in self._ACTIVE:
+                    raise DatabaseError("storage_operation_unknown")
+                elif original_pending or remaining:
+                    current.thumbnail_keys = remaining
+                    current.error = self._merge_delete_error(
+                        delete_marker,
+                        error="storage_cleanup_pending",
+                        original_pending=original_pending,
+                        thumbnail_count=len(remaining),
+                    )
+                    current.updated_at = utcnow()
+                    session.flush()
+                else:
+                    current.thumbnail_keys = []
+                    self._set_status(current, "completed", session=session)
+        except (DatabaseError, OSError) as exc:
+            # 原图隔离和 Meme 删除已经提交；第三阶段失败只能留下可重试的
+            # file_applied 事实，不能让 HTTP 层把该操作误判为可 release。
+            self._record_delete_cleanup_pending(
+                token,
+                remaining,
+                delete_marker or {},
+                original_pending=original_pending,
+                error="storage_cleanup_pending",
             )
-            if current is None:
-                raise DatabaseError("storage_operation_missing")
-            if original_pending or remaining:
-                current.thumbnail_keys = remaining
-                current.error = {
-                    "error": "storage_cleanup_pending",
-                    "original_pending": original_pending,
-                    "thumbnail_count": len(remaining),
-                }
-                current.updated_at = utcnow()
-                session.flush()
-            else:
-                current.thumbnail_keys = []
-                self._set_status(current, "completed", session=session)
+            raise DatabaseError("storage_cleanup_pending") from exc
+        if cleanup_already_completed:
+            return
         if original_pending or remaining:
             raise DatabaseError("storage_cleanup_pending")
 
@@ -827,7 +1010,14 @@ class StorageCoordinator:
                         self._set_status(operation, "blocked", error={"error": "storage_operation_unknown_type"}, session=session)
                         counts["blocked"] += 1
                 except DatabaseError as exc:
-                    self._set_status(operation, "blocked", error={"error": exc.code, "message": str(exc)}, session=session)
+                    diagnostic = {"error": exc.code, "message": str(exc)}
+                    # 删除 operation 可能已经解除 Meme 外键；恢复失败时仍保留
+                    # 身份 marker，方便下一次人工/离线恢复定位同源派生输出。
+                    if isinstance(operation.error, dict):
+                        for key in ("meme_id", "source_sha256", "source_size_bytes"):
+                            if key in operation.error:
+                                diagnostic[key] = operation.error[key]
+                    self._set_status(operation, "blocked", error=diagnostic, session=session)
                     counts["blocked"] += 1
             session.commit()
             self._session = None
@@ -956,6 +1146,37 @@ class StorageCoordinator:
         """恢复原图隔离和派生清理；冲突时阻断自动修改。"""
         assert operation.source_key and operation.target_key
         thumbnail_keys = self._thumbnail_keys(operation)
+        delete_identity = self._delete_identity(operation)
+        if delete_identity is not None:
+            marker_meme_id, marker_sha256, marker_size = delete_identity
+            if operation.meme_id is not None and UUID(str(operation.meme_id)) != marker_meme_id:
+                raise DatabaseError("delete_identity_mismatch")
+            if (
+                str(operation.before_sha256).lower() != marker_sha256
+                or operation.before_size != marker_size
+            ):
+                raise DatabaseError("delete_identity_mismatch")
+            # Meme 外键解除后只能依靠 marker 定位同一 Meme 的未登记派生输出；
+            # 其 key 仍包含稳定 ID 和源 SHA，不接受任意文件名扫描。
+            try:
+                thumbnail_keys.extend(self._thumbnail_file_keys(marker_meme_id, marker_sha256))
+            except DatabaseError as exc:
+                if exc.code != "thumbnail_storage_unavailable":
+                    raise
+                self._mark_delete_scan_pending(operation, thumbnail_keys, counts)
+                return
+            thumbnail_keys = list(dict.fromkeys(thumbnail_keys))
+            if operation.meme_id is None:
+                replacement = session.scalar(
+                    select(Meme)
+                    .where(
+                        Meme.scope_id == self.scope.scope_id,
+                        Meme.id == marker_meme_id,
+                    )
+                    .with_for_update()
+                )
+                if replacement is not None:
+                    raise DatabaseError("delete_target_changed")
         source_ok = self.blob_store.exists_with_identity(operation.source_key, sha256=operation.before_sha256, size_bytes=operation.before_size)
         quarantine_ok = self.blob_store.exists_with_identity(operation.target_key, sha256=operation.before_sha256, size_bytes=operation.before_size)
         if operation.status == "prepared" and source_ok and not quarantine_ok:
@@ -964,10 +1185,52 @@ class StorageCoordinator:
             counts["retried"] += 1
         if operation.status == "prepared" and quarantine_ok and not source_ok:
             self._set_status(operation, "file_applied", session=session)
+            if delete_identity is not None:
+                operation.error = self._delete_identity_marker(*delete_identity)
+                operation.updated_at = utcnow()
             record = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == operation.meme_id).with_for_update()) if operation.meme_id else None
             if record is not None:
+                if (
+                    record.storage_key != operation.source_key
+                    or record.sha256.lower() != str(operation.before_sha256).lower()
+                    or record.size_bytes != operation.before_size
+                ):
+                    # prepared 期间原图已隔离但删除事务尚未提交；若 Meme 已被其它
+                    # 操作改写，不能把当前记录误当成原删除目标强行删除。
+                    raise DatabaseError("delete_target_changed")
+                thumbnail_rows = self._thumbnail_rows(session, record.id)
+                try:
+                    thumbnail_keys = list(dict.fromkeys([*thumbnail_keys, *self._thumbnail_keys_for_record(session, record, rows=thumbnail_rows)]))
+                except DatabaseError as exc:
+                    if exc.code != "thumbnail_storage_unavailable":
+                        raise
+                    self._mark_delete_scan_pending(operation, thumbnail_keys, counts)
+                    return
+                operation.thumbnail_keys = thumbnail_keys
+                for row in thumbnail_rows:
+                    row.status = "stale"
+                    row.diagnostic = {"error": "meme_delete_in_progress"}
+                    row.updated_at = utcnow()
                 operation.meme_id = None
                 self._session.delete(record)
+            elif operation.meme_id is not None:
+                # Meme 记录可能已由前一次恢复提交删除，但 operation 仍保留旧 ID；
+                # 在解除外键前仍可按同一源指纹回收未登记输出。
+                try:
+                    thumbnail_keys = list(
+                        dict.fromkeys(
+                            [
+                                *thumbnail_keys,
+                                *self._thumbnail_file_keys(operation.meme_id, str(operation.before_sha256)),
+                            ]
+                        )
+                    )
+                except DatabaseError as exc:
+                    if exc.code != "thumbnail_storage_unavailable":
+                        raise
+                    self._mark_delete_scan_pending(operation, thumbnail_keys, counts)
+                    return
+                operation.thumbnail_keys = thumbnail_keys
             session.flush()
         elif operation.status == "prepared":
             raise DatabaseError("delete_recovery_ambiguous")
@@ -987,6 +1250,22 @@ class StorageCoordinator:
                 .with_for_update()
             )
             if record is None:
+                if operation.meme_id is not None:
+                    try:
+                        thumbnail_keys = list(
+                            dict.fromkeys(
+                                [
+                                    *thumbnail_keys,
+                                    *self._thumbnail_file_keys(operation.meme_id, str(operation.before_sha256)),
+                                ]
+                            )
+                        )
+                    except DatabaseError as exc:
+                        if exc.code != "thumbnail_storage_unavailable":
+                            raise
+                        self._mark_delete_scan_pending(operation, thumbnail_keys, counts)
+                        return
+                    operation.thumbnail_keys = thumbnail_keys
                 operation.meme_id = None
             elif (
                 record.storage_key != operation.source_key
@@ -995,6 +1274,19 @@ class StorageCoordinator:
             ):
                 raise DatabaseError("delete_target_changed")
             else:
+                thumbnail_rows = self._thumbnail_rows(session, record.id)
+                try:
+                    thumbnail_keys = list(dict.fromkeys([*thumbnail_keys, *self._thumbnail_keys_for_record(session, record, rows=thumbnail_rows)]))
+                except DatabaseError as exc:
+                    if exc.code != "thumbnail_storage_unavailable":
+                        raise
+                    self._mark_delete_scan_pending(operation, thumbnail_keys, counts)
+                    return
+                operation.thumbnail_keys = thumbnail_keys
+                for row in thumbnail_rows:
+                    row.status = "stale"
+                    row.diagnostic = {"error": "meme_delete_in_progress"}
+                    row.updated_at = utcnow()
                 operation.meme_id = None
                 session.delete(record)
                 session.flush()
@@ -1015,13 +1307,26 @@ class StorageCoordinator:
             return
 
         remaining = self._cleanup_thumbnail_files(thumbnail_keys)
+        if delete_identity is not None:
+            # 第一次清理期间若有已启动的旧 Worker 落位，删除操作没有父行锁可再等它；
+            # 完成 operation 前再扫一次同一 marker，避免把晚到孤立文件当成已清理。
+            try:
+                late_thumbnail_keys = self._thumbnail_file_keys(delete_identity[0], delete_identity[1])
+            except DatabaseError as exc:
+                if exc.code != "thumbnail_storage_unavailable":
+                    raise
+                self._mark_delete_scan_pending(operation, remaining, counts)
+                return
+            if late_thumbnail_keys:
+                remaining = self._cleanup_thumbnail_files(list(dict.fromkeys([*remaining, *late_thumbnail_keys])))
         if original_pending or remaining:
             operation.thumbnail_keys = remaining
-            operation.error = {
-                "error": "storage_cleanup_pending",
-                "original_pending": original_pending,
-                "thumbnail_count": len(remaining),
-            }
+            operation.error = self._merge_delete_error(
+                self._delete_identity_marker(*delete_identity) if delete_identity is not None else None,
+                error="storage_cleanup_pending",
+                original_pending=original_pending,
+                thumbnail_count=len(remaining),
+            )
             operation.updated_at = utcnow()
             session.flush()
             counts["retried"] += 1

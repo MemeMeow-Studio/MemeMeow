@@ -119,6 +119,16 @@ async def delete_image(
     try:
         scoped_metadata.remove_by_id(payload.meme_id)
     except MetadataError as exc:
+        if exc.code == "storage_cleanup_pending":
+            # Meme 已在 durable 事务中删除，剩余文件由 storage operation 恢复器继续
+            # 清理；grant 必须提交而不能 release，搜索也必须立即失效。原始可恢复
+            # 错误仍向客户端返回，避免把“已删除待恢复”伪装成完整成功。
+            try:
+                commit_operation(request, delete_grant)
+            except OperationPolicyError:
+                pass
+            invalidate_search(request)
+            raise error(503, "storage_cleanup_pending", "图片已删除，文件清理待恢复") from exc
         if exc.code in {"meme_not_found", "file_not_found", "target_exists", "invalid_storage_key"}:
             try:
                 release_operation(request, delete_grant)

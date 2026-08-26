@@ -11,6 +11,7 @@ from typing import Any, Iterable
 from uuid import UUID
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.persistence.engine import DatabaseError
@@ -78,15 +79,26 @@ class DerivedThumbnailRepository:
         reset_failed: bool = False,
     ) -> DerivedImageThumbnail:
         """幂等创建当前源版本的 pending 事实，并使旧版本进入 stale。"""
-        current = self.current(meme, profile, for_update=True)
+        # 先锁住父 Meme，再检查派生行。这样删除事务不能在 FK 检查和首次插入之间
+        # 删除父行；SAVEPOINT 仍保留为数据库约束或历史数据竞态的最后一道防线。
+        authoritative = self.session.scalar(
+            select(Meme)
+            .where(Meme.scope_id == self.scope.scope_id, Meme.id == _uuid(meme.id))
+            .with_for_update()
+        )
+        if authoritative is None:
+            raise DatabaseError("meme_not_found")
+        source_sha256 = str(authoritative.sha256).lower()
+        source_size_bytes = authoritative.size_bytes
+        current = self.get(authoritative.id, source_sha256, source_size_bytes, profile, for_update=True)
         old_rows = list(
             self.session.scalars(
                 select(DerivedImageThumbnail)
                 .where(
                     DerivedImageThumbnail.scope_id == self.scope.scope_id,
-                    DerivedImageThumbnail.meme_id == meme.id,
+                    DerivedImageThumbnail.meme_id == authoritative.id,
                     DerivedImageThumbnail.profile == profile,
-                    DerivedImageThumbnail.source_sha256 != meme.sha256,
+                    DerivedImageThumbnail.source_sha256 != source_sha256,
                 )
                 .with_for_update()
             )
@@ -99,14 +111,27 @@ class DerivedThumbnailRepository:
         if current is None:
             current = DerivedImageThumbnail(
                 scope_id=self.scope.scope_id,
-                meme_id=meme.id,
-                source_sha256=str(meme.sha256).lower(),
-                source_size_bytes=meme.size_bytes,
+                meme_id=authoritative.id,
+                source_sha256=source_sha256,
+                source_size_bytes=source_size_bytes,
                 profile=profile,
                 status="pending",
             )
-            self.session.add(current)
-            self.session.flush()
+            try:
+                with self.session.begin_nested():
+                    self.session.add(current)
+                    self.session.flush()
+            except IntegrityError as exc:
+                # 并发首次投影/任务/生成可能仍在历史事务路径中竞争同一
+                # 复合主键；唯一冲突回滚到 SAVEPOINT 后重读权威行即可复用。
+                current = self.get(authoritative.id, source_sha256, source_size_bytes, profile, for_update=True)
+                if current is None:
+                    parent = self.session.scalar(
+                        select(Meme.id).where(Meme.scope_id == self.scope.scope_id, Meme.id == authoritative.id)
+                    )
+                    if parent is None:
+                        raise DatabaseError("meme_not_found") from exc
+                    raise DatabaseError("thumbnail_pending_conflict") from exc
             return current
         if reset_failed and current.status in {"failed", "stale"}:
             current.status = "pending"
@@ -165,6 +190,18 @@ class DerivedThumbnailRepository:
         if output_size_bytes < 1 or width < 1 or height < 1:
             raise DatabaseError("thumbnail_output_invalid")
         row = self.ensure_pending(meme, profile)
+        if (
+            row.status == "available"
+            and row.output_key == output_key
+            and str(row.output_sha256).lower() == output_sha256.lower()
+            and row.output_size_bytes == output_size_bytes
+            and row.width == width
+            and row.height == height
+            and row.media_type == media_type
+        ):
+            # 同一确定输出已被另一 Worker 提交时，保留先完成的成功事实，避免
+            # 后到者重复刷新时间或在异常路径中把 available 降级。
+            return row
         row.output_key = output_key
         row.output_sha256 = output_sha256.lower()
         row.output_size_bytes = output_size_bytes

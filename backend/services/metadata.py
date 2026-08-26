@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -117,18 +118,40 @@ class PostgresMetadataService:
                 raise MetadataError("metadata_missing")
             return record
 
-    def load(self, image: Path) -> SidecarMetadata:
-        """读取数据库元数据并严格校验当前图片指纹。"""
+    def load(self, image: Path, *, identity: dict[str, object] | None = None) -> SidecarMetadata:
+        """读取数据库元数据并严格校验当前图片指纹。
+
+        `identity` 只能来自调用方刚完成的同一受控文件校验；省略时仍由本方法
+        完整读取原图指纹，确保独立调用不会放宽完整性边界。
+        """
         key = self._relative(image)
         try:
-            identity = self._identity(image)
+            checked_identity = identity if identity is not None else self._identity(image)
         except MetadataError:
             raise
         with self.resources.environment(self.scope.scope_id) as environment:
             record = environment.memes.by_storage_key(key)
             if record is None:
                 raise MetadataError("metadata_missing")
-            if record.extension != identity["extension"] or record.size_bytes != identity["size_bytes"] or record.sha256 != identity["sha256"]:
+            try:
+                identity_relative_path = checked_identity["relative_path"]
+                identity_extension = checked_identity["extension"]
+                identity_size = checked_identity["size_bytes"]
+                identity_sha256 = checked_identity["sha256"]
+            except (KeyError, TypeError) as exc:
+                raise MetadataError("metadata_invalid") from exc
+            if (
+                not isinstance(identity_relative_path, str)
+                or identity_relative_path != key
+                or not isinstance(identity_extension, str)
+                or identity_extension != image.suffix.lower()
+                or type(identity_size) is not int
+                or identity_size < 0
+                or not isinstance(identity_sha256, str)
+                or re.fullmatch(r"[0-9a-fA-F]{64}", identity_sha256) is None
+            ):
+                raise MetadataError("metadata_invalid")
+            if record.extension != identity_extension or record.size_bytes != identity_size or record.sha256.lower() != str(identity_sha256).lower():
                 record.context_status = "repair_required"
                 record.updated_at = utcnow()
                 environment.uow.session.flush()
@@ -140,10 +163,10 @@ class PostgresMetadataService:
                 record.context_status = "repair_required"
                 raise MetadataError("metadata_invalid") from exc
 
-    def status(self, image: Path) -> dict[str, object]:
+    def status(self, image: Path, *, identity: dict[str, object] | None = None) -> dict[str, object]:
         """返回图片库安全状态摘要；失效指纹始终显示为 repair_required。"""
         try:
-            metadata = self.load(image)
+            metadata = self.load(image, identity=identity)
         except MetadataError as exc:
             return {"status": "repair_required", "error": exc.code}
         context = metadata.meme_context

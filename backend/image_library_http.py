@@ -7,6 +7,7 @@ services、数据库环境、处理 repository、视觉 identity 和路由注册
 
 from __future__ import annotations
 
+import inspect
 import mimetypes
 from collections.abc import Callable
 from typing import Any
@@ -51,11 +52,10 @@ async def list_images(
     with environment(request) as database_environment:
         records = database_environment.memes.list(search=search, page=page, page_size=page_size)
         total = database_environment.memes.count(search=search)
-    items: list[dict[str, object]] = []
-    identity = visual_identity(request)
-    thumbnails = getattr(scoped_services, "thumbnails", None)
-    projection_batch = getattr(thumbnails, "projections", None) if thumbnails is not None else None
-    thumbnail_projections = projection_batch(records) if callable(projection_batch) and records else {}
+    valid_records: list[Any] = []
+    source_images: dict[Any, Any] = {}
+    source_metadata: dict[Any, dict[str, object]] = {}
+    source_identities: dict[Any, tuple[int, str]] = {}
     for record in records:
         try:
             image = scoped_services.metadata.blob_store.resolve(record.storage_key)
@@ -63,7 +63,44 @@ async def list_images(
         except (DatabaseError, MetadataError):
             # 与旧入口一致：无法证明文件指纹的记录不进入公开列表。
             continue
-        metadata_status = scoped_services.metadata.status(image)
+        valid_records.append(record)
+        source_images[record.id] = image
+        source_metadata[record.id] = image_identity
+        source_sha256 = image_identity.get("sha256")
+        if isinstance(source_sha256, str) and len(source_sha256) == 64:
+            source_identities[record.id] = (int(image_identity["size_bytes"]), source_sha256)
+    items: list[dict[str, object]] = []
+    identity = visual_identity(request)
+    thumbnails = getattr(scoped_services, "thumbnails", None)
+    projection_batch = getattr(thumbnails, "projections", None) if thumbnails is not None else None
+    thumbnail_projections: dict[Any, dict[str, object]] = {}
+    if callable(projection_batch) and valid_records:
+        accepts_source_identities = False
+        try:
+            projection_parameters = inspect.signature(projection_batch).parameters
+            accepts_source_identities = "source_identities" in projection_parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in projection_parameters.values()
+            )
+        except (TypeError, ValueError):
+            # 无法反射的旧 facade 使用最小 positional 形状，避免把兼容读取升级为 500。
+            accepts_source_identities = False
+        if accepts_source_identities:
+            thumbnail_projections = projection_batch(valid_records, source_identities=source_identities)
+        else:
+            thumbnail_projections = projection_batch(valid_records)
+    metadata_status_fn = scoped_services.metadata.status
+    accepts_identity = False
+    try:
+        accepts_identity = "identity" in inspect.signature(metadata_status_fn).parameters
+    except (TypeError, ValueError):
+        pass
+    for record in valid_records:
+        image = source_images[record.id]
+        image_identity = source_metadata[record.id]
+        if accepts_identity:
+            metadata_status = metadata_status_fn(image, identity=image_identity)
+        else:
+            metadata_status = metadata_status_fn(image)
         with environment(request) as database_environment:
             visual_row = database_environment.visual.get(
                 record.id,

@@ -34,6 +34,7 @@ SettingsProvider = Callable[[Request], Any]
 ProcessingWorkerProvider = Callable[[Request], Any]
 ProcessingConfigProvider = Callable[[Request], dict[str, object]]
 VisualTaskSubmitter = Callable[..., Any]
+ThumbnailEnqueue = Callable[[Request, str], Any]
 ContextEnqueueError = Callable[[Exception], str]
 OperationAcquire = Callable[..., Any]
 OperationCommit = Callable[[Request, Any], None]
@@ -46,6 +47,16 @@ UploadContentReader = Callable[..., Any]
 ArchivePreflight = Callable[..., Any]
 FilenameResolver = Callable[..., Any]
 PackageErrorProjector = Callable[[CollectionPackageError], HTTPException]
+
+
+def _thumbnail_enqueue_error(exc: Exception) -> str:
+    """把派生任务异常收敛为稳定错误码，不把任意异常文本返回给客户端。"""
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code:
+        return code
+    if isinstance(exc, RuntimeError) and str(exc) == "thumbnail_task_unavailable":
+        return "thumbnail_task_unavailable"
+    return "thumbnail_enqueue_failed"
 
 
 def collection_package_error(exc: CollectionPackageError, *, error: ErrorFactory) -> HTTPException:
@@ -115,6 +126,7 @@ async def import_collection(
     invalidate_search: SearchInvalidator,
     error: ErrorFactory,
     database_error: DatabaseErrorProjector,
+    thumbnail_enqueue: ThumbnailEnqueue | None = None,
     parse_upload_form: MultipartFormParser | None = None,
     read_upload_content: UploadContentReader | None = None,
     preflight: ArchivePreflight | None = None,
@@ -211,6 +223,11 @@ async def import_collection(
                 with environment(request) as database_environment:
                     database_environment.collections.add_members(collection_id, [target_id])
                 result.update({"ok": True, "status": "reused", "target_meme_id": target_id, "saved_filename": target.filename})
+                if thumbnail_enqueue is not None:
+                    try:
+                        thumbnail_enqueue(request, target_id)
+                    except Exception as exc:  # noqa: BLE001 - 派生失败不回滚已建立的合集关系
+                        result["thumbnail_enqueue_error"] = _thumbnail_enqueue_error(exc)
             else:
                 try:
                     import_grant = acquire_operation(
@@ -250,6 +267,11 @@ async def import_collection(
                     database_environment.collections.add_members(collection_id, [target_id])
                 existing_by_name[target.filename] = {"meme": target_id, "sha256": member.sha256}
                 result.update({"ok": True, "status": "imported", "target_meme_id": target_id, "saved_filename": target_path.name})
+                if thumbnail_enqueue is not None:
+                    try:
+                        thumbnail_enqueue(request, target_id)
+                    except Exception as exc:  # noqa: BLE001 - 派生失败不回滚已完成导入
+                        result["thumbnail_enqueue_error"] = _thumbnail_enqueue_error(exc)
                 processing_worker_instance = None
                 try:
                     processing_worker_instance = processing_worker(request)
@@ -305,7 +327,7 @@ async def import_collection(
     if created_count:
         invalidate_search(request)
     failed_count = sum(1 for item in results if not item.get("ok"))
-    warning_count = sum(1 for item in results if item.get("metadata_job_error"))
+    warning_count = sum(1 for item in results if item.get("metadata_job_error") or item.get("thumbnail_enqueue_error"))
     status = "succeeded" if not failed_count and not warning_count else "partial"
     return {
         "collection_id": str(collection_id),

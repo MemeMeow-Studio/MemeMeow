@@ -253,6 +253,31 @@ def test_delete_releases_only_known_pre_durable_metadata_failure(tmp_path: Path)
     assert events == [("acquire", "grant"), ("release", "grant-1")]
 
 
+def test_delete_cleanup_pending_commits_grant_invalidates_search_and_keeps_recoverable_error(tmp_path: Path) -> None:
+    """durable 删除后的清理失败必须提交计量、失效搜索并返回可恢复错误。"""
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    metadata = _Metadata(source, tmp_path)
+    metadata.remove_error = "storage_cleanup_pending"
+    events: list[tuple[str, object]] = []
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(
+            image_mutation_http.delete_image(
+                _request(),
+                _payload(),
+                metadata_service=lambda _request: metadata,
+                acquire_operation=lambda *_args, **_kwargs: events.append(("acquire", "grant")) or "grant-1",
+                commit_operation=lambda _request, grant: events.append(("commit", grant)),
+                release_operation=lambda _request, grant: events.append(("release", grant)),
+                operation_error=_operation_error,
+                invalidate_search=lambda _request: events.append(("invalidate", "search")),
+                error=_error,
+            )
+        )
+    assert (caught.value.status_code, caught.value.detail["error"]) == (503, "storage_cleanup_pending")
+    assert events == [("acquire", "grant"), ("commit", "grant-1"), ("invalidate", "search")]
+
+
 def test_delete_policy_rejection_happens_before_metadata_remove(tmp_path: Path) -> None:
     """policy acquire 拒绝时 fail-closed，metadata 删除和缓存失效均不发生。"""
     source = tmp_path / "source.png"

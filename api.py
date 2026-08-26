@@ -1878,6 +1878,7 @@ async def import_collection(request: Request) -> dict[str, object]:
         processing_worker=_processing_worker,
         processing_config=_processing_config,
         submit_visual_task=_submit_visual_task,
+        thumbnail_enqueue=_enqueue_thumbnail,
         context_enqueue_error=_context_enqueue_error,
         acquire_operation=_acquire_operation,
         commit_operation=_commit_operation,
