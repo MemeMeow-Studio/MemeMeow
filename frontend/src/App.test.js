@@ -271,7 +271,7 @@ describe('App', () => {
     expect(wrapper.findAll('.visual-embedding-state')[1].text()).toBe('图片向量已就绪')
   })
 
-  it('图片库点击图片会打开放大预览并显示完整 JSON', async () => {
+  it('图片库点击图片会打开放大预览并分层显示元数据', async () => {
     images.mockResolvedValue({
       items: [{ meme_id: '55555555-5555-4555-8555-555555555555', filename: 'pending.png', size: 10, extension: '.png', media_url: '/media/55555555-5555-4555-8555-555555555555', metadata: { status: 'pending' }, embedding_status: 'pending', visual_embedding_status: 'pending' }],
     })
@@ -285,10 +285,14 @@ describe('App', () => {
     await flushPromises()
     expect(imageMetadata).toHaveBeenCalledWith('55555555-5555-4555-8555-555555555555')
     expect(wrapper.get('[role="dialog"] .image-dialog-preview img').attributes('src')).toBe('/media/55555555-5555-4555-8555-555555555555')
-    expect(wrapper.get('.metadata-json').text()).toContain('等待处理')
+    expect(wrapper.get('.metadata-empty-state').text()).toBe('图片语境尚未生成，完成处理后会显示识别结果')
+    const metadataDetails = wrapper.findAll('.metadata-details')
+    expect(metadataDetails).toHaveLength(2)
+    expect(metadataDetails.every((detail) => detail.element.open)).toBe(false)
     expect(document.activeElement).toBe(wrapper.get('[aria-label="关闭图片预览"]').element)
-    await wrapper.get('.metadata-panel .quiet').trigger('click')
-    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(expect.stringContaining('等待处理'))
+    expect(wrapper.findAll('button').some((button) => button.text().includes('复制元数据'))).toBe(false)
+    await metadataDetails[1].get('summary').trigger('click')
+    expect(wrapper.get('.metadata-json').text()).toContain('等待处理')
     await wrapper.get('[aria-label="关闭图片预览"]').trigger('click')
     expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
     expect(document.activeElement).toBe(previewTrigger.element)
