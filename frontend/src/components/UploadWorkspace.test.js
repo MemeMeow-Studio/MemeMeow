@@ -106,4 +106,63 @@ describe('UploadWorkspace', () => {
     await flushPromises()
     expect(upload).toHaveBeenNthCalledWith(2, [files[1]], { reverse_image_policy: 'forbid', auto_name: false }, expect.objectContaining({ signal: expect.any(AbortSignal) }))
   })
+
+  it('将图片预检错误码展示为具体且不泄漏内部诊断的原因', async () => {
+    const file = new File(['not-an-image'], 'broken.png', { type: 'image/png' })
+    upload.mockResolvedValue({ results: [{ filename: file.name, ok: false, error: 'invalid_image' }] })
+    const wrapper = mount(UploadWorkspace, { props: { config: { reverse_image_available: true } } })
+
+    await selectFiles(wrapper, [file])
+    await wrapper.get('button.primary').trigger('click')
+    await wrapper.get('.processing-options-dialog form').trigger('submit')
+    await flushPromises()
+
+    expect(wrapper.get('.upload-result small').text()).toContain('图片内容无法解码')
+    expect(wrapper.get('.upload-result small').text()).not.toContain('invalid_image')
+  })
+
+  it('未知上传错误码使用通用提示而不回显内部标识', async () => {
+    const file = new File(['unknown-error'], 'unknown.png', { type: 'image/png' })
+    upload.mockResolvedValue({ results: [{ filename: file.name, ok: false, error: 'internal_storage_path_42' }] })
+    const wrapper = mount(UploadWorkspace, { props: { config: { reverse_image_available: true } } })
+
+    await selectFiles(wrapper, [file])
+    await wrapper.get('button.primary').trigger('click')
+    await wrapper.get('.processing-options-dialog form').trigger('submit')
+    await flushPromises()
+
+    expect(wrapper.get('.upload-result small').text()).toBe('上传失败，请稍后重试')
+    expect(wrapper.get('.upload-result small').text()).not.toContain('internal_storage_path_42')
+  })
+
+  it('传输错误按公开错误码展示安全原因，不回显 detail.message', async () => {
+    const file = new File(['server-error'], 'server-error.png', { type: 'image/png' })
+    const transportError = Object.assign(new Error('private detail /srv/runtime/token'), { code: 'operation_grant_invalid', status: 503 })
+    upload.mockRejectedValue(transportError)
+    const wrapper = mount(UploadWorkspace, { props: { config: { reverse_image_available: true } } })
+
+    await selectFiles(wrapper, [file])
+    await wrapper.get('button.primary').trigger('click')
+    await wrapper.get('.processing-options-dialog form').trigger('submit')
+    await flushPromises()
+
+    expect(wrapper.emitted('error')?.at(-1)).toEqual(['上传授权无效，请稍后重试'])
+    expect(wrapper.text()).not.toContain('private detail')
+    expect(wrapper.text()).not.toContain('/srv/runtime/token')
+    expect(wrapper.find('.processing-options-dialog').exists()).toBe(true)
+  })
+
+  it('没有公开错误码的传输错误使用通用提示', async () => {
+    const file = new File(['unknown-error'], 'network.png', { type: 'image/png' })
+    upload.mockRejectedValue(new Error('private upstream response'))
+    const wrapper = mount(UploadWorkspace, { props: { config: { reverse_image_available: true } } })
+
+    await selectFiles(wrapper, [file])
+    await wrapper.get('button.primary').trigger('click')
+    await wrapper.get('.processing-options-dialog form').trigger('submit')
+    await flushPromises()
+
+    expect(wrapper.emitted('error')?.at(-1)).toEqual(['上传失败，请稍后重试'])
+    expect(wrapper.text()).not.toContain('private upstream response')
+  })
 })

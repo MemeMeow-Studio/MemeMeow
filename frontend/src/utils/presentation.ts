@@ -10,6 +10,47 @@ export function errorMessage(reason: unknown, fallback = '请求失败'): string
   return reason instanceof Error && reason.message ? reason.message : fallback
 }
 
+/**
+ * 将上传接口的稳定错误码映射为固定的用户提示。
+ *
+ * 映射只依赖服务端公开的错误码，不渲染 Pillow 异常、文件路径或其它内部诊断；
+ * 未知错误统一使用通用提示，避免新错误码意外暴露敏感信息。
+ */
+const UPLOAD_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  unsupported_format: '文件格式不受支持，请选择 PNG、JPG、JPEG 或 GIF 图片',
+  invalid_image: '图片内容无法解码，可能已损坏或扩展名与实际格式不一致',
+  image_frame_count_exceeded: '图片动画帧数超过服务端限制',
+  image_frame_pixels_exceeded: '图片单帧像素超过服务端限制',
+  image_total_pixels_exceeded: '图片累计帧像素超过服务端限制',
+  image_preflight_timeout: '图片校验超时，请稍后重试',
+  image_preflight_failed: '图片校验失败，请确认文件有效后重试',
+  invalid_filename: '文件名不符合要求',
+  file_too_large: '文件超过大小限制',
+  file_exists: '同名图片已存在',
+  upload_reconciliation_required: '图片状态需要恢复后才能重试',
+  metadata_write_failed: '图片保存失败，请稍后重试',
+  operation_forbidden: '当前账户暂不允许上传图片',
+  operation_limit_exceeded: '已达到图片上传额度限制',
+  operation_policy_unavailable: '上传服务暂不可用，请稍后重试',
+  operation_grant_invalid: '上传授权无效，请稍后重试',
+  operation_unknown: '上传操作类型无效',
+  rate_limited: '上传请求过于频繁，请稍后重试',
+  upload_cancelled: '上传已取消',
+  request_failed: '上传请求失败，请检查网络后重试',
+})
+const GENERIC_UPLOAD_ERROR_MESSAGE = '上传失败，请稍后重试'
+
+/** 根据错误码或带稳定 code 的异常返回安全原因，未知码不直接展示原始消息。 */
+export function uploadErrorMessage(value: unknown): string {
+  const code = typeof value === 'object' && value !== null
+    ? (value as { code?: unknown }).code
+    : value
+  if (typeof code !== 'string' || !Object.prototype.hasOwnProperty.call(UPLOAD_ERROR_MESSAGES, code)) {
+    return GENERIC_UPLOAD_ERROR_MESSAGE
+  }
+  return UPLOAD_ERROR_MESSAGES[code]
+}
+
 /** 生成图片的稳定业务键，列表选择和 Vue key 都以 meme_id 为准。 */
 export function imageKey(item: Pick<MemeImage, 'meme_id'>): string {
   return item.meme_id || ''

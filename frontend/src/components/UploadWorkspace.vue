@@ -2,7 +2,7 @@
 /** 上传工作区：管理文件选择、选项确认与逐文件结果。 */
 import { computed, shallowRef } from 'vue'
 import type { ImageProcessingOptions, ServiceConfig } from '../types'
-import { errorMessage } from '../utils/presentation'
+import { uploadErrorMessage } from '../utils/presentation'
 import ImageProcessingOptionsDialog from './ImageProcessingOptionsDialog.vue'
 import { useUploadBatch, type UploadBatchItem } from '../composables/useUploadBatch'
 
@@ -66,7 +66,8 @@ async function confirmOptions(options: ImageProcessingOptions): Promise<void> {
     .filter((item) => item.status === 'failed' && item.retryable)
     .map((item) => item.file)
   if (outcome.transportError) {
-    emit('error', errorMessage(outcome.transportError))
+    // 传输异常的 message 可能来自后端 detail；这里只信任稳定错误码并使用固定文案。
+    emit('error', uploadErrorMessage(outcome.transportError))
     // 网络或服务错误时保持对话框和选择，用户可以直接再次确认。
     return
   }
@@ -84,9 +85,9 @@ function statusLabel(item: UploadBatchItem): string {
   return item.error === 'rate_limited' ? '等待重试' : '失败'
 }
 
-/** 展示服务端成功摘要或稳定错误码，避免把原始异常对象渲染到页面。 */
+/** 展示服务端成功摘要或稳定错误原因，不把内部错误码直接暴露给用户。 */
 function itemDetail(item: UploadBatchItem): string {
-  if (item.error) return item.error
+  if (item.error) return uploadErrorMessage(item.error)
   return item.result?.saved_filename || item.result?.processing_status || ''
 }
 </script>
