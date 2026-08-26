@@ -60,7 +60,6 @@ useModalDialog({
           <dd>
             <strong>{{ activity.turns }}</strong>
             <time>最近活动 {{ activity.lastActivity }}</time>
-            <small>工作回合仅表示 Agent 活动，不代表任务完成进度。</small>
           </dd>
         </div>
         <div><dt>创建时间</dt><dd>{{ formatTaskTime(task.created_at) }}</dd></div>

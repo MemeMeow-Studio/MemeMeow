@@ -124,7 +124,6 @@ void loadMetadata()
       <header class="image-dialog-head">
         <div>
           <h2 id="image-dialog-title">{{ image.filename }}</h2>
-          <p>图片预览与详情</p>
         </div>
         <button ref="closeButton" class="quiet" type="button" aria-label="关闭图片预览" @click="emit('close')">
           关闭

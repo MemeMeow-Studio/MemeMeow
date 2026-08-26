@@ -137,9 +137,8 @@ onMounted(loadCollections)
         </button>
         <h1>{{ selectedCollection ? selectedCollection.name : '合集' }}</h1>
         <p v-if="selectedCollection">
-          {{ members.length }} 张图片<span aria-hidden="true"> · </span>删除合集不会删除图片。
+          {{ members.length }} 张图片
         </p>
-        <p v-else>用合集组织图片库中的资产。</p>
       </div>
       <div v-if="selectedCollection" class="collection-detail-actions" role="group" aria-label="合集管理操作">
         <button class="quiet" type="button" :disabled="busy" @click="renameCollection(selectedCollection)">重命名</button>
@@ -162,7 +161,6 @@ onMounted(loadCollections)
         </article>
         <div v-if="!members.length" class="empty-state compact collection-empty">
           <h2>这个合集还没有图片</h2>
-          <p>在图片库选择图片后加入合集。</p>
         </div>
       </div>
       <p v-if="notice" class="inline-notice" role="status">{{ notice }}</p>
@@ -202,7 +200,7 @@ onMounted(loadCollections)
             <button class="quiet collection-danger" type="button" :disabled="busy" @click="deleteCollection(item)">删除合集</button>
           </div>
         </article>
-        <div v-if="!collections.length && !busy" class="empty-state compact"><h2>还没有合集</h2><p>创建合集后可从图片库添加成员。</p></div>
+        <div v-if="!collections.length && !busy" class="empty-state compact"><h2>还没有合集</h2></div>
       </div>
     </template>
   </section>

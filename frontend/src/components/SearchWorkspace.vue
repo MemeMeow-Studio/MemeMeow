@@ -142,7 +142,6 @@ async function runSearch(): Promise<void> {
     <div class="section-head">
       <div>
         <h1>找到合适的表达</h1>
-        <p>用一句自然语言描述你想要的情绪或场景。</p>
       </div>
       <span class="cache-pill" :class="{ ready: config }">{{ config ? 'API 已连接' : '等待连接' }}</span>
     </div>
@@ -197,7 +196,6 @@ async function runSearch(): Promise<void> {
     </template>
     <div v-else class="empty-state" :class="{ loading: busy }" role="status" aria-live="polite">
       <h2>{{ busy ? '正在分析你的描述' : '还没有检索结果' }}</h2>
-      <p v-if="!busy">输入一句情绪或场景描述后开始。</p>
     </div>
   </section>
 </template>

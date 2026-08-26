@@ -241,7 +241,7 @@ onBeforeUnmount(() => {
       <template v-if="loading && !taskItems.length">
         <div v-for="n in 5" :key="n" class="task-skeleton"></div>
       </template>
-      <div v-if="!loading && !taskItems.length" class="empty-state compact"><h2>没有匹配的任务</h2><p>调整筛选条件后再试。</p></div>
+      <div v-if="!loading && !taskItems.length" class="empty-state compact"><h2>没有匹配的任务</h2></div>
     </div>
     <button v-if="cursor" class="quiet load-more" type="button" @click="loadTasks({ append: true })">加载更多</button>
     <TaskDrawer

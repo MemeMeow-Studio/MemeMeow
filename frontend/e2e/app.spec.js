@@ -139,7 +139,7 @@ test('重试选中默认可选择并按指定阶段提交', async ({ page }) => 
   await retryButton.click()
   const dialog = page.getByRole('dialog', { name: '重试选中' })
   await expect(dialog).toBeVisible()
-  await expect(dialog).toContainText('已选 1 张图片，选择本次要重新处理的范围。')
+  await expect(dialog).toContainText('已选 1 张图片')
   await expect(dialog.getByRole('button', { name: '完整重试' })).toBeEnabled()
   expect(stageRequests).toHaveLength(0)
   expect(fullRetryRequests).toHaveLength(0)

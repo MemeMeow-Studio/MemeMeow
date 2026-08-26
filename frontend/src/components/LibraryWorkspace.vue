@@ -337,7 +337,7 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
 <template>
   <section class="workspace" :aria-busy="busy">
     <div class="section-head">
-      <div><h1>图片库</h1><p>浏览、筛选和整理本地图片。</p></div>
+      <div><h1>图片库</h1></div>
     </div>
     <div class="toolbar" aria-label="图片库工具">
       <input v-model="filter" aria-label="筛选文件名" placeholder="筛选文件名" @keyup.enter="loadLibrary" />
@@ -408,7 +408,7 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
           <button class="quiet" type="button" @click="rename(item)">重命名</button>
         </div>
       </article>
-      <div v-if="!images.length" class="empty-state compact"><h2>图片库还没有图片</h2><p>上传图片后，它们会出现在这里。</p></div>
+      <div v-if="!images.length" class="empty-state compact"><h2>图片库还没有图片</h2></div>
     </div>
     <p v-if="collectionNotice" class="inline-notice" role="status">{{ collectionNotice }}</p>
   </section>

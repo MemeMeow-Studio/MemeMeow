@@ -61,7 +61,7 @@ function cancel(): void {
       <header class="image-dialog-head">
         <div>
           <h2 id="retry-selected-title">重试选中</h2>
-          <p>已选 {{ selectedCount }} 张图片，选择本次要重新处理的范围。</p>
+          <p>已选 {{ selectedCount }} 张图片</p>
         </div>
         <button class="quiet" type="button" :disabled="busy" aria-label="取消重试选中" @click="cancel">取消</button>
       </header>
@@ -78,15 +78,13 @@ function cancel(): void {
           </label>
         </fieldset>
 
-        <fieldset v-if="mode === 'parts'" class="option-fieldset retry-stage-fieldset" aria-describedby="retry-stage-hint">
+        <fieldset v-if="mode === 'parts'" class="option-fieldset retry-stage-fieldset" :aria-describedby="partsInvalid ? 'retry-stage-hint' : undefined">
           <legend>处理部分</legend>
           <label v-for="option in stageOptions" :key="option.value" class="option-choice">
             <input v-model="stages" type="checkbox" :value="option.value" :disabled="busy" />
             <span><strong>{{ option.label }}</strong><small>{{ option.description }}</small></span>
           </label>
-          <small id="retry-stage-hint" class="retry-stage-hint" :class="{ error: partsInvalid }" role="status">
-            {{ partsInvalid ? '至少选择一个处理部分' : '可同时选择多个处理部分' }}
-          </small>
+          <small v-if="partsInvalid" id="retry-stage-hint" class="retry-stage-hint error" role="status">至少选择一个处理部分</small>
         </fieldset>
 
         <div class="processing-options-actions">

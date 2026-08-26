@@ -179,7 +179,8 @@ describe('App', () => {
     const library = wrapper.findAll('.sidebar nav button').find((button) => button.text().includes('图片库'))
     await library.trigger('click')
     await flushPromises()
-    expect(wrapper.text()).toContain('浏览、筛选和整理本地图片')
+    expect(wrapper.get('h1').text()).toBe('图片库')
+    expect(wrapper.text()).not.toContain('浏览、筛选和整理本地图片')
   })
 
   it('仅在图片库工具栏提供缓存生成入口', async () => {

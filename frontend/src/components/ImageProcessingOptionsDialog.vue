@@ -68,7 +68,6 @@ function cancel(): void {
       <header class="image-dialog-head">
         <div>
           <h2 id="processing-options-title">图片处理选项</h2>
-          <p>确认后开始提交本次处理。</p>
         </div>
         <button class="quiet" type="button" :disabled="busy" aria-label="取消图片处理" @click="cancel">取消</button>
       </header>
