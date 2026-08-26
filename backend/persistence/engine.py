@@ -25,7 +25,7 @@ from backend.persistence.models import (
 
 SCOPE_LOCAL = "local"
 # 当前代码要求的 Alembic head；数据库初始化脚本会显式传入同一 revision。
-CURRENT_SCHEMA_REVISION = "0016_agent_fair_scheduling"
+CURRENT_SCHEMA_REVISION = "0017_derived_image_thumbnails"
 
 
 class DatabaseError(RuntimeError):
@@ -108,6 +108,7 @@ def ensure_optional_control_schema(engine: Engine) -> None:
             connection.execute(text("ALTER TABLE storage_operations ADD COLUMN IF NOT EXISTS attempt INTEGER"))
             connection.execute(text("ALTER TABLE storage_operations ADD COLUMN IF NOT EXISTS task_id VARCHAR(255)"))
             connection.execute(text("ALTER TABLE storage_operations ADD COLUMN IF NOT EXISTS expected_title_fingerprint VARCHAR(64)"))
+            connection.execute(text("ALTER TABLE storage_operations ADD COLUMN IF NOT EXISTS thumbnail_keys JSONB NOT NULL DEFAULT '[]'::jsonb"))
             Base.metadata.create_all(connection, tables=list(OPTIONAL_CONTROL_TABLES), checkfirst=True)
             # 旧安装可能已经存在同名三阶段约束。先删后建，确保启动兼容路径和
             # Alembic migration 对阶段/Task 映射使用完全相同的集合。

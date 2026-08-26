@@ -3,7 +3,7 @@
  */
 
 import { formatAgentActivity } from '../agentActivity'
-import type { AgentActivityView, MemeImage, TaskItem } from '../types'
+import type { AgentActivityView, MemeImage, TaskItem, ThumbnailInfo } from '../types'
 
 /** 读取未知异常的可展示消息，调用失败分支时用于统一降级。 */
 export function errorMessage(reason: unknown, fallback = '请求失败'): string {
@@ -54,6 +54,25 @@ export function uploadErrorMessage(value: unknown): string {
 /** 生成图片的稳定业务键，列表选择和 Vue key 都以 meme_id 为准。 */
 export function imageKey(item: Pick<MemeImage, 'meme_id'>): string {
   return item.meme_id || ''
+}
+
+/** 返回缩略图优先的展示地址；pending/failed/stale 统一回退原图。 */
+export function thumbnailMediaUrl(originalUrl: string | undefined, thumbnail?: ThumbnailInfo | null): string {
+  if (thumbnail?.status === 'available' && thumbnail.media_url) return thumbnail.media_url
+  return originalUrl || ''
+}
+
+/** 返回图片库或合集成员的展示地址，原图地址始终由调用方单独保留。 */
+export function imageDisplayUrl(item: Pick<MemeImage, 'media_url' | 'thumbnail'>): string {
+  return thumbnailMediaUrl(item.media_url, item.thumbnail)
+}
+
+/** 缩略图加载失败时只切换一次原图，原图失败不会进入循环或隐藏业务条目。 */
+export function fallbackImageToOriginal(event: Event, originalUrl: string): void {
+  const image = event.currentTarget as HTMLImageElement | null
+  if (!image || image.dataset.fallbackApplied === 'true' || !originalUrl) return
+  image.dataset.fallbackApplied = 'true'
+  image.src = originalUrl
 }
 
 /** 判断图片语境是否需要重新处理。 */
@@ -107,6 +126,7 @@ export function taskTypeLabel(type?: string): string {
     meme_context_generation: '语境生成',
     cache_generation: '检索缓存',
     metadata_repair: '元数据修复',
+    derived_thumbnail_generation: '缩略图生成',
     visual_embedding_generation: '图片向量生成',
     image_auto_rename: '自动重命名',
     text_embedding_generation: '文本 embedding',

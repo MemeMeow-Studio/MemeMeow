@@ -3,7 +3,7 @@
 import { onMounted, shallowRef } from 'vue'
 import { api } from '../api'
 import type { CollectionSummary, MemeImage } from '../types'
-import { errorMessage } from '../utils/presentation'
+import { errorMessage, fallbackImageToOriginal, imageDisplayUrl, thumbnailMediaUrl } from '../utils/presentation'
 import ImagePreviewDialog from './ImagePreviewDialog.vue'
 
 const emit = defineEmits<{
@@ -150,7 +150,7 @@ onMounted(loadCollections)
       <div class="collection-gallery" role="list" aria-label="合集图片">
         <article v-for="item in members" :key="item.meme_id" class="collection-asset" role="listitem">
           <button class="collection-asset-media" type="button" :aria-label="`查看 ${item.filename} 图片与元数据`" @click="openImagePreview(item, $event)">
-            <img :src="item.media_url" :alt="`预览 ${item.filename}`" loading="lazy" />
+            <img :src="imageDisplayUrl(item)" :alt="`预览 ${item.filename}`" loading="lazy" @error="fallbackImageToOriginal($event, item.media_url)" />
           </button>
           <div class="collection-asset-meta">
             <strong :title="item.filename">{{ item.filename }}</strong>
@@ -183,7 +183,13 @@ onMounted(loadCollections)
         <article v-for="item in collections" :key="item.collection_id" class="collection-row" role="listitem">
           <button class="collection-open" type="button" :disabled="busy" :aria-label="`打开合集 ${item.name}`" @click="openCollection(item)">
             <span class="collection-cover" aria-hidden="true">
-              <img v-if="item.cover_media_url" :src="item.cover_media_url" alt="" loading="lazy" />
+              <img
+                v-if="item.cover_media_url"
+                :src="thumbnailMediaUrl(item.cover_media_url, item.cover_thumbnail)"
+                alt=""
+                loading="lazy"
+                @error="fallbackImageToOriginal($event, item.cover_media_url)"
+              />
               <span v-else>无图</span>
             </span>
             <span class="collection-summary">

@@ -20,7 +20,7 @@ from typing import Any, Callable
 from uuid import UUID, uuid4
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -90,7 +90,9 @@ from backend.image_library_http import (
     image_metadata as _image_metadata_http,
     list_images as _list_images_http,
     media as _media_http,
+    thumbnail_media as _thumbnail_media_http,
 )
+from backend.thumbnail_http import reconcile_thumbnails as _reconcile_thumbnails_http
 from backend.image_processing_submission_http import process_image_library as _process_image_library_http
 from backend.image_mutation_http import delete_image as _delete_image_http, rename_image as _rename_image_http
 from backend.collection_import_http import (
@@ -116,6 +118,7 @@ from backend.reverse_image_http import internal_reverse_image_search as _interna
 from backend.settings_http import (
     ConcurrencyUpdateRequest,
     _authorize_settings,
+    _settings_token,
     _backend_settings_status,
     _update_backend_settings,
     backend_settings,
@@ -585,6 +588,25 @@ async def lifespan(app: FastAPI):
         service = services_for_task(payload)
         result = service.metadata.repair(progress)
         service.search.invalidate_cache()
+        return result
+
+    def thumbnail_handler(payload: dict[str, object], progress):
+        """执行与图片处理 Job 隔离的缩略图派生任务。"""
+        service = services_for_task(payload)
+        thumbnails = getattr(service, "thumbnails", None)
+        meme_id = payload.get("meme_id")
+        if thumbnails is None or not isinstance(meme_id, str) or not meme_id:
+            raise RuntimeError("thumbnail_task_unavailable")
+        if progress:
+            progress(0.1, "正在生成缩略图")
+        result = thumbnails.generate(
+            meme_id,
+            source_sha256=payload.get("image_sha256") if isinstance(payload.get("image_sha256"), str) else None,
+            source_size_bytes=payload.get("source_size_bytes") if isinstance(payload.get("source_size_bytes"), int) else None,
+            profile=payload.get("profile") if isinstance(payload.get("profile"), str) else None,
+        )
+        if progress:
+            progress(1.0, "缩略图已生成")
         return result
 
     def visual_handler(payload: dict[str, object], progress):
@@ -1124,6 +1146,7 @@ async def lifespan(app: FastAPI):
             return
         register("cache_generation", cache_handler)
         register("metadata_repair", repair_handler)
+        register("derived_thumbnail_generation", thumbnail_handler)
         register("visual_embedding_generation", visual_handler)
         register("meme_context_generation", context_handler)
         register("image_auto_rename", auto_rename_handler)
@@ -1219,7 +1242,7 @@ def _service(request: Request, name: str):
     """返回当前请求的服务；local 测试夹具覆盖仍只在同 scope 下生效。"""
     # 领域函数的少量单元测试使用轻量 request stub，不经过 ASGI middleware；
     # 真实 HTTP 请求始终拥有 request.state.services 并走下面的 scope 校验。
-    legacy_name = {"search": "search_engine", "visual_search": "visual_search", "reverse_image": "reverse_image", "metadata": "metadata", "tasks": "tasks"}.get(name, name)
+    legacy_name = {"search": "search_engine", "visual_search": "visual_search", "reverse_image": "reverse_image", "metadata": "metadata", "tasks": "tasks", "thumbnails": "thumbnails"}.get(name, name)
     if not hasattr(request.app, "router") and (
         getattr(request, "state", None) is None or (
             getattr(request.state, "services", None) is None and hasattr(request.app.state, legacy_name)
@@ -1235,6 +1258,24 @@ def _service(request: Request, name: str):
         if override is not None and getattr(override, "scope", services.scope).scope_id == "local":
             return override
     return value
+
+
+def _enqueue_thumbnail(request: Request, meme_id: str) -> Any:
+    """在原图 durable 成功后提交独立缩略图任务，失败只作为派生诊断。"""
+    thumbnails = _service(request, "thumbnails")
+    if thumbnails is None:
+        raise RuntimeError("thumbnail_task_unavailable")
+    return thumbnails.enqueue(meme_id)
+
+
+def _thumbnail_for_meme(request: Request, meme_id: str) -> dict[str, object] | None:
+    """将当前 scope Meme 映射为有限缩略图投影，失败时保留原图路径。"""
+    try:
+        thumbnails = _service(request, "thumbnails")
+        project = getattr(thumbnails, "projection_for_meme_id", None)
+        return project(meme_id) if callable(project) else None
+    except (DatabaseError, MetadataError, RuntimeError, ValueError):
+        return {"status": "pending", "media_url": None}
 
 
 def _processing_repository(request: Request) -> ImageProcessingRepository:
@@ -1407,7 +1448,7 @@ _route_template.router.routes.extend(settings_router.routes)
 
 
 @app.post("/search", tags=["search"])
-async def search_images(request: Request, payload: SearchRequest) -> dict[str, list[str]]:
+async def search_images(request: Request, payload: SearchRequest) -> dict[str, object]:
     """兼容旧检索入口，并注入当前 scope 的 service、媒体和错误投影。"""
     return await _search_images(
         request,
@@ -1415,6 +1456,7 @@ async def search_images(request: Request, payload: SearchRequest) -> dict[str, l
         service=_service,
         media_for_meme=_media_for_meme,
         error=_error,
+        thumbnail_for_meme=_thumbnail_for_meme,
     )
 
 
@@ -1784,16 +1826,45 @@ async def media(request: Request, meme_id: str):
     return await _media_http(request, meme_id=meme_id, services=_request_services, error=_error)
 
 
+@app.get("/media/{meme_id}/thumbnail", tags=["images"])
+async def thumbnail_media(request: Request, meme_id: str):
+    """按当前 scope 的稳定 meme_id 读取可用缩略图。"""
+    return await _thumbnail_media_http(request, meme_id=meme_id, services=_request_services, error=_error)
+
+
+@app.post("/images/thumbnails/reconcile", tags=["images", "tasks"])
+async def reconcile_thumbnails(
+    request: Request,
+    page: int = Query(default=1, ge=1),
+    page_size: int | None = Query(default=None, ge=1, le=1000),
+    limit: int | None = Query(default=None, ge=1, le=1000),
+    x_settings_admin_token: str | None = Header(default=None),
+    x_mememeow_settings_token: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> dict[str, int]:
+    """在当前 scope 内受保护地回填或重建缩略图派生任务。"""
+    return await _reconcile_thumbnails_http(
+        request,
+        page=page,
+        page_size=page_size,
+        limit=limit,
+        token=_settings_token(x_settings_admin_token, x_mememeow_settings_token, authorization),
+        thumbnail_service=lambda received: _service(received, "thumbnails"),
+        authorize=_authorize_settings,
+        error=_error,
+    )
+
+
 @app.get("/collections", tags=["collections"])
 async def list_collections(request: Request, page: int = Query(default=1, ge=1), page_size: int = Query(default=50, ge=1, le=100)) -> dict[str, object]:
     """兼容合集列表入口，并注入当前 scope environment 与错误工厂。"""
-    return await _list_collections_http(request, page=page, page_size=page_size, environment=_environment, error=_error)
+    return await _list_collections_http(request, page=page, page_size=page_size, environment=_environment, error=_error, thumbnail_service=lambda received: _service(received, "thumbnails"))
 
 
 @app.post("/collections", status_code=201, tags=["collections"])
 async def create_collection(request: Request, payload: CollectionRequest) -> dict[str, object]:
     """兼容合集创建入口，并注入当前 scope environment 与错误工厂。"""
-    return await _create_collection_http(request, payload, environment=_environment, error=_error)
+    return await _create_collection_http(request, payload, environment=_environment, error=_error, thumbnail_service=lambda received: _service(received, "thumbnails"))
 
 
 @app.post("/collections/import", tags=["collections"])
@@ -1834,6 +1905,7 @@ async def get_collection(request: Request, collection_id: str, page: int = Query
         environment=_environment,
         metadata_service=lambda received: _service(received, "metadata"),
         error=_error,
+        thumbnail_service=lambda received: _service(received, "thumbnails"),
     )
 
 
@@ -1867,7 +1939,7 @@ async def export_collection(request: Request, collection_id: str):
 @app.patch("/collections/{collection_id}", tags=["collections"])
 async def rename_collection(request: Request, collection_id: str, payload: CollectionRequest) -> dict[str, object]:
     """兼容合集重命名入口，并注入当前 scope environment 与错误工厂。"""
-    return await _rename_collection_http(request, collection_id, payload, environment=_environment, error=_error)
+    return await _rename_collection_http(request, collection_id, payload, environment=_environment, error=_error, thumbnail_service=lambda received: _service(received, "thumbnails"))
 
 
 @app.delete("/collections/{collection_id}", tags=["collections"])
@@ -1927,6 +1999,7 @@ def _idempotent_upload_result(
     original: str,
     reverse_image_policy: str,
     auto_name: bool,
+    thumbnail_enqueue: Callable[[Request, str], Any] | None = None,
 ) -> dict[str, object]:
     """兼容旧 helper 名称，并委托给公共图片上传边界。"""
     return _idempotent_upload_result_http(
@@ -1939,6 +2012,7 @@ def _idempotent_upload_result(
         auto_name=auto_name,
         processing_worker=_processing_worker,
         submit_processing_job=_submit_processing_job_for_image,
+        thumbnail_enqueue=thumbnail_enqueue,
     )
 
 
@@ -1968,6 +2042,7 @@ async def upload_images(
         release_operation=_release_operation,
         invalidate_search=_invalidate_search,
         error=_error,
+        thumbnail_enqueue=_enqueue_thumbnail,
         release_errors=UPLOAD_RESERVATION_RELEASE_ERRORS,
     )
 

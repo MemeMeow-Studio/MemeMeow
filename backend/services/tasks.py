@@ -663,7 +663,16 @@ class PostgresTaskService:
             self._grant_store.transition(association.grant, "unknown")
             raise OperationPolicyError("operation_grant_invalid")
 
-    def submit(self, task_type: str, payload: dict[str, Any] | None = None, *, schedule: bool = True) -> TaskRecord:
+    def submit(
+        self,
+        task_type: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        schedule: bool = True,
+        _lane: str | None = None,
+        _lane_backpressure: int | None = None,
+        _lane_backpressure_scope: str | None = None,
+    ) -> TaskRecord:
         """以事务插入或复用活动任务，并立即安排本进程执行。
 
         图片阶段来源由当前受信控制面 payload 规范化后落入专用列；客户端不能
@@ -680,7 +689,7 @@ class PostgresTaskService:
         # 即使携带同名字段也不得改变续跑绑定事实。
         for internal_field in ("session_id", "executor_attempt_id", "attempt_id", "resume_available", "resume_reason"):
             payload.pop(internal_field, None)
-        lane = "agent" if task_type == "meme_context_generation" else "default"
+        lane = _lane if _lane is not None else ("agent" if task_type == "meme_context_generation" else "default")
         image_stage = None
         submission_mode = None
         processing_job_id = None
@@ -729,14 +738,14 @@ class PostgresTaskService:
             self._context_policy_conflict(payload, dedupe)
         with self.resources.environment(self.scope.scope_id) as environment:
             try:
-                record = environment.tasks.submit(task_type=task_type, payload=payload, lane=lane, dedupe_key=dedupe, settings_version=self.settings_version, max_attempts=self.max_attempts, lane_backpressure=self.agent_backpressure if lane == "agent" else None, submission_mode=submission_mode, image_stage=image_stage, processing_job_id=processing_job_id)
+                record = environment.tasks.submit(task_type=task_type, payload=payload, lane=lane, dedupe_key=dedupe, settings_version=self.settings_version, max_attempts=self.max_attempts, lane_backpressure=_lane_backpressure if _lane_backpressure is not None else self.agent_backpressure if lane == "agent" else None, lane_backpressure_scope_id=_lane_backpressure_scope, submission_mode=submission_mode, image_stage=image_stage, processing_job_id=processing_job_id)
             except DatabaseError as exc:
                 if exc.code == "agent_backpressure":
                     existing = environment.uow.session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.task_type == task_type, Task.dedupe_key == dedupe, Task.status.in_(("queued", "running"))))
                     if existing:
                         record = existing
                     else:
-                        raise RuntimeError("agent_backpressure") from exc
+                        raise RuntimeError("thumbnail_backpressure" if lane == "thumbnail" else "agent_backpressure") from exc
                 else:
                     raise
             if task_type == "meme_context_generation":
@@ -747,6 +756,16 @@ class PostgresTaskService:
         if schedule:
             self._schedule(snapshot.task_id)
         return snapshot
+
+    def submit_thumbnail(self, payload: dict[str, Any], *, backpressure: int) -> TaskRecord:
+        """在独立缩略图 lane 中原子提交任务，并按当前 scope 执行背压。"""
+        return self.submit(
+            "derived_thumbnail_generation",
+            payload,
+            _lane="thumbnail",
+            _lane_backpressure=backpressure,
+            _lane_backpressure_scope=self.scope.scope_id,
+        )
 
     def retry(self, task_id: str) -> TaskRecord:
         """重试一个普通失败任务；图片阶段必须通过受限图片入口重试。"""

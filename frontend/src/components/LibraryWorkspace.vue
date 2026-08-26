@@ -6,6 +6,8 @@ import type { CollectionSummary, CoreImageProcessingStage, ImageProcessingOption
 import {
   embeddingLabel,
   errorMessage,
+  fallbackImageToOriginal,
+  imageDisplayUrl,
   imageKey,
   metadataLabel,
   visualEmbeddingLabel,
@@ -389,7 +391,7 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
         </label>
         <div class="library-row-main">
           <button class="library-preview-trigger" type="button" :aria-label="`查看 ${item.filename} 图片与详情`" @click="openImagePreview(item, $event)">
-            <img :src="item.media_url" :alt="`预览 ${item.filename}`" loading="lazy" />
+            <img :src="imageDisplayUrl(item)" :alt="`预览 ${item.filename}`" loading="lazy" @error="fallbackImageToOriginal($event, item.media_url)" />
           </button>
           <div class="file-meta">
             <strong :title="item.filename">{{ item.filename }}</strong>

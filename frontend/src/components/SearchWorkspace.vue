@@ -3,7 +3,7 @@
 import { computed, shallowRef } from 'vue'
 import { api } from '../api'
 import { useImageClipboard } from '../composables/useImageClipboard'
-import type { ServiceConfig } from '../types'
+import type { SearchResponse, SearchResultMedia, ServiceConfig } from '../types'
 import { errorMessage, resultIdentity } from '../utils/presentation'
 
 defineProps<{
@@ -19,6 +19,10 @@ const query = shallowRef('')
 const resultCount = shallowRef(8)
 const llmEnhance = shallowRef(false)
 const results = shallowRef<string[]>([])
+const resultMedia = shallowRef<SearchResultMedia[]>([])
+const originalLoaded = shallowRef(new Set<string>())
+const originalFailed = shallowRef(new Set<string>())
+const thumbnailFailed = shallowRef(new Set<string>())
 const busy = shallowRef(false)
 const { copyNotice, copyImage } = useImageClipboard()
 
@@ -32,6 +36,82 @@ const uniqueResults = computed(() => {
   })
 })
 
+const searchItems = computed(() => {
+  const media = resultMedia.value
+  const usedMedia = new Set<number>()
+  return uniqueResults.value.map((url, index) => {
+    const identity = resultIdentity(url)
+    const ordered = media[index]
+    const orderedMatches = ordered && resultIdentity(ordered.media_url) === identity
+    const mediaIndex = orderedMatches
+      ? index
+      : media.findIndex((candidate, candidateIndex) => !usedMedia.has(candidateIndex) && resultIdentity(candidate.media_url) === identity)
+    const candidate = mediaIndex >= 0 ? media[mediaIndex] : undefined
+    if (mediaIndex >= 0) usedMedia.add(mediaIndex)
+    return {
+      meme_id: candidate?.meme_id || identity || `result-${index}`,
+      media_url: candidate?.media_url || url,
+      thumbnail: candidate?.thumbnail,
+    }
+  })
+})
+
+/** 判断旁路缩略图是否可用于当前结果的初始展示。 */
+function hasThumbnail(item: SearchResultMedia): boolean {
+  return item.thumbnail?.status === 'available' && !!item.thumbnail.media_url && !thumbnailFailed.value.has(item.meme_id)
+}
+
+/** 记录一个结果集合状态并用新 Set 触发浅层响应式更新。 */
+function addResultState(target: typeof originalLoaded, key: string): void {
+  if (target.value.has(key)) return
+  const next = new Set(target.value)
+  next.add(key)
+  target.value = next
+}
+
+/** 返回当前结果图片层，原图成功后替换缩略图，失败时保留缩略图。 */
+function resultSource(item: SearchResultMedia): string {
+  if (originalLoaded.value.has(item.meme_id) && !originalFailed.value.has(item.meme_id)) return item.media_url
+  if (hasThumbnail(item)) return item.thumbnail?.media_url || item.media_url
+  return item.media_url
+}
+
+/** 让浏览器尽早并行请求原图；成功后由 visible 图片切换到原图。 */
+function shouldPreloadOriginal(item: SearchResultMedia): boolean {
+  return hasThumbnail(item) && !originalLoaded.value.has(item.meme_id) && !originalFailed.value.has(item.meme_id)
+}
+
+/** 原图预加载成功时更新对应结果，不影响其它结果的加载状态。 */
+function markOriginalLoaded(item: SearchResultMedia): void {
+  addResultState(originalLoaded, item.meme_id)
+}
+
+/** 原图预加载失败时保留仍可用的缩略图。 */
+function markOriginalFailed(item: SearchResultMedia): void {
+  addResultState(originalFailed, item.meme_id)
+}
+
+/** 缩略图失败时回退原图；原图失败则保持缩略图或当前空状态。 */
+function handleResultImageError(event: Event, item: SearchResultMedia): void {
+  const image = event.currentTarget as HTMLImageElement | null
+  if (!image) return
+  const source = image.getAttribute('src') || ''
+  if (item.thumbnail?.media_url && source === item.thumbnail.media_url) {
+    addResultState(thumbnailFailed, item.meme_id)
+    if (!originalFailed.value.has(item.meme_id)) image.src = item.media_url
+    return
+  }
+  if (source === item.media_url) addResultState(originalFailed, item.meme_id)
+}
+
+/** 清理上一次检索的结果媒体关联和渐进加载状态。 */
+function resetResultState(): void {
+  resultMedia.value = []
+  originalLoaded.value = new Set()
+  originalFailed.value = new Set()
+  thumbnailFailed.value = new Set()
+}
+
 /** 提交自然语言查询，并在工作区内维护独立加载状态。 */
 async function runSearch(): Promise<void> {
   emit('clearError')
@@ -41,9 +121,15 @@ async function runSearch(): Promise<void> {
       query: query.value,
       n_results: resultCount.value,
       llm_enhance: llmEnhance.value,
-    })
-    results.value = response.results
+    }) as SearchResponse
+    results.value = Array.isArray(response.results) ? response.results : []
+    resultMedia.value = Array.isArray(response.result_media) ? response.result_media : []
+    originalLoaded.value = new Set()
+    originalFailed.value = new Set()
+    thumbnailFailed.value = new Set()
   } catch (reason) {
+    resetResultState()
+    results.value = []
     emit('error', errorMessage(reason))
   } finally {
     busy.value = false
@@ -87,15 +173,24 @@ async function runSearch(): Promise<void> {
     <template v-if="uniqueResults.length">
       <div class="result-grid">
         <button
-          v-for="(url, index) in uniqueResults"
-          :key="resultIdentity(url)"
+          v-for="(item, index) in searchItems"
+          :key="`${item.meme_id}:${index}`"
           class="result-item"
           type="button"
           :aria-label="`复制检索结果 ${index + 1}`"
           title="复制图片"
-          @click="copyImage(url)"
+          @click="copyImage(item.media_url)"
         >
-          <img :src="url" alt="检索结果" loading="lazy" />
+          <img :src="resultSource(item)" alt="检索结果" loading="lazy" @error="handleResultImageError($event, item)" />
+          <img
+            v-if="shouldPreloadOriginal(item)"
+            class="result-original-preload"
+            :src="item.media_url"
+            alt=""
+            aria-hidden="true"
+            @load="markOriginalLoaded(item)"
+            @error="markOriginalFailed(item)"
+          />
         </button>
       </div>
       <p v-if="copyNotice" class="copy-notice" role="status" aria-live="polite">{{ copyNotice }}</p>

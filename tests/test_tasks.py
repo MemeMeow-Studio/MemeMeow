@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from threading import Event, Lock
 
+import pytest
+
 from backend.tasks import PersistentTaskService, TaskManager, TaskRecord
 
 
@@ -61,6 +63,26 @@ def test_failure_is_diagnostic_and_shutdown_marks_pending_failed():
     assert stopped.status == "failed"
     assert stopped.error["error"] == "task_not_recoverable"
     release.set()
+
+
+@pytest.mark.parametrize("code", ["thumbnail_generation_failed", "thumbnail_output_invalid", "thumbnail_source_changed"])
+def test_thumbnail_task_failure_keeps_stable_error_code(tmp_path, code):
+    """缩略图处理器抛出的稳定错误码不会被本地任务服务归一为 task_failed。"""
+    manager = PersistentTaskService(tmp_path / "tasks")
+
+    def fail(_payload, _progress):
+        """模拟缩略图处理器返回带诊断信息的领域错误。"""
+        raise RuntimeError(f"{code}: diagnostic")
+
+    manager.register("derived_thumbnail_generation", fail)
+    manager.start()
+    try:
+        record = manager.submit("derived_thumbnail_generation", {"meme_id": code})
+        completed = wait_for_terminal(manager, record.task_id)
+        assert completed.status == "failed"
+        assert completed.error["error"] == code
+    finally:
+        manager.shutdown()
 
 
 def test_agent_lane_runs_different_images_in_parallel_and_keeps_cache_lane_available(tmp_path):

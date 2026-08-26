@@ -38,6 +38,7 @@ class DataEnvironment:
             ReverseImageUsageRepository,
             SearchRepository,
             TaskRepository,
+            DerivedThumbnailRepository,
             VisualEmbeddingRepository,
         )
 
@@ -52,6 +53,7 @@ class DataEnvironment:
         self.tasks = TaskRepository(self.uow.session, scope)
         self.reverse_image_usage = ReverseImageUsageRepository(self.uow.session, scope)
         self.callback_requests = AgentCallbackRequestRepository(self.uow.session, scope)
+        self.thumbnails = DerivedThumbnailRepository(self.uow.session, scope)
 
     def __enter__(self) -> "DataEnvironment":
         """进入共享事务并返回当前环境。"""
@@ -77,6 +79,8 @@ class DatabaseResources:
         self.factory = sessionmaker(engine, expire_on_commit=False, class_=Session)
         self.image_root = image_root
         self.data_root = data_root
+        # 派生媒体使用独立根目录，StorageCoordinator 的原图扫描不会触碰这里。
+        self.derived_thumbnail_root = data_root / "derived-thumbnails"
         self._scope_cache: dict[str, Scope] = {}
         self._lock = Lock()
         ensure_optional_control_schema(engine)
@@ -116,3 +120,16 @@ class DatabaseResources:
             if scope is None:
                 raise DatabaseError("scope_not_found")
             return BlobStore(root=self.data_root, scope=ScopeContext(scope_id), storage_namespace=scope.storage_namespace, local=False)
+
+    def thumbnail_store_for_scope(self, scope_id: str | ScopeContext) -> BlobStore:
+        """创建与原图物理隔离、但使用同一 scope namespace 的派生存储。"""
+        context = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
+        if context.scope_id == SCOPE_LOCAL:
+            if self.blob_store is None:
+                raise DatabaseError("scope_not_found")
+            return BlobStore(root=self.derived_thumbnail_root, scope=context, local=True)
+        with self.factory() as session:
+            scope = session.scalar(select(Scope).where(Scope.id == context.scope_id))
+            if scope is None:
+                raise DatabaseError("scope_not_found")
+            return BlobStore(root=self.derived_thumbnail_root, scope=context, storage_namespace=scope.storage_namespace, local=False)

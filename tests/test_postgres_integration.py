@@ -41,6 +41,7 @@ from backend.database import (
     ScopeContext,
     StorageCoordinator,
     StorageOperation,
+    DerivedImageThumbnail,
     TaskLaneSlot,
     TaskLaneFairness,
     AgentCallbackRequest,
@@ -1166,7 +1167,7 @@ def test_search_migration_state_uses_single_epoch_and_atomic_switch(postgres_res
 def _clean_business_rows(engine: Engine) -> None:
     """清理集成测试产生的业务行，不触碰 scope、安装标记和迁移版本。"""
     with engine.begin() as connection:
-        for table in ("agent_callback_requests", "reverse_image_usage_events", "operation_grants", "image_processing_attempts", "image_processing_stages", "image_processing_jobs", "meme_text_embeddings", "search_migration_states", "task_lane_fairness", "task_lane_slots", "task_batch_items", "task_batches", "tasks", "meme_visual_embeddings", "meme_embeddings", "search_heads", "search_generations", "storage_operations", "meme_collection_items", "meme_collections", "memes"):
+        for table in ("agent_callback_requests", "reverse_image_usage_events", "operation_grants", "image_processing_attempts", "image_processing_stages", "image_processing_jobs", "meme_text_embeddings", "search_migration_states", "task_lane_fairness", "task_lane_slots", "task_batch_items", "task_batches", "tasks", "meme_visual_embeddings", "meme_embeddings", "search_heads", "search_generations", "derived_image_thumbnails", "storage_operations", "meme_collection_items", "meme_collections", "memes"):
             connection.execute(text(f"DELETE FROM {table} WHERE scope_id = 'local'" if table not in {"task_lane_slots"} else f"DELETE FROM {table}"))
 
 
@@ -1208,6 +1209,65 @@ def test_storage_recovery_and_two_scope_namespaces(postgres_resources, postgres_
         assert len(environment.memes.list()) == 1
     with postgres_engine.begin() as connection:
         connection.execute(text("DELETE FROM scopes WHERE id = :id"), {"id": f"isolated-{suffix}"})
+
+
+def test_storage_recovery_removes_meme_after_file_applied_before_delete_commit(postgres_resources) -> None:
+    """恢复 ``file_applied`` 删除时核对仍存在的 Meme，并清理派生文件和事实。"""
+    resources = postgres_resources
+    coordinator = StorageCoordinator(resources)
+    source_key = f"delete-recovery-{uuid4().hex}.png"
+    meme = coordinator.upload(b"delete-recovery", target_key=source_key, extension=".png", context={}, provenance={})
+    thumbnail_key = f"{meme.id.hex}-{meme.sha256}-thumbnail-v1.png"
+    thumbnail_store = resources.thumbnail_store_for_scope("local")
+    thumbnail_content = b"derived"
+    thumbnail_store._key_path(thumbnail_key).write_bytes(thumbnail_content)
+    token = uuid4()
+    quarantine_key = resources.blob_store.quarantine(source_key, token=token)
+
+    with resources.factory() as session:
+        session.add(
+            DerivedImageThumbnail(
+                scope_id="local",
+                meme_id=meme.id,
+                source_sha256=meme.sha256,
+                source_size_bytes=meme.size_bytes,
+                profile="thumbnail-v1",
+                output_key=thumbnail_key,
+                output_sha256=hashlib.sha256(thumbnail_content).hexdigest(),
+                output_size_bytes=len(thumbnail_content),
+                width=4,
+                height=4,
+                media_type="image/png",
+                status="available",
+            )
+        )
+        session.add(
+            StorageOperation(
+                scope_id="local",
+                meme_id=meme.id,
+                operation_type="delete",
+                operation_token=token,
+                source_key=source_key,
+                target_key=quarantine_key,
+                before_sha256=meme.sha256,
+                before_size=meme.size_bytes,
+                thumbnail_keys=[thumbnail_key],
+                status="file_applied",
+            )
+        )
+        session.commit()
+
+    counts = coordinator.recover()
+    assert counts["completed"] == 1
+    assert not resources.blob_store._key_path(quarantine_key, must_exist=False).exists()
+    assert not thumbnail_store._key_path(thumbnail_key, must_exist=False).exists()
+    with resources.factory() as session:
+        assert session.scalar(select(Meme).where(Meme.id == meme.id)) is None
+        assert session.scalar(select(DerivedImageThumbnail).where(DerivedImageThumbnail.meme_id == meme.id)) is None
+        operation = session.scalar(select(StorageOperation).where(StorageOperation.operation_token == token))
+        assert operation is not None
+        assert operation.status == "completed"
+        assert operation.meme_id is None
 
 
 def test_collection_export_query_is_ordered_and_excludes_active_storage_operations(postgres_resources) -> None:

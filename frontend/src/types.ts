@@ -42,10 +42,23 @@ export interface ImageMetadataSummary {
   status?: string
 }
 
+/** 缩略图派生事实的有限状态，只有 available 可以携带媒体地址。 */
+export type ThumbnailStatus = 'available' | 'pending' | 'failed' | 'stale'
+
+/** 与同一 Meme 原图版本绑定的受控缩略图投影。 */
+export interface ThumbnailInfo {
+  status: ThumbnailStatus
+  media_url?: string | null
+  width?: number
+  height?: number
+  media_type?: string
+}
+
 export interface MemeImage {
   meme_id: string
   filename: string
   media_url: string
+  thumbnail?: ThumbnailInfo
   size?: number
   extension?: string
   metadata?: ImageMetadataSummary
@@ -63,7 +76,22 @@ export interface CollectionSummary {
   name: string
   member_count?: number
   cover_media_url?: string
+  cover_meme_id?: string
+  cover_thumbnail?: ThumbnailInfo
   members?: MemeImage[]
+}
+
+/** 保持检索 results 数组兼容的原图/缩略图旁路关联。 */
+export interface SearchResultMedia {
+  meme_id: string
+  media_url: string
+  thumbnail?: ThumbnailInfo
+}
+
+/** 检索响应的稳定主结果和可选富媒体旁路。 */
+export interface SearchResponse {
+  results: string[]
+  result_media?: SearchResultMedia[]
 }
 
 export interface AgentActivityView {

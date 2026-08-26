@@ -14,7 +14,7 @@ from api import image_metadata
 
 def test_schema_contains_scope_and_queue_tables():
     """首版 schema 必须覆盖业务记录、generation 和持久任务队列。"""
-    expected = {"scopes", "installation_state", "memes", "storage_operations", "search_generations", "search_heads", "meme_embeddings", "meme_visual_embeddings", "meme_text_embeddings", "search_migration_states", "image_processing_jobs", "image_processing_stages", "image_processing_attempts", "operation_grants", "agent_callback_requests", "tasks", "task_batches", "task_batch_items", "task_lane_slots", "meme_collections", "meme_collection_items", "reverse_image_usage_events"}
+    expected = {"scopes", "installation_state", "memes", "storage_operations", "derived_image_thumbnails", "search_generations", "search_heads", "meme_embeddings", "meme_visual_embeddings", "meme_text_embeddings", "search_migration_states", "image_processing_jobs", "image_processing_stages", "image_processing_attempts", "operation_grants", "agent_callback_requests", "tasks", "task_batches", "task_batch_items", "task_lane_slots", "meme_collections", "meme_collection_items", "reverse_image_usage_events"}
     assert expected <= set(Base.metadata.tables)
     assert EMBEDDING_DIMENSIONS == 1024
     assert Base.metadata.tables["meme_embeddings"].c.embedding.type.dim == 1024

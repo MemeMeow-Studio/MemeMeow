@@ -8,10 +8,13 @@ from .metadata import PostgresMetadataService
 from .search import PostgresSearchService
 from .tasks import PostgresTaskService
 from .worker_manager import PostgresTaskWorkerManager
+from .thumbnails import DerivedThumbnailService, ThumbnailError
 
 __all__ = [
     "PostgresMetadataService",
     "PostgresSearchService",
     "PostgresTaskService",
     "PostgresTaskWorkerManager",
+    "DerivedThumbnailService",
+    "ThumbnailError",
 ]

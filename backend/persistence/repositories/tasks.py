@@ -79,6 +79,7 @@ class TaskRepository:
         max_attempts: int = 3,
         task_id: str | None = None,
         lane_backpressure: int | None = None,
+        lane_backpressure_scope_id: str | None = None,
         submission_mode: str | None = None,
         image_stage: str | None = None,
         processing_job_id: UUID | str | None = None,
@@ -132,7 +133,10 @@ class TaskRepository:
             if existing:
                 return existing
         if lane_backpressure is not None:
-            active = self.session.scalar(select(func.count()).select_from(Task).where(Task.lane == lane, Task.status.in_(("queued", "running")))) or 0
+            active_filters = [Task.lane == lane, Task.status.in_(("queued", "running"))]
+            if lane_backpressure_scope_id is not None:
+                active_filters.append(Task.scope_id == lane_backpressure_scope_id)
+            active = self.session.scalar(select(func.count()).select_from(Task).where(*active_filters)) or 0
             if int(active) >= int(lane_backpressure):
                 raise DatabaseError("agent_backpressure")
         task = Task(

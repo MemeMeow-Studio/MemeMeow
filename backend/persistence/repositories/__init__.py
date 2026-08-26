@@ -15,11 +15,13 @@ from backend.persistence.repositories.memes import MemeRepository
 from backend.persistence.repositories.reverse_image import ReverseImageUsageRepository
 from backend.persistence.repositories.search import SearchRepository
 from backend.persistence.repositories.tasks import IMAGE_PROCESSING_LANE_TYPES, TaskRepository, _validate_lane_capacities
+from backend.persistence.repositories.thumbnails import DerivedThumbnailRepository
 from backend.persistence.repositories.visual_embeddings import VisualEmbeddingRepository, validate_visual_vector
 
 __all__ = [
     "AgentCallbackRequestRepository",
     "CollectionRepository",
+    "DerivedThumbnailRepository",
     "IMAGE_PROCESSING_LANE_TYPES",
     "InMemoryAgentCallbackRequestRepository",
     "InMemoryCallbackRequest",

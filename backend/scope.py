@@ -71,8 +71,10 @@ def validate_scope_services(expected_scope: ScopeContext | str, services: object
     outer = _bound_scope(services)
     if outer is None or outer != expected:
         raise ScopeServicesError("scope service 外层 scope 不一致")
-    for name in ("metadata", "search", "tasks", "reverse_image", "visual_search"):
+    for name in ("metadata", "search", "tasks", "reverse_image", "visual_search", "thumbnails"):
         child = getattr(services, name, None)
+        if child is None:
+            continue
         child_scope = _bound_scope(child)
         if child_scope is None or child_scope != expected:
             raise ScopeServicesError(f"scope service 子服务 {name} 绑定不一致")
@@ -208,6 +210,7 @@ async def resolve_scope_async(request: Any) -> ScopeContext:
 if TYPE_CHECKING:
     from backend.pg_services import PostgresMetadataService, PostgresSearchService, PostgresTaskService
     from backend.reverse_image import ReverseImageService
+    from backend.services.thumbnails import DerivedThumbnailService
     from backend.visual import VisualSearchService
 
 
@@ -226,6 +229,7 @@ class ScopeServices:
     tasks: "PostgresTaskService"
     reverse_image: "ReverseImageService"
     visual_search: "VisualSearchService"
+    thumbnails: "DerivedThumbnailService | None" = None
 
     @property
     def search_engine(self) -> "PostgresSearchService":
@@ -296,6 +300,7 @@ class ScopeServiceFactory:
             # 局部导入避免 database 与 pg_services 在启动期形成循环导入。
             from backend.pg_services import PostgresMetadataService, PostgresSearchService, PostgresTaskService
             from backend.reverse_image import ReverseImageService
+            from backend.services.thumbnails import DerivedThumbnailService
             from backend.visual import VisualSearchService
 
             metadata = PostgresMetadataService(self.resources, scope_id=context.scope_id)
@@ -326,8 +331,19 @@ class ScopeServiceFactory:
                 resume_timeout_seconds=self._task_config.get("resume_timeout_seconds", getattr(self.settings, "agent_resume_timeout_seconds", 900)),
                 worker_manager=self._worker_manager,
             )
+            thumbnail_store = getattr(self.resources, "thumbnail_store_for_scope", None)
+            thumbnails = (
+                DerivedThumbnailService(
+                    self.resources,
+                    self.settings,
+                    scope_id=context,
+                    task_service=tasks,
+                )
+                if callable(thumbnail_store)
+                else None
+            )
             register = self._task_config.get("register_handlers")
-            services = ScopeServices(context, metadata, search, tasks, reverse_image, visual_search)
+            services = ScopeServices(context, metadata, tasks=tasks, search=search, reverse_image=reverse_image, visual_search=visual_search, thumbnails=thumbnails)
             # 在注册 handler 或启动子服务前完成一致性校验，避免装配错误已经产生副作用。
             validate_scope_services(context, services)
             if callable(register):

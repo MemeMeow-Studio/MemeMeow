@@ -470,6 +470,19 @@ def _build_scope_runtime(
                 operation_policy=app.state.operation_policy_gateway,
                 grant_store=app.state.operation_grants,
             )
+            from backend.services.thumbnails import DerivedThumbnailService
+
+            thumbnail_store = getattr(app.state.database, "thumbnail_store_for_scope", None)
+            local_thumbnails = (
+                DerivedThumbnailService(
+                    app.state.database,
+                    settings,
+                    scope_id=local_scope,
+                    task_service=local_tasks,
+                )
+                if callable(thumbnail_store)
+                else None
+            )
             local_services = ScopeServices(
                 local_scope,
                 local_metadata,
@@ -477,6 +490,7 @@ def _build_scope_runtime(
                 local_tasks,
                 local_reverse_image,
                 local_visual_search,
+                local_thumbnails,
             )
             ownership.local_services = local_services
     runtime_factory: Any

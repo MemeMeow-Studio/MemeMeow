@@ -56,6 +56,7 @@ from backend.persistence.models import (
     OPTIONAL_CONTROL_TABLES,
     AgentCallbackRequest,
     Base,
+    DerivedImageThumbnail,
     ImageProcessingAttempt,
     ImageProcessingJob,
     ImageProcessingStage,
@@ -96,6 +97,7 @@ from backend.persistence.repositories.memes import MemeRepository
 from backend.persistence.repositories.reverse_image import ReverseImageUsageRepository
 from backend.persistence.repositories.search import SearchRepository
 from backend.persistence.repositories.tasks import IMAGE_PROCESSING_LANE_TYPES, TaskRepository, _validate_lane_capacities
+from backend.persistence.repositories.thumbnails import DerivedThumbnailRepository
 from backend.persistence.repositories.visual_embeddings import VisualEmbeddingRepository, validate_visual_vector
 from backend.persistence.storage import BlobStore, StorageCoordinator
 from backend.persistence.unit_of_work import UnitOfWork
@@ -112,6 +114,8 @@ __all__ = [
     "CheckConstraint",
     "CollectionRepository",
     "DataEnvironment",
+    "DerivedImageThumbnail",
+    "DerivedThumbnailRepository",
     "DatabaseError",
     "DatabaseResources",
     "DateTime",

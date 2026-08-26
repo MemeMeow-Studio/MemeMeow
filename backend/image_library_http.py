@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse
 
 from backend.database import DatabaseError
 from backend.metadata import MetadataError
+from backend.services.thumbnails import ThumbnailError
 
 
 ServicesProvider = Callable[[Request], Any]
@@ -52,6 +53,9 @@ async def list_images(
         total = database_environment.memes.count(search=search)
     items: list[dict[str, object]] = []
     identity = visual_identity(request)
+    thumbnails = getattr(scoped_services, "thumbnails", None)
+    projection_batch = getattr(thumbnails, "projections", None) if thumbnails is not None else None
+    thumbnail_projections = projection_batch(records) if callable(projection_batch) and records else {}
     for record in records:
         try:
             image = scoped_services.metadata.blob_store.resolve(record.storage_key)
@@ -78,6 +82,8 @@ async def list_images(
             "embedding_status": "ready" if scoped_services.search.has_cache() and metadata_status.get("status") in {"partial", "ready"} else "blocked" if metadata_status.get("status") == "repair_required" else "pending",
             "visual_embedding_status": "ready" if visual_row is not None else "pending",
         }
+        if thumbnails is not None:
+            item["thumbnail"] = thumbnail_projections.get(record.id, {"status": "pending", "media_url": None})
         latest_processing = processing_repository(request).latest_for_target(record.id, record.sha256)
         if latest_processing is not None:
             processing_public = latest_processing.as_dict()
@@ -139,7 +145,25 @@ async def media(
     except MetadataError as exc:
         raise error(404, "meme_not_found", "图片不存在") from exc
     media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    return FileResponse(path, media_type=media_type)
+    return FileResponse(path, media_type=media_type, headers={"Cache-Control": "private, no-store", "Vary": "Cookie"})
 
 
-__all__ = ["image_metadata", "list_images", "media"]
+async def thumbnail_media(
+    request: Request,
+    *,
+    meme_id: str,
+    services: ServicesProvider,
+    error: ErrorFactory,
+) -> FileResponse:
+    """按当前 scope 的稳定 Meme ID读取可用缩略图，隐藏内部输出 key。"""
+    thumbnails = getattr(services(request), "thumbnails", None)
+    if thumbnails is None:
+        raise error(404, "meme_not_found", "图片不存在")
+    try:
+        path, media_type = thumbnails.media_path(meme_id)
+    except (ThumbnailError, DatabaseError, MetadataError) as exc:
+        raise error(404, "meme_not_found", "图片不存在") from exc
+    return FileResponse(path, media_type=media_type, headers={"Cache-Control": "private, no-store", "Vary": "Cookie"})
+
+
+__all__ = ["image_metadata", "list_images", "media", "thumbnail_media"]

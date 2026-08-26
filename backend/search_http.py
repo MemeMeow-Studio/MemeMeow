@@ -27,6 +27,9 @@ class SearchRequest(_SearchRequestModel):
     llm_enhance: bool = False
 
 
+ThumbnailProjectionProvider = Callable[[Request, str], dict[str, object] | None]
+
+
 async def search_images(
     request: Request,
     payload: SearchRequest,
@@ -34,7 +37,8 @@ async def search_images(
     service: Callable[[Request, str], Any],
     media_for_meme: Callable[[Request, str], str | None],
     error: Callable[[int, str, str], HTTPException],
-) -> dict[str, list[str]]:
+    thumbnail_for_meme: ThumbnailProjectionProvider | None = None,
+) -> dict[str, object]:
     """执行 scope-bound 检索并把结果投影为受控媒体 URL。
 
     关键输入是严格校验后的 query、结果数量和 LLM 开关；service、media_for_meme 与
@@ -66,13 +70,20 @@ async def search_images(
     # 保留原入口的 service 访问顺序，确保 metadata scope/service 不会被隐式放宽。
     service(request, "metadata")
     mapped: list[str] = []
+    result_media: list[dict[str, object]] = []
     for item in results or []:
         media = media_for_meme(request, str(item)) if isinstance(item, str) else None
         if media and media not in mapped:
             mapped.append(media)
+            if thumbnail_for_meme is not None:
+                projection = thumbnail_for_meme(request, str(item))
+                result_media.append({"meme_id": str(item), "media_url": media, "thumbnail": projection or {"status": "pending", "media_url": None}})
         if len(mapped) >= payload.n_results:
             break
-    return {"results": mapped}
+    response: dict[str, object] = {"results": mapped}
+    if thumbnail_for_meme is not None:
+        response["result_media"] = result_media
+    return response
 
 
 __all__ = ["SearchRequest", "search_images"]

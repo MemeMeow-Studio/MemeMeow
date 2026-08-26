@@ -50,6 +50,7 @@ OperationRelease = Callable[[Request, Any], None]
 ProcessingSubmitter = Callable[..., Any]
 VisualSubmitter = Callable[..., Any]
 ProcessingConfigProvider = Callable[[Request], dict[str, object]]
+ThumbnailEnqueue = Callable[[Request, str], Any]
 EnqueueErrorProjector = Callable[[Exception], str]
 SearchInvalidator = Callable[[Request], None]
 OperationErrorProjector = Callable[[OperationPolicyError], HTTPException]
@@ -131,6 +132,7 @@ def idempotent_upload_result(
     auto_name: bool,
     processing_worker: ProcessingWorkerProvider,
     submit_processing_job: ProcessingSubmitter,
+    thumbnail_enqueue: ThumbnailEnqueue | None = None,
 ) -> dict[str, object]:
     """构造已存在 durable 图片的幂等成功结果并复用当前处理状态。
 
@@ -149,6 +151,11 @@ def idempotent_upload_result(
         "auto_name": auto_name,
         "reverse_image_policy": reverse_image_policy,
     }
+    if thumbnail_enqueue is not None:
+        try:
+            thumbnail_enqueue(request, str(record.id))
+        except Exception as exc:  # noqa: BLE001 - 缩略图失败不得影响原图幂等成功
+            result["thumbnail_enqueue_error"] = getattr(exc, "code", "thumbnail_enqueue_failed")
     worker = processing_worker(request)
     snapshot = worker.jobs.latest_for_target(record.id, record.sha256) if worker is not None else None
     if snapshot is None:
@@ -197,6 +204,7 @@ async def upload_images(
     release_operation: OperationRelease,
     invalidate_search: SearchInvalidator,
     error: ErrorFactory,
+    thumbnail_enqueue: ThumbnailEnqueue | None = None,
     operation_error: OperationErrorProjector | None = None,
     release_errors: Collection[str] = UPLOAD_RESERVATION_RELEASE_ERRORS,
 ) -> dict[str, object]:
@@ -290,6 +298,7 @@ async def upload_images(
                     auto_name=auto_name,
                     processing_worker=processing_worker,
                     submit_processing_job=submit_processing_job,
+                    thumbnail_enqueue=thumbnail_enqueue,
                 )
             )
             continue
@@ -337,6 +346,7 @@ async def upload_images(
                             auto_name=auto_name,
                             processing_worker=processing_worker,
                             submit_processing_job=submit_processing_job,
+                            thumbnail_enqueue=thumbnail_enqueue,
                         )
                     )
                     continue
@@ -364,6 +374,11 @@ async def upload_images(
             "media_url": f"/media/{meme_id}",
             "auto_named": False,
         }
+        if thumbnail_enqueue is not None:
+            try:
+                thumbnail_enqueue(request, meme_id)
+            except Exception as exc:  # noqa: BLE001 - 派生失败保留原图成功事实
+                result["thumbnail_enqueue_error"] = getattr(exc, "code", "thumbnail_enqueue_failed")
         worker = None
         try:
             worker = processing_worker(request)

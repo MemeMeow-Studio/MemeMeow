@@ -17,18 +17,18 @@ from backend.database import DatabaseError
 
 EnvironmentProvider = Callable[[Request], Any]
 MetadataServiceProvider = Callable[[Request], Any]
+ThumbnailServiceProvider = Callable[[Request], Any]
 ErrorFactory = Callable[[int, str, str], HTTPException]
 
 
-def collection_payload(request: Request, environment: Any, row: Any) -> dict[str, object]:
+def collection_payload(request: Request, environment: Any, row: Any, thumbnail_service: ThumbnailServiceProvider | None = None) -> dict[str, object]:
     """构造不暴露 scope 的合集摘要。
 
     输入是当前请求、scope-bound 数据环境和合集 ORM 行；输出包含稳定合集 ID、成员数、
     受控封面媒体地址及时间字段。调用场景是列表、创建和重命名成功响应。
     """
-    del request  # 保留旧 helper 的参数形状，摘要只依赖已绑定 environment。
     cover = environment.collections.cover(row.id)
-    return {
+    payload: dict[str, object] = {
         "collection_id": str(row.id),
         "name": row.name,
         "member_count": environment.collections.member_count(row.id),
@@ -36,6 +36,12 @@ def collection_payload(request: Request, environment: Any, row: Any) -> dict[str
         "created_at": row.created_at.isoformat(),
         "updated_at": row.updated_at.isoformat(),
     }
+    if cover is not None and thumbnail_service is not None:
+        thumbnails = thumbnail_service(request)
+        project = getattr(thumbnails, "projection", None)
+        payload["cover_meme_id"] = str(cover.id)
+        payload["cover_thumbnail"] = project(cover) if callable(project) else {"status": "pending", "media_url": None}
+    return payload
 
 
 def collection_error(exc: DatabaseError, *, error: ErrorFactory) -> HTTPException:
@@ -62,6 +68,7 @@ async def list_collections(
     page_size: int,
     environment: EnvironmentProvider,
     error: ErrorFactory,
+    thumbnail_service: ThumbnailServiceProvider | None = None,
 ) -> dict[str, object]:
     """分页列出当前 scope 的合集。
 
@@ -74,7 +81,7 @@ async def list_collections(
     with environment(request) as database_environment:
         rows = database_environment.collections.list(page=page, page_size=page_size)
         return {
-            "items": [collection_payload(request, database_environment, row) for row in rows],
+            "items": [collection_payload(request, database_environment, row, thumbnail_service) for row in rows],
             "total": database_environment.collections.count(),
             "page": page,
             "page_size": page_size,
@@ -87,6 +94,7 @@ async def create_collection(
     *,
     environment: EnvironmentProvider,
     error: ErrorFactory,
+    thumbnail_service: ThumbnailServiceProvider | None = None,
 ) -> dict[str, object]:
     """创建当前 scope 的空合集。
 
@@ -96,7 +104,7 @@ async def create_collection(
     try:
         with environment(request) as database_environment:
             row = database_environment.collections.create(payload.name)
-            return collection_payload(request, database_environment, row)
+            return collection_payload(request, database_environment, row, thumbnail_service)
     except DatabaseError as exc:
         raise collection_error(exc, error=error) from exc
 
@@ -110,6 +118,7 @@ async def get_collection(
     environment: EnvironmentProvider,
     metadata_service: MetadataServiceProvider,
     error: ErrorFactory,
+    thumbnail_service: ThumbnailServiceProvider | None = None,
 ) -> dict[str, object]:
     """返回合集元数据和当前文件信息的分页成员。
 
@@ -139,7 +148,11 @@ async def get_collection(
                         "metadata": metadata_status,
                     }
                 )
-            payload = collection_payload(request, database_environment, row)
+                if thumbnail_service is not None:
+                    thumbnails = thumbnail_service(request)
+                    project = getattr(thumbnails, "projection", None)
+                    members[-1]["thumbnail"] = project(meme) if callable(project) else {"status": "pending", "media_url": None}
+            payload = collection_payload(request, database_environment, row, thumbnail_service)
             payload["members"] = members
             payload["total"] = database_environment.collections.member_count(row.id)
             payload["page"] = page
@@ -156,6 +169,7 @@ async def rename_collection(
     *,
     environment: EnvironmentProvider,
     error: ErrorFactory,
+    thumbnail_service: ThumbnailServiceProvider | None = None,
 ) -> dict[str, object]:
     """重命名合集并保留成员关系。
 
@@ -165,7 +179,7 @@ async def rename_collection(
     try:
         with environment(request) as database_environment:
             row = database_environment.collections.rename(collection_id, payload.name)
-            return collection_payload(request, database_environment, row)
+            return collection_payload(request, database_environment, row, thumbnail_service)
     except DatabaseError as exc:
         raise collection_error(exc, error=error) from exc
 

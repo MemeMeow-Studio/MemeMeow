@@ -107,4 +107,31 @@ describe('CollectionsWorkspace', () => {
     expect(wrapper.get('.collection-empty').text()).toContain('这个合集还没有图片')
     expect(wrapper.text()).toContain('图片已从合集移除')
   })
+
+  it('封面和成员优先显示缩略图，加载失败回退原图，预览仍使用原图', async () => {
+    const coverThumbnail = { status: 'available', media_url: '/media/meme-1/thumbnail', width: 320, height: 160, media_type: 'image/png' }
+    const memberWithThumbnail = { ...member, thumbnail: coverThumbnail }
+    collections.mockResolvedValue({ items: [{ ...summary, cover_thumbnail: coverThumbnail }] })
+    collection.mockResolvedValue({ ...summary, cover_thumbnail: coverThumbnail, members: [memberWithThumbnail] })
+    const wrapper = mount(CollectionsWorkspace, { attachTo: document.body })
+    await flushPromises()
+
+    const coverImage = wrapper.get('.collection-cover img')
+    expect(coverImage.attributes('src')).toBe('/media/meme-1/thumbnail')
+    await coverImage.trigger('error')
+    expect(coverImage.attributes('src')).toBe('/media/meme-1')
+
+    await wrapper.get('[aria-label="打开合集 会议反应"]').trigger('click')
+    await flushPromises()
+    const memberImage = wrapper.get('.collection-asset-media img')
+    expect(memberImage.attributes('src')).toBe('/media/meme-1/thumbnail')
+    await memberImage.trigger('error')
+    expect(memberImage.attributes('src')).toBe('/media/meme-1')
+
+    await wrapper.get('.collection-asset-media').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.image-dialog-preview img').attributes('src')).toBe('/media/meme-1')
+    await wrapper.get('[aria-label="关闭图片预览"]').trigger('click')
+    wrapper.unmount()
+  })
 })

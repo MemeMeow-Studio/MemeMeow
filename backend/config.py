@@ -20,6 +20,7 @@ from pydantic import AliasChoices, Field, PrivateAttr, field_validator, model_va
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from backend.visual_models import ACTIVE_VISUAL_MODEL_ID, active_visual_model_spec, source_repository_valid, visual_model_spec
+from backend.thumbnail_config import ThumbnailConfig
 from executor.agent_limits import (
     AGENT_BACKPRESSURE_DEFAULT,
     validate_agent_backpressure,
@@ -97,6 +98,15 @@ class Settings(BaseSettings):
     max_files_per_request: int = Field(default=20, ge=1, le=20, validation_alias=AliasChoices("MEMEMEOW_MAX_FILES_PER_REQUEST", "max_files_per_request"))
     max_concurrent_upload_requests: int = Field(default=2, ge=1, le=2, validation_alias=AliasChoices("MEMEMEOW_MAX_CONCURRENT_UPLOAD_REQUESTS", "max_concurrent_upload_requests"))
     max_request_bytes: int | None = Field(default=None, ge=1, le=4 * 1024 * 1024 * 1024, validation_alias=AliasChoices("MEMEMEOW_MAX_REQUEST_BYTES", "max_request_bytes"))
+    # 缩略图配置由 ThumbnailConfig 再次收束，避免客户端或任务 payload 改变 profile。
+    thumbnail_profile: str = Field(default="thumbnail-v1", validation_alias=AliasChoices("MEMEMEOW_THUMBNAIL_PROFILE", "thumbnail_profile"))
+    thumbnail_max_edge: int = Field(default=320, ge=1, le=320, validation_alias=AliasChoices("MEMEMEOW_THUMBNAIL_MAX_EDGE", "thumbnail_max_edge"))
+    thumbnail_max_output_bytes: int = Field(default=4 * 1024 * 1024, ge=1, le=64 * 1024 * 1024, validation_alias=AliasChoices("MEMEMEOW_THUMBNAIL_MAX_OUTPUT_BYTES", "thumbnail_max_output_bytes"))
+    thumbnail_timeout_seconds: float = Field(default=10.0, gt=0, le=120, validation_alias=AliasChoices("MEMEMEOW_THUMBNAIL_TIMEOUT_SECONDS", "thumbnail_timeout_seconds"))
+    thumbnail_max_temp_bytes: int = Field(default=64 * 1024 * 1024, ge=1, le=512 * 1024 * 1024, validation_alias=AliasChoices("MEMEMEOW_THUMBNAIL_MAX_TEMP_BYTES", "thumbnail_max_temp_bytes"))
+    thumbnail_concurrency: int = Field(default=2, ge=1, le=32, validation_alias=AliasChoices("MEMEMEOW_THUMBNAIL_CONCURRENCY", "thumbnail_concurrency"))
+    thumbnail_backpressure: int = Field(default=100, ge=1, le=10000, validation_alias=AliasChoices("MEMEMEOW_THUMBNAIL_BACKPRESSURE", "thumbnail_backpressure"))
+    thumbnail_reconcile_batch_size: int = Field(default=100, ge=1, le=1000, validation_alias=AliasChoices("MEMEMEOW_THUMBNAIL_RECONCILE_BATCH_SIZE", "thumbnail_reconcile_batch_size"))
     opencode_executable: str | None = Field(default="opencode", validation_alias=AliasChoices("MEMEMEOW_OPENCODE_EXECUTABLE", "opencode_executable"))
     agent_runtime_mode: str = Field(default="auto", validation_alias=AliasChoices("MEMEMEOW_AGENT_RUNTIME_MODE", "agent_runtime_mode"))
     public_release_profile: str = Field(default="local", validation_alias=AliasChoices("MEMEMEOW_PUBLIC_RELEASE_PROFILE", "public_release_profile"))
@@ -217,6 +227,7 @@ class Settings(BaseSettings):
         validate_agent_backpressure(self.agent_backpressure)
         validate_agent_concurrency(self.opencode_concurrency, backpressure=self.agent_backpressure)
         validate_agent_concurrency(self.agent_scope_concurrency, backpressure=self.opencode_concurrency)
+        ThumbnailConfig.from_settings(self)
         return self
 
     @property
@@ -301,6 +312,8 @@ class Settings(BaseSettings):
             "opencode_concurrency": self.opencode_concurrency,
             "agent_scope_concurrency": self.agent_scope_concurrency,
             "agent_backpressure": self.agent_backpressure,
+            "thumbnail_profile": self.thumbnail_profile,
+            "thumbnail_max_edge": self.thumbnail_max_edge,
             "protected_mode": self.protected_mode,
             "opencode_workspace_root_configured": bool(self.opencode_workspace_root),
         }
@@ -362,6 +375,10 @@ class Settings(BaseSettings):
             "max_files_per_request": self.max_files_per_request,
             "max_concurrent_upload_requests": self.max_concurrent_upload_requests,
             "max_request_bytes": self.max_request_bytes,
+            "thumbnail_profile": self.thumbnail_profile,
+            "thumbnail_max_edge": self.thumbnail_max_edge,
+            "thumbnail_concurrency": self.thumbnail_concurrency,
+            "thumbnail_backpressure": self.thumbnail_backpressure,
         }
 
     def backend_status(self, *, cache_ready: bool = False, runtime_ready: bool = False) -> dict[str, object]:

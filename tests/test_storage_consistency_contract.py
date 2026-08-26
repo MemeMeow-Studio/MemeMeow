@@ -85,6 +85,7 @@ def test_storage_operation_schema_retains_durable_and_fencing_facts() -> None:
         "source_key",
         "target_key",
         "staging_key",
+        "thumbnail_keys",
         "before_sha256",
         "after_sha256",
         "before_size",

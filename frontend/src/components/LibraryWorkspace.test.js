@@ -303,4 +303,41 @@ describe('LibraryWorkspace', () => {
     await wrapper.get('[aria-label="关闭图片预览"]').trigger('click')
     wrapper.unmount()
   })
+
+  it('列表优先显示可用缩略图，缩略图失败回退原图且完整预览继续使用原图', async () => {
+    images.mockResolvedValue({
+      items: [{
+        ...image,
+        thumbnail: { status: 'available', media_url: '/media/meme-1/thumbnail', width: 320, height: 160, media_type: 'image/png' },
+      }],
+    })
+    const wrapper = mount(LibraryWorkspace, {
+      props: { config: null, cacheTask: null, cacheBusy: false, refreshToken: 0 },
+      attachTo: document.body,
+    })
+    await flushPromises()
+
+    const listImage = wrapper.get('.library-preview-trigger img')
+    expect(listImage.attributes('src')).toBe('/media/meme-1/thumbnail')
+    await listImage.trigger('error')
+    expect(listImage.attributes('src')).toBe('/media/meme-1')
+
+    await wrapper.get('.metadata-button').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.image-dialog-preview img').attributes('src')).toBe('/media/meme-1')
+    await wrapper.get('[aria-label="关闭图片预览"]').trigger('click')
+    wrapper.unmount()
+  })
+
+  it('pending、failed 和 stale 缩略图状态均直接使用原图展示', async () => {
+    images.mockResolvedValue({
+      items: [{ ...image, thumbnail: { status: 'failed', media_url: null } }],
+    })
+    const wrapper = mount(LibraryWorkspace, {
+      props: { config: null, cacheTask: null, cacheBusy: false, refreshToken: 0 },
+    })
+    await flushPromises()
+    expect(wrapper.get('.library-preview-trigger img').attributes('src')).toBe('/media/meme-1')
+    wrapper.unmount()
+  })
 })

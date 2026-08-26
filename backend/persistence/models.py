@@ -116,6 +116,45 @@ class Meme(Base):
     )
 
 
+class DerivedImageThumbnail(Base):
+    """与原图版本绑定的缩略图派生事实。
+
+    该表独立于图片处理 Job 和 Meme 语境，复合主键包含 scope、稳定 Meme 身份、
+    源内容指纹和固定 profile；派生文件只在 ``available`` 且指纹复核通过时可访问。
+    """
+
+    __tablename__ = "derived_image_thumbnails"
+
+    scope_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    meme_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    source_sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_size_bytes: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    profile: Mapped[str] = mapped_column(String(128), primary_key=True)
+    output_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    output_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    output_size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    media_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    diagnostic: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(["scope_id", "meme_id"], ["memes.scope_id", "memes.id"], ondelete="CASCADE"),
+        CheckConstraint("length(source_sha256) = 64", name="ck_thumbnail_source_sha256"),
+        CheckConstraint("source_size_bytes >= 0", name="ck_thumbnail_source_size_nonnegative"),
+        CheckConstraint("status IN ('available','pending','failed','stale')", name="ck_thumbnail_status"),
+        CheckConstraint("output_sha256 IS NULL OR length(output_sha256) = 64", name="ck_thumbnail_output_sha256"),
+        CheckConstraint("output_size_bytes IS NULL OR output_size_bytes >= 0", name="ck_thumbnail_output_size_nonnegative"),
+        CheckConstraint("width IS NULL OR width > 0", name="ck_thumbnail_width"),
+        CheckConstraint("height IS NULL OR height > 0", name="ck_thumbnail_height"),
+        Index("ix_thumbnail_current", "scope_id", "meme_id", "profile", "status", "updated_at"),
+    )
+
+
 class MemeCollection(Base):
     """当前 scope 内的逻辑 Meme 合集，不拥有图片文件。"""
 
@@ -161,6 +200,8 @@ class StorageOperation(Base):
     source_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     target_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     staging_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # 删除 operation 在 Meme 行解除关联后仍需保留派生文件 key，供恢复器重试清理。
+    thumbnail_keys: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
     before_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     after_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     before_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -617,9 +658,10 @@ class SearchMigrationState(Base):
     )
 
 
-# 这些表属于图片处理控制面；在已安装旧 revision 的部署启动时用 ``checkfirst``
-# 幂等补齐，标准部署仍以 Alembic 0011 迁移作为唯一 schema 版本事实。
+# 这些表属于可选控制面；在已安装旧 revision 的部署启动时用 ``checkfirst``
+# 幂等补齐，标准部署仍以对应 Alembic 迁移作为 schema 版本事实。
 OPTIONAL_CONTROL_TABLES = (
+    DerivedImageThumbnail.__table__,
     OperationGrant.__table__,
     ImageProcessingJob.__table__,
     ImageProcessingStage.__table__,

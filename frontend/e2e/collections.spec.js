@@ -8,6 +8,8 @@ const collection = {
   name: '本周会议里的反应合集',
   member_count: 2,
   cover_media_url: '/media/member-1',
+  cover_meme_id: 'member-1',
+  cover_thumbnail: { status: 'available', media_url: '/media/member-1/thumbnail' },
 }
 const members = [
   {
@@ -15,12 +17,14 @@ const members = [
     filename: 'meeting-reaction-with-a-long-descriptive-file-name.png',
     extension: '.png',
     media_url: '/media/member-1',
+    thumbnail: { status: 'available', media_url: '/media/member-1/thumbnail' },
   },
   {
     meme_id: 'member-2',
     filename: 'waiting-for-the-decision.jpg',
     extension: '.jpg',
     media_url: '/media/member-2',
+    thumbnail: { status: 'available', media_url: '/media/member-2/thumbnail' },
   },
 ]
 
@@ -44,13 +48,18 @@ test('合集列表和详情在桌面、移动端保持可扫描且图片可见',
     contentType: 'application/json',
     body: JSON.stringify({ filename: members[0].filename }),
   }))
-  await page.route('**/media/**', (route) => route.fulfill({ status: 200, contentType: 'image/png', body: image }))
+  await page.route('**/media/**', (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === '/media/member-2/thumbnail') return route.fulfill({ status: 200, contentType: 'image/png', body: Buffer.from('thumbnail unavailable') })
+    return route.fulfill({ status: 200, contentType: 'image/png', body: image })
+  })
 
   await page.goto('/')
   await page.setViewportSize({ width: 1440, height: 1000 })
   await page.getByRole('button', { name: '合集' }).click()
   await expect(page.getByRole('heading', { name: '合集', exact: true })).toBeVisible()
   await expect(page.locator('.collection-cover img')).toHaveCount(1)
+  await expect(page.locator('.collection-cover img')).toHaveAttribute('src', /\/media\/member-1\/thumbnail$/)
   await expect.poll(() => page.locator('.collection-cover img').evaluate((image) => image.naturalWidth)).toBeGreaterThan(0)
   await page.screenshot({ path: '/home/infstellar/vscode/MemeMeow/frontend/test-results/collections-list-desktop.png', fullPage: true })
 
@@ -62,6 +71,8 @@ test('合集列表和详情在桌面、移动端保持可扫描且图片可见',
   await expect(page.getByRole('heading', { name: collection.name })).toBeVisible()
   await expect(page.getByRole('button', { name: `从合集移除 ${members[0].filename}` })).toBeVisible()
   await expect(page.locator('.collection-asset-media img')).toHaveCount(2)
+  await expect(page.locator('.collection-asset-media img').first()).toHaveAttribute('src', /\/media\/member-1\/thumbnail$/)
+  await expect(page.locator('.collection-asset-media img').nth(1)).toHaveAttribute('src', /\/media\/member-2$/)
   await expect.poll(() => page.locator('.collection-asset-media img').first().evaluate((image) => image.naturalWidth)).toBeGreaterThan(0)
   await page.getByRole('button', { name: `查看 ${members[0].filename} 图片与元数据` }).click()
   await expect(page.getByRole('button', { name: '关闭图片预览' })).toBeVisible()
