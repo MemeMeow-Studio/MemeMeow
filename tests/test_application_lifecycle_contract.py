@@ -191,12 +191,27 @@ def test_scope_runtime_failure_closes_factory_worker_and_executor(monkeypatch) -
             """记录 factory 关闭。"""
             events.append("factory.shutdown")
 
+    class OpenCode:
+        """记录外层 shutdown 仍需收束的 OpenCode 资源。"""
+
+        def shutdown(self) -> None:
+            """记录 OpenCode 关闭。"""
+            events.append("opencode.shutdown")
+
+    class Engine:
+        """记录外层 shutdown 仍需收束的数据库 Engine。"""
+
+        def dispose(self) -> None:
+            """记录 Engine 连接池关闭。"""
+            events.append("engine.dispose")
+
     monkeypatch.setattr(lifecycle, "ThreadPoolExecutor", lambda *args, **kwargs: Executor())
     monkeypatch.setattr(lifecycle, "ScopeServiceFactory", Factory)
     app = FastAPI()
     app.state.database = object()
     app.state.operation_policy_gateway = object()
     app.state.operation_grants = object()
+    app.state.opencode = OpenCode()
     settings = _lifecycle_settings()
     setup = LifecycleSetup(
         app=app,
@@ -205,7 +220,7 @@ def test_scope_runtime_failure_closes_factory_worker_and_executor(monkeypatch) -
         configured_factory=None,
         custom_factory=False,
         configured_agent_input_provider=None,
-        engine=object(),
+        engine=Engine(),
     )
 
     with pytest.raises(RuntimeError, match="worker_start_failed"):
@@ -226,6 +241,47 @@ def test_scope_runtime_failure_closes_factory_worker_and_executor(monkeypatch) -
         "executor.shutdown",
     ]
     assert not hasattr(app.state, "service_factory")
+    assert hasattr(app.state, "opencode")
+
+    async def close_prepare_resources() -> None:
+        """模拟 lifespan 外层在 runtime 失败后继续收束 prepare 资源。"""
+        await shutdown_lifecycle(setup, None, primary_error=RuntimeError("worker_start_failed"))
+
+    asyncio.run(close_prepare_resources())
+    assert events[-2:] == ["opencode.shutdown", "engine.dispose"]
+
+
+def test_start_extensions_preserves_partial_startup_for_shutdown() -> None:
+    """扩展启动中途失败时，调用方仍能取得已启动及失败中的扩展。"""
+    events: list[str] = []
+
+    class Extension:
+        """可注入启动失败的扩展替身。"""
+
+        def __init__(self, name: str, fail: bool = False) -> None:
+            self.name = name
+            self.fail = fail
+
+        async def on_startup(self, _app) -> None:
+            """记录启动并按配置失败。"""
+            events.append(self.name)
+            if self.fail:
+                raise RuntimeError("extension_startup_failed")
+
+    first = Extension("first")
+    second = Extension("second", fail=True)
+    app = FastAPI()
+    app.state.extensions = (first, second)
+    started: list[object] = []
+
+    async def exercise() -> None:
+        """执行一次扩展启动。"""
+        with pytest.raises(RuntimeError, match="extension_startup_failed"):
+            await lifecycle.start_extensions(app, started)
+
+    asyncio.run(exercise())
+    assert events == ["first", "second"]
+    assert started == [first, second]
 
 
 def test_shutdown_continues_after_extension_error() -> None:

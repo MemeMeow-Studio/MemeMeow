@@ -1188,7 +1188,7 @@ async def lifespan(app: FastAPI):
         shared_worker_executor = runtime.shared_worker_executor
         local_services = runtime.local_services
         tasks = runtime.tasks
-        started_extensions = await start_extensions(app)
+        await start_extensions(app, started_extensions)
         yield
     except BaseException as primary:
         # 启动或请求阶段已有原始错误时，关闭失败只作为 note 附加，不能掩盖根因。
