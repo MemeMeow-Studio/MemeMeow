@@ -140,7 +140,7 @@ button, input, select, textarea { border-radius: var(--radius-control); }
 .inline-notice.error { color: var(--error); }
 
 .library-list { border-top: 1px solid var(--line); }
-.library-row { min-height: 82px; display: grid; grid-template-columns: 24px minmax(214px, 1.05fr) minmax(214px, .95fr) max-content; grid-template-areas: "select main status actions"; align-items: center; gap: 14px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+.library-row { min-height: 82px; display: grid; grid-template-columns: 24px minmax(0, 1fr) minmax(min-content, max-content) max-content; grid-template-areas: "select main status actions"; align-items: center; gap: 14px; padding: 9px 0; border-bottom: 1px solid var(--line); }
 .library-row img { display: block; width: 64px; height: 64px; object-fit: contain; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); }
 .library-row-main { grid-area: main; display: grid; grid-template-columns: 64px minmax(0, 1fr); align-items: center; gap: 14px; min-width: 0; }
 .library-preview-trigger { width: 64px; height: 64px; flex: 0 0 64px; border: 0; border-radius: 5px; padding: 0; cursor: zoom-in; background: var(--surface); }
