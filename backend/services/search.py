@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from typing import Any
+from uuid import UUID
 
 import numpy as np
 from openai import OpenAI
@@ -75,6 +77,11 @@ class PostgresSearchService:
 
     def mark_cache_invalidated(self, batch_id: object = None) -> None:
         """兼容旧批次回调，generation 由独立任务显式刷新。"""
+
+    def valid_text_embedding_ids(self, memes: Sequence[Meme]) -> set[UUID]:
+        """返回给定图片中通过当前 scope/model 全部指纹校验的文本向量 ID。"""
+        with self.resources.environment(self.scope.scope_id) as environment:
+            return environment.search.valid_text_embedding_ids(self.model, memes)
 
     def generate_cache(self, progress: Callable[[float | None, str | None], None], claim: tuple[str, int, str] | None = None) -> dict[str, object]:
         """短事务固化源快照，在事务外调用 embedding，完成后原子激活。"""

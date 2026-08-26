@@ -2,7 +2,7 @@
 /** 处理任务工作区：管理筛选、分页、轮询和详情打开状态。 */
 import { computed, onBeforeUnmount, onMounted, shallowRef } from 'vue'
 import { api } from '../api'
-import type { ImageProcessingJob, TaskItem } from '../types'
+import type { ImageProcessingJob, ImageProcessingTerminalEvent, TaskItem } from '../types'
 import {
   errorMessage,
   formatTaskTime,
@@ -22,6 +22,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   error: [message: string]
+  imageProcessingTerminal: [event: ImageProcessingTerminalEvent]
 }>()
 
 const taskItems = shallowRef<TaskItem[]>([])
@@ -36,7 +37,56 @@ const retrying = shallowRef(false)
 let taskTimer: number | undefined
 let disposed = false
 let listRequestId = 0
+let processingRequestId = 0
 let detailRequestId = 0
+const latestProcessingByMeme = new Map<string, ImageProcessingJob>()
+
+const terminalJobStatuses = new Set(['succeeded', 'failed', 'blocked', 'unknown_execution', 'warning', 'skipped'])
+
+/** 终态具有最高优先级；活动阶段只允许从排队推进到运行中。 */
+function processingStatusRank(status: string): number {
+  if (terminalJobStatuses.has(status)) return 2
+  if (status === 'running') return 1
+  return 0
+}
+
+/** 按 revision、Job 标识和状态进度判断候选是否比已知事实更新。 */
+function isNewerProcessingJob(candidate: ImageProcessingJob, current: ImageProcessingJob | undefined): boolean {
+  if (!current) return true
+  if (candidate.revision !== current.revision) return candidate.revision > current.revision
+  if (candidate.job_id !== current.job_id) {
+    const candidateUpdated = candidate.updated_at ? Date.parse(candidate.updated_at) : Number.NaN
+    const currentUpdated = current.updated_at ? Date.parse(current.updated_at) : Number.NaN
+    return Number.isFinite(candidateUpdated) && Number.isFinite(currentUpdated) && candidateUpdated > currentUpdated
+  }
+  if (terminalJobStatuses.has(current.status)) return false
+  const candidateUpdated = candidate.updated_at ? Date.parse(candidate.updated_at) : Number.NaN
+  const currentUpdated = current.updated_at ? Date.parse(current.updated_at) : Number.NaN
+  if (Number.isFinite(candidateUpdated) && Number.isFinite(currentUpdated) && candidateUpdated < currentUpdated) return false
+  const candidateRank = processingStatusRank(candidate.status)
+  const currentRank = processingStatusRank(current.status)
+  if (candidateRank < currentRank) return false
+  return candidateRank > currentRank || !Number.isFinite(currentUpdated) || (Number.isFinite(candidateUpdated) && candidateUpdated > currentUpdated)
+}
+
+/** 只在最新图片处理 Job 从活动状态进入终态时通知图片库刷新。 */
+function applyProcessingJobs(nextJobs: ImageProcessingJob[]): void {
+  const latestInResponse = new Map<string, ImageProcessingJob>()
+  for (const job of nextJobs) {
+    if (!job.meme_id || !job.job_id || !Number.isInteger(job.revision) || job.revision < 1) continue
+    const current = latestInResponse.get(job.meme_id)
+    if (isNewerProcessingJob(job, current)) latestInResponse.set(job.meme_id, job)
+  }
+  for (const job of latestInResponse.values()) {
+    const previous = latestProcessingByMeme.get(job.meme_id)
+    if (isNewerProcessingJob(job, previous)) {
+      latestProcessingByMeme.set(job.meme_id, job)
+      if (previous && processingStatusRank(previous.status) < 2 && terminalJobStatuses.has(job.status)) {
+        emit('imageProcessingTerminal', { meme_id: job.meme_id, job_id: job.job_id, revision: job.revision })
+      }
+    }
+  }
+}
 
 const visibleTaskItems = computed(() => taskItems.value.filter((item) => !(item.submission_mode === 'pipeline' && item.processing_job_id)))
 const hasActiveTasks = computed(() => taskItems.value.some((item) => item.status === 'queued' || item.status === 'running') || processingJobs.value.some((item) => ['queued', 'running'].includes(item.status)))
@@ -59,10 +109,13 @@ function processingPipelineLabel(job: ImageProcessingJob): string {
 /** 加载完整图片处理 Job；旧测试夹具没有该 API 时保持任务列表兼容。 */
 async function loadProcessingJobs(): Promise<void> {
   if (typeof api.processingJobs !== 'function') return
+  const requestId = ++processingRequestId
   try {
     const response = await api.processingJobs({ limit: 100 })
-    if (!disposed) {
-      processingJobs.value = response.items || []
+    if (!disposed && requestId === processingRequestId) {
+      const nextJobs = Array.isArray(response.items) ? response.items : []
+      applyProcessingJobs(nextJobs)
+      processingJobs.value = nextJobs
       // 父 Job 可能没有可见叶子 Task；列表首次加载后仍要依据最新 Job
       // 状态启动轮询，否则用户只能手动刷新才能看到阶段推进。
       syncPolling()
@@ -178,6 +231,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   disposed = true
   listRequestId += 1
+  processingRequestId += 1
   detailRequestId += 1
   stopPolling()
   document.removeEventListener('visibilitychange', onVisibilityChange)

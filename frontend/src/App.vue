@@ -9,7 +9,7 @@ import SearchWorkspace from './components/SearchWorkspace.vue'
 import TasksWorkspace from './components/TasksWorkspace.vue'
 import UploadWorkspace from './components/UploadWorkspace.vue'
 import WorkspaceNav from './components/WorkspaceNav.vue'
-import type { NavigationItem, PageId, ServiceConfig, TaskItem } from './types'
+import type { ImageProcessingTerminalEvent, NavigationItem, PageId, ServiceConfig, TaskItem } from './types'
 import { errorMessage } from './utils/presentation'
 
 const pages: NavigationItem[] = [
@@ -27,6 +27,7 @@ const cacheTask = shallowRef<TaskItem | null>(null)
 const cacheBusy = shallowRef(false)
 const libraryRefreshToken = shallowRef(0)
 const pendingTaskId = shallowRef<string | null>(null)
+const latestTerminalByMeme = new Map<string, ImageProcessingTerminalEvent>()
 
 const embeddingState = computed(() => {
   if (cacheTask.value?.status === 'queued' || cacheTask.value?.status === 'running') return 'running'
@@ -65,6 +66,14 @@ function openUploadTask(taskId: string): void {
   pendingTaskId.value = taskId
   page.value = 'tasks'
   error.value = ''
+}
+
+/** 接收最新图片处理 Job 的终态事实，使图片库在下次渲染时读取服务端新状态。 */
+function handleImageProcessingTerminal(event: ImageProcessingTerminalEvent): void {
+  const previous = latestTerminalByMeme.get(event.meme_id)
+  if (previous && event.revision <= previous.revision) return
+  latestTerminalByMeme.set(event.meme_id, event)
+  libraryRefreshToken.value += 1
 }
 
 /** 提交并轮询缓存任务；状态由不会随工作区切换卸载的根组件持有。 */
@@ -126,7 +135,7 @@ onMounted(async () => {
           @clear-error="clearError"
           @open-task="openUploadTask"
         />
-        <TasksWorkspace v-else :initial-task-id="pendingTaskId" @error="showError" />
+        <TasksWorkspace v-else :initial-task-id="pendingTaskId" @error="showError" @image-processing-terminal="handleImageProcessingTerminal" />
       </main>
     </div>
   </div>

@@ -74,6 +74,20 @@ def test_incremental_query_returns_only_validated_meme_ids() -> None:
     ]
 
 
+def test_valid_text_embedding_ids_only_returns_requested_images_from_selected_source() -> None:
+    """逐图状态只返回请求图片中通过当前来源校验的 ID，不能复用其它图片的缓存。"""
+    repository = object.__new__(SearchRepository)
+    ready_id = UUID("00000000-0000-0000-0000-000000000001")
+    pending_id = UUID("00000000-0000-0000-0000-000000000002")
+    ready_meme = SimpleNamespace(id=ready_id)
+    pending_meme = SimpleNamespace(id=pending_id)
+    repository.migration_state = lambda _model: SimpleNamespace(mode="incremental_only")
+    repository._incremental_rows = lambda _model: [(SimpleNamespace(), ready_meme)]
+    repository._legacy_rows = lambda _model: pytest.fail("不应读取未选中的 legacy 来源")
+
+    assert repository.valid_text_embedding_ids("model", [ready_meme, pending_meme]) == {ready_id}
+
+
 def test_query_rejects_invalid_dimensions_and_zero_norm() -> None:
     """输入维度和范数错误必须继续 fail-closed。"""
     repository = object.__new__(SearchRepository)

@@ -165,6 +165,13 @@ export interface ImageProcessingJob {
   completed_at?: string | null
 }
 
+/** 图片处理 Job 从活动状态进入终态时通知图片库失效的事件。 */
+export interface ImageProcessingTerminalEvent {
+  meme_id: string
+  job_id: string
+  revision: number
+}
+
 export interface UploadResult {
   meme_id?: string
   filename: string

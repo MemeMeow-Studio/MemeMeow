@@ -32,6 +32,39 @@ describe('TasksWorkspace', () => {
     vi.useRealTimers()
   })
 
+  it('只为最新 revision 的 active 到 terminal 转换通知图片库，并忽略旧 Job', async () => {
+    tasks.mockResolvedValue({ items: [], next_cursor: null })
+    processingJobs
+      .mockResolvedValueOnce({ items: [
+        {
+          task_id: 'old-task', task_type: 'image_processing', job_id: 'old-job', meme_id: 'meme-1', processing_job_id: 'old-job', revision: 1,
+          image_sha256: 'a'.repeat(64), reverse_image_policy: 'forbid', status: 'failed', updated_at: '2026-08-26T00:00:02Z', stages: [],
+        },
+        {
+          task_id: 'current-task', task_type: 'image_processing', job_id: 'current-job', meme_id: 'meme-1', processing_job_id: 'current-job', revision: 2,
+          image_sha256: 'b'.repeat(64), reverse_image_policy: 'forbid', status: 'running', updated_at: '2026-08-26T00:00:03Z', stages: [],
+        },
+      ] })
+      .mockResolvedValueOnce({ items: [
+        {
+          task_id: 'old-task', task_type: 'image_processing', job_id: 'old-job', meme_id: 'meme-1', processing_job_id: 'old-job', revision: 1,
+          image_sha256: 'a'.repeat(64), reverse_image_policy: 'forbid', status: 'succeeded', updated_at: '2026-08-26T00:00:04Z', stages: [],
+        },
+        {
+          task_id: 'current-task', task_type: 'image_processing', job_id: 'current-job', meme_id: 'meme-1', processing_job_id: 'current-job', revision: 2,
+          image_sha256: 'b'.repeat(64), reverse_image_policy: 'forbid', status: 'succeeded', updated_at: '2026-08-26T00:00:05Z', stages: [],
+        },
+      ] })
+    const wrapper = mount(TasksWorkspace)
+    await flushPromises()
+
+    await vi.advanceTimersByTimeAsync(2500)
+    await flushPromises()
+
+    expect(wrapper.emitted('imageProcessingTerminal')).toEqual([[{ meme_id: 'meme-1', job_id: 'current-job', revision: 2 }]])
+    wrapper.unmount()
+  })
+
   it('活跃任务进入终态后停止轮询', async () => {
     tasks
       .mockResolvedValueOnce({ items: [{ task_id: 'task-1', task_type: 'cache_generation', status: 'running' }], next_cursor: null })

@@ -295,6 +295,28 @@ class SearchRepository:
         """判断迁移回退 generation 是否仍有逐条校验通过的条目。"""
         return bool(self._legacy_rows(model))
 
+    def valid_text_embedding_ids(self, model: str, memes: Sequence[Meme]) -> set[UUID]:
+        """返回给定图片中具有当前有效文本向量的 Meme ID。
+
+        依据当前迁移来源复用逐条校验结果；每个 Meme 都必须同时满足 scope、图片
+        SHA、metadata hash、模型、维度和向量状态约束，不能由 scope 级缓存状态推断。
+        """
+        if not isinstance(model, str) or not model.strip():
+            return set()
+        meme_ids = {meme.id for meme in memes if isinstance(getattr(meme, "id", None), UUID)}
+        if not meme_ids:
+            return set()
+
+        state = self.migration_state(model)
+        if state is not None:
+            rows = self._incremental_rows(model) if state.mode == "incremental_only" else self._legacy_rows(model)
+        else:
+            # 与 source_mode 保持同一选择顺序，同时避免为同一请求重复读取增量来源。
+            rows = self._incremental_rows(model)
+            if not rows:
+                rows = self._legacy_rows(model)
+        return {meme.id for _row, meme in rows if meme.id in meme_ids}
+
     def create_generation(self, model: str, source_snapshot_hash: str) -> SearchGeneration:
         """创建 building generation，维度固定为 1024。"""
         generation = SearchGeneration(scope_id=self.scope.scope_id, model=model, dimensions=EMBEDDING_DIMENSIONS, source_snapshot_hash=source_snapshot_hash, status="building")

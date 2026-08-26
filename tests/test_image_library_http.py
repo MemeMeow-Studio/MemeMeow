@@ -68,7 +68,14 @@ class _Metadata:
 
 def _services(image, *, status: dict[str, object] | None = None, cache: bool = True) -> SimpleNamespace:
     """组装当前 scope 的 metadata/search facade。"""
-    return SimpleNamespace(metadata=_Metadata(image, status=status), search=SimpleNamespace(has_cache=lambda: cache))
+    def valid_text_embedding_ids(records: list[object]) -> set[object]:
+        """按测试开关返回明确的逐图向量集合，而不是读取 scope 缓存状态。"""
+        return {record.id for record in records} if cache else set()
+
+    return SimpleNamespace(
+        metadata=_Metadata(image, status=status),
+        search=SimpleNamespace(model="test-model", valid_text_embedding_ids=valid_text_embedding_ids),
+    )
 
 
 def _request() -> SimpleNamespace:
@@ -132,6 +139,25 @@ def test_image_list_projects_status_and_processing_summary(tmp_path: Path) -> No
     assert item["visual_embedding_status"] == "ready"
     assert item["processing_job_id"] == "job-1"
     assert payload["total"] == 1
+
+
+def test_image_list_projects_text_embedding_status_per_image(tmp_path: Path) -> None:
+    """同一 scope 中只有实际拥有有效向量的图片才显示文本索引已就绪。"""
+    image = tmp_path / "meme.png"
+    image.write_bytes(b"image-content")
+    ready = SimpleNamespace(id=uuid4(), storage_key="ready.png", extension=".png", sha256="a" * 64)
+    pending = SimpleNamespace(id=uuid4(), storage_key="pending.png", extension=".png", sha256="b" * 64)
+    services = SimpleNamespace(
+        metadata=_Metadata(image),
+        search=SimpleNamespace(
+            model="test-model",
+            valid_text_embedding_ids=lambda records: {ready.id},
+        ),
+    )
+
+    payload = _call_list(_request(), [ready, pending], _Environment([ready, pending]), services)
+
+    assert [item["embedding_status"] for item in payload["items"]] == ["ready", "pending"]
 
 
 def test_image_list_reuses_source_identity_for_thumbnail_projection_and_metadata(tmp_path: Path) -> None:

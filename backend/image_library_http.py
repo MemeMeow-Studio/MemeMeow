@@ -88,6 +88,10 @@ async def list_images(
             thumbnail_projections = projection_batch(valid_records, source_identities=source_identities)
         else:
             thumbnail_projections = projection_batch(valid_records)
+    ready_text_embedding_ids: set[object] = set()
+    ready_text_embedding_ids_fn = getattr(scoped_services.search, "valid_text_embedding_ids", None)
+    if callable(ready_text_embedding_ids_fn) and valid_records:
+        ready_text_embedding_ids = set(ready_text_embedding_ids_fn(valid_records))
     metadata_status_fn = scoped_services.metadata.status
     accepts_identity = False
     try:
@@ -116,7 +120,7 @@ async def list_images(
             "size": image_identity["size_bytes"],
             "media_url": f"/media/{record.id}",
             "metadata": metadata_status,
-            "embedding_status": "ready" if scoped_services.search.has_cache() and metadata_status.get("status") in {"partial", "ready"} else "blocked" if metadata_status.get("status") == "repair_required" else "pending",
+            "embedding_status": "blocked" if metadata_status.get("status") == "repair_required" else "ready" if record.id in ready_text_embedding_ids else "pending",
             "visual_embedding_status": "ready" if visual_row is not None else "pending",
         }
         if thumbnails is not None:
