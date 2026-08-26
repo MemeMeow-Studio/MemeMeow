@@ -25,7 +25,7 @@ from backend.persistence.models import (
 
 SCOPE_LOCAL = "local"
 # 当前代码要求的 Alembic head；数据库初始化脚本会显式传入同一 revision。
-CURRENT_SCHEMA_REVISION = "0017_derived_image_thumbnails"
+CURRENT_SCHEMA_REVISION = "0018_operation_grant_metering_units"
 
 
 class DatabaseError(RuntimeError):
@@ -162,6 +162,7 @@ def ensure_optional_control_schema(engine: Engine) -> None:
             connection.execute(text("ALTER TABLE search_migration_states ADD COLUMN IF NOT EXISTS model VARCHAR(255)"))
             connection.execute(text("ALTER TABLE operation_grants ADD COLUMN IF NOT EXISTS source VARCHAR(64)"))
             connection.execute(text("ALTER TABLE operation_grants ADD COLUMN IF NOT EXISTS units INTEGER"))
+            connection.execute(text("ALTER TABLE operation_grants ADD COLUMN IF NOT EXISTS metering_units INTEGER"))
             connection.execute(text("ALTER TABLE operation_grants ADD COLUMN IF NOT EXISTS request_fingerprint VARCHAR(64)"))
             connection.execute(text("""
                 DO $$ BEGIN
@@ -172,6 +173,10 @@ def ensure_optional_control_schema(engine: Engine) -> None:
                     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_operation_grant_units') THEN
                         ALTER TABLE operation_grants ADD CONSTRAINT ck_operation_grant_units
                             CHECK(units IS NULL OR units > 0);
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_operation_grant_metering_units') THEN
+                        ALTER TABLE operation_grants ADD CONSTRAINT ck_operation_grant_metering_units
+                            CHECK(metering_units IS NULL OR metering_units >= 0);
                     END IF;
                     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_operation_grant_fingerprint') THEN
                         ALTER TABLE operation_grants ADD CONSTRAINT ck_operation_grant_fingerprint

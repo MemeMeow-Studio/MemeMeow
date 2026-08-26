@@ -82,9 +82,31 @@ def _request_fingerprint(
     task_id: str | None,
     source: str,
     units: int,
+    metering_units: int,
     input_digest: str | None,
 ) -> str:
     """按服务端可信事实生成稳定摘要，供 grant 关联复用和冲突校验。"""
+    payload = {
+        "input_digest": input_digest,
+        "resource_id": resource_id,
+        "source": source,
+        "task_id": task_id,
+        "units": units,
+        "metering_units": metering_units,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _legacy_request_fingerprint(
+    *,
+    resource_id: str | None,
+    task_id: str | None,
+    source: str,
+    units: int,
+    input_digest: str | None,
+) -> str:
+    """重建迁移前未包含独立计量字段的 grant 指纹。"""
     payload = {
         "input_digest": input_digest,
         "resource_id": resource_id,
@@ -117,6 +139,7 @@ class OperationRequest:
     task_id: str | None = None
     source: str = "core"
     units: int = 1
+    metering_units: int = 0
     input_digest: str | None = None
 
     def __post_init__(self) -> None:
@@ -133,12 +156,15 @@ class OperationRequest:
         source = _validate_field(self.source, maximum=64, required=True)
         if isinstance(self.units, bool) or not isinstance(self.units, int) or self.units < 1:
             raise OperationPolicyError("operation_grant_invalid")
+        if isinstance(self.metering_units, bool) or not isinstance(self.metering_units, int) or self.metering_units < 0:
+            raise OperationPolicyError("operation_grant_invalid")
         input_digest = _validate_input_digest(self.input_digest)
         object.__setattr__(self, "scope", scope)
         object.__setattr__(self, "idempotency_key", idempotency_key)
         object.__setattr__(self, "resource_id", resource_id)
         object.__setattr__(self, "task_id", task_id)
         object.__setattr__(self, "source", source)
+        object.__setattr__(self, "metering_units", self.metering_units)
         object.__setattr__(self, "input_digest", input_digest)
 
     @property
@@ -149,6 +175,7 @@ class OperationRequest:
             task_id=self.task_id,
             source=self.source,
             units=self.units,
+            metering_units=self.metering_units,
             input_digest=self.input_digest,
         )
 
@@ -263,12 +290,14 @@ def _validate_association(
         association.request.task_id,
         association.request.source,
         association.request.units,
+        association.request.metering_units,
         association.request.input_digest,
     ) != (
         request.resource_id,
         request.task_id,
         request.source,
         request.units,
+        request.metering_units,
         request.input_digest,
     ):
         raise OperationPolicyError("operation_policy_unavailable")
@@ -309,6 +338,7 @@ class AllowAllOperationPolicy:
             request.task_id,
             request.source,
             request.units,
+            request.metering_units,
             request.input_digest,
         )
         return PolicyDecision(True)
@@ -378,7 +408,7 @@ class OperationPolicyGateway:
         kwargs.pop("scope_id", None)
         kwargs.pop("user_id", None)
         kwargs.pop("grant", None)
-        return OperationRequest(scope if isinstance(scope, ScopeContext) else ScopeContext(scope), operation, idempotency_key, **{key: value for key, value in kwargs.items() if key in {"resource_id", "task_id", "source", "units", "input_digest"}})
+        return OperationRequest(scope if isinstance(scope, ScopeContext) else ScopeContext(scope), operation, idempotency_key, **{key: value for key, value in kwargs.items() if key in {"resource_id", "task_id", "source", "units", "metering_units", "input_digest"}})
 
     def probe(self, request: OperationRequest) -> PolicyDecision:
         """执行非权威可用性查询。"""
@@ -595,16 +625,28 @@ class PersistentGrantRepository:
 
     @staticmethod
     def _row_fingerprint(row: OperationGrant) -> str:
-        """从持久列重建请求指纹；旧行缺字段时必须拒绝执行。"""
+        """从持久列重建请求指纹，并保留历史无独立计量字段的读取路径。"""
         if row.source is None or row.units is None or row.request_fingerprint is None:
             raise OperationPolicyError("operation_policy_unavailable")
-        expected = _request_fingerprint(
-            resource_id=row.resource_id,
-            task_id=row.task_id,
-            source=row.source,
-            units=row.units,
-            input_digest=row.input_digest,
-        )
+        if row.metering_units is None:
+            expected = _legacy_request_fingerprint(
+                resource_id=row.resource_id,
+                task_id=row.task_id,
+                source=row.source,
+                units=row.units,
+                input_digest=row.input_digest,
+            )
+        else:
+            if isinstance(row.metering_units, bool) or row.metering_units < 0:
+                raise OperationPolicyError("operation_policy_unavailable")
+            expected = _request_fingerprint(
+                resource_id=row.resource_id,
+                task_id=row.task_id,
+                source=row.source,
+                units=row.units,
+                metering_units=row.metering_units,
+                input_digest=row.input_digest,
+            )
         if row.request_fingerprint != expected:
             raise OperationPolicyError("operation_policy_unavailable")
         return expected
@@ -619,6 +661,7 @@ class PersistentGrantRepository:
             row.task_id,
             row.source,
             row.units,
+            row.metering_units if row.metering_units is not None else 0,
             row.input_digest,
         ) != (
             request.resource_id,
@@ -626,7 +669,17 @@ class PersistentGrantRepository:
             request.source,
             request.units,
             request.input_digest,
-        ) or fingerprint != request.request_fingerprint:
+        ) or fingerprint != (
+            request.request_fingerprint
+            if row.metering_units is not None
+            else _legacy_request_fingerprint(
+                resource_id=request.resource_id,
+                task_id=request.task_id,
+                source=request.source,
+                units=request.units,
+                input_digest=request.input_digest,
+            )
+        ):
             raise OperationPolicyError("operation_policy_unavailable")
         return GrantAssociation(
             request,
@@ -663,6 +716,7 @@ class PersistentGrantRepository:
                     resource_id=request.resource_id,
                     source=request.source,
                     units=request.units,
+                    metering_units=request.metering_units,
                     input_digest=request.input_digest,
                     request_fingerprint=request.request_fingerprint,
                     state=association.state,
@@ -699,6 +753,7 @@ class PersistentGrantRepository:
                 resource_id=request.resource_id,
                 source=request.source,
                 units=request.units,
+                metering_units=request.metering_units,
                 input_digest=request.input_digest,
                 request_fingerprint=request.request_fingerprint,
                 state="acquired",
@@ -777,11 +832,13 @@ class PersistentGrantRepository:
                 if task is None or row.state != "acquired":
                     session.commit()
                     return False
-                next_fingerprint = _request_fingerprint(
+                fingerprint_builder = _request_fingerprint if row.metering_units is not None else _legacy_request_fingerprint
+                next_fingerprint = fingerprint_builder(
                     resource_id=row.resource_id,
                     task_id=task_id,
                     source=row.source,
                     units=row.units,
+                    **({"metering_units": row.metering_units} if row.metering_units is not None else {}),
                     input_digest=row.input_digest,
                 )
                 if row.task_id == task_id:

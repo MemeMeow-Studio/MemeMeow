@@ -482,6 +482,7 @@ class OperationGrant(Base):
     resource_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     source: Mapped[str | None] = mapped_column(String(64), nullable=True)
     units: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    metering_units: Mapped[int | None] = mapped_column(Integer, nullable=True)
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="acquired")
     attempt_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     input_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -497,6 +498,7 @@ class OperationGrant(Base):
         CheckConstraint("state IN ('acquired','committed','released','unknown')", name="ck_operation_grant_state"),
         CheckConstraint("source IS NULL OR (length(source) > 0 AND length(source) <= 64)", name="ck_operation_grant_source"),
         CheckConstraint("units IS NULL OR units > 0", name="ck_operation_grant_units"),
+        CheckConstraint("metering_units IS NULL OR metering_units >= 0", name="ck_operation_grant_metering_units"),
         CheckConstraint("request_fingerprint IS NULL OR length(request_fingerprint) = 64", name="ck_operation_grant_fingerprint"),
         Index("ix_operation_grants_scope_task", "scope_id", "task_id"),
     )

@@ -74,6 +74,9 @@ def test_grant_validation_rejects_scope_or_operation_rebinding() -> None:
         {"idempotency_key": " key"},
         {"units": True},
         {"units": 1.5},
+        {"metering_units": True},
+        {"metering_units": -1},
+        {"metering_units": 1.5},
         {"source": "worker\x00"},
     ),
 )
@@ -83,6 +86,36 @@ def test_operation_request_rejects_ambiguous_field_types_and_controls(kwargs: di
         arguments = {"scope": ScopeContext("local"), "operation": Operations.IMAGE_UPLOAD, "idempotency_key": "upload:one"}
         arguments.update(kwargs)
         OperationRequest(**arguments)
+
+
+@pytest.mark.parametrize("metering_units", (0, 1000, 2000))
+def test_metering_units_is_non_negative_and_part_of_fingerprint(metering_units: int) -> None:
+    """公共核心保留逻辑 units=1，并冻结宿主传入的独立计量成本。"""
+    gateway = OperationPolicyGateway(AllowAllOperationPolicy(), allow_all=True)
+    request = gateway.request(
+        "metering-scope",
+        Operations.ANALYSIS_AGENT,
+        f"agent:metering:{metering_units}",
+        units=1,
+        metering_units=metering_units,
+        source="image-processing",
+    )
+    assert request.units == 1
+    assert request.metering_units == metering_units
+    assert request.request_fingerprint
+
+
+def test_metering_units_changes_fingerprint_and_lifecycle_is_idempotent() -> None:
+    """不同成本不能复用同一请求事实，取得和终态收束仍沿用公共 grant 生命周期。"""
+    gateway = OperationPolicyGateway(AllowAllOperationPolicy(), allow_all=True)
+    store = GrantAssociationStore()
+    first = gateway.request("metering-scope", Operations.ANALYSIS_AGENT, "agent:metering", metering_units=1000)
+    second = gateway.request("metering-scope", Operations.ANALYSIS_AGENT, "agent:metering", metering_units=2000)
+    assert first.request_fingerprint != second.request_fingerprint
+    association = store.acquire(first, gateway)
+    assert store.acquire(first, gateway).grant == association.grant
+    assert store.transition(association.grant, "committed") is True
+    assert gateway.commit(association.grant).state == "committed"
 
 
 class _WrongCommitStatePolicy(AllowAllOperationPolicy):

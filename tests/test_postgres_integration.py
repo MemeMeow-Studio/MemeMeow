@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import hashlib
+import json
 import threading
 import time
 from datetime import timedelta
@@ -364,6 +365,45 @@ def test_persistent_legacy_grant_without_request_facts_fails_closed(postgres_res
     with pytest.raises(OperationPolicyError) as error:
         store.get(request)
     assert error.value.code == "operation_policy_unavailable"
+
+
+def test_persistent_legacy_grant_without_metering_units_remains_readable(postgres_resources) -> None:
+    """迁移前已具备完整旧请求事实的 grant 可按零成本兼容收束一次。"""
+    resources = postgres_resources
+    legacy_key = "legacy:metering-compatible"
+    legacy_grant = f"legacy-{uuid4().hex}"
+    payload = {
+        "input_digest": None,
+        "resource_id": None,
+        "source": "legacy-worker",
+        "task_id": None,
+        "units": 1,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    ).hexdigest()
+    with resources.factory() as session:
+        session.add(
+            OperationGrant(
+                scope_id="local",
+                operation=Operations.ANALYSIS_AGENT,
+                idempotency_key=legacy_key,
+                grant_id=legacy_grant,
+                source="legacy-worker",
+                units=1,
+                request_fingerprint=fingerprint,
+                state="acquired",
+            )
+        )
+        session.commit()
+    gateway = OperationPolicyGateway(AllowAllOperationPolicy(), allow_all=True)
+    store = PersistentGrantAssociationStore(resources)
+    request = gateway.request("local", Operations.ANALYSIS_AGENT, legacy_key, source="legacy-worker", metering_units=0)
+    association = store.get(request)
+    assert association is not None
+    assert association.grant.grant_id == legacy_grant
+    assert store.transition(association.grant, "committed") is True
+    assert store.transition(association.grant, "committed") is True
 
 
 def test_image_processing_repository_enforces_stage_order_claim_fencing_and_retry(postgres_resources) -> None:
