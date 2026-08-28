@@ -36,6 +36,8 @@ export type SelectedImageRetryMode = 'full' | 'parts'
 export interface SelectedImageStageRetryRequest {
   items: Array<{ meme_id: string }>
   stages: CoreImageProcessingStage[]
+  reverse_image_policy?: ImageProcessingOptions['reverse_image_policy']
+  auto_name?: boolean
 }
 
 export interface ImageMetadataSummary {

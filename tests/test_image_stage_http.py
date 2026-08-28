@@ -282,9 +282,9 @@ def test_batch_isolates_partial_failures_and_counts_only_tasks() -> None:
         return Metadata()
 
     def normalize(_request: object, **kwargs: object) -> SimpleNamespace:
-        """确认批量始终使用 forbid 策略。"""
-        assert kwargs == {"reverse_image_policy": "forbid"}
-        return SimpleNamespace(reverse_image_policy="forbid")
+        """确认批量统一规范化两项处理选项。"""
+        assert kwargs == {"reverse_image_policy": "forbid", "auto_name": False}
+        return SimpleNamespace(reverse_image_policy="forbid", auto_name=False)
 
     def summary(_request: object, task: SimpleNamespace) -> dict[str, object]:
         """只投影安全 task id。"""
@@ -313,6 +313,60 @@ def test_batch_isolates_partial_failures_and_counts_only_tasks() -> None:
     assert result["failed_count"] == 3
     assert [item.get("error") for item in result["results"]] == [None, None, "meme_not_found", "meme_not_found", "target_changed", None]
     assert len([item for item in calls if item[0] == "worker"]) == 4
+
+
+def test_batch_forwards_processing_options_to_independent_stage_worker() -> None:
+    """包含 Agent 的选中阶段重试必须保留联网策略和自动命名选项。"""
+    request = _request()
+    calls: list[dict[str, object]] = []
+
+    class Worker:
+        """记录独立阶段提交参数的 Worker。"""
+
+        def submit_stage(self, meme_id: str, stage: str, **kwargs: object) -> SimpleNamespace:
+            """保存目标、阶段和处理选项。"""
+            calls.append({"meme_id": meme_id, "stage": stage, **kwargs})
+            return SimpleNamespace(task_id=f"task-{stage}", task_type=f"{stage}_task", image_stage=stage)
+
+    class Metadata:
+        """返回当前 scope 的独立阶段目标。"""
+
+        def image_for_meme(self, meme_id: str) -> tuple[SimpleNamespace, object]:
+            """按 meme_id 返回 metadata 记录。"""
+            return SimpleNamespace(id=f"record-{meme_id}"), object()
+
+    normalize_calls: list[dict[str, object]] = []
+
+    def normalize(_request: object, **kwargs: object) -> SimpleNamespace:
+        """记录并返回规范化处理选项。"""
+        normalize_calls.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    payload = image_stage_http.ImageStageBatchRequest.model_validate(
+        {
+            "items": [{"meme_id": "meme-1"}],
+            "stages": ["agent", "text_embedding"],
+            "reverse_image_policy": "auto",
+            "auto_name": True,
+        }
+    )
+    result = asyncio.run(
+        image_stage_http.submit_image_stage_batch(
+            request,
+            payload,
+            service=lambda _request, _name: Metadata(),
+            error=_error,
+            processing_worker=lambda _request: Worker(),
+            normalize_processing_options=normalize,
+            processing_config=lambda _request: {"version": "test"},
+            task_summary=lambda _request, task: {"task_id": task.task_id},
+        )
+    )
+
+    assert result["submitted_count"] == 2
+    assert normalize_calls == [{"reverse_image_policy": "auto", "auto_name": True}]
+    assert all(call["reverse_image_policy"] == "auto" for call in calls)
+    assert all(call["auto_name"] is True for call in calls)
 
 
 def test_single_stage_operation_policy_error_uses_host_projection_callback() -> None:

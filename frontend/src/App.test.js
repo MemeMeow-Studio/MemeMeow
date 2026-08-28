@@ -264,8 +264,17 @@ describe('App', () => {
     expect(retrySelectedButton).toBeDefined()
     await retrySelectedButton.trigger('click')
     await wrapper.get('.retry-selected-dialog form').trigger('submit')
+    expect(wrapper.find('.retry-selected-dialog').exists()).toBe(false)
+    expect(wrapper.get('.processing-options-dialog').exists()).toBe(true)
+    expect(contextBatch).not.toHaveBeenCalled()
+    await wrapper.get('.processing-options-dialog form').trigger('submit')
     await flushPromises()
-    expect(contextBatch).toHaveBeenCalledWith({ items: [{ meme_id: '33333333-3333-4333-8333-333333333333' }], include_unready: true })
+    expect(contextBatch).toHaveBeenCalledWith({
+      items: [{ meme_id: '33333333-3333-4333-8333-333333333333' }],
+      include_unready: true,
+      reverse_image_policy: 'forbid',
+      auto_name: false,
+    })
     expect(wrapper.text()).toContain('文本索引已就绪')
     expect(wrapper.findAll('.visual-embedding-state')[0].text()).toBe('图片向量待生成')
     expect(wrapper.findAll('.visual-embedding-state')[1].text()).toBe('图片向量已就绪')

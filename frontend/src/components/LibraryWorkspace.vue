@@ -30,6 +30,19 @@ const emit = defineEmits<{
   generateCache: []
 }>()
 
+/** 返回每次新建处理确认时使用的安全选项，避免复用上一次的高风险状态。 */
+function defaultProcessingOptions(): ImageProcessingOptions {
+  return { reverse_image_policy: 'forbid', auto_name: false }
+}
+
+type SelectedRetrySubmission = {
+  mode: SelectedImageRetryMode
+  stages: CoreImageProcessingStage[]
+  items: Array<{ meme_id: string }>
+}
+
+type ProcessingOptionsTarget = 'unready' | 'selected'
+
 const images = shallowRef<MemeImage[]>([])
 const filter = shallowRef('')
 const busy = shallowRef(false)
@@ -47,12 +60,16 @@ const previewImage = shallowRef<MemeImage | null>(null)
 const previewTrigger = shallowRef<HTMLElement | null>(null)
 const stageBusy = shallowRef('')
 const processingOptionsOpen = shallowRef(false)
+const processingOptionsTarget = shallowRef<ProcessingOptionsTarget | null>(null)
 const processingOptionsTrigger = shallowRef<HTMLElement | null>(null)
 const retryDetails = shallowRef<UnreadyProcessingResponse['results']>([])
-const retryOptions = shallowRef<ImageProcessingOptions>({ reverse_image_policy: 'forbid', auto_name: false })
+const retryOptions = shallowRef<ImageProcessingOptions>(defaultProcessingOptions())
 const preserveRetryOptions = shallowRef(false)
 const retrySelectedDialogOpen = shallowRef(false)
 const retrySelectedDialogTrigger = shallowRef<HTMLElement | null>(null)
+const selectedRetrySubmission = shallowRef<SelectedRetrySubmission | null>(null)
+const selectedRetryOptions = shallowRef<ImageProcessingOptions>(defaultProcessingOptions())
+const preserveSelectedRetryOptions = shallowRef(false)
 let libraryRequestId = 0
 
 const selectedIds = computed(() => [...selectedImages.value])
@@ -229,25 +246,40 @@ function cancelRetrySelected(): void {
   if (!retryBusy.value) retrySelectedDialogOpen.value = false
 }
 
-/** 为选中图片按完整流水线或指定阶段提交真实处理任务。 */
-async function confirmRetrySelected(payload: { mode: SelectedImageRetryMode; stages: CoreImageProcessingStage[] }): Promise<void> {
-  if (retryBusy.value || !selectedCount.value) return
-  const items = images.value.filter((item) => selectedImages.value.has(imageKey(item))).map((item) => ({ meme_id: item.meme_id }))
-  if (!items.length) return
+/** 提交选中图片的完整流水线或指定阶段，并在请求成功后清理选择。 */
+async function submitSelectedRetry(submission: SelectedRetrySubmission, options?: ImageProcessingOptions): Promise<void> {
+  if (retryBusy.value) return
   emit('clearError')
   retryNotice.value = ''
   retryBusy.value = true
   try {
-    if (payload.mode === 'full') {
-      const response = await api.contextBatch({ items, include_unready: true })
-      const queued = response.results.filter((item: { task_id?: string }) => item.task_id).length
-      const failed = response.results.filter((item: { error?: unknown }) => item.error).length
+    if (submission.mode === 'full') {
+      if (!options) return
+      const response = await api.contextBatch({
+        items: submission.items,
+        include_unready: true,
+        reverse_image_policy: options.reverse_image_policy,
+        auto_name: options.auto_name,
+      })
+      const results = Array.isArray(response.results) ? response.results : []
+      const queued = results.filter((item: { task_id?: string }) => item.task_id).length
+      const failed = results.filter((item: { error?: unknown }) => item.error).length
       retryNotice.value = `重试选中：已提交 ${queued} 个完整任务${failed ? `，${failed} 项未提交` : ''}`
     } else {
-      const response = await api.retryImageStagesBatch({ items, stages: payload.stages })
+      const payload: Record<string, unknown> = { items: submission.items, stages: submission.stages }
+      if (options) {
+        payload.reverse_image_policy = options.reverse_image_policy
+        payload.auto_name = options.auto_name
+      }
+      const response = await api.retryImageStagesBatch(payload)
       retryNotice.value = `重试选中：已提交 ${response.submitted_count ?? 0} 个阶段任务${response.failed_count ? `，${response.failed_count} 项未提交` : ''}`
     }
     retrySelectedDialogOpen.value = false
+    processingOptionsOpen.value = false
+    processingOptionsTarget.value = null
+    selectedRetrySubmission.value = null
+    preserveSelectedRetryOptions.value = false
+    selectedRetryOptions.value = defaultProcessingOptions()
     selectedImages.value = new Set()
     await loadLibrary()
   } catch (reason) {
@@ -257,12 +289,51 @@ async function confirmRetrySelected(payload: { mode: SelectedImageRetryMode; sta
   }
 }
 
+/** 处理第一层重试范围确认；需要 Agent 时先切换到共享选项对话框。 */
+async function confirmRetrySelected(payload: { mode: SelectedImageRetryMode; stages: CoreImageProcessingStage[] }): Promise<void> {
+  if (retryBusy.value || !selectedCount.value) return
+  const items = selectedIds.value.map((meme_id) => ({ meme_id }))
+  if (!items.length) return
+  const submission: SelectedRetrySubmission = { mode: payload.mode, stages: [...payload.stages], items }
+  if (payload.mode === 'full' || payload.stages.includes('agent')) {
+    selectedRetrySubmission.value = submission
+    if (!preserveSelectedRetryOptions.value) selectedRetryOptions.value = defaultProcessingOptions()
+    retrySelectedDialogOpen.value = false
+    processingOptionsTarget.value = 'selected'
+    processingOptionsTrigger.value = retrySelectedDialogTrigger.value
+    processingOptionsOpen.value = true
+    return
+  }
+  await submitSelectedRetry(submission)
+}
+
+/** 取消选中重试的共享选项确认，保留图片选择但丢弃本次未提交范围。 */
+function cancelSelectedRetryOptions(): void {
+  if (!retryBusy.value) {
+    processingOptionsOpen.value = false
+    processingOptionsTarget.value = null
+    selectedRetrySubmission.value = null
+    preserveSelectedRetryOptions.value = false
+    selectedRetryOptions.value = defaultProcessingOptions()
+  }
+}
+
+/** 使用共享选项提交已快照的选中重试范围；失败时保留选项和图片选择。 */
+async function confirmSelectedRetryOptions(options: ImageProcessingOptions): Promise<void> {
+  const submission = selectedRetrySubmission.value
+  if (retryBusy.value || !submission) return
+  selectedRetryOptions.value = options
+  preserveSelectedRetryOptions.value = true
+  await submitSelectedRetry(submission, options)
+}
+
 /** 打开 scope 级完整重试的共享选项对话框。 */
 function openUnreadyOptions(event: MouseEvent): void {
   if (retryBusy.value) return
-  if (!preserveRetryOptions.value) retryOptions.value = { reverse_image_policy: 'forbid', auto_name: false }
+  if (!preserveRetryOptions.value) retryOptions.value = defaultProcessingOptions()
   retryDetails.value = []
   processingOptionsTrigger.value = event.currentTarget instanceof HTMLElement ? event.currentTarget : null
+  processingOptionsTarget.value = 'unready'
   processingOptionsOpen.value = true
 }
 
@@ -270,8 +341,9 @@ function openUnreadyOptions(event: MouseEvent): void {
 function cancelUnreadyOptions(): void {
   if (!retryBusy.value) {
     processingOptionsOpen.value = false
+    processingOptionsTarget.value = null
     preserveRetryOptions.value = false
-    retryOptions.value = { reverse_image_policy: 'forbid', auto_name: false }
+    retryOptions.value = defaultProcessingOptions()
   }
 }
 
@@ -294,10 +366,11 @@ async function confirmUnreadyOptions(options: ImageProcessingOptions): Promise<v
     retryDetails.value = response.results || []
     retryNotice.value = `完整重试：目标 ${response.target_count ?? 0}，提交 ${response.submitted_count ?? 0}，复用 ${response.reused_count ?? 0}，冲突 ${response.conflict_count ?? 0}，失败 ${response.failed_count ?? 0}`
     processingOptionsOpen.value = false
+    processingOptionsTarget.value = null
     // 请求已经返回后关闭本次确认；下一次打开不得继承可能更高风险的选择。
     // 请求异常不会进入这里，因此仍会在当前对话框内保留选择供安全重试。
     preserveRetryOptions.value = false
-    retryOptions.value = { reverse_image_policy: 'forbid', auto_name: false }
+    retryOptions.value = defaultProcessingOptions()
     await loadLibrary()
   } catch (reason) {
     emit('error', errorMessage(reason))
@@ -305,6 +378,18 @@ async function confirmUnreadyOptions(options: ImageProcessingOptions): Promise<v
   } finally {
     retryBusy.value = false
   }
+}
+
+/** 将共享选项对话框的取消事件路由到当前重试场景。 */
+function cancelProcessingOptions(): void {
+  if (processingOptionsTarget.value === 'selected') cancelSelectedRetryOptions()
+  else cancelUnreadyOptions()
+}
+
+/** 将共享选项对话框的确认事件路由到当前重试场景。 */
+async function confirmProcessingOptions(options: ImageProcessingOptions): Promise<void> {
+  if (processingOptionsTarget.value === 'selected') await confirmSelectedRetryOptions(options)
+  else await confirmUnreadyOptions(options)
 }
 
 /** 打开图片预览并保留触发按钮，供关闭后恢复键盘焦点。 */
@@ -449,8 +534,10 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
     :reverse-image-reason="props.config ? '反向图片服务不可用' : '服务状态未知'"
     :busy="retryBusy"
     :return-focus="processingOptionsTrigger"
-    :initial-options="preserveRetryOptions ? retryOptions : undefined"
-    @cancel="cancelUnreadyOptions"
-    @confirm="confirmUnreadyOptions"
+    :initial-options="processingOptionsTarget === 'selected'
+      ? (preserveSelectedRetryOptions ? selectedRetryOptions : undefined)
+      : (preserveRetryOptions ? retryOptions : undefined)"
+    @cancel="cancelProcessingOptions"
+    @confirm="confirmProcessingOptions"
   />
 </template>

@@ -909,19 +909,24 @@ class ImageProcessingWorker:
         *,
         config: Mapping[str, object] | None = None,
         reverse_image_policy: object = None,
+        auto_name: object = None,
         explicit_retry: bool = False,
         schedule: bool = True,
     ) -> Any:
         """提交或复用一个无父 Job 的独立图片阶段 Task。
 
-        目标 SHA、阶段配置和 scope 均由当前数据库 Meme 与服务端配置派生。
+        目标 SHA、阶段配置、处理选项和 scope 均由当前数据库 Meme 与服务端配置派生。
         活动任务按持久 dedupe key 复用；终态任务因不再属于活动集合而由同一
         请求创建新的逻辑 Task。只有 Agent 阶段会在 Task 建立后取得 grant。
+
+        ``auto_name`` 会随共享处理确认写入独立 Task 输入，避免选项在公共 HTTP 边界
+        丢失；独立阶段本身不负责编排自动命名的下游阶段。
         """
         del explicit_retry  # 终态任务天然脱离活动 dedupe 集合，显式参数仅保留 API 兼容性。
         canonical = self._canonical_stage(stage)
         task_type = STAGE_TASK_TYPES[canonical]
         policy = normalize_reverse_image_policy(reverse_image_policy)
+        auto_name_value = normalize_auto_name(auto_name)
         config_value = dict(config or {})
         config_hash = processing_config_hash(config_value)
         try:
@@ -947,6 +952,7 @@ class ImageProcessingWorker:
             "image_sha256": image_sha256,
             "processing_config_hash": config_hash,
             "reverse_image_policy": policy,
+            "auto_name": auto_name_value,
             # 该 nonce 只用于识别并发 submit 的胜者，不进入 dedupe key。
             "standalone_submission_nonce": uuid4().hex,
         }

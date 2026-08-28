@@ -77,8 +77,8 @@ app = create_app(scope_resolver=LocalScopeResolver("local"))
 
 `POST /images/thumbnails/reconcile?page=1&page_size=100&limit=100`：在当前可信 scope 内分页扫描并幂等提交存量图片的缩略图回填/失败重建，返回 `{ "scanned": 100, "submitted": 80, "available": 15, "failed": 5 }`。该入口受 Settings 管理 token 保护，优先使用 `X-Settings-Admin-Token`，兼容 `X-MemeMeow-Settings-Token` 和大小写不敏感的 `Authorization: Bearer <token>`；token 由服务端 `MEMEMEOW_SETTINGS_ADMIN_TOKEN` 配置。`page`、`page_size` 和 `limit` 之外的查询参数会被拒绝，scope 从可信请求上下文派生。错误语义为：未授权 `403 settings_forbidden`，非法查询 `400 invalid_request`，任务背压 `429 thumbnail_backpressure`，回填服务或数据库不可用 `503 thumbnail_reconcile_unavailable`。
 
-- `POST /images/context`：请求 `{ "meme_id": "...", "reverse_image_policy": "forbid|auto" }`，异步创建或复用单图处理 job，返回 `processing_job_id` 和当前 Agent 阶段摘要。缺省策略为 `forbid`。
-- `POST /images/context/batch`：请求 `{ "items": [{"meme_id":"..."}], "include_unready": true, "reverse_image_policy": "forbid|auto" }`，逐图返回处理 job 结果；省略 `items` 时不隐式扫描孤立文件。
+- `POST /images/context`：请求 `{ "meme_id": "...", "reverse_image_policy": "forbid|auto", "auto_name": false }`，异步创建或复用单图处理 job，返回 `processing_job_id` 和当前 Agent 阶段摘要。缺省策略为 `forbid`，自动命名缺省关闭。
+- `POST /images/context/batch`：请求 `{ "items": [{"meme_id":"..."}], "include_unready": true, "reverse_image_policy": "forbid|auto", "auto_name": false }`，逐图返回处理 job 结果；省略 `items` 时不隐式扫描孤立文件。
 - `POST /images/visual-embedding` 和 `/images/visual-embedding/batch`：为既有图片提交完整图片处理 Job 的视觉前置；视觉任务失败必须使用完整 Job 重试或受限独立阶段入口。
 - `POST /images/metadata/repair`：异步执行数据库记录、图片文件和指纹完整性扫描；不读取 sidecar、不默认调用模型或外部搜索。
 - 图片库的“选择图片”“重试选中”和“完整重试所有未就绪”会调用上述逐图处理接口；有效文本向量写回后会立即具备当前 scope 的搜索资格，不需要为每次上传重建全库缓存。模型切换和存量迁移的显式回填见 [`docs/image-processing-migration.md`](docs/image-processing-migration.md)。
@@ -95,7 +95,7 @@ app = create_app(scope_resolver=LocalScopeResolver("local"))
 
 `POST /images/stages` 请求仅接受 `{ "meme_id": "...", "stage": "visual|agent|auto_rename|text_embedding", "reverse_image_policy": "forbid|auto" }`，创建或复用无父 Job 的独立阶段 Task。scope、图片 SHA、配置、grant、标题指纹和目标文件名均由服务端派生；返回 `submission_mode=standalone` 与 `processing_job_id=null`。`image_auto_rename` 不得通过通用 `/tasks/{task_id}/retry` 重试。
 
-`POST /images/stages/batch` 请求 `{ "items": [{"meme_id":"..."}], "stages": ["visual", "agent", "text_embedding"] }`，为每个选中图片和所选阶段创建或复用独立 Task；阶段列表至少一项、最多三项且不得重复，只接受三个核心阶段。完整重试仍使用 `/images/context/batch` 的旧完整流水线契约。
+`POST /images/stages/batch` 请求 `{ "items": [{"meme_id":"..."}], "stages": ["visual", "agent", "text_embedding"], "reverse_image_policy": "forbid|auto", "auto_name": false }`，为每个选中图片和所选阶段创建或复用独立 Task；阶段列表至少一项、最多三项且不得重复，只接受三个核心阶段。完整重试仍使用 `/images/context/batch` 的完整流水线契约。
 
 `POST /images/processing/{job_id}/retry` 只接受 `failed`、`blocked` 或 `unknown_execution` job，并创建新的 revision、叶子 Task 和必要的 grant；旧 job、Task 和 grant 保持终态。`unknown_execution` 表示外部执行窗口已经开始但结果无法证明，恢复流程不会自动重放，必须由人工确认后显式 retry。兼容路径 `/image-processing/...` 仍可用但不在 OpenAPI 中展示。
 

@@ -13,7 +13,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from backend.image_processing import ImageProcessingError
 from backend.metadata import MetadataError
@@ -31,14 +31,16 @@ class ContextRequest(_StrictRequestModel):
 
     meme_id: str | None = None
     reverse_image_policy: str = Field(default="forbid", pattern="^(forbid|auto)$")
+    auto_name: StrictBool = False
 
 
 class ContextBatchRequest(_StrictRequestModel):
-    """批量补齐既有图片语境或视觉向量的请求。"""
+    """批量补齐既有图片语境或视觉向量的请求及其统一处理选项。"""
 
     items: list[ContextRequest] = Field(default_factory=list, max_length=500)
     include_unready: bool = True
     reverse_image_policy: str = Field(default="forbid", pattern="^(forbid|auto)$")
+    auto_name: StrictBool = False
 
 
 Service = Callable[[Request, str], Any]
@@ -122,7 +124,13 @@ async def generate_context(
     """
     record, image = _target_from_scope(request, payload.meme_id, service=service, environment=environment, error=error)
     try:
-        snapshot = submit_processing_job(request, record, image, reverse_image_policy=payload.reverse_image_policy)
+        snapshot = submit_processing_job(
+            request,
+            record,
+            image,
+            reverse_image_policy=payload.reverse_image_policy,
+            auto_name=payload.auto_name,
+        )
     except ImageProcessingError as exc:
         if exc.code in {"operation_forbidden", "operation_limit_exceeded", "operation_policy_unavailable"} and operation_error is not None:
             raise operation_error(OperationPolicyError(exc.code, retry_at=exc.retry_at)) from exc
@@ -167,6 +175,7 @@ async def generate_context_batch(
                 record,
                 image,
                 reverse_image_policy=payload.reverse_image_policy,
+                auto_name=payload.auto_name,
                 explicit_retry=payload.include_unready,
                 schedule=True,
             )

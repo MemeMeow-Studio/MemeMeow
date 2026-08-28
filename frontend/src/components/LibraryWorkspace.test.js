@@ -48,26 +48,39 @@ describe('LibraryWorkspace', () => {
     submitImageStage.mockReset().mockResolvedValue({ task_id: 'stage-1' })
   })
 
-  it('默认显示可选择列表并移除选择图片入口，完整重试保持旧请求契约', async () => {
+  it('默认显示可选择列表，完整重试先确认选项再只提交原选中图片', async () => {
+    const secondImage = { ...image, meme_id: 'meme-2', filename: 'other.png', media_url: '/media/meme-2' }
+    images.mockResolvedValue({ items: [image, secondImage] })
     const wrapper = mount(LibraryWorkspace, {
       props: { config: { reverse_image_available: true }, cacheTask: null, cacheBusy: false, refreshToken: 0 },
     })
     await flushPromises()
 
-    expect(wrapper.findAll('.image-check input')).toHaveLength(1)
+    expect(wrapper.findAll('.image-check input')).toHaveLength(2)
     expect(wrapper.text()).not.toContain('选择图片')
 
-    await wrapper.get('.image-check input').setValue(true)
+    await wrapper.find('.image-check input').setValue(true)
     await wrapper.findAll('button').find((button) => button.text().includes('重试选中')).trigger('click')
     expect(wrapper.get('.retry-selected-dialog').text()).toContain('完整重试')
     await wrapper.get('.retry-selected-dialog form').trigger('submit')
+    expect(wrapper.find('.retry-selected-dialog').exists()).toBe(false)
+    expect(wrapper.get('.processing-options-dialog').text()).toContain('图片处理选项')
+    expect(contextBatch).not.toHaveBeenCalled()
+    await wrapper.get('.processing-options-dialog form').trigger('submit')
     await flushPromises()
-    expect(contextBatch).toHaveBeenCalledWith({ items: [{ meme_id: 'meme-1' }], include_unready: true })
+    expect(contextBatch).toHaveBeenCalledWith({
+      items: [{ meme_id: 'meme-1' }],
+      include_unready: true,
+      reverse_image_policy: 'forbid',
+      auto_name: false,
+    })
+    expect(wrapper.findAll('.image-check input')[0].element.checked).toBe(false)
+    expect(wrapper.findAll('.image-check input')[1].element.checked).toBe(false)
   })
 
-  it('指定部分允许多选三个核心阶段，并发送准确阶段载荷', async () => {
+  it('指定部分包含 Agent 时先确认选项，并发送准确阶段和选项载荷', async () => {
     const wrapper = mount(LibraryWorkspace, {
-      props: { config: null, cacheTask: null, cacheBusy: false, refreshToken: 0 },
+      props: { config: { reverse_image_available: true }, cacheTask: null, cacheBusy: false, refreshToken: 0 },
     })
     await flushPromises()
     await wrapper.get('.image-check input').setValue(true)
@@ -76,13 +89,42 @@ describe('LibraryWorkspace', () => {
     await wrapper.get('.retry-selected-dialog input[value="agent"]').setValue(true)
     await wrapper.get('.retry-selected-dialog input[value="text_embedding"]').setValue(true)
     await wrapper.get('.retry-selected-dialog form').trigger('submit')
+    expect(wrapper.find('.retry-selected-dialog').exists()).toBe(false)
+    expect(wrapper.get('.processing-options-dialog').exists()).toBe(true)
+    expect(retryImageStagesBatch).not.toHaveBeenCalled()
+    await wrapper.get('.processing-options-dialog input[type="checkbox"]').setValue(true)
+    await wrapper.get('.processing-options-dialog form').trigger('submit')
     await flushPromises()
 
     expect(retryImageStagesBatch).toHaveBeenCalledWith({
       items: [{ meme_id: 'meme-1' }],
       stages: ['agent', 'text_embedding'],
+      reverse_image_policy: 'forbid',
+      auto_name: true,
     })
     expect(contextBatch).not.toHaveBeenCalled()
+  })
+
+  it('指定部分不包含 Agent 时保持直接提交旧载荷', async () => {
+    const wrapper = mount(LibraryWorkspace, {
+      props: { config: { reverse_image_available: true }, cacheTask: null, cacheBusy: false, refreshToken: 0 },
+    })
+    await flushPromises()
+    await wrapper.get('.image-check input').setValue(true)
+    await wrapper.findAll('button').find((button) => button.text().includes('重试选中')).trigger('click')
+    await wrapper.get('.retry-selected-dialog input[value="parts"]').setValue(true)
+    await wrapper.get('.retry-selected-dialog input[value="visual"]').setValue(true)
+    await wrapper.get('.retry-selected-dialog input[value="text_embedding"]').setValue(true)
+    await wrapper.get('.retry-selected-dialog form').trigger('submit')
+    await flushPromises()
+
+    expect(wrapper.find('.processing-options-dialog').exists()).toBe(false)
+    expect(retryImageStagesBatch).toHaveBeenCalledWith({
+      items: [{ meme_id: 'meme-1' }],
+      stages: ['visual', 'text_embedding'],
+    })
+    expect(contextBatch).not.toHaveBeenCalled()
+    expect(wrapper.get('.image-check input').element.checked).toBe(false)
   })
 
   it('指定部分没有阶段时不可提交，取消后重新打开恢复完整模式', async () => {
@@ -165,6 +207,32 @@ describe('LibraryWorkspace', () => {
     await wrapper.get('.processing-options-dialog form').trigger('submit')
     await flushPromises()
     expect(unreadyProcessing).toHaveBeenCalledTimes(2)
+    wrapper.unmount()
+  })
+
+  it('选中重试取消或失败时保留图片选择和已确认选项', async () => {
+    contextBatch.mockRejectedValueOnce(new Error('selected_failed'))
+    const wrapper = mount(LibraryWorkspace, {
+      props: { config: { reverse_image_available: true }, cacheTask: null, cacheBusy: false, refreshToken: 0 },
+    })
+    await flushPromises()
+
+    await wrapper.get('.image-check input').setValue(true)
+    await wrapper.findAll('button').find((button) => button.text().includes('重试选中')).trigger('click')
+    await wrapper.get('.retry-selected-dialog form').trigger('submit')
+    await wrapper.get('.processing-options-dialog input[value="auto"]').setValue(true)
+    await wrapper.get('.processing-options-dialog input[type="checkbox"]').setValue(true)
+    await wrapper.get('.processing-options-dialog form').trigger('submit')
+    await flushPromises()
+
+    expect(wrapper.get('.processing-options-dialog input[value="auto"]').element.checked).toBe(true)
+    expect(wrapper.get('.processing-options-dialog input[type="checkbox"]').element.checked).toBe(true)
+    expect(wrapper.get('.image-check input').element.checked).toBe(true)
+    expect(contextBatch).toHaveBeenCalledTimes(1)
+
+    await wrapper.get('[aria-label="取消图片处理"]').trigger('click')
+    expect(wrapper.find('.processing-options-dialog').exists()).toBe(false)
+    expect(wrapper.get('.image-check input').element.checked).toBe(true)
     wrapper.unmount()
   })
 

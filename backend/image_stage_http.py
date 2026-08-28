@@ -46,10 +46,12 @@ class ImageStageBatchItem(_StrictRequestModel):
 
 
 class ImageStageBatchRequest(_StrictRequestModel):
-    """图片库批量阶段提交请求，只允许三个核心阶段。"""
+    """图片库批量阶段提交请求，只允许三个核心阶段和统一处理选项。"""
 
     items: list[ImageStageBatchItem] = Field(default_factory=list, max_length=500)
     stages: list[str] = Field(min_length=1, max_length=3)
+    reverse_image_policy: str = Field(default="forbid", pattern="^(forbid|auto)$")
+    auto_name: StrictBool = False
 
 
 Service = Callable[[Request, str], Any]
@@ -237,14 +239,23 @@ async def submit_image_stage_batch(
 ) -> dict[str, object]:
     """为选中图片提交一个或多个核心阶段，并隔离逐项失败。
 
-    输入只允许三种核心阶段和当前 scope 的 Meme 标识；输出保留每项成功/失败摘要及
-    实际 task 数量，调用场景是图片工作区批量阶段恢复。
+    输入只允许三种核心阶段、当前 scope 的 Meme 标识和统一处理选项；输出保留每项
+    成功/失败摘要及实际 task 数量，调用场景是图片工作区批量阶段恢复。
     """
     allowed_stages = {"visual", "agent", "text_embedding"}
     if len(set(payload.stages)) != len(payload.stages) or any(stage not in allowed_stages for stage in payload.stages):
         raise error(422, "invalid_image_stage", "批量阶段只能选择视觉向量、图片语境或文本索引，且不能重复")
     if not payload.items:
         return {"target_count": 0, "submitted_count": 0, "failed_count": 0, "results": []}
+    try:
+        options = normalize_processing_options(
+            request,
+            reverse_image_policy=payload.reverse_image_policy,
+            auto_name=payload.auto_name,
+        )
+    except ImageProcessingError as exc:
+        status = 503 if exc.code == "reverse_image_unavailable" else 400
+        raise error(status, exc.code, "图片处理选项无效或服务不可用") from exc
     worker = processing_worker(request)
     if worker is None:
         raise error(503, "image_processing_unavailable", "图片处理服务当前不可用")
@@ -252,14 +263,14 @@ async def submit_image_stage_batch(
     for item in payload.items:
         for stage in payload.stages:
             try:
-                # 复用单阶段入口的目标和 scope 校验；批量阶段始终使用安全的离线策略。
+                # 复用单阶段入口的目标和 scope 校验；批量选项在循环前统一规范化。
                 record, _image = service(request, "metadata").image_for_meme(item.meme_id)
-                options = normalize_processing_options(request, reverse_image_policy="forbid")
                 task = worker.submit_stage(
                     record.id,
                     stage,
                     config=processing_config(request),
                     reverse_image_policy=options.reverse_image_policy,
+                    auto_name=getattr(options, "auto_name", payload.auto_name),
                     schedule=True,
                 )
                 if task is None:

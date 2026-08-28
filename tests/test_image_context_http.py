@@ -180,6 +180,56 @@ def test_context_batch_isolates_failures_and_preserves_ready_skip() -> None:
     assert set(result["results"][-1]) == {"meme_id", "processing_job_id", "submission_mode", "image_stage", "task_id", "status"}
 
 
+def test_context_batch_forwards_both_processing_options_to_each_job() -> None:
+    """选中图片完整重试的两项处理选项必须逐项传入 Job 提交 callback。"""
+    request = _request()
+    calls: list[dict[str, object]] = []
+
+    class Metadata:
+        """提供可提交的当前 scope 图片。"""
+
+        def image_for_meme(self, meme_id: str) -> tuple[SimpleNamespace, str]:
+            """按稳定 meme_id 返回目标。"""
+            return SimpleNamespace(id=meme_id), f"/{meme_id}.webp"
+
+        def status(self, _image: str) -> dict[str, str]:
+            """返回未就绪状态以触发完整重试。"""
+            return {"status": "pending"}
+
+    def submit(_request: object, record: SimpleNamespace, _image: str, **kwargs: object) -> SimpleNamespace:
+        """记录处理选项并返回最小 Job snapshot。"""
+        calls.append({"meme_id": record.id, **kwargs})
+        return _snapshot(f"job-{record.id}")
+
+    payload = image_context_http.ContextBatchRequest.model_validate(
+        {
+            "items": [{"meme_id": "meme-1"}],
+            "include_unready": True,
+            "reverse_image_policy": "auto",
+            "auto_name": True,
+        }
+    )
+    result = asyncio.run(
+        image_context_http.generate_context_batch(
+            request,
+            payload,
+            service=lambda _request, _name: Metadata(),
+            submit_processing_job=submit,
+            error=_error,
+            enqueue_error=lambda _exc: "context_enqueue_failed",
+        )
+    )
+
+    assert result["results"][0]["meme_id"] == "meme-1"
+    assert calls == [{
+        "meme_id": "meme-1",
+        "reverse_image_policy": "auto",
+        "auto_name": True,
+        "explicit_retry": True,
+        "schedule": True,
+    }]
+
+
 def test_visual_batch_keeps_following_items_after_failure() -> None:
     """视觉批量一项失败后仍提交后续有效项。"""
     request = _request()

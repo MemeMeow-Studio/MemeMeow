@@ -77,15 +77,22 @@ describe('请求封装', () => {
     })
   })
 
-  it('选中图片阶段批量请求发送准确图片和阶段列表', async () => {
+  it('选中图片阶段批量请求发送准确图片、阶段列表和处理选项', async () => {
     await api.retryImageStagesBatch({
       items: [{ meme_id: 'meme-1' }],
       stages: ['agent', 'text_embedding'],
+      reverse_image_policy: 'auto',
+      auto_name: true,
     })
 
     expect(fetch).toHaveBeenCalledWith('/api/images/stages/batch', {
       method: 'POST',
-      body: JSON.stringify({ items: [{ meme_id: 'meme-1' }], stages: ['agent', 'text_embedding'] }),
+      body: JSON.stringify({
+        items: [{ meme_id: 'meme-1' }],
+        stages: ['agent', 'text_embedding'],
+        reverse_image_policy: 'auto',
+        auto_name: true,
+      }),
       headers: { 'Content-Type': 'application/json' },
     })
   })
