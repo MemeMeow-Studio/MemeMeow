@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from backend.config import AGENT_BACKPRESSURE_DEFAULT, Settings
-from backend.database import DatabaseError, _validate_lane_capacities
+from backend.database import DatabaseError, _validate_lane_capacities, validate_lane_resource_concurrency, validate_lane_resource_key
 from backend.image_processing import ImageProcessingWorker
 from backend.opencode import OpenCodeRunner
 from backend.pg_services import PostgresTaskService, PostgresTaskWorkerManager
@@ -61,6 +61,17 @@ def test_database_lane_capacity_preserves_large_value_without_old_cap() -> None:
     assert _validate_lane_capacities(1024, 1024) == (1024, 1024)
     with pytest.raises(DatabaseError, match="agent_claim_config_invalid"):
         _validate_lane_capacities(0, 0)
+
+
+def test_resource_capacity_mapping_is_opaque_and_cannot_exceed_global() -> None:
+    """资源映射只校验 key 和正整数关系，缺失项由调用方继承全局值。"""
+    assert validate_lane_resource_concurrency({"free_series": 40, "luna_high": 60}, 500) == {"free_series": 40, "luna_high": 60}
+    assert validate_lane_resource_concurrency(None, 500) == {}
+    assert validate_lane_resource_key(None) == "__global__"
+    with pytest.raises(ValueError, match="agent_resource_concurrency_invalid"):
+        validate_lane_resource_concurrency({"model": 501}, 500)
+    with pytest.raises(ValueError, match="agent_resource_key_duplicate"):
+        validate_lane_resource_concurrency({"model": 1, " model ": 2}, 500)
 
 
 def test_opencode_and_image_workers_preserve_large_configured_capacity(tmp_path: Path) -> None:

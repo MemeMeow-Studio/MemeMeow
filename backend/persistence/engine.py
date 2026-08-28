@@ -25,7 +25,7 @@ from backend.persistence.models import (
 
 SCOPE_LOCAL = "local"
 # 当前代码要求的 Alembic head；数据库初始化脚本会显式传入同一 revision。
-CURRENT_SCHEMA_REVISION = "0018_operation_grant_metering_units"
+CURRENT_SCHEMA_REVISION = "0019_task_lane_resource_scheduling"
 
 
 class DatabaseError(RuntimeError):
@@ -75,6 +75,9 @@ def ensure_optional_control_schema(engine: Engine) -> None:
         with engine.begin() as connection:
             connection.execute(text("SELECT pg_advisory_xact_lock(hashtext('mememeow:optional-control-schema'))"))
             connection.execute(text("ALTER TABLE task_lane_slots ADD COLUMN IF NOT EXISTS claim_generation BIGINT"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS lane_resource_key VARCHAR(128) NOT NULL DEFAULT '__global__'"))
+            connection.execute(text("UPDATE tasks SET lane_resource_key = '__global__' WHERE lane_resource_key IS NULL OR length(trim(lane_resource_key)) = 0"))
+            connection.execute(text("ALTER TABLE tasks ALTER COLUMN lane_resource_key SET DEFAULT '__global__', ALTER COLUMN lane_resource_key SET NOT NULL"))
             connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS submission_mode VARCHAR(16)"))
             connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS image_stage VARCHAR(32)"))
             connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS processing_job_id UUID"))

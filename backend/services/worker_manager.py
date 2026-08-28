@@ -4,7 +4,7 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from sqlalchemy import select
 
@@ -19,6 +19,7 @@ from backend.persistence.models import (
     StorageOperation,
     Task,
     TaskBatch,
+    TaskLaneResourceSlot,
     TaskLaneSlot,
 )
 from backend.persistence.engine import DatabaseError
@@ -29,6 +30,7 @@ from backend.config import AGENT_BACKPRESSURE_DEFAULT, validate_agent_backpressu
 from backend.tasks import IMAGE_PROCESSING_TASK_TYPES
 from backend.metadata import MetadataError
 from backend.scope import validate_scope_services
+from backend.persistence.repositories.tasks import validate_lane_resource_concurrency, validate_lane_resource_key
 
 # Worker 的调度和恢复日志继续归入旧 facade logger。
 logger = logging.getLogger("backend.pg_services")
@@ -47,6 +49,7 @@ class PostgresTaskWorkerManager:
         *,
         agent_concurrency: int = 1,
         scope_concurrency: int | None = None,
+        resource_concurrency: Mapping[str, int] | None = None,
         agent_backpressure: int = AGENT_BACKPRESSURE_DEFAULT,
         settings_version: str | None = None,
         lease_seconds: int = 120,
@@ -58,6 +61,7 @@ class PostgresTaskWorkerManager:
         self.agent_backpressure = validate_agent_backpressure(agent_backpressure)
         self.agent_concurrency = validate_agent_concurrency(agent_concurrency, backpressure=self.agent_backpressure)
         self.agent_scope_concurrency = validate_agent_concurrency(scope_concurrency if scope_concurrency is not None else 1, backpressure=self.agent_concurrency)
+        self.resource_concurrency = validate_lane_resource_concurrency(resource_concurrency, self.agent_concurrency)
         self.settings_version = settings_version
         self.lease_seconds = lease_seconds
         self.max_attempts = max_attempts
@@ -71,6 +75,14 @@ class PostgresTaskWorkerManager:
         self._started = False
         self._scheduled: set[str] = set()
         self.owner = f"worker-{os.getpid()}-{id(self)}"
+
+    def resource_capacity(self, resource_key: str | None) -> int:
+        """返回资源 key 的运行容量，缺省资源继承全局 Agent 容量。"""
+        try:
+            key = validate_lane_resource_key(resource_key)
+        except ValueError as exc:
+            raise DatabaseError("agent_resource_key_invalid") from exc
+        return self.resource_concurrency.get(key, self.agent_concurrency)
 
     @property
     def worker_count(self) -> int:
@@ -140,6 +152,8 @@ class PostgresTaskWorkerManager:
                 )
             )
             for task in rows:
+                previous_owner = task.lease_owner
+                previous_generation = task.claim_generation
                 recovery_error = {"error": "lease_expired", "message": "Worker 租约已过期"}
                 append_task_error_history(
                     task,
@@ -172,29 +186,36 @@ class PostgresTaskWorkerManager:
                 task.lease_owner = None
                 task.lease_expires_at = None
                 task.updated_at = now
-                self._release_slot(session, task.scope_id, task.id, owner=self.owner, claim_generation=task.claim_generation)
+                self._release_slot(session, task.scope_id, task.id, owner=previous_owner, claim_generation=previous_generation)
             session.commit()
         return queued
 
     @staticmethod
     def _release_slot(session: Any, scope_id: str, task_id: str, *, owner: str | None = None, claim_generation: int | None = None) -> bool:
-        """在全局恢复事务中按完整 claim 释放 lane 槽位。"""
+        """在全局恢复事务中按完整 claim 释放全局和资源槽位。"""
         slot = session.scalar(select(TaskLaneSlot).where(TaskLaneSlot.task_scope_id == scope_id, TaskLaneSlot.task_id == task_id).with_for_update())
-        if slot is not None:
-            if owner is not None and slot.lease_owner not in {None, owner}:
-                logger.info("task_lane_fencing_rejection task=%s scope=%s", task_id, scope_id)
-                return False
-            if claim_generation is not None and getattr(slot, "claim_generation", None) not in {None, claim_generation}:
-                logger.info("task_lane_fencing_rejection task=%s scope=%s", task_id, scope_id)
-                return False
-            slot.task_scope_id = None
-            slot.task_id = None
-            slot.lease_owner = None
-            if hasattr(slot, "claim_generation"):
-                slot.claim_generation = None
-            slot.lease_expires_at = None
-            return True
-        return False
+        resource_slot = session.scalar(
+            select(TaskLaneResourceSlot)
+            .where(TaskLaneResourceSlot.task_scope_id == scope_id, TaskLaneResourceSlot.task_id == task_id)
+            .with_for_update()
+        )
+        slots = [candidate for candidate in (slot, resource_slot) if candidate is not None]
+        if not slots:
+            return False
+        if any(owner is not None and candidate.lease_owner not in {None, owner} for candidate in slots):
+            logger.info("task_lane_fencing_rejection task=%s scope=%s", task_id, scope_id)
+            return False
+        if any(claim_generation is not None and getattr(candidate, "claim_generation", None) not in {None, claim_generation} for candidate in slots):
+            logger.info("task_lane_fencing_rejection task=%s scope=%s", task_id, scope_id)
+            return False
+        for candidate in slots:
+            candidate.task_scope_id = None
+            candidate.task_id = None
+            candidate.lease_owner = None
+            if hasattr(candidate, "claim_generation"):
+                candidate.claim_generation = None
+            candidate.lease_expires_at = None
+        return True
 
     def _fail_invalid_scope_tasks(self) -> list[str]:
         """启动扫描发现非法持久 scope 时稳定失败，绝不猜测为 local。"""
@@ -325,6 +346,8 @@ class PostgresTaskWorkerManager:
                     lease_seconds=self.lease_seconds,
                     lane="agent",
                     lane_capacity=self.agent_concurrency,
+                    resource_key=queued.lane_resource_key,
+                    resource_capacity=self.resource_capacity(queued.lane_resource_key),
                     scope_capacity=self.agent_scope_concurrency,
                     exclude_image_pipeline=True,
                 )
@@ -342,6 +365,8 @@ class PostgresTaskWorkerManager:
                 task_id=task_id,
                 lane=queued.lane,
                 lane_capacity=self.agent_concurrency if queued.lane == "agent" else None,
+                resource_key=queued.lane_resource_key if queued.lane == "agent" else None,
+                resource_capacity=self.resource_capacity(queued.lane_resource_key) if queued.lane == "agent" else None,
                 scope_capacity=self.agent_scope_concurrency if queued.lane == "agent" else None,
             )
 

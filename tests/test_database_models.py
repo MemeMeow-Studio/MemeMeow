@@ -11,7 +11,7 @@ from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from backend.database import AgentCallbackRequest, AgentCallbackRequestRepository, DatabaseError, ScopeContext, TaskLaneFairness
+from backend.database import AgentCallbackRequest, AgentCallbackRequestRepository, DatabaseError, GLOBAL_LANE_RESOURCE_KEY, ScopeContext, TaskLaneFairness, TaskLaneResourceSlot
 from backend import database
 from backend.persistence import models
 
@@ -19,7 +19,7 @@ from backend.persistence import models
 def test_single_forward_migration_head():
     """仓库只暴露一个前向 revision head，回滚由 migration 明确拒绝。"""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == ["0018_operation_grant_metering_units"]
+    assert script.get_heads() == ["0019_task_lane_resource_scheduling"]
     assert (Path("alembic/versions/0001_postgres_scoped.py")).is_file()
 
 
@@ -63,6 +63,18 @@ def test_fair_scheduling_migration_is_chained_and_forward_only():
     assert "raise RuntimeError" in migration
 
 
+def test_resource_scheduling_migration_backfills_global_resource_and_adds_resource_slots():
+    """资源迁移必须回填旧任务、公平行并安装独立资源槽位表。"""
+    migration = Path("alembic/versions/0019_task_lane_resource_scheduling.py").read_text(encoding="utf-8")
+    assert 'down_revision = "0018_operation_grant_metering_units"' in migration
+    assert "lane_resource_key" in migration
+    assert "__global__" in migration
+    assert "task_lane_resource_slots" in migration
+    assert "PRIMARY KEY (lane, resource_key, slot_number)" in migration
+    assert "PRIMARY KEY (lane, resource_key, scope_id)" in migration
+    assert "raise RuntimeError" in migration
+
+
 def test_callback_model_keeps_request_id_and_logic_unique_facts():
     """ORM callback 表同时保留旧 request ID 主键和新的复合逻辑唯一约束。"""
     table = AgentCallbackRequest.__table__
@@ -71,11 +83,19 @@ def test_callback_model_keeps_request_id_and_logic_unique_facts():
 
 
 def test_fairness_model_is_lane_scope_keyed_and_has_dispatch_index():
-    """公平事实以 lane/scope 为复合主键，并可按持久序号排序。"""
+    """公平事实以 lane/资源/scope 为复合主键，并可按持久序号排序。"""
     table = TaskLaneFairness.__table__
-    assert {column.name for column in table.primary_key.columns} == {"lane", "scope_id"}
-    assert {column.name for column in table.columns} >= {"last_dispatch_sequence", "created_at", "updated_at"}
+    assert {column.name for column in table.primary_key.columns} == {"lane", "resource_key", "scope_id"}
+    assert {column.name for column in table.columns} >= {"resource_key", "last_dispatch_sequence", "created_at", "updated_at"}
     assert any(index.name == "ix_task_lane_fairness_dispatch" for index in table.indexes)
+
+
+def test_resource_slot_model_keeps_global_slot_separate_from_resource_slot():
+    """资源槽位使用独立表，旧全局槽位表仍保留原主键。"""
+    table = TaskLaneResourceSlot.__table__
+    assert {column.name for column in table.primary_key.columns} == {"lane", "resource_key", "slot_number"}
+    assert {column.name for column in table.columns} >= {"resource_key", "claim_generation", "lease_expires_at"}
+    assert GLOBAL_LANE_RESOURCE_KEY == "__global__"
 
 
 def test_callback_repository_fails_closed_without_postgres_schema():
@@ -113,6 +133,7 @@ def test_database_facade_reexports_one_model_declaration_source():
         "SearchMigrationState",
         "TaskBatch",
         "TaskBatchItem",
+        "TaskLaneResourceSlot",
         "TaskLaneSlot",
         "TaskLaneFairness",
     )

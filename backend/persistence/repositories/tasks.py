@@ -8,10 +8,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import uuid
-from typing import Any
+from typing import Any, Mapping
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -26,7 +26,9 @@ from backend.persistence.models import (
     TaskBatch,
     TaskBatchItem,
     TaskLaneFairness,
+    TaskLaneResourceSlot,
     TaskLaneSlot,
+    GLOBAL_LANE_RESOURCE_KEY,
     utcnow,
 )
 
@@ -55,6 +57,46 @@ def _validate_lane_capacities(lane_capacity: object | None, scope_capacity: obje
     return capacity, limit
 
 
+def validate_lane_resource_key(value: object | None) -> str:
+    """校验并规范化不透明资源 key，供任务提交和 claim 共用。"""
+    if value is None:
+        return GLOBAL_LANE_RESOURCE_KEY
+    if not isinstance(value, str):
+        raise ValueError("agent_resource_key_invalid")
+    normalized = value.strip()
+    if not normalized or len(normalized) > 128 or any(ord(char) < 32 or ord(char) == 127 for char in normalized):
+        raise ValueError("agent_resource_key_invalid")
+    return normalized
+
+
+def _validate_resource_capacity(resource_capacity: object | None, lane_capacity: int) -> int:
+    """校验资源槽位容量，并确保资源池不会放宽全局 lane 上限。"""
+    try:
+        value = lane_capacity if resource_capacity is None else validate_agent_concurrency(resource_capacity, backpressure=lane_capacity)
+    except (TypeError, ValueError) as exc:
+        raise DatabaseError("agent_claim_config_invalid") from exc
+    return int(value)
+
+
+def validate_lane_resource_concurrency(value: object | None, lane_capacity: int) -> dict[str, int]:
+    """校验资源 key 到运行容量的映射，缺失 key 由调用方继承全局容量。"""
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("agent_resource_concurrency_invalid")
+    result: dict[str, int] = {}
+    for raw_key, raw_capacity in value.items():
+        try:
+            key = validate_lane_resource_key(raw_key)
+            capacity = validate_agent_concurrency(raw_capacity, backpressure=lane_capacity)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("agent_resource_concurrency_invalid") from exc
+        if key in result:
+            raise ValueError("agent_resource_key_duplicate")
+        result[key] = int(capacity)
+    return result
+
+
 class TaskRepository:
     """数据库任务队列 repository，所有方法自动带 scope 条件。"""
 
@@ -80,6 +122,7 @@ class TaskRepository:
         task_id: str | None = None,
         lane_backpressure: int | None = None,
         lane_backpressure_scope_id: str | None = None,
+        lane_resource_key: str | None = None,
         submission_mode: str | None = None,
         image_stage: str | None = None,
         processing_job_id: UUID | str | None = None,
@@ -125,14 +168,26 @@ class TaskRepository:
                 raise DatabaseError("image_task_job_conflict")
             if submission_mode == "standalone" and payload.get("job_id") is not None:
                 raise DatabaseError("image_task_job_conflict")
+        try:
+            lane_resource_key = validate_lane_resource_key(lane_resource_key)
+        except ValueError as exc:
+            raise DatabaseError(exc.args[0]) from exc
         # Agent 任务先锁定 lane，再检查活动去重，避免策略请求并发穿过预检窗口。
         if lane == "agent" or lane_backpressure is not None:
             self._lock_lane(lane)
         if dedupe_key:
             existing = self.session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.task_type == task_type, Task.dedupe_key == dedupe_key, Task.status.in_(("queued", "running"))).with_for_update())
             if existing:
+                try:
+                    existing_resource = validate_lane_resource_key(getattr(existing, "lane_resource_key", None))
+                except ValueError as exc:
+                    raise DatabaseError("agent_resource_key_invalid") from exc
+                if existing_resource != lane_resource_key:
+                    raise DatabaseError("task_resource_conflict")
                 return existing
-        if lane_backpressure is not None:
+        # Agent 队列不设 queued+running 容量门禁；其它独立 lane（例如缩略图）
+        # 仍可显式使用既有背压策略。
+        if lane_backpressure is not None and lane != "agent":
             active_filters = [Task.lane == lane, Task.status.in_(("queued", "running"))]
             if lane_backpressure_scope_id is not None:
                 active_filters.append(Task.scope_id == lane_backpressure_scope_id)
@@ -147,6 +202,7 @@ class TaskRepository:
             image_stage=image_stage,
             processing_job_id=processing_job_id,
             lane=lane,
+            lane_resource_key=lane_resource_key,
             payload=payload,
             dedupe_key=dedupe_key,
             settings_version=settings_version,
@@ -161,6 +217,12 @@ class TaskRepository:
                 # SAVEPOINT 已回滚唯一冲突，外层事务仍可继续写入批次关系。
                 existing = self.session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.task_type == task_type, Task.dedupe_key == dedupe_key, Task.status.in_(("queued", "running"))))
                 if existing:
+                    try:
+                        existing_resource = validate_lane_resource_key(getattr(existing, "lane_resource_key", None))
+                    except ValueError as exc:
+                        raise DatabaseError("agent_resource_key_invalid") from exc
+                    if existing_resource != lane_resource_key:
+                        raise DatabaseError("task_resource_conflict")
                     return existing
             raise DatabaseError("task_submit_conflict")
         return task
@@ -174,6 +236,14 @@ class TaskRepository:
         for number in range(max(1, int(capacity))):
             if self.session.get(TaskLaneSlot, (lane, number)) is None:
                 self.session.add(TaskLaneSlot(lane=lane, slot_number=number))
+        self.session.flush()
+
+    def _ensure_lane_resource_slots(self, lane: str, resource_key: str, capacity: int) -> None:
+        """幂等创建资源池槽位；调用者必须先持有同一 lane advisory lock。"""
+        for number in range(max(1, int(capacity))):
+            identity = (lane, resource_key, number)
+            if self.session.get(TaskLaneResourceSlot, identity) is None:
+                self.session.add(TaskLaneResourceSlot(lane=lane, resource_key=resource_key, slot_number=number))
         self.session.flush()
 
     def _release_lane_slot(self, task_scope_id: str, task_id: str, *, owner: str | None = None, claim_generation: int | None = None) -> bool:
@@ -193,9 +263,58 @@ class TaskRepository:
         slot.lease_expires_at = None
         return True
 
+    def _release_lane_resource_slot(self, task_scope_id: str, task_id: str, *, resource_key: str | None = None, owner: str | None = None, claim_generation: int | None = None) -> bool:
+        """按任务和 claim fencing 释放模型资源槽位。"""
+        filters = [TaskLaneResourceSlot.task_scope_id == task_scope_id, TaskLaneResourceSlot.task_id == task_id]
+        if resource_key is not None:
+            filters.append(TaskLaneResourceSlot.resource_key == resource_key)
+        slot = self.session.scalar(select(TaskLaneResourceSlot).where(*filters).with_for_update())
+        if slot is None:
+            return False
+        if owner is not None and slot.lease_owner not in {None, owner}:
+            return False
+        if claim_generation is not None and slot.claim_generation not in {None, claim_generation}:
+            return False
+        slot.task_scope_id = None
+        slot.task_id = None
+        slot.lease_owner = None
+        slot.claim_generation = None
+        slot.lease_expires_at = None
+        return True
+
+    def _release_lane_slots(self, task_scope_id: str, task_id: str, *, resource_key: str | None = None, owner: str | None = None, claim_generation: int | None = None) -> bool:
+        """在同一事务中释放全局槽位和资源槽位，并应用完整 claim fencing。"""
+        global_slot = self.session.scalar(
+            select(TaskLaneSlot)
+            .where(TaskLaneSlot.task_scope_id == task_scope_id, TaskLaneSlot.task_id == task_id)
+            .with_for_update()
+        )
+        resource_filters = [TaskLaneResourceSlot.task_scope_id == task_scope_id, TaskLaneResourceSlot.task_id == task_id]
+        if resource_key is not None:
+            resource_filters.append(TaskLaneResourceSlot.resource_key == resource_key)
+        resource_slot = self.session.scalar(select(TaskLaneResourceSlot).where(*resource_filters).with_for_update())
+        slots = [slot for slot in (global_slot, resource_slot) if slot is not None]
+        if not slots:
+            return False
+        if any(owner is not None and slot.lease_owner not in {None, owner} for slot in slots):
+            return False
+        if any(claim_generation is not None and slot.claim_generation not in {None, claim_generation} for slot in slots):
+            return False
+        for slot in slots:
+            slot.task_scope_id = None
+            slot.task_id = None
+            slot.lease_owner = None
+            slot.claim_generation = None
+            slot.lease_expires_at = None
+        return True
+
     def slot_for_task(self, task_id: str) -> TaskLaneSlot | None:
         """读取当前 scope 任务占用的槽位，用于安全摘要和诊断。"""
         return self.session.scalar(select(TaskLaneSlot).where(TaskLaneSlot.task_scope_id == self.scope.scope_id, TaskLaneSlot.task_id == task_id))
+
+    def resource_slot_for_task(self, task_id: str) -> TaskLaneResourceSlot | None:
+        """读取当前 scope 任务占用的资源槽位，供内部恢复和诊断使用。"""
+        return self.session.scalar(select(TaskLaneResourceSlot).where(TaskLaneResourceSlot.task_scope_id == self.scope.scope_id, TaskLaneResourceSlot.task_id == task_id))
 
     def recover_expired(self, *, owner: str, limit: int = 1000, exclude_task_types: set[str] | frozenset[str] | None = None, include_task_types: set[str] | frozenset[str] | None = None) -> list[str]:
         """恢复失效租约；可按任务类型限制专用 Worker 的恢复范围。"""
@@ -250,7 +369,7 @@ class TaskRepository:
             task.lease_owner = None
             task.lease_expires_at = None
             task.updated_at = now
-            self._release_lane_slot(task.scope_id, task.id, owner=previous_owner, claim_generation=previous_generation)
+            self._release_lane_slots(task.scope_id, task.id, resource_key=task.lane_resource_key, owner=previous_owner, claim_generation=previous_generation)
         self.session.flush()
         return queued
 
@@ -275,7 +394,7 @@ class TaskRepository:
             task.lease_owner = None
             task.lease_expires_at = None
             task.updated_at = now
-            self._release_lane_slot(task.scope_id, task.id, owner=owner)
+            self._release_lane_slots(task.scope_id, task.id, resource_key=task.lane_resource_key, owner=owner)
         self.session.flush()
         return len(rows)
 
@@ -299,7 +418,7 @@ class TaskRepository:
         task.lease_owner = None
         task.lease_expires_at = None
         task.updated_at = utcnow()
-        self._release_lane_slot(task.scope_id, task.id, owner=None)
+        self._release_lane_slots(task.scope_id, task.id, resource_key=task.lane_resource_key, owner=None)
         self.session.flush()
         return True
 
@@ -351,6 +470,61 @@ class TaskRepository:
         if holder is not None and holder.status == "running":
             if holder.lease_expires_at is None or holder.lease_expires_at > now:
                 raise DatabaseError("agent_lane_slot_inconsistent")
+        slot.task_scope_id = task.scope_id
+        slot.task_id = task.id
+        slot.lease_owner = owner
+        slot.claim_generation = None
+        slot.lease_expires_at = lease_expires_at
+        self.session.flush()
+        return True
+
+    def _claim_lane_resource_slot(self, task: Task, *, resource_key: str, owner: str, lease_expires_at: datetime, capacity: int) -> bool:
+        """为任务分配资源池槽位；资源槽位与全局槽位由调用方在同一事务申请。"""
+        self._lock_lane(task.lane)
+        self._ensure_lane_resource_slots(task.lane, resource_key, capacity)
+        now = utcnow()
+        candidate = self.session.scalar(
+            select(TaskLaneResourceSlot)
+            .where(
+                TaskLaneResourceSlot.lane == task.lane,
+                TaskLaneResourceSlot.resource_key == resource_key,
+                TaskLaneResourceSlot.slot_number < max(1, int(capacity)),
+                (
+                    (TaskLaneResourceSlot.task_id.is_(None))
+                    | (TaskLaneResourceSlot.lease_expires_at.is_(None))
+                    | (TaskLaneResourceSlot.lease_expires_at <= now)
+                ),
+            )
+            .order_by(TaskLaneResourceSlot.slot_number)
+            .limit(1)
+        )
+        if candidate is None:
+            return False
+        holder = None
+        if candidate.task_id is not None:
+            holder = self.session.scalar(
+                select(Task)
+                .where(Task.scope_id == candidate.task_scope_id, Task.id == candidate.task_id)
+                .with_for_update()
+            )
+        slot = self.session.scalar(
+            select(TaskLaneResourceSlot)
+            .where(
+                TaskLaneResourceSlot.lane == task.lane,
+                TaskLaneResourceSlot.resource_key == resource_key,
+                TaskLaneResourceSlot.slot_number == candidate.slot_number,
+            )
+            .with_for_update(skip_locked=True)
+        )
+        if slot is None:
+            return False
+        if slot.task_id != candidate.task_id or slot.task_scope_id != candidate.task_scope_id:
+            return False
+        if slot.task_id is not None and slot.lease_expires_at is not None and slot.lease_expires_at > now:
+            return False
+        if holder is not None and holder.status == "running":
+            if holder.lease_expires_at is None or holder.lease_expires_at > now:
+                raise DatabaseError("agent_lane_resource_slot_inconsistent")
         slot.task_scope_id = task.scope_id
         slot.task_id = task.id
         slot.lease_owner = owner
@@ -423,7 +597,7 @@ class TaskRepository:
             task.lease_owner = None
             task.lease_expires_at = None
             task.updated_at = now
-            self._release_lane_slot(task.scope_id, task.id, owner=previous_owner, claim_generation=previous_generation)
+            self._release_lane_slots(task.scope_id, task.id, resource_key=task.lane_resource_key, owner=previous_owner, claim_generation=previous_generation)
         self.session.flush()
         return queued
 
@@ -475,6 +649,52 @@ class TaskRepository:
             slot.lease_expires_at = None
         self.session.flush()
 
+    def _clear_expired_lane_resource_slots_locked(self, *, lane: str, resource_key: str, now: datetime, capacity: int) -> None:
+        """清理指定资源池的失效槽位，并拒绝有效租约不一致状态。"""
+        candidates = list(
+            self.session.scalars(
+                select(TaskLaneResourceSlot)
+                .where(
+                    TaskLaneResourceSlot.lane == lane,
+                    TaskLaneResourceSlot.resource_key == resource_key,
+                    TaskLaneResourceSlot.slot_number < max(1, int(capacity)),
+                    TaskLaneResourceSlot.task_id.is_not(None),
+                    (
+                        TaskLaneResourceSlot.lease_expires_at.is_(None)
+                        | (TaskLaneResourceSlot.lease_expires_at <= now)
+                    ),
+                )
+            )
+        )
+        for candidate in candidates:
+            holder = self.session.scalar(
+                select(Task)
+                .where(Task.scope_id == candidate.task_scope_id, Task.id == candidate.task_id)
+                .with_for_update()
+            )
+            slot = self.session.scalar(
+                select(TaskLaneResourceSlot)
+                .where(
+                    TaskLaneResourceSlot.lane == lane,
+                    TaskLaneResourceSlot.resource_key == resource_key,
+                    TaskLaneResourceSlot.slot_number == candidate.slot_number,
+                )
+                .with_for_update()
+            )
+            if slot is None or slot.task_id != candidate.task_id or slot.task_scope_id != candidate.task_scope_id:
+                continue
+            if slot.lease_expires_at is None or slot.lease_expires_at > now:
+                continue
+            if holder is not None and holder.status == "running":
+                if holder.lease_expires_at is None or holder.lease_expires_at > now:
+                    raise DatabaseError("agent_lane_resource_slot_inconsistent")
+            slot.task_scope_id = None
+            slot.task_id = None
+            slot.lease_owner = None
+            slot.claim_generation = None
+            slot.lease_expires_at = None
+        self.session.flush()
+
     def claim_next(
         self,
         *,
@@ -482,6 +702,8 @@ class TaskRepository:
         lease_seconds: int = 120,
         lane: str = "agent",
         lane_capacity: int = 1,
+        resource_key: str | None = None,
+        resource_capacity: int | None = None,
         scope_capacity: int | None = None,
         scope_id: str | None = None,
         exclude_task_types: set[str] | frozenset[str] | None = None,
@@ -492,8 +714,9 @@ class TaskRepository:
         ``scope_id`` 只供内部恢复或测试缩小候选范围；正常 Agent manager 必须
         省略它，让候选 scope 完全来自持久 Task.scope_id。客户端 payload、user_id
         和进程内 cursor 不参与选择。返回的 Task.scope_id 是后续 facade 装配的
-        唯一可信归属；公平状态、slot、claim generation 和 lease 会在本事务一起
-        提交，任一步失败都会由 UnitOfWork 回滚。
+        唯一可信归属；全局 slot、资源 slot、公平状态、claim generation 和 lease 会
+        在本事务一起提交，任一步失败都会由 UnitOfWork 回滚。资源 key 只作为不透明
+        分区标识，队列数量不参与 claim 拒绝。
         """
         if not isinstance(owner, str) or not owner.strip():
             raise DatabaseError("agent_claim_owner_invalid")
@@ -502,6 +725,8 @@ class TaskRepository:
         try:
             capacity, limit = _validate_lane_capacities(lane_capacity, scope_capacity)
             assert capacity is not None
+            resource_key = validate_lane_resource_key(resource_key)
+            resource_capacity = _validate_resource_capacity(resource_capacity, capacity)
             lease_seconds = max(1, min(int(lease_seconds), 86400))
         except (TypeError, ValueError, AssertionError) as exc:
             raise DatabaseError("agent_claim_config_invalid") from exc
@@ -515,10 +740,16 @@ class TaskRepository:
             # 所有跨 scope 的读写都必须在同一 lane advisory lock 内完成。
             self._lock_lane(lane)
             self._ensure_lane_slots(lane, capacity)
+            self._ensure_lane_resource_slots(lane, resource_key, resource_capacity)
             self._recover_expired_lane_locked(lane=lane, now=now, scope_id=scope_id, exclude_task_types=exclude_task_types)
             self._clear_expired_lane_slots_locked(lane=lane, now=now, capacity=capacity)
+            self._clear_expired_lane_resource_slots_locked(lane=lane, resource_key=resource_key, now=now, capacity=resource_capacity)
 
             candidate_filters = [Task.lane == lane, Task.status == "queued", Task.available_at <= now]
+            resource_filter = Task.lane_resource_key == resource_key
+            if resource_key == GLOBAL_LANE_RESOURCE_KEY:
+                resource_filter = or_(resource_filter, Task.lane_resource_key.is_(None))
+            candidate_filters.append(resource_filter)
             if scope_id is not None:
                 candidate_filters.append(Task.scope_id == scope_id)
             if exclude_task_types:
@@ -534,24 +765,24 @@ class TaskRepository:
             if not candidate_scope_ids:
                 return None
 
-            # 公平行按 lane/scope 唯一键惰性建立，初次平局交给 Scope.created_at 和
+            # 公平行按 lane/resource/scope 唯一键惰性建立，初次平局交给 Scope.created_at 和
             # scope ID，动态加入的 scope 不依赖任何进程内状态获得确定顺序。
             for candidate_scope in candidate_scope_ids:
                 rows = list(
                     self.session.scalars(
                         select(TaskLaneFairness)
-                        .where(TaskLaneFairness.lane == lane, TaskLaneFairness.scope_id == candidate_scope)
+                        .where(TaskLaneFairness.lane == lane, TaskLaneFairness.resource_key == resource_key, TaskLaneFairness.scope_id == candidate_scope)
                         .with_for_update()
                     )
                 )
                 if len(rows) > 1:
                     raise DatabaseError("agent_fairness_unavailable")
                 if not rows:
-                    self.session.add(TaskLaneFairness(lane=lane, scope_id=candidate_scope, last_dispatch_sequence=0))
+                    self.session.add(TaskLaneFairness(lane=lane, resource_key=resource_key, scope_id=candidate_scope, last_dispatch_sequence=0))
             self.session.flush()
             fairness_rows = list(
                 self.session.scalars(
-                    select(TaskLaneFairness).where(TaskLaneFairness.lane == lane).with_for_update()
+                    select(TaskLaneFairness).where(TaskLaneFairness.lane == lane, TaskLaneFairness.resource_key == resource_key).with_for_update()
                 )
             )
             if any(not isinstance(row.last_dispatch_sequence, int) or row.last_dispatch_sequence < 0 for row in fairness_rows):
@@ -606,6 +837,7 @@ class TaskRepository:
                             & Task.submission_mode.in_(('pipeline', 'standalone'))
                         )
                     )
+                task_filters.append(resource_filter)
                 task = self.session.scalar(
                     select(Task)
                     .where(*task_filters)
@@ -618,6 +850,11 @@ class TaskRepository:
                 expires_at = now + timedelta(seconds=lease_seconds)
                 if not self._claim_lane_slot(task, owner=owner, lease_expires_at=expires_at, capacity=capacity):
                     # lane 已由本事务独占；无 slot 意味着全局背压，公平序号不得推进。
+                    return None
+                if not self._claim_lane_resource_slot(task, resource_key=resource_key, owner=owner, lease_expires_at=expires_at, capacity=resource_capacity):
+                    # 全局 slot 已先取得；显式释放后再返回 queued，避免部分 claim
+                    # 在正常返回路径中提交。异常路径仍由事务整体回滚。
+                    self._release_lane_slot(task.scope_id, task.id, owner=owner)
                     return None
                 task.status = "running"
                 task.claim_generation += 1
@@ -634,6 +871,19 @@ class TaskRepository:
                 if slot is None:
                     raise DatabaseError("agent_lane_slot_inconsistent")
                 slot.claim_generation = task.claim_generation
+                resource_slot = self.session.scalar(
+                    select(TaskLaneResourceSlot)
+                    .where(
+                        TaskLaneResourceSlot.lane == task.lane,
+                        TaskLaneResourceSlot.resource_key == resource_key,
+                        TaskLaneResourceSlot.task_scope_id == task.scope_id,
+                        TaskLaneResourceSlot.task_id == task.id,
+                    )
+                    .with_for_update()
+                )
+                if resource_slot is None:
+                    raise DatabaseError("agent_lane_resource_slot_inconsistent")
+                resource_slot.claim_generation = task.claim_generation
                 fairness = fairness_by_scope[candidate_scope]
                 fairness.last_dispatch_sequence = next_sequence
                 fairness.updated_at = now
@@ -753,17 +1003,24 @@ class TaskRepository:
         self.session.flush()
         return task
 
-    def claim(self, *, owner: str, lease_seconds: int = 120, lane: str | None = None, task_id: str | None = None, lane_capacity: int | None = None, scope_capacity: int | None = None, exclude_task_types: set[str] | frozenset[str] | None = None) -> Task | None:
+    def claim(self, *, owner: str, lease_seconds: int = 120, lane: str | None = None, task_id: str | None = None, lane_capacity: int | None = None, resource_key: str | None = None, resource_capacity: int | None = None, scope_capacity: int | None = None, exclude_task_types: set[str] | frozenset[str] | None = None) -> Task | None:
         """兼容 scope-bound 认领并递增 claim generation。
 
         Agent 正常调度必须使用 ``claim_next``；这个入口只保留给已由专用控制面
         选定的任务、租约恢复和历史兼容路径。lane 任务仍持有 advisory lock，
-        因而不能绕过全局 slot 或可选 scope 上限。
+        因而不能绕过全局 slot、资源 slot 或可选 scope 上限。传入的资源 key
+        必须与持久任务事实一致；省略时从任务列恢复。
         """
         now = utcnow()
+        requested_resource_key = resource_key
         if lane and lane_capacity is not None:
             lane_capacity, scope_capacity = _validate_lane_capacities(lane_capacity, scope_capacity)
             assert lane_capacity is not None
+            try:
+                if requested_resource_key is not None:
+                    resource_key = validate_lane_resource_key(requested_resource_key)
+            except ValueError as exc:
+                raise DatabaseError(exc.args[0]) from exc
             self._lock_lane(lane)
             self._ensure_lane_slots(lane, lane_capacity)
             self._recover_expired_lane_locked(lane=lane, now=now, scope_id=self.scope.scope_id, exclude_task_types=exclude_task_types)
@@ -788,6 +1045,11 @@ class TaskRepository:
             filters.append(Task.lane == lane)
         if task_id:
             filters.append(Task.id == task_id)
+        if requested_resource_key is not None:
+            requested_resource_filter = Task.lane_resource_key == resource_key
+            if resource_key == GLOBAL_LANE_RESOURCE_KEY:
+                requested_resource_filter = or_(requested_resource_filter, Task.lane_resource_key.is_(None))
+            filters.append(requested_resource_filter)
         if exclude_task_types:
             filters.append(~Task.task_type.in_(exclude_task_types))
         statement = select(Task).where(*filters).order_by(Task.available_at, Task.created_at, Task.id).with_for_update(skip_locked=True).limit(1)
@@ -798,6 +1060,11 @@ class TaskRepository:
                 filters.append(Task.lane == lane)
             if task_id:
                 filters.append(Task.id == task_id)
+            if requested_resource_key is not None:
+                requested_resource_filter = Task.lane_resource_key == resource_key
+                if resource_key == GLOBAL_LANE_RESOURCE_KEY:
+                    requested_resource_filter = or_(requested_resource_filter, Task.lane_resource_key.is_(None))
+                filters.append(requested_resource_filter)
             if exclude_task_types:
                 filters.append(~Task.task_type.in_(exclude_task_types))
             statement = select(Task).where(*filters).order_by(Task.lease_expires_at, Task.created_at, Task.id).with_for_update(skip_locked=True).limit(1)
@@ -805,9 +1072,22 @@ class TaskRepository:
         if task is None:
             return None
         if lane and lane_capacity is not None:
+            try:
+                selected_resource_key = validate_lane_resource_key(getattr(task, "lane_resource_key", None))
+            except ValueError as exc:
+                raise DatabaseError(exc.args[0]) from exc
+            if requested_resource_key is not None and selected_resource_key != resource_key:
+                raise DatabaseError("agent_claim_resource_mismatch")
+            resource_key = selected_resource_key
+            selected_resource_capacity = _validate_resource_capacity(resource_capacity, lane_capacity)
+            self._ensure_lane_resource_slots(lane, resource_key, selected_resource_capacity)
+            self._clear_expired_lane_resource_slots_locked(lane=lane, resource_key=resource_key, now=now, capacity=selected_resource_capacity)
             # task_id 过滤只缩小候选范围，不能绕过全局 lane 槽位上限。
             expires_at = now + timedelta(seconds=lease_seconds)
             if not self._claim_lane_slot(task, owner=owner, lease_expires_at=expires_at, capacity=lane_capacity):
+                return None
+            if not self._claim_lane_resource_slot(task, resource_key=resource_key, owner=owner, lease_expires_at=expires_at, capacity=selected_resource_capacity):
+                self._release_lane_slot(task.scope_id, task.id, owner=owner)
                 return None
         else:
             expires_at = now + timedelta(seconds=lease_seconds)
@@ -822,6 +1102,19 @@ class TaskRepository:
             slot = self.session.scalar(select(TaskLaneSlot).where(TaskLaneSlot.task_scope_id == task.scope_id, TaskLaneSlot.task_id == task.id).with_for_update())
             if slot is not None and slot.lease_owner == owner:
                 slot.claim_generation = task.claim_generation
+            resource_slot = self.session.scalar(
+                select(TaskLaneResourceSlot)
+                .where(
+                    TaskLaneResourceSlot.lane == task.lane,
+                    TaskLaneResourceSlot.resource_key == resource_key,
+                    TaskLaneResourceSlot.task_scope_id == task.scope_id,
+                    TaskLaneResourceSlot.task_id == task.id,
+                )
+                .with_for_update()
+            )
+            if resource_slot is None:
+                raise DatabaseError("agent_lane_resource_slot_inconsistent")
+            resource_slot.claim_generation = task.claim_generation
         self.session.flush()
         return task
 
@@ -829,13 +1122,40 @@ class TaskRepository:
         """在当前 claim 仍有效时续租，防止长时间外部调用被误判为崩溃。"""
         now = utcnow()
         expires_at = now + timedelta(seconds=lease_seconds)
-        result = self.session.execute(update(Task).where(Task.scope_id == self.scope.scope_id, Task.id == task_id, Task.claim_generation == claim_generation, Task.lease_owner == owner, Task.status == "running", Task.lease_expires_at > now).values(lease_expires_at=expires_at, updated_at=now))
-        if result.rowcount != 1:
+        task = self.session.scalar(
+            select(Task)
+            .where(
+                Task.scope_id == self.scope.scope_id,
+                Task.id == task_id,
+                Task.claim_generation == claim_generation,
+                Task.lease_owner == owner,
+                Task.status == "running",
+                Task.lease_expires_at > now,
+            )
+            .with_for_update()
+        )
+        if task is None:
             return False
         slot = self.session.scalar(select(TaskLaneSlot).where(TaskLaneSlot.task_scope_id == self.scope.scope_id, TaskLaneSlot.task_id == task_id).with_for_update())
+        resource_slot = self.session.scalar(
+            select(TaskLaneResourceSlot)
+            .where(TaskLaneResourceSlot.task_scope_id == self.scope.scope_id, TaskLaneResourceSlot.task_id == task_id)
+            .with_for_update()
+        )
+        if task.lane == "agent":
+            if slot is None or resource_slot is None:
+                return False
+            if slot.lease_owner != owner or slot.claim_generation not in {None, claim_generation}:
+                return False
+            if resource_slot.lease_owner != owner or resource_slot.claim_generation not in {None, claim_generation}:
+                return False
+        task.lease_expires_at = expires_at
+        task.updated_at = now
         if slot is not None and slot.lease_owner == owner and slot.claim_generation in {None, claim_generation}:
             slot.lease_expires_at = expires_at
-            self.session.flush()
+        if resource_slot is not None and resource_slot.lease_owner == owner and resource_slot.claim_generation in {None, claim_generation}:
+            resource_slot.lease_expires_at = expires_at
+        self.session.flush()
         return True
 
     def fail_fenced(self, task_id: str, claim_generation: int, owner: str, *, error: dict[str, Any], message: str, retry: bool = True, result: Any | None = None, retry_delay_seconds: int = 0, resume_available: bool | None = None, resume_reason: str | None = None, session_id: str | None = None, executor_attempt_id: str | None = None) -> tuple[bool, bool]:
@@ -878,7 +1198,7 @@ class TaskRepository:
             task.lease_owner = None
             task.lease_expires_at = None
             task.updated_at = now
-            self._release_lane_slot(task.scope_id, task.id, owner=owner, claim_generation=claim_generation)
+            self._release_lane_slots(task.scope_id, task.id, resource_key=task.lane_resource_key, owner=owner, claim_generation=claim_generation)
         else:
             task.status = "failed"
             task.completed_at = now
@@ -889,7 +1209,7 @@ class TaskRepository:
             task.lease_owner = None
             task.lease_expires_at = None
             task.updated_at = now
-            self._release_lane_slot(task.scope_id, task.id, owner=owner, claim_generation=claim_generation)
+            self._release_lane_slots(task.scope_id, task.id, resource_key=task.lane_resource_key, owner=owner, claim_generation=claim_generation)
         self.session.flush()
         return True, should_retry
 
@@ -915,7 +1235,7 @@ class TaskRepository:
         if result.rowcount != 1:
             return False
         if requested_status in {"succeeded", "failed"}:
-            self._release_lane_slot(self.scope.scope_id, task_id, owner=owner, claim_generation=claim_generation)
+            self._release_lane_slots(self.scope.scope_id, task_id, owner=owner, claim_generation=claim_generation)
             self.session.flush()
         return True
 
@@ -979,7 +1299,7 @@ class TaskRepository:
                             meme.updated_at = now
                     except Exception:  # noqa: BLE001 - 附属写回失败不回滚任务终态
                         pass
-        self._release_lane_slot(self.scope.scope_id, task_id, owner=owner, claim_generation=claim_generation)
+        self._release_lane_slots(self.scope.scope_id, task_id, resource_key=task.lane_resource_key, owner=owner, claim_generation=claim_generation)
         self.session.flush()
         return True
 
@@ -1001,4 +1321,4 @@ class TaskRepository:
 
 
 
-__all__ = ["IMAGE_PROCESSING_LANE_TYPES", "TaskRepository", "_validate_lane_capacities"]
+__all__ = ["IMAGE_PROCESSING_LANE_TYPES", "TaskRepository", "_validate_lane_capacities", "validate_lane_resource_key", "validate_lane_resource_concurrency"]

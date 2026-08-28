@@ -19,7 +19,7 @@ app = create_app(scope_resolver=LocalScopeResolver("local"))
 
 任务创建时服务端把请求 scope 写入不可为空的 `Task.scope_id`，payload 不承担授权 scope。Worker、重试、视觉/反向图片 callback 和 Agent 子任务从持久任务或有效 claim 恢复 scope；两个既有 `/internal/...` callback 不依赖请求上下文。宿主 non-local scope 必须提供受控 `agent_input_provider`；未配置或返回符号链接/非普通文件时任务稳定失败为 `agent_input_provider_unavailable`。内部 callback 由 API 独立验证短期任务凭据，网络隔离和内部路由暴露范围仍由部署宿主负责；本 API 不新增身份管理接口。
 
-进程内只运行一个 scope-aware Worker manager，所有 scope 共享线程池、handler registry、lane 背压、claim owner 和恢复扫描；请求侧 task facade 不启动 scope 专属 Worker。
+进程内只运行一个 scope-aware Worker manager，所有 scope 共享线程池、handler registry、全局/资源 lane slot、claim owner 和恢复扫描；请求侧 task facade 不启动 scope 专属 Worker。
 
 ## 检索
 
@@ -144,6 +144,6 @@ Agent 只获得当前任务 token、内部地址和 executor token，不获得 c
 - Agent 运行模式只接受 `auto`、`executor` 和 `host`。`auto` 在 executor URL 与 token 同时可用时选择 executor，否则选择 host；显式 `executor` 缺少配置时失败关闭。旧 Docker runtime、容器名和运行时字段不能启用任何执行分支；回滚使用显式 host，运维诊断使用当前 project 的 `docker compose exec <service>`。
 - `MEMEMEOW_PROTECTED_MODE=true` 时仅放行 `MEMEMEOW_ALLOWED_ENDPOINTS`；限流由 `MEMEMEOW_RATE_LIMIT_*` 控制，超限返回 `429` 和 `Retry-After`。
 
-Agent lane 的 `MEMEMEOW_OPENCODE_CONCURRENCY` 必须为正整数且不超过 `MEMEMEOW_AGENT_BACKPRESSURE`；`MEMEMEOW_AGENT_SCOPE_CONCURRENCY` 还不得超过全局并发，默认值仍为 `1`。公共核心不绑定固定产品并发规模，也不设置固定背压容量上限；部署适配层应按实际资源施加门禁。背压默认值为 `80`。设置页保存的全局并发值需要重启后生效。PostgreSQL 任务服务按 Agent lane 的 `queued+running` 统计背压，executor 和本地兼容任务服务只统计 `queued`，因此相同阈值下三层的可接受排队长度不同。
+Agent lane 的 `MEMEMEOW_OPENCODE_CONCURRENCY`、`MEMEMEOW_AGENT_SCOPE_CONCURRENCY` 和资源池容量必须为正整数，scope 容量不得超过全局容量。资源槽位只限制运行，不限制排队数量；任务的 `lane_resource_key` 在提交时冻结，公平状态按资源池分别维护。容量由部署环境决定，设置页保存的并发值需要重启后生效。
 
 系统不提供注册、JWT、角色或多租户权限接口。资源包和社区同步功能已从生产入口移除。

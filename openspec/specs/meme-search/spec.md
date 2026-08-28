@@ -64,11 +64,11 @@
 - **THEN** 系统回退到原始查询并按普通检索返回结果
 
 ### Requirement: OpenCode 运行时必须复用且隔离图片上下文
-系统 MUST 在固定 runtime 中执行已安装的 OpenCode，所有图片 job MUST 复用同一套受控配置和预安装的 Node.js 依赖，且任务执行期间 MUST NOT 调用包管理器或为每个 job 下载依赖。系统 MUST 在 `<runtime>/workspace/opencode.json` 维护不含密钥的 `@ai-sdk/openai` Responses provider 配置，其中只注册 `gpt-5.6-luna`；服务地址和密钥 MUST 分别从 `MEMEMEOW_OPENCODE_BASE_URL`、`MEMEMEOW_OPENCODE_API_KEY` 的环境变量引用，模型 MUST 由 `MEMEMEOW_OPENCODE_MODEL` 经命令行传递，并固定传入 `--variant max` 以使用 `max` 推理强度。每张图片 MUST 使用独立的 OpenCode session，后一张图片不得继承前一张图片的会话内容。系统 MUST 通过 PostgreSQL 持久公平 claim、配置的全局并发上限、scope 运行上限和跨进程 slot 互斥限制同时运行的语境生成子进程；默认全局和 scope 上限 MUST 为 `1`，公平状态不可用时 MUST fail-closed，不得退化为进程内或竞争式调度。
+系统 MUST 在固定 runtime 中执行已安装的 OpenCode，所有图片 job MUST 复用同一套受控配置和预安装的 Node.js 依赖，且任务执行期间 MUST NOT 调用包管理器或为每个 job 下载依赖。系统 MUST 在 `<runtime>/workspace/opencode.json` 维护不含密钥的 `@ai-sdk/openai` Responses provider 配置，其中只注册 `gpt-5.6-luna`；服务地址和密钥 MUST 分别从 `MEMEMEOW_OPENCODE_BASE_URL`、`MEMEMEOW_OPENCODE_API_KEY` 的环境变量引用，模型 MUST 由 `MEMEMEOW_OPENCODE_MODEL` 经命令行传递，并固定传入 `--variant max` 以使用 `max` 推理强度。每张图片 MUST 使用独立的 OpenCode session，后一张图片不得继承前一张图片的会话内容。系统 MUST 通过 PostgreSQL 持久公平 claim、配置的全局并发上限、scope 运行上限、任务的 `lane_resource_key` 资源上限和跨进程双重 slot 互斥限制同时运行语境生成子进程；资源槽位只限制运行，不限制排队数量；公平状态不可用时 MUST fail-closed，不得退化为进程内或竞争式调度。
 
 #### Scenario: 默认配置保持单并发
 - **WHEN** 未配置 OpenCode 并发上限或显式设置为 `1`
-- **THEN** 系统一次只运行一个语境生成子进程，并保持现有稳定排队顺序
+- **THEN** 系统一次只运行一个语境生成子进程，并保持现有稳定排队顺序；队列不因数量增长被拒绝
 
 #### Scenario: 不同图片在安全上限内并行
 - **WHEN** 多个不同图片的语境生成 job 同时处于 `queued`，且运行时已验证支持配置的并发上限
@@ -78,9 +78,9 @@
 - **WHEN** 活跃语境生成子进程数量已达到配置上限
 - **THEN** 后续 job 保持 `queued`，不启动额外子进程、不重复调用外部检索服务，并在资源释放后按稳定顺序继续调度
 
-#### Scenario: 多 scope 任务按持久公平序号轮询
-- **WHEN** 多个 scope 都有可执行的 Agent 任务且 lane 存在可用 slot
-- **THEN** Worker 按 `task_lane_fairness` 的最久未服务序号轮转 scope；服务重启或多个 Worker 并发不会重置或复制内存 cursor
+#### Scenario: 多 scope 任务按资源池公平序号轮询
+- **WHEN** 多个 scope 都有同一资源池的可执行 Agent 任务且全局和该资源池都存在可用 slot
+- **THEN** Worker 按 `(lane, resource_key, scope)` 公平事实的最久未服务序号轮转 scope；服务重启或多个 Worker 并发不会重置或复制内存 cursor
 
 #### Scenario: 公平状态故障时停止 claim
 - **WHEN** `task_lane_fairness` 缺失、不可读或无法与 Task/slot 在同一事务提交

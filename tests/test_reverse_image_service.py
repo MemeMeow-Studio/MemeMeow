@@ -43,6 +43,7 @@ def _clear_database(engine: Any) -> None:
             "image_processing_stages",
             "image_processing_jobs",
             "search_migration_states",
+            "task_lane_resource_slots",
             "task_lane_slots",
             "task_batch_items",
             "task_batches",

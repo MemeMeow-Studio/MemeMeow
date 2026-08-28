@@ -49,10 +49,10 @@
 - **WHEN** 服务已重启并加载新的有效并发数量
 - **THEN** 新任务使用新上限，既有终态任务历史不被重写，排队和运行任务遵循既有恢复语义
 
-### Requirement: 并行长任务必须受公平调度和背压保护
-任务服务 MUST 对可并行的长任务施加显式全局并发上限、scope 级运行上限和排队背压，MUST 保证单一 scope 或任务类型不会无限占用所有执行资源，且 MUST 保持活动任务去重和 `queued -> running -> succeeded/failed` 状态语义。Agent lane 的跨 scope 选择 MUST 使用 PostgreSQL 持久公平状态和事务内公平 claim；公平状态不可用时 MUST 返回 `agent_fairness_unavailable`，不得退化为竞争式 claim。
+### Requirement: 并行长任务必须受公平调度和运行槽位保护
+任务服务 MUST 对可并行的长任务施加显式全局并发上限、scope 级运行上限和可选资源池运行上限，MUST 保证单一 scope 或资源不会无限占用运行资源，且 MUST 保持活动任务去重和 `queued -> running -> succeeded/failed` 状态语义。Agent lane 的跨 scope、跨资源选择 MUST 使用 PostgreSQL 持久公平状态和事务内公平 claim；公平状态不可用时 MUST 返回 `agent_fairness_unavailable`，不得退化为竞争式 claim。队列数量不作为拒绝门禁。
 
-Agent 全局并发配置 MUST 为正整数且不超过当前 Agent 背压容量；单 scope 并发还 MUST 不超过全局并发，默认值为 `1`。公共核心不得绑定固定产品并发规模，也不得设置固定背压容量上限；部署适配层必须根据实际资源施加适当门禁。背压默认值为 `80`。PostgreSQL 实现按 `queued+running` 统计，executor 和本地兼容实现按 `queued` 统计。
+Agent 全局并发、scope 并发和资源池运行容量 MUST 为正整数；scope 和资源容量不得超过全局并发。公共核心不得绑定固定产品并发规模或有限队列容量；部署适配层必须根据实际资源施加适当门禁。
 
 #### Scenario: Agent 任务不得阻塞其他任务类型
 - **WHEN** 语境生成 job 数量超过 Agent 并发上限，且存在 cache generation 或 metadata repair job
@@ -119,7 +119,7 @@ Agent 全局并发配置 MUST 为正整数且不超过当前 Agent 背压容量�
 - **THEN** 前端如实展示最近活动距今时间，但不据此把任务标记为失败或卡死
 
 ### Requirement: 任务认领和去重必须支持并发进程
-系统 MUST 使用数据库原子操作确保一个任务在任一时刻最多由一个有效 Worker 执行，并 MUST 在并发提交语义相同的活动任务时复用同一 `task_id`。每次认领 MUST 产生递增的 claim generation，所有进度、终态和业务副作用提交都 MUST 验证当前 claim；租约过期的旧 Worker 不得写回。Agent lane 的全局并发上限、scope 级运行上限、等待队列背压和公平状态 MUST 对所有应用进程共同生效。
+系统 MUST 使用数据库原子操作确保一个任务在任一时刻最多由一个有效 Worker 执行，并 MUST 在并发提交语义相同的活动任务时复用同一 `task_id`。每次认领 MUST 产生递增的 claim generation，所有进度、终态和业务副作用提交都 MUST 验证当前 claim；租约过期的旧 Worker 不得写回。Agent lane 的全局并发上限、scope 级运行上限、资源池运行上限和公平状态 MUST 对所有应用进程共同生效。
 
 #### Scenario: 两个 Worker 同时认领
 - **WHEN** 多个 Worker 同时尝试认领同一排队任务
@@ -134,11 +134,11 @@ Agent 全局并发配置 MUST 为正整数且不超过当前 Agent 背压容量�
 - **THEN** 系统只保留一个活动任务并向所有提交者返回同一 `task_id`
 
 #### Scenario: Agent 队列达到上限
-- **WHEN** 所有进程合计的 Agent 运行任务和排队任务达到配置上限
-- **THEN** 新任务被明确拒绝或返回现有去重任务，不因增加应用进程而绕过背压
+- **WHEN** Agent 运行槽位已满但请求没有命中活动去重任务
+- **THEN** 新任务继续保持 `queued`，不因排队数量增加而拒绝，也不能通过增加应用进程突破运行槽位
 
 ### Requirement: Agent lane 必须按持久 scope 公平调度
-Agent lane MUST 在 lane advisory lock 事务内从当前可执行 scope 中选择最久未服务者，并在同一事务内分配全局 slot、更新 Task claim/lease 和推进公平序号。公平状态表缺失、不可读或不一致时，任务 MUST 保持可恢复的排队状态并记录稳定 `agent_fairness_unavailable`，不能由旧 scope-bound 竞争入口替代。
+Agent lane MUST 在 lane advisory lock 事务内从当前资源池的可执行 scope 中选择最久未服务者，并在同一事务内分配全局 slot、资源 slot、更新 Task claim/lease 和推进资源池公平序号。公平状态表缺失、不可读或不一致时，任务 MUST 保持可恢复的排队状态并记录稳定 `agent_fairness_unavailable`，不能由旧 scope-bound 竞争入口替代。
 
 #### Scenario: 单一 scope 不得连续占满可用 slot
 - **WHEN** scope A 持续提交大量 Agent 任务，scope B、C 也持续有 queued 任务，且全局 lane 存在可用 slot

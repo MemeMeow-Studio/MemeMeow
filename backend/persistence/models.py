@@ -36,6 +36,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 EMBEDDING_DIMENSIONS = 1024
 VISUAL_EMBEDDING_DIMENSIONS = 768
 UTC = timezone.utc
+# 未提供资源维度的历史任务统一归入该保留资源池；它不是容量值，不用于模拟无限队列。
+GLOBAL_LANE_RESOURCE_KEY = "__global__"
 
 
 def utcnow() -> datetime:
@@ -335,6 +337,7 @@ class Task(Base):
     image_stage: Mapped[str | None] = mapped_column(String(32), nullable=True)
     processing_job_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     lane: Mapped[str] = mapped_column(String(64), nullable=False, default="default")
+    lane_resource_key: Mapped[str] = mapped_column(String(128), nullable=False, default=GLOBAL_LANE_RESOURCE_KEY, server_default=text("'__global__'"))
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     dedupe_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
@@ -373,6 +376,7 @@ class Task(Base):
         CheckConstraint("image_stage IS NULL OR image_stage IN ('visual','agent','auto_rename','text_embedding')", name="ck_task_image_stage"),
         CheckConstraint("submission_mode IS NULL OR (submission_mode = 'standalone' AND processing_job_id IS NULL) OR (submission_mode = 'pipeline' AND processing_job_id IS NOT NULL)", name="ck_task_submission_job_exclusivity"),
         CheckConstraint("task_type NOT IN ('visual_embedding_generation','meme_context_generation','image_auto_rename','text_embedding_generation') OR (submission_mode IS NULL OR (image_stage IS NOT NULL AND ((task_type = 'visual_embedding_generation' AND image_stage = 'visual') OR (task_type = 'meme_context_generation' AND image_stage = 'agent') OR (task_type = 'image_auto_rename' AND image_stage = 'auto_rename') OR (task_type = 'text_embedding_generation' AND image_stage = 'text_embedding'))))", name="ck_task_image_stage_type"),
+        CheckConstraint("length(lane_resource_key) > 0", name="ck_task_lane_resource_key"),
         UniqueConstraint("scope_id", "id", name="uq_task_scope_id"),
         Index("ix_tasks_image_submission", "scope_id", "submission_mode", "image_stage", "processing_job_id", "created_at"),
     )
@@ -660,20 +664,6 @@ class SearchMigrationState(Base):
     )
 
 
-# 这些表属于可选控制面；在已安装旧 revision 的部署启动时用 ``checkfirst``
-# 幂等补齐，标准部署仍以对应 Alembic 迁移作为 schema 版本事实。
-OPTIONAL_CONTROL_TABLES = (
-    DerivedImageThumbnail.__table__,
-    OperationGrant.__table__,
-    ImageProcessingJob.__table__,
-    ImageProcessingStage.__table__,
-    ImageProcessingAttempt.__table__,
-    MemeTextEmbedding.__table__,
-    SearchMigrationState.__table__,
-    AgentCallbackRequest.__table__,
-)
-
-
 class TaskBatch(Base):
     """批次成员与索引刷新收束状态。"""
 
@@ -706,7 +696,11 @@ class TaskBatchItem(Base):
 
 
 class TaskLaneSlot(Base):
-    """数据库全局 Agent lane 槽位和租约。"""
+    """数据库全局 Agent lane 槽位和租约。
+
+    该表代表整个 lane 的总运行容量；模型或其它资源维度由同一任务额外占用
+    ``TaskLaneResourceSlot``，两类槽位必须在一次 claim 事务中同时获得。
+    """
 
     __tablename__ = "task_lane_slots"
     lane: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -725,8 +719,35 @@ class TaskLaneSlot(Base):
     )
 
 
+class TaskLaneResourceSlot(Base):
+    """按 lane 和不透明资源 key 持久化的运行槽位。
+
+    ``resource_key`` 由受信控制面冻结，公共核心不解析 provider 或计量含义；任务
+    同时持有全局 ``TaskLaneSlot`` 和本表槽位时才算一次有效 Agent claim。
+    """
+
+    __tablename__ = "task_lane_resource_slots"
+    lane: Mapped[str] = mapped_column(String(64), primary_key=True)
+    resource_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    slot_number: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_scope_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    task_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    claim_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        ForeignKeyConstraint(["task_scope_id"], ["scopes.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(["task_scope_id", "task_id"], ["tasks.scope_id", "tasks.id"]),
+        UniqueConstraint("task_scope_id", "task_id", name="uq_task_lane_resource_slot_task"),
+        CheckConstraint("slot_number >= 0", name="ck_resource_slot_number"),
+        CheckConstraint("length(resource_key) > 0", name="ck_task_lane_resource_key_value"),
+        Index("ix_task_lane_resource_slot_dispatch", "lane", "resource_key", "slot_number"),
+    )
+
+
 class TaskLaneFairness(Base):
-    """按 lane/scope 持久化最近一次成功调度序号。
+    """按 lane、资源和 scope 持久化最近一次成功调度序号。
 
     该表是跨进程 Agent 公平 claim 的唯一轮询事实。``last_dispatch_sequence``
     只在任务、槽位和租约同一事务成功提交时推进，不能由客户端 payload 或
@@ -735,6 +756,7 @@ class TaskLaneFairness(Base):
 
     __tablename__ = "task_lane_fairness"
     lane: Mapped[str] = mapped_column(String(64), primary_key=True)
+    resource_key: Mapped[str] = mapped_column(String(128), primary_key=True, default=GLOBAL_LANE_RESOURCE_KEY, server_default=text("'__global__'"))
     scope_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     last_dispatch_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
@@ -743,8 +765,24 @@ class TaskLaneFairness(Base):
     __table_args__ = (
         ForeignKeyConstraint(["scope_id"], ["scopes.id"], ondelete="CASCADE"),
         CheckConstraint("last_dispatch_sequence >= 0", name="ck_task_lane_fairness_sequence"),
-        Index("ix_task_lane_fairness_dispatch", "lane", "last_dispatch_sequence", "scope_id"),
+        CheckConstraint("length(resource_key) > 0", name="ck_task_lane_fairness_resource_key"),
+        Index("ix_task_lane_fairness_dispatch", "lane", "resource_key", "last_dispatch_sequence", "scope_id"),
     )
+
+
+# 这些表属于可选控制面；在已安装旧 revision 的部署启动时用 ``checkfirst``
+# 幂等补齐，标准部署仍以对应 Alembic 迁移作为 schema 版本事实。
+OPTIONAL_CONTROL_TABLES = (
+    DerivedImageThumbnail.__table__,
+    OperationGrant.__table__,
+    ImageProcessingJob.__table__,
+    ImageProcessingStage.__table__,
+    ImageProcessingAttempt.__table__,
+    MemeTextEmbedding.__table__,
+    SearchMigrationState.__table__,
+    AgentCallbackRequest.__table__,
+    TaskLaneResourceSlot.__table__,
+)
 
 
 Index("ix_tasks_active_dedupe", Task.scope_id, Task.task_type, Task.dedupe_key, unique=True, postgresql_where=text("status IN ('queued','running') AND dedupe_key IS NOT NULL"))

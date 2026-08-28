@@ -14,7 +14,7 @@ from backend.persistence.repositories.collections import CollectionRepository
 from backend.persistence.repositories.memes import MemeRepository
 from backend.persistence.repositories.reverse_image import ReverseImageUsageRepository
 from backend.persistence.repositories.search import SearchRepository
-from backend.persistence.repositories.tasks import IMAGE_PROCESSING_LANE_TYPES, TaskRepository, _validate_lane_capacities
+from backend.persistence.repositories.tasks import IMAGE_PROCESSING_LANE_TYPES, TaskRepository, _validate_lane_capacities, validate_lane_resource_concurrency, validate_lane_resource_key
 from backend.persistence.repositories.thumbnails import DerivedThumbnailRepository
 from backend.persistence.repositories.visual_embeddings import VisualEmbeddingRepository, validate_visual_vector
 
@@ -32,5 +32,7 @@ __all__ = [
     "TaskRepository",
     "VisualEmbeddingRepository",
     "_validate_lane_capacities",
+    "validate_lane_resource_key",
+    "validate_lane_resource_concurrency",
     "validate_visual_vector",
 ]

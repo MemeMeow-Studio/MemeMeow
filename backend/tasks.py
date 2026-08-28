@@ -25,6 +25,7 @@ from backend.image_stage_plan import (
     image_task_requires_single_attempt,
 )
 from backend.opencode_workspace import SELECTOR_RE
+from backend.persistence.models import GLOBAL_LANE_RESOURCE_KEY
 from backend.public_dto import (
     PUBLIC_TASK_STATUSES,
     normalize_public_code,
@@ -189,6 +190,8 @@ class TaskRecord:
     submission_mode: str | None = None
     image_stage: str | None = None
     processing_job_id: str | None = None
+    # 数据库任务的资源归属事实；公开 DTO 不暴露调度内部 key。
+    lane_resource_key: str = GLOBAL_LANE_RESOURCE_KEY
     payload: dict[str, Any] = field(default_factory=dict)
     status: str = "queued"
     progress: float | None = 0.0
@@ -271,6 +274,7 @@ class TaskRecord:
         # slot 是调度器内部事实，不属于任务公开契约；旧调用方仍可从内部对象读取。
         if include_payload:
             result["payload"] = self.payload
+            result["lane_resource_key"] = self.lane_resource_key
         return result
 
     @classmethod
@@ -314,6 +318,7 @@ class TaskRecord:
             submission_mode=submission_mode,
             image_stage=image_stage,
             processing_job_id=processing_job_id,
+            lane_resource_key=value.get("lane_resource_key") if isinstance(value.get("lane_resource_key"), str) and value.get("lane_resource_key") else GLOBAL_LANE_RESOURCE_KEY,
             payload=payload,
             status=safe_status,
             progress=value.get("progress") if isinstance(value.get("progress"), (int, float)) and not isinstance(value.get("progress"), bool) and 0 <= value.get("progress") <= 1 else None,
@@ -500,9 +505,6 @@ class PersistentTaskService:
                             record.payload["batch_ids"] = batch_ids
                             self._write(record)
                     return TaskRecord.from_dict(record.as_dict(include_payload=True))
-            if task_type in self._agent_task_types and self._queued_agent_count_locked() >= self.agent_backpressure:
-                # 只限制等待队列，正在运行的 slot 不被新配置半途打断。
-                raise RuntimeError("agent_backpressure")
             record = TaskRecord(
                 task_id=uuid4().hex,
                 task_type=task_type,

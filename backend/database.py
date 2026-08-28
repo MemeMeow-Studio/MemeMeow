@@ -78,8 +78,10 @@ from backend.persistence.models import (
     Task,
     TaskBatch,
     TaskBatchItem,
+    TaskLaneResourceSlot,
     TaskLaneFairness,
     TaskLaneSlot,
+    GLOBAL_LANE_RESOURCE_KEY,
     mapped_column,
     timezone,
     unicodedata,
@@ -96,7 +98,7 @@ from backend.persistence.repositories.collections import CollectionRepository
 from backend.persistence.repositories.memes import MemeRepository
 from backend.persistence.repositories.reverse_image import ReverseImageUsageRepository
 from backend.persistence.repositories.search import SearchRepository
-from backend.persistence.repositories.tasks import IMAGE_PROCESSING_LANE_TYPES, TaskRepository, _validate_lane_capacities
+from backend.persistence.repositories.tasks import IMAGE_PROCESSING_LANE_TYPES, TaskRepository, _validate_lane_capacities, validate_lane_resource_concurrency, validate_lane_resource_key
 from backend.persistence.repositories.thumbnails import DerivedThumbnailRepository
 from backend.persistence.repositories.visual_embeddings import VisualEmbeddingRepository, validate_visual_vector
 from backend.persistence.storage import BlobStore, StorageCoordinator
@@ -160,8 +162,10 @@ __all__ = [
     "Task",
     "TaskBatch",
     "TaskBatchItem",
+    "TaskLaneResourceSlot",
     "TaskLaneFairness",
     "TaskLaneSlot",
+    "GLOBAL_LANE_RESOURCE_KEY",
     "TaskRepository",
     "UTC",
     "UniqueConstraint",
@@ -171,6 +175,8 @@ __all__ = [
     "Vector",
     "VisualEmbeddingRepository",
     "_validate_lane_capacities",
+    "validate_lane_resource_key",
+    "validate_lane_resource_concurrency",
     "check_database",
     "create_engine_for_settings",
     "create_engine_for_url",

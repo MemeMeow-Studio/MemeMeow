@@ -44,6 +44,7 @@ from backend.database import (
     StorageOperation,
     DerivedImageThumbnail,
     TaskLaneSlot,
+    TaskLaneResourceSlot,
     TaskLaneFairness,
     AgentCallbackRequest,
     ImageProcessingJob,
@@ -1235,8 +1236,8 @@ def test_search_migration_state_uses_single_epoch_and_atomic_switch(postgres_res
 def _clean_business_rows(engine: Engine) -> None:
     """清理集成测试产生的业务行，不触碰 scope、安装标记和迁移版本。"""
     with engine.begin() as connection:
-        for table in ("agent_callback_requests", "reverse_image_usage_events", "operation_grants", "image_processing_attempts", "image_processing_stages", "image_processing_jobs", "meme_text_embeddings", "search_migration_states", "task_lane_fairness", "task_lane_slots", "task_batch_items", "task_batches", "tasks", "meme_visual_embeddings", "meme_embeddings", "search_heads", "search_generations", "derived_image_thumbnails", "storage_operations", "meme_collection_items", "meme_collections", "memes"):
-            connection.execute(text(f"DELETE FROM {table} WHERE scope_id = 'local'" if table not in {"task_lane_slots"} else f"DELETE FROM {table}"))
+        for table in ("agent_callback_requests", "reverse_image_usage_events", "operation_grants", "image_processing_attempts", "image_processing_stages", "image_processing_jobs", "meme_text_embeddings", "search_migration_states", "task_lane_fairness", "task_lane_resource_slots", "task_lane_slots", "task_batch_items", "task_batches", "tasks", "meme_visual_embeddings", "meme_embeddings", "search_heads", "search_generations", "derived_image_thumbnails", "storage_operations", "meme_collection_items", "meme_collections", "memes"):
+            connection.execute(text(f"DELETE FROM {table} WHERE scope_id = 'local'" if table not in {"task_lane_slots", "task_lane_resource_slots"} else f"DELETE FROM {table}"))
 
 
 @pytest.fixture
@@ -1748,6 +1749,186 @@ def test_fair_claim_skips_scope_limit_and_preserves_sequence_when_slot_full(post
             queued = session.scalar(select(Task).where(Task.scope_id == scope_a, Task.id == second.id))
             assert fairness[scope_a] == 1 and fairness[scope_b] == 2
             assert queued is not None and queued.status == "queued"
+    finally:
+        with postgres_engine.begin() as connection:
+            connection.execute(text("DELETE FROM scopes WHERE id = ANY(:scope_ids)"), {"scope_ids": [scope_a, scope_b]})
+
+
+def test_resource_claim_isolated_and_bounded_by_global_slots(postgres_resources) -> None:
+    """不同资源池分别占用资源槽位，同时受同一全局 lane 容量约束。"""
+    with postgres_resources.environment("local") as environment:
+        free = environment.tasks.submit(
+            task_type="resource-free",
+            payload={},
+            lane="agent",
+            lane_resource_key="free_series",
+            dedupe_key=f"resource-free-{uuid4().hex}",
+        )
+        free_queued = environment.tasks.submit(
+            task_type="resource-free",
+            payload={"second": True},
+            lane="agent",
+            lane_resource_key="free_series",
+            dedupe_key=f"resource-free-queued-{uuid4().hex}",
+        )
+        high = environment.tasks.submit(
+            task_type="resource-high",
+            payload={},
+            lane="agent",
+            lane_resource_key="luna_high",
+            dedupe_key=f"resource-high-{uuid4().hex}",
+        )
+        first = environment.tasks.claim_next(
+            owner="resource-free-worker",
+            lane="agent",
+            lane_capacity=2,
+            resource_key="free_series",
+            resource_capacity=1,
+            scope_capacity=2,
+            lease_seconds=60,
+        )
+        assert first is not None and first.id == free.id
+        assert environment.tasks.claim_next(
+            owner="resource-free-worker-2",
+            lane="agent",
+            lane_capacity=2,
+            resource_key="free_series",
+            resource_capacity=1,
+            scope_capacity=2,
+            lease_seconds=60,
+        ) is None
+        second = environment.tasks.claim_next(
+            owner="resource-high-worker",
+            lane="agent",
+            lane_capacity=2,
+            resource_key="luna_high",
+            resource_capacity=1,
+            scope_capacity=2,
+            lease_seconds=60,
+        )
+        assert second is not None and second.id == high.id
+        free_slot = environment.tasks.resource_slot_for_task(free.id)
+        high_slot = environment.tasks.resource_slot_for_task(high.id)
+        assert free_slot is not None and free_slot.resource_key == "free_series"
+        assert high_slot is not None and high_slot.resource_key == "luna_high"
+        assert environment.tasks.heartbeat(free.id, first.claim_generation, "resource-free-worker", lease_seconds=90) is True
+        assert environment.tasks.heartbeat(free.id, first.claim_generation, "stale-resource-worker", lease_seconds=90) is False
+        assert environment.tasks.get(free_queued.id).status == "queued"
+        assert environment.tasks.update_fenced(free.id, first.claim_generation, "resource-free-worker", status="succeeded") is True
+        assert environment.tasks.update_fenced(high.id, second.claim_generation, "resource-high-worker", status="succeeded") is True
+
+
+def test_resource_claim_rolls_back_global_slot_when_resource_pool_is_full(postgres_resources) -> None:
+    """资源池无空位时不能遗留已取得的全局槽位或任务运行状态。"""
+    with postgres_resources.environment("local") as environment:
+        first = environment.tasks.submit(
+            task_type="resource-rollback",
+            payload={},
+            lane="agent",
+            lane_resource_key="luna_max",
+            dedupe_key=f"resource-rollback-first-{uuid4().hex}",
+        )
+        second = environment.tasks.submit(
+            task_type="resource-rollback",
+            payload={"second": True},
+            lane="agent",
+            lane_resource_key="luna_max",
+            dedupe_key=f"resource-rollback-second-{uuid4().hex}",
+        )
+        first_claim = environment.tasks.claim_next(
+            owner="resource-rollback-first",
+            lane="agent",
+            lane_capacity=2,
+            resource_key="luna_max",
+            resource_capacity=1,
+            scope_capacity=2,
+            lease_seconds=60,
+        )
+        assert first_claim is not None and first_claim.id == first.id
+        assert environment.tasks.claim_next(
+            owner="resource-rollback-second",
+            lane="agent",
+            lane_capacity=2,
+            resource_key="luna_max",
+            resource_capacity=1,
+            scope_capacity=2,
+            lease_seconds=60,
+        ) is None
+        session = environment.uow.session
+        second_row = session.scalar(select(Task).where(Task.scope_id == "local", Task.id == second.id))
+        occupied_global = session.scalar(select(func.count()).select_from(TaskLaneSlot).where(TaskLaneSlot.task_id.is_not(None)))
+        occupied_resource = session.scalar(select(func.count()).select_from(TaskLaneResourceSlot).where(TaskLaneResourceSlot.task_id.is_not(None), TaskLaneResourceSlot.resource_key == "luna_max"))
+        assert second_row is not None and second_row.status == "queued"
+        assert occupied_global == 1
+        assert occupied_resource == 1
+        assert environment.tasks.update_fenced(first.id, first_claim.claim_generation, "resource-rollback-first", status="succeeded") is True
+        next_claim = environment.tasks.claim_next(
+            owner="resource-rollback-retry",
+            lane="agent",
+            lane_capacity=2,
+            resource_key="luna_max",
+            resource_capacity=1,
+            scope_capacity=2,
+            lease_seconds=60,
+        )
+        assert next_claim is not None and next_claim.id == second.id
+        assert environment.tasks.update_fenced(second.id, next_claim.claim_generation, "resource-rollback-retry", status="succeeded") is True
+
+
+def test_agent_queue_does_not_use_finite_backpressure_capacity(postgres_resources) -> None:
+    """Agent 的兼容背压参数不限制 queued 数量，运行容量仍由 slot 控制。"""
+    with postgres_resources.environment("local") as environment:
+        tasks = [
+            environment.tasks.submit(
+                task_type="agent-unbounded-queue",
+                payload={"index": index},
+                lane="agent",
+                lane_backpressure=1,
+                dedupe_key=f"agent-unbounded-queue-{index}-{uuid4().hex}",
+            )
+            for index in range(3)
+        ]
+        assert len(tasks) == 3
+        claimed = environment.tasks.claim_next(owner="agent-unbounded-worker", lane="agent", lane_capacity=1, scope_capacity=1, lease_seconds=60)
+        assert claimed is not None and claimed.status == "running"
+        queued = list(environment.uow.session.scalars(select(Task).where(Task.id.in_([record.id for record in tasks]), Task.status == "queued")))
+        assert len(queued) == 2
+        assert environment.tasks.update_fenced(claimed.id, claimed.claim_generation, "agent-unbounded-worker", status="succeeded") is True
+
+
+def test_resource_fairness_rotates_scopes_and_recovery_releases_both_slots(postgres_resources, postgres_engine: Engine) -> None:
+    """同一资源池按 scope 公平轮询，过期 claim 恢复时两类 slot 都释放。"""
+    suffix = uuid4().hex
+    scope_a, scope_b = f"resource-fair-a-{suffix}", f"resource-fair-b-{suffix}"
+    with postgres_engine.begin() as connection:
+        for scope_id in (scope_a, scope_b):
+            connection.execute(text("INSERT INTO scopes(id, storage_namespace, created_at) VALUES (:id, :namespace, now())"), {"id": scope_id, "namespace": uuid4()})
+    try:
+        task_ids = {}
+        for scope_id in (scope_a, scope_b):
+            with postgres_resources.environment(scope_id) as environment:
+                task = environment.tasks.submit(task_type="resource-fair", payload={}, lane="agent", lane_resource_key="luna_max", dedupe_key=f"resource-fair-{scope_id}")
+                task_ids[scope_id] = task.id
+        with postgres_resources.environment("local") as environment:
+            first = environment.tasks.claim_next(owner="resource-fair-a", lane="agent", lane_capacity=2, resource_key="luna_max", resource_capacity=2, scope_capacity=1, lease_seconds=60)
+            second = environment.tasks.claim_next(owner="resource-fair-b", lane="agent", lane_capacity=2, resource_key="luna_max", resource_capacity=2, scope_capacity=1, lease_seconds=60)
+            assert first is not None and first.scope_id == scope_a
+            assert second is not None and second.scope_id == scope_b
+        with postgres_resources.factory() as session:
+            resource_slots = list(session.scalars(select(TaskLaneResourceSlot).where(TaskLaneResourceSlot.task_id.in_((first.id, second.id)))))
+            assert {row.resource_key for row in resource_slots} == {"luna_max"}
+            first_row = session.scalar(select(Task).where(Task.id == first.id, Task.scope_id == scope_a))
+            assert first_row is not None
+            first_row.lease_expires_at = utcnow() - timedelta(seconds=1)
+            session.commit()
+        with postgres_resources.environment("local") as environment:
+            recovered = environment.tasks.claim_next(owner="resource-fair-recovered", lane="agent", lane_capacity=2, resource_key="luna_max", resource_capacity=2, scope_capacity=1, lease_seconds=60)
+            assert recovered is not None and recovered.id == first.id and recovered.claim_generation == first.claim_generation + 1
+        with postgres_resources.environment(scope_a) as environment:
+            assert environment.tasks.update_fenced(first.id, first.claim_generation, "resource-fair-a", status="succeeded") is False
+            assert environment.tasks.update_fenced(recovered.id, recovered.claim_generation, "resource-fair-recovered", status="succeeded") is True
+        with postgres_resources.environment(scope_b) as environment:
+            assert environment.tasks.update_fenced(second.id, second.claim_generation, "resource-fair-b", status="succeeded") is True
     finally:
         with postgres_engine.begin() as connection:
             connection.execute(text("DELETE FROM scopes WHERE id = ANY(:scope_ids)"), {"scope_ids": [scope_a, scope_b]})

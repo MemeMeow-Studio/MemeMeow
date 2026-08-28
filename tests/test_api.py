@@ -38,6 +38,7 @@ def _clear_test_scope() -> None:
         "DELETE FROM image_processing_stages",
         "DELETE FROM image_processing_jobs",
         "DELETE FROM search_migration_states",
+        "DELETE FROM task_lane_resource_slots",
         "DELETE FROM task_lane_slots",
         "DELETE FROM task_batch_items",
         "DELETE FROM task_batches",
