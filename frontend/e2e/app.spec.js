@@ -212,6 +212,69 @@ test('图片库分别显示文本索引和图片向量状态', async ({ page }) 
   await expect(page.locator('.visual-embedding-state')).toHaveText(['图片向量已就绪', '图片向量待生成'])
 })
 
+/** 使用真实浏览器确认元数据面板内容超出可视区域时仍可滚动到底部。 */
+test('图片预览元数据面板可滚动查看底部详情', async ({ page }) => {
+  await page.route('**/api/images?**', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      items: [{
+        meme_id: 'meme-metadata-scroll',
+        filename: 'metadata-scroll.png',
+        size: 2048,
+        extension: '.png',
+        media_url: 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=',
+        metadata: { status: 'ready' },
+        processing_status: 'succeeded',
+        processing_stages: [{ stage: 'agent', status: 'succeeded' }],
+      }],
+      total: 1,
+      page: 1,
+      page_size: 50,
+    }),
+  }))
+  await page.route('**/api/images/metadata**', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      schema_version: 1,
+      image: { relative_path: 'metadata-scroll.png', extension: '.png', size_bytes: 2048 },
+      context_status: 'ready',
+      meme_context: {
+        title: '可滚动元数据',
+        summary: '这是一段足够长的摘要，用于确认元数据主体能够在有限高度内滚动。'.repeat(10),
+        subjects: ['主体'],
+        visible_text: ['图片文字'],
+        meaning: '含义',
+        keywords: ['关键词'],
+        source_urls: ['https://example.com/metadata-scroll'],
+        references: ['文本引用'],
+        uncertainties: ['底部不确定项'],
+      },
+      provenance: { producer: 'agent', updated_at: '2026-08-26T08:30:00Z' },
+    }),
+  }))
+
+  await page.goto('/')
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await page.getByRole('button', { name: '图片库' }).click()
+  await page.getByRole('button', { name: '查看 metadata-scroll.png 图片与详情' }).click()
+  const metadataDetails = page.locator('.metadata-details')
+  await metadataDetails.first().locator('summary').click()
+  await expect.poll(() => page.locator('.metadata-panel-body').evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true)
+
+  const scrollState = await page.locator('.metadata-panel-body').evaluate((element) => {
+    element.scrollTop = element.scrollHeight
+    const bottomGroup = element.querySelector('.metadata-detail-group:last-child')
+    if (!bottomGroup) return null
+    const bodyRect = element.getBoundingClientRect()
+    const groupRect = bottomGroup.getBoundingClientRect()
+    return { scrollTop: element.scrollTop, bottomVisible: groupRect.bottom <= bodyRect.bottom + 1 }
+  })
+  expect(scrollState).toEqual({ scrollTop: expect.any(Number), bottomVisible: true })
+  expect(scrollState.scrollTop).toBeGreaterThan(0)
+})
+
 /** 使用真实 Chromium 验证延迟网络下仍保持图片写入手势，并读取系统剪贴板确认没有文本或 URL。 */
 test('检索结果在延迟加载后仍只写入图片剪贴板', async ({ page, context }) => {
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')

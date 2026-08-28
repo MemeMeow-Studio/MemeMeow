@@ -341,7 +341,7 @@ button, input, select, textarea { border-radius: var(--radius-control); }
 .metadata-panel { min-height: 0; display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 6px; }
 .metadata-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 15px; border-bottom: 1px solid var(--line); }
 .metadata-panel-head h3 { margin: 0; color: var(--ink-soft); font-size: 17px; }
-.metadata-panel-body { display: grid; min-width: 0; }
+.metadata-panel-body { display: grid; min-width: 0; min-height: 0; overflow-y: auto; }
 .metadata-file-summary { display: grid; gap: 4px; min-width: 0; border-bottom: 1px solid var(--line); padding: 14px 15px 12px; }
 .metadata-file-summary strong { min-width: 0; overflow-wrap: anywhere; color: var(--ink-soft); font-size: 16px; line-height: 1.35; }
 .metadata-file-summary span { color: var(--muted); font-size: 14px; line-height: 1.35; }
