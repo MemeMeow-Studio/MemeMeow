@@ -72,6 +72,8 @@ LOG_ROOT = RUNTIME_ROOT / "logs"
 SKILL_ROOT = Path(os.getenv("MEMEMEOW_EXECUTOR_SKILL_ROOT", "/skills/research-meme-context"))
 WORKSPACE_ROOT = Path(os.getenv("MEMEMEOW_EXECUTOR_WORKSPACE_ROOT", str(RUNTIME_ROOT / "workspaces")))
 DEFAULT_MAX_RESULT_BYTES = 1024 * 1024
+# session 只解析完整 JSONL 行；单行超过上限时跳过，避免异常输出占满内存。
+SESSION_CAPTURE_LINE_BYTES = 1024 * 1024
 ALLOWED_REQUEST_FIELDS = frozenset(
     {
         "task_id",
@@ -1169,11 +1171,10 @@ class Executor:
                         task.process_reaped = True
                 out.flush()
                 err.flush()
-                out.seek(0)
-                err.seek(0)
+                # session 必须从完整 stdout 流解析；采样只保留给有限错误诊断。
+                self._capture_session(task, out)
                 stdout = _stream_sample(out, 256 * 1024)
                 stderr = _stream_sample(err, 16 * 1024)
-            self._capture_session(task, stdout)
             if task.cancel_event.is_set():
                 raise RuntimeError("task_interrupted")
             if timed_out:
@@ -1255,13 +1256,23 @@ class Executor:
                     pass
                 task.done.set()
 
-    def _capture_session(self, task: TaskState, stdout: bytes) -> None:
-        """从成功、失败和超时的有限 JSONL 输出中绑定 session 标识。"""
+    def _capture_session(self, task: TaskState, stdout: Any) -> None:
+        """从完整临时 stdout 流逐行绑定 session，避免采样截断 JSONL。"""
         found_session: str | None = None
-        for line in stdout.splitlines():
+        stdout.seek(0)
+        while True:
+            line = stdout.readline(SESSION_CAPTURE_LINE_BYTES + 1)
+            if not line:
+                break
+            # BufferedIO.readline(size) 可能只返回超长行的前缀；丢弃该行剩余内容，
+            # 让后续 JSONL 行仍能被解析，同时把单行内存限制在固定上限附近。
+            if len(line) > SESSION_CAPTURE_LINE_BYTES:
+                while line and not line.endswith(b"\n"):
+                    line = stdout.readline(SESSION_CAPTURE_LINE_BYTES + 1)
+                continue
             try:
                 candidate = _session_id_from_event(json.loads(line))
-            except (json.JSONDecodeError, RecursionError):
+            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
                 continue
             if candidate and SESSION_ID_RE.fullmatch(candidate):
                 if task.session_id and candidate != task.session_id:

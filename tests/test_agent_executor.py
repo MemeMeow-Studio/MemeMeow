@@ -128,7 +128,16 @@ def executor_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "        sys.exit(8)\n"
         "    with open(directory / 'result.json.draft', 'w', encoding='utf-8') as handle: json.dump(candidate, handle, ensure_ascii=False)\n"
         "    os.replace(directory / 'result.json.draft', directory / 'result.json.tmp')\n"
-        "    print(json.dumps({'type':'session.created','session_id':'session-' + task}), flush=True)\n"
+        "    if os.getenv('FAKE_MODE') == 'large-stdout':\n"
+        "        filler = json.dumps({'type':'message','text':'前置🙂' * 80}, ensure_ascii=False)\n"
+        "        for _ in range(400): print(filler)\n"
+        "        sys.stdout.flush()\n"
+        "        sys.stdout.buffer.write(b'{\"type\":\"message\",\"text\":\"broken \\xff\"}\\n')\n"
+        "        sys.stdout.flush()\n"
+        "        print(json.dumps({'type':'session.created','session_id':'session-' + task}), flush=True)\n"
+        "        for _ in range(400): print(filler)\n"
+        "    else:\n"
+        "        print(json.dumps({'type':'session.created','session_id':'session-' + task}), flush=True)\n"
         "finally:\n"
         "    marker.unlink(missing_ok=True)\n",
         encoding="utf-8",
@@ -189,6 +198,18 @@ def test_executor_runs_fixed_task_and_returns_result(executor_fixture) -> None:
     with pytest.raises(AgentExecutorError) as error:
         client._request("POST", "/v1/tasks", {"task_id": "task-path", "image_relative_path": "../outside.png", "wait": True})
     assert error.value.code == "agent_image_path_forbidden"
+
+
+def test_executor_captures_session_from_complete_large_stdout(executor_fixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    """stdout 超过采样范围且含损坏 UTF-8 时，完整流仍应交付合法结果。"""
+    executor, client, _runtime = executor_fixture
+    original_environment = executor._task_environment
+    monkeypatch.setattr(executor, "_task_environment", lambda task: {**original_environment(task), "FAKE_MODE": "large-stdout"})
+
+    result = client.run(task_id="large-stdout", image_relative_path="sample.png", reverse_image_policy="forbid", timeout_seconds=5)
+
+    assert result.status == "succeeded"
+    assert result.session_id == "session-large-stdout"
 
 
 def test_executor_rejects_malformed_json_with_stable_error(executor_fixture) -> None:
