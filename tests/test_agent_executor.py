@@ -367,7 +367,6 @@ def test_executor_fences_concurrent_attempts_for_same_business_task(executor_fix
 def test_executor_queue_accepts_tasks_beyond_legacy_backpressure(executor_fixture, monkeypatch: pytest.MonkeyPatch) -> None:
     """运行任务占用 worker 时，旧背压值不应把排队任务拒绝为 429。"""
     executor, client, _runtime = executor_fixture
-    executor.backpressure = 1
     original_environment = executor._task_environment
     monkeypatch.setattr(executor, "_task_environment", lambda task: {**original_environment(task), "FAKE_SLEEP": "2"})
     client._request(

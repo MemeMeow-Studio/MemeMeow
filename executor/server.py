@@ -47,11 +47,7 @@ from backend.opencode_workspace import (
     validate_directory_path,
     validate_file_path,
 )
-from executor.agent_limits import (
-    AGENT_BACKPRESSURE_DEFAULT,
-    validate_agent_backpressure,
-    validate_agent_concurrency,
-)
+from executor.agent_limits import validate_agent_concurrency
 from executor.process_supervisor import ProcessSupervisor
 from executor.result_store import ExecutorResultStore, ExecutorResultStoreError
 from executor.task_queue import ExecutionQueue
@@ -162,21 +158,8 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(value, maximum))
 
 
-def _env_agent_backpressure(name: str, default: int) -> int:
-    """读取旧 executor 背压配置，供兼容诊断使用。"""
-    raw = os.getenv(name)
-    if raw is None:
-        return validate_agent_backpressure(default)
-    try:
-        value = int(raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("agent_backpressure_invalid") from exc
-    return validate_agent_backpressure(value)
-
-
-def _env_agent_concurrency(name: str, default: int, *, backpressure: int | None = None) -> int:
-    """读取 executor 的 Agent 运行并发；旧背压参数不参与容量判定。"""
-    del backpressure
+def _env_agent_concurrency(name: str, default: int) -> int:
+    """读取 executor 的 Agent 运行并发，只校验正整数。"""
     raw = os.getenv(name)
     if raw is None:
         value = default
@@ -376,11 +359,7 @@ class Executor:
         self.legacy_base_url = os.getenv("MEMEMEOW_OPENCODE_BASE_URL", "").strip()
         self.legacy_api_key = os.getenv("MEMEMEOW_OPENCODE_API_KEY", "").strip()
         self.opencode_executable = os.getenv("MEMEMEOW_OPENCODE_EXECUTABLE", "opencode")
-        self.backpressure = _env_agent_backpressure("MEMEMEOW_AGENT_BACKPRESSURE", AGENT_BACKPRESSURE_DEFAULT)
-        self.max_workers = _env_agent_concurrency(
-            "MEMEMEOW_OPENCODE_CONCURRENCY",
-            1,
-        )
+        self.max_workers = _env_agent_concurrency("MEMEMEOW_OPENCODE_CONCURRENCY", 1)
         self.max_timeout = _env_int("MEMEMEOW_AGENT_EXECUTOR_MAX_TIMEOUT_SECONDS", 1800, 1, 7200)
         self.max_result_bytes = _env_int("MEMEMEOW_AGENT_RESULT_MAX_BYTES", DEFAULT_MAX_RESULT_BYTES, 1024, 16 * 1024 * 1024)
         capability_key = os.getenv("MEMEMEOW_WORKSPACE_CAPABILITY_KEY", os.getenv("MEMEMEOW_AGENT_WORKSPACE_CAPABILITY_KEY", ""))

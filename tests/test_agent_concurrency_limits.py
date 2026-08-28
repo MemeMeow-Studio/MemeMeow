@@ -8,13 +8,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from backend.config import AGENT_BACKPRESSURE_DEFAULT, Settings
+from backend.config import Settings
 from backend.database import DatabaseError, _validate_lane_capacities, validate_lane_resource_concurrency, validate_lane_resource_key
 from backend.image_processing import ImageProcessingWorker
 from backend.opencode import OpenCodeRunner
 from backend.pg_services import PostgresTaskService, PostgresTaskWorkerManager
-from executor.agent_limits import validate_agent_backpressure, validate_agent_concurrency, validate_agent_concurrency_at_most
-from executor.server import _env_agent_backpressure, _env_agent_concurrency
+from executor.agent_limits import validate_agent_concurrency, validate_agent_concurrency_at_most
+from executor.server import _env_agent_concurrency
 
 
 def test_postgres_task_layers_preserve_configured_large_capacity() -> None:
@@ -106,15 +106,13 @@ def test_executor_environment_parser_ignores_legacy_backpressure(monkeypatch) ->
     configured = 500
     monkeypatch.setenv("MEMEMEOW_AGENT_BACKPRESSURE", "80")
     monkeypatch.setenv("MEMEMEOW_OPENCODE_CONCURRENCY", str(configured))
-    backpressure = _env_agent_backpressure("MEMEMEOW_AGENT_BACKPRESSURE", AGENT_BACKPRESSURE_DEFAULT)
-    assert _env_agent_concurrency("MEMEMEOW_OPENCODE_CONCURRENCY", 1, backpressure=backpressure) == configured
+    assert _env_agent_concurrency("MEMEMEOW_OPENCODE_CONCURRENCY", 1) == configured
     monkeypatch.setenv("MEMEMEOW_OPENCODE_CONCURRENCY", str(configured + 1))
-    assert _env_agent_concurrency("MEMEMEOW_OPENCODE_CONCURRENCY", 1, backpressure=backpressure) == configured + 1
+    assert _env_agent_concurrency("MEMEMEOW_OPENCODE_CONCURRENCY", 1) == configured + 1
 
 
 def test_agent_capacity_has_no_shared_fixed_safety_limit() -> None:
     """公共核心接受大运行容量，层级关系由显式运行容量校验负责。"""
-    assert validate_agent_backpressure(80) == 80
     assert validate_agent_concurrency(500, backpressure=80) == 500
     assert validate_agent_concurrency_at_most(10, 500) == 10
     with pytest.raises(ValueError, match="agent_scope_concurrency_exceeds_global"):
