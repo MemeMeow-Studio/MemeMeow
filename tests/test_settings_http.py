@@ -213,7 +213,7 @@ def test_settings_get_legacy_and_canonical_paths_return_same_masked_projection(t
         "settings_version",
     }
     assert body["effective"]["opencode_concurrency"] == 2
-    assert body["editable"]["opencode_concurrency"]["maximum"] == 8
+    assert body["editable"]["opencode_concurrency"]["maximum"] is None
     assert body["readonly"]["runtime_ready"] is True
     assert "settings_admin_token" not in body
     assert "dotenv_path" not in body
@@ -239,8 +239,8 @@ def test_settings_update_errors_keep_stable_mappings(tmp_path: Path, monkeypatch
     headers = {"X-Settings-Admin-Token": "settings-test-token"}
 
     def invalid(*_args, **_kwargs):
-        """模拟背压校验失败。"""
-        raise ValueError("agent_concurrency_exceeds_backpressure")
+        """模拟并发配置校验失败。"""
+        raise ValueError("opencode_concurrency_out_of_range")
 
     monkeypatch.setattr(settings_http, "update_dotenv_concurrency", invalid)
     response = TestClient(application).patch("/settings", json={"value": 4}, headers=headers)

@@ -1327,10 +1327,7 @@ def _processing_worker(request: Request) -> ImageProcessingWorker | None:
             task_service=services.tasks,
             policy=getattr(request.app.state, "operation_policy_gateway", None),
             grant_store=getattr(request.app.state, "operation_grants", None),
-            max_workers=validate_agent_concurrency(
-                getattr(request.app.state.settings, "opencode_concurrency", 1),
-                backpressure=getattr(request.app.state.settings, "agent_backpressure", None),
-            ),
+            max_workers=validate_agent_concurrency(getattr(request.app.state.settings, "opencode_concurrency", 1)),
             task_handlers=getattr(request.app.state, "image_processing_task_handlers", None),
         )
         workers[scope.scope_id] = worker

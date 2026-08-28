@@ -52,7 +52,7 @@
 ### Requirement: 并行长任务必须受公平调度和运行槽位保护
 任务服务 MUST 对可并行的长任务施加显式全局并发上限、scope 级运行上限和可选资源池运行上限，MUST 保证单一 scope 或资源不会无限占用运行资源，且 MUST 保持活动任务去重和 `queued -> running -> succeeded/failed` 状态语义。Agent lane 的跨 scope、跨资源选择 MUST 使用 PostgreSQL 持久公平状态和事务内公平 claim；公平状态不可用时 MUST 返回 `agent_fairness_unavailable`，不得退化为竞争式 claim。队列数量不作为拒绝门禁。
 
-Agent 全局并发、scope 并发和资源池运行容量 MUST 为正整数；scope 和资源容量不得超过全局并发。公共核心不得绑定固定产品并发规模或有限队列容量；部署适配层必须根据实际资源施加适当门禁。
+Agent 全局并发、scope 并发和资源池运行容量 MUST 为正整数；scope 和资源容量不得超过全局并发。公共核心不得绑定固定产品并发规模或有限队列容量；资源不足由部署运行时显式报告。
 
 #### Scenario: Agent 任务不得阻塞其他任务类型
 - **WHEN** 语境生成 job 数量超过 Agent 并发上限，且存在 cache generation 或 metadata repair job

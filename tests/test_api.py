@@ -58,7 +58,7 @@ def _clear_test_scope() -> None:
 
 
 def test_concurrency_update_request_accepts_large_positive_value() -> None:
-    """设置接口请求模型保留大正整数，部署背压由路由结合 Settings 校验。"""
+    """设置接口请求模型保留大正整数，Agent 队列不设置数量门禁。"""
     assert ConcurrencyUpdateRequest.model_validate({"value": 128}).opencode_concurrency == 128
     with pytest.raises(ValidationError):
         ConcurrencyUpdateRequest.model_validate({"value": 0})

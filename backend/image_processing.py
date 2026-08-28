@@ -34,7 +34,7 @@ from backend.database import (
     Task,
     utcnow,
 )
-from backend.config import AGENT_BACKPRESSURE_DEFAULT, validate_agent_backpressure, validate_agent_concurrency
+from backend.config import validate_agent_concurrency
 from backend.image_stage_plan import (
     IMAGE_STAGE_ORDER,
     SETTLED_STAGE_STATUSES,
@@ -748,11 +748,8 @@ class ImageProcessingWorker:
         self.grants = grant_store or GrantAssociationStore()
         self.owner = owner or f"image-worker-{uuid4().hex}"
         self.handlers = dict(handlers or {})
-        worker_backpressure = validate_agent_backpressure(
-            getattr(task_service, "agent_backpressure", AGENT_BACKPRESSURE_DEFAULT)
-        )
         self.executor = ThreadPoolExecutor(
-            max_workers=validate_agent_concurrency(max_workers, backpressure=worker_backpressure),
+            max_workers=validate_agent_concurrency(max_workers),
             thread_name_prefix="mememeow-image-worker",
         )
         self._task_runner = None
@@ -766,7 +763,6 @@ class ImageProcessingWorker:
                 scope_id=self.scope,
                 agent_concurrency=int(getattr(task_service, "agent_concurrency", 1)),
                 scope_concurrency=int(getattr(task_service, "agent_scope_concurrency", 1)),
-                agent_backpressure=int(getattr(task_service, "agent_backpressure", AGENT_BACKPRESSURE_DEFAULT)),
                 settings_version=getattr(task_service, "settings_version", None),
                 lease_seconds=int(getattr(task_service, "lease_seconds", 120)),
                 max_attempts=int(getattr(task_service, "max_attempts", 3)),

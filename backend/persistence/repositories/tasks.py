@@ -16,7 +16,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from backend.agent_resume import append_error_history, append_task_error_history, normalize_identifier, sanitize_error
-from executor.agent_limits import validate_agent_concurrency
+from executor.agent_limits import validate_agent_concurrency, validate_agent_concurrency_at_most
 from backend.persistence.engine import DatabaseError
 from backend.persistence.models import (
     Meme,
@@ -51,7 +51,11 @@ def _validate_lane_capacities(lane_capacity: object | None, scope_capacity: obje
         return None, None
     try:
         capacity = validate_agent_concurrency(lane_capacity)
-        limit = validate_agent_concurrency(scope_capacity, backpressure=capacity) if scope_capacity is not None else None
+        limit = validate_agent_concurrency_at_most(
+            scope_capacity,
+            capacity,
+            error_code="agent_scope_concurrency_exceeds_global",
+        ) if scope_capacity is not None else None
     except ValueError as exc:
         raise DatabaseError("agent_claim_config_invalid") from exc
     return capacity, limit
@@ -72,7 +76,11 @@ def validate_lane_resource_key(value: object | None) -> str:
 def _validate_resource_capacity(resource_capacity: object | None, lane_capacity: int) -> int:
     """校验资源槽位容量，并确保资源池不会放宽全局 lane 上限。"""
     try:
-        value = lane_capacity if resource_capacity is None else validate_agent_concurrency(resource_capacity, backpressure=lane_capacity)
+        value = lane_capacity if resource_capacity is None else validate_agent_concurrency_at_most(
+            resource_capacity,
+            lane_capacity,
+            error_code="agent_resource_concurrency_exceeds_lane",
+        )
     except (TypeError, ValueError) as exc:
         raise DatabaseError("agent_claim_config_invalid") from exc
     return int(value)
@@ -88,7 +96,11 @@ def validate_lane_resource_concurrency(value: object | None, lane_capacity: int)
     for raw_key, raw_capacity in value.items():
         try:
             key = validate_lane_resource_key(raw_key)
-            capacity = validate_agent_concurrency(raw_capacity, backpressure=lane_capacity)
+            capacity = validate_agent_concurrency_at_most(
+                raw_capacity,
+                lane_capacity,
+                error_code="agent_resource_concurrency_exceeds_lane",
+            )
         except (TypeError, ValueError) as exc:
             raise ValueError("agent_resource_concurrency_invalid") from exc
         if key in result:
@@ -228,7 +240,7 @@ class TaskRepository:
         return task
 
     def _lock_lane(self, lane: str) -> None:
-        """在当前事务中锁定整个 lane，保证跨进程槽位和背压判断原子化。"""
+        """在当前事务中锁定整个 lane，保证跨进程槽位判断原子化。"""
         self.session.execute(select(func.pg_advisory_xact_lock(func.hashtext(f"mememeow:lane:{lane}"))))
 
     def _ensure_lane_slots(self, lane: str, capacity: int) -> None:
@@ -849,7 +861,7 @@ class TaskRepository:
                     continue
                 expires_at = now + timedelta(seconds=lease_seconds)
                 if not self._claim_lane_slot(task, owner=owner, lease_expires_at=expires_at, capacity=capacity):
-                    # lane 已由本事务独占；无 slot 意味着全局背压，公平序号不得推进。
+                    # lane 已由本事务独占；无 slot 只表示运行容量暂满，公平序号不得推进。
                     return None
                 if not self._claim_lane_resource_slot(task, resource_key=resource_key, owner=owner, lease_expires_at=expires_at, capacity=resource_capacity):
                     # 全局 slot 已先取得；显式释放后再返回 queued，避免部分 claim

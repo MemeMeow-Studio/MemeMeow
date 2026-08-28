@@ -26,7 +26,8 @@ from backend.persistence.engine import DatabaseError
 from backend.persistence.resources import DatabaseResources
 from backend.persistence.models import utcnow
 from backend.agent_resume import append_error_history, append_task_error_history
-from backend.config import AGENT_BACKPRESSURE_DEFAULT, validate_agent_backpressure, validate_agent_concurrency
+from backend.config import validate_agent_concurrency
+from executor.agent_limits import validate_agent_concurrency_at_most
 from backend.tasks import IMAGE_PROCESSING_TASK_TYPES
 from backend.metadata import MetadataError
 from backend.scope import validate_scope_services
@@ -50,17 +51,24 @@ class PostgresTaskWorkerManager:
         agent_concurrency: int = 1,
         scope_concurrency: int | None = None,
         resource_concurrency: Mapping[str, int] | None = None,
-        agent_backpressure: int = AGENT_BACKPRESSURE_DEFAULT,
+        agent_backpressure: int | None = None,
         settings_version: str | None = None,
         lease_seconds: int = 120,
         max_attempts: int = 3,
         executor: ThreadPoolExecutor | None = None,
     ) -> None:
-        """创建进程级线程池和任务协调状态，等待宿主安装 service resolver。"""
+        """创建进程级线程池和任务协调状态，等待宿主安装 service resolver。
+
+        ``agent_backpressure`` 仅为旧调用方保留，不参与 Agent 运行槽位或队列判定。
+        """
+        del agent_backpressure
         self.resources = resources
-        self.agent_backpressure = validate_agent_backpressure(agent_backpressure)
-        self.agent_concurrency = validate_agent_concurrency(agent_concurrency, backpressure=self.agent_backpressure)
-        self.agent_scope_concurrency = validate_agent_concurrency(scope_concurrency if scope_concurrency is not None else 1, backpressure=self.agent_concurrency)
+        self.agent_concurrency = validate_agent_concurrency(agent_concurrency)
+        self.agent_scope_concurrency = validate_agent_concurrency_at_most(
+            scope_concurrency if scope_concurrency is not None else 1,
+            self.agent_concurrency,
+            error_code="agent_scope_concurrency_exceeds_global",
+        )
         self.resource_concurrency = validate_lane_resource_concurrency(resource_concurrency, self.agent_concurrency)
         self.settings_version = settings_version
         self.lease_seconds = lease_seconds
@@ -426,7 +434,7 @@ class PostgresTaskWorkerManager:
             self._schedule_queued()
 
     def _schedule_queued(self) -> None:
-        """跨 scope 唤醒 queued 任务，保持全局 lane 背压后的前进性。"""
+        """跨 scope 唤醒 queued 任务，保持全局运行槽位释放后的前进性。"""
         if self._stopped.is_set():
             return
         with self.resources.factory() as session:

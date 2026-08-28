@@ -18,7 +18,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from backend.agent_resume import normalize_identifier, sanitize_error, sanitize_error_history
-from backend.config import AGENT_BACKPRESSURE_DEFAULT, validate_agent_backpressure, validate_agent_concurrency
+from backend.config import validate_agent_concurrency
 from backend.image_stage_plan import (
     IMAGE_PROCESSING_MAX_ATTEMPTS,
     IMAGE_PROCESSING_TASK_TYPES,
@@ -353,16 +353,19 @@ class PersistentTaskService:
     仅是单 scope 的本地兼容实现，不宣称提供 PostgreSQL 跨进程公平保证。
     """
 
-    def __init__(self, task_root: Path, max_workers: int = 2, *, agent_concurrency: int = 1, agent_backpressure: int = AGENT_BACKPRESSURE_DEFAULT, settings_version: str | None = None):
-        """创建持久任务服务，并为 Agent 任务建立独立执行 lane。"""
+    def __init__(self, task_root: Path, max_workers: int = 2, *, agent_concurrency: int = 1, agent_backpressure: int | None = None, settings_version: str | None = None):
+        """创建持久任务服务，并为 Agent 任务建立独立执行 lane。
+
+        ``agent_backpressure`` 仅为旧调用方保留，不参与 Agent 运行槽位或队列判定。
+        """
+        del agent_backpressure
         self.task_root = task_root.expanduser()
         self.task_root.mkdir(parents=True, exist_ok=True)
         self._records: dict[str, TaskRecord] = {}
         self._handlers: dict[str, TaskHandler] = {}
         self._lock = Lock()
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="mememeow-task")
-        self.agent_backpressure = validate_agent_backpressure(agent_backpressure)
-        self.agent_concurrency = validate_agent_concurrency(agent_concurrency, backpressure=self.agent_backpressure)
+        self.agent_concurrency = validate_agent_concurrency(agent_concurrency)
         self.settings_version = settings_version
         self._agent_executor = ThreadPoolExecutor(max_workers=self.agent_concurrency, thread_name_prefix="mememeow-agent")
         self._agent_task_types = {"meme_context_generation"}
@@ -509,7 +512,7 @@ class PersistentTaskService:
                 task_id=uuid4().hex,
                 task_type=task_type,
                 payload=payload,
-                message="Agent lane 背压排队" if task_type in self._agent_task_types and self._agent_load_locked() >= self.agent_concurrency else None,
+                message="等待 Agent 运行槽位" if task_type in self._agent_task_types and self._agent_load_locked() >= self.agent_concurrency else None,
                 settings_version=str(payload.get("settings_version") or self.settings_version) if task_type == "meme_context_generation" else self.settings_version,
                 agent_concurrency=self.agent_concurrency if task_type == "meme_context_generation" else None,
             )

@@ -1,9 +1,8 @@
-"""Agent lane 的公共容量校验。
+"""Agent lane 的公共运行容量校验。
 
-该模块位于 executor 公共快照中，后端和独立 executor 共用同一套容量语义。
-并发和背压本身不绑定某个产品规模；它们必须是正整数，并发不能超过部署配置的
-Agent 背压容量。具体部署的资源门禁由适配层或运行环境负责，而不是由公共核心
-设置一个固定的容量上限。
+该模块位于 executor 公共快照中，后端和独立 executor 共用同一套容量语义。运行
+并发只要求是正整数；全局、scope 和资源池之间的层级关系由调用方显式校验。Agent
+队列不使用有限的背压容量作为拒绝门禁，具体部署资源由适配层和运行环境负责。
 """
 
 from __future__ import annotations
@@ -15,11 +14,10 @@ AGENT_BACKPRESSURE_DEFAULT: Final = 80
 
 
 def validate_agent_backpressure(value: object) -> int:
-    """校验 Agent 背压容量并返回原始整数。
+    """校验旧 Agent 背压配置，供兼容读取使用。
 
-    背压容量决定排队资源预算，调用场景是配置加载、任务服务和 executor 启动。
-    非正数、布尔值或非整数输入都会显式失败，不做静默截断；容量上限由部署适配层
-    根据实际资源设置。
+    该字段不再参与 Agent 运行并发或队列拒绝；保留校验函数是为了让旧部署和外部
+    调用方在迁移期间仍能读取其正整数配置，而不是把该值伪装成无限队列容量。
     """
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError("agent_backpressure_invalid")
@@ -29,16 +27,32 @@ def validate_agent_backpressure(value: object) -> int:
 
 
 def validate_agent_concurrency(value: object, *, backpressure: object | None = None) -> int:
-    """校验 Agent 并发并返回原始整数。
+    """校验 Agent 运行并发并返回原始整数。
 
-    并发是部署配置而非公共核心的固定产品规模。调用场景是 Settings、API、调度器
-    和线程池创建；当提供背压容量时，并发不得超过该容量，从而让不同执行层都拥有
-    明确的资源预算。任何越界输入都抛出稳定错误，禁止隐式转换或截断。
+    ``backpressure`` 仅为旧调用方保留，不再参与校验；Agent 队列没有有限容量门禁。
+    需要表达 scope 或资源池不超过上层容量时，调用
+    :func:`validate_agent_concurrency_at_most`，避免误把队列预算当作运行上限。
     """
+    del backpressure
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError("agent_concurrency_invalid")
-    if backpressure is not None:
-        pressure = validate_agent_backpressure(backpressure)
-        if value > pressure:
-            raise ValueError("agent_concurrency_exceeds_backpressure")
     return value
+
+
+def validate_agent_concurrency_at_most(
+    value: object,
+    maximum: object,
+    *,
+    error_code: str = "agent_concurrency_exceeds_limit",
+) -> int:
+    """校验运行并发为正整数且不超过显式的上层容量。
+
+    ``value`` 通常是 scope 或资源池容量，``maximum`` 是全局 Agent 或 lane 容量；
+    该关系只限制可运行任务数量，不限制 queued 任务数量。调用方可通过
+    ``error_code`` 保持配置层和数据库层的稳定错误边界。
+    """
+    candidate = validate_agent_concurrency(value)
+    ceiling = validate_agent_concurrency(maximum)
+    if candidate > ceiling:
+        raise ValueError(error_code)
+    return candidate

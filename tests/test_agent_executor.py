@@ -364,8 +364,8 @@ def test_executor_fences_concurrent_attempts_for_same_business_task(executor_fix
     client.cancel("attempt-first")
 
 
-def test_executor_queue_backpressure_returns_stable_429(executor_fixture, monkeypatch: pytest.MonkeyPatch) -> None:
-    """运行任务占用 worker 时，排队上限必须返回 429 而不是无限积压。"""
+def test_executor_queue_accepts_tasks_beyond_legacy_backpressure(executor_fixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    """运行任务占用 worker 时，旧背压值不应把排队任务拒绝为 429。"""
     executor, client, _runtime = executor_fixture
     executor.backpressure = 1
     original_environment = executor._task_environment
@@ -379,18 +379,22 @@ def test_executor_queue_backpressure_returns_stable_429(executor_fixture, monkey
         if executor.tasks["task-running"].status == "running":
             break
         time.sleep(0.01)
-    client._request(
+    status, queued = client._request(
         "POST",
         "/v1/tasks",
         {"task_id": "task-queued", "image_relative_path": "sample.png", "timeout_seconds": 5, "wait": False},
     )
-    with pytest.raises(AgentExecutorError) as error:
-        client._request(
-            "POST",
-            "/v1/tasks",
-            {"task_id": "task-overflow", "image_relative_path": "sample.png", "timeout_seconds": 5, "wait": False},
-        )
-    assert error.value.code == "agent_backpressure"
+    assert status == 202
+    assert queued["status"] in {"queued", "running"}
+    status, overflow = client._request(
+        "POST",
+        "/v1/tasks",
+        {"task_id": "task-overflow", "image_relative_path": "sample.png", "timeout_seconds": 5, "wait": False},
+    )
+    assert status == 202
+    assert overflow["status"] in {"queued", "running"}
+    for task_id in ("task-running", "task-queued", "task-overflow"):
+        client.cancel(task_id)
 
 
 def test_executor_concurrent_workspaces_share_runtime_and_isolate_execution(executor_fixture, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

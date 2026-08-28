@@ -25,6 +25,7 @@ from executor.agent_limits import (
     AGENT_BACKPRESSURE_DEFAULT,
     validate_agent_backpressure,
     validate_agent_concurrency,
+    validate_agent_concurrency_at_most,
 )
 from executor.token import ExecutorTokenError, read_token_file
 from backend.storage_security import StorageRootError, validate_controlled_root
@@ -130,11 +131,11 @@ class Settings(BaseSettings):
     agent_result_max_bytes: int = Field(default=1024 * 1024, ge=1024, le=16 * 1024 * 1024, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESULT_MAX_BYTES", "agent_result_max_bytes"))
     agent_result_retention_days: int = Field(default=14, ge=1, le=365, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESULT_RETENTION_DAYS", "agent_result_retention_days"))
     agent_result_max_tasks: int = Field(default=500, ge=1, le=10000, validation_alias=AliasChoices("MEMEMEOW_AGENT_RESULT_MAX_TASKS", "agent_result_max_tasks"))
-    # 并发不绑定公共产品规模；启动时由背压容量提供资源预算约束。
+    # Agent 运行并发只由部署配置决定，不把旧队列背压字段当作硬性上限。
     opencode_concurrency: int = Field(default=1, ge=1, validation_alias=AliasChoices(CONCURRENCY_ENV, "opencode_concurrency"))
     # 每个持久 scope 在 Agent lane 中的同时运行上限；公平调度在数据库内 enforce。
     agent_scope_concurrency: int = Field(default=1, ge=1, validation_alias=AliasChoices("MEMEMEOW_AGENT_SCOPE_CONCURRENCY", "agent_scope_concurrency"))
-    # 背压是公共核心的资源预算；具体部署资源门禁由适配层负责。
+    # 兼容旧部署字段；Agent 队列不使用该值作容量门禁。
     agent_backpressure: int = Field(default=AGENT_BACKPRESSURE_DEFAULT, ge=1, validation_alias=AliasChoices("MEMEMEOW_AGENT_BACKPRESSURE", "agent_backpressure"))
     database_url: str = Field(default="postgresql+psycopg://mememeow:mememeow@127.0.0.1:5434/mememeow", validation_alias=AliasChoices("MEMEMEOW_DATABASE_URL", "database_url"), repr=False)
     database_pool_size: int = Field(default=5, ge=1, le=100, validation_alias=AliasChoices("MEMEMEOW_DATABASE_POOL_SIZE", "database_pool_size"))
@@ -225,8 +226,12 @@ class Settings(BaseSettings):
         if self.public_release_profile.strip().casefold() not in {"local", "development", "dev", "test", "production", "public", "1", "true", "yes", "on"}:
             raise ValueError("public_release_profile_invalid")
         validate_agent_backpressure(self.agent_backpressure)
-        validate_agent_concurrency(self.opencode_concurrency, backpressure=self.agent_backpressure)
-        validate_agent_concurrency(self.agent_scope_concurrency, backpressure=self.opencode_concurrency)
+        validate_agent_concurrency(self.opencode_concurrency)
+        validate_agent_concurrency_at_most(
+            self.agent_scope_concurrency,
+            self.opencode_concurrency,
+            error_code="agent_scope_concurrency_exceeds_global",
+        )
         ThumbnailConfig.from_settings(self)
         return self
 
@@ -412,7 +417,7 @@ class Settings(BaseSettings):
                 "value": self.opencode_concurrency,
                 "pending_value": pending,
                 "minimum": 1,
-                "maximum": self.agent_backpressure,
+                "maximum": None,
                 "environment_overridden": environment_override,
                 "restart_required": restart_required,
             },
@@ -474,14 +479,12 @@ class Settings(BaseSettings):
 def update_dotenv_concurrency(path: str | Path, value: int, *, backpressure: int | None = None) -> Path:
     """原子更新 dotenv 的并发字段，保留未知变量、注释和其他格式。
 
-    ``backpressure`` 由 API 调用方传入当前部署预算；独立调用不做产品规模猜测，
-    但服务重启时 Settings 仍会再次执行相同的容量校验。
+    ``backpressure`` 仅为旧调用方保留，不参与 Agent 运行并发或队列容量判定。
     """
+    del backpressure
     try:
-        validate_agent_concurrency(value, backpressure=backpressure)
+        validate_agent_concurrency(value)
     except ValueError as exc:
-        if str(exc) == "agent_concurrency_exceeds_backpressure":
-            raise
         raise ValueError("opencode_concurrency_out_of_range") from exc
     target = Path(path).expanduser()
     if target.is_symlink():

@@ -15,7 +15,6 @@ from typing import Any, Callable, Protocol, TYPE_CHECKING
 
 from sqlalchemy import select
 
-from backend.config import AGENT_BACKPRESSURE_DEFAULT
 from backend.database import ScopeContext, Task, utcnow
 
 if TYPE_CHECKING:  # pragma: no cover - 仅用于类型检查，避免运行时循环导入
@@ -275,7 +274,6 @@ class ScopeServiceFactory:
                 agent_concurrency=self._task_config.get("agent_concurrency", getattr(settings, "opencode_concurrency", 1)),
                 scope_concurrency=self._task_config.get("scope_concurrency", getattr(settings, "agent_scope_concurrency", 1)),
                 resource_concurrency=self._task_config.get("resource_concurrency", getattr(settings, "agent_resource_concurrency", None)),
-                agent_backpressure=self._task_config.get("agent_backpressure", getattr(settings, "agent_backpressure", AGENT_BACKPRESSURE_DEFAULT)),
                 settings_version=self._task_config.get("settings_version", getattr(settings, "settings_version", None)),
                 lease_seconds=self._task_config.get("lease_seconds", getattr(settings, "worker_lease_seconds", 120)),
                 max_attempts=self._task_config.get("max_attempts", getattr(settings, "worker_max_attempts", 3)),
@@ -322,7 +320,6 @@ class ScopeServiceFactory:
                 agent_concurrency=self._task_config.get("agent_concurrency", getattr(self.settings, "opencode_concurrency", 1)),
                 scope_concurrency=self._task_config.get("scope_concurrency", getattr(self.settings, "agent_scope_concurrency", 1)),
                 resource_concurrency=self._task_config.get("resource_concurrency", getattr(self.settings, "agent_resource_concurrency", None)),
-                agent_backpressure=self._task_config.get("agent_backpressure", getattr(self.settings, "agent_backpressure", AGENT_BACKPRESSURE_DEFAULT)),
                 settings_version=self._task_config.get("settings_version", getattr(self.settings, "settings_version", None)),
                 lease_seconds=self._task_config.get("lease_seconds", getattr(self.settings, "worker_lease_seconds", 120)),
                 max_attempts=self._task_config.get("max_attempts", getattr(self.settings, "worker_max_attempts", 3)),

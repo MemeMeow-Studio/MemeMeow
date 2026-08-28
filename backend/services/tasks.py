@@ -44,7 +44,8 @@ from backend.agent_resume import (
     sanitize_error_history,
     within_total_timeout,
 )
-from backend.config import AGENT_BACKPRESSURE_DEFAULT, validate_agent_backpressure, validate_agent_concurrency
+from backend.config import validate_agent_concurrency
+from executor.agent_limits import validate_agent_concurrency_at_most
 from backend.operation_policy import GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations
 from backend.opencode_workspace import SELECTOR_RE
 from backend.public_dto import sanitize_task_result
@@ -78,13 +79,20 @@ class PostgresTaskService:
     恢复并校验 scope，避免普通 payload 或 Worker 的历史默认值成为归属事实。
     """
 
-    def __init__(self, resources: DatabaseResources, *, scope_id: str | ScopeContext = "local", agent_concurrency: int = 1, scope_concurrency: int | None = None, resource_concurrency: Mapping[str, int] | None = None, agent_backpressure: int = AGENT_BACKPRESSURE_DEFAULT, settings_version: str | None = None, lease_seconds: int = 120, max_attempts: int = 3, executor: ThreadPoolExecutor | None = None, worker_manager: PostgresTaskWorkerManager | None = None, finalize_image_tasks: bool = True, operation_policy: OperationPolicyGateway | None = None, grant_store: GrantAssociationStore | None = None, resume_enabled: bool = False, resume_max_attempts: int = 2, resume_backoff_seconds: int = 2, resume_max_backoff_seconds: int = 60, resume_timeout_seconds: int = 900):
-        """绑定任务资源、scope、并发/租约配置和可选的进程级 Worker manager。"""
+    def __init__(self, resources: DatabaseResources, *, scope_id: str | ScopeContext = "local", agent_concurrency: int = 1, scope_concurrency: int | None = None, resource_concurrency: Mapping[str, int] | None = None, agent_backpressure: int | None = None, settings_version: str | None = None, lease_seconds: int = 120, max_attempts: int = 3, executor: ThreadPoolExecutor | None = None, worker_manager: PostgresTaskWorkerManager | None = None, finalize_image_tasks: bool = True, operation_policy: OperationPolicyGateway | None = None, grant_store: GrantAssociationStore | None = None, resume_enabled: bool = False, resume_max_attempts: int = 2, resume_backoff_seconds: int = 2, resume_max_backoff_seconds: int = 60, resume_timeout_seconds: int = 900):
+        """绑定任务资源、scope、并发/租约配置和可选的进程级 Worker manager。
+
+        ``agent_backpressure`` 仅为旧调用方保留，不参与 Agent 运行槽位或队列判定。
+        """
+        del agent_backpressure
         self.resources = resources
         self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
-        self.agent_backpressure = validate_agent_backpressure(agent_backpressure)
-        self.agent_concurrency = validate_agent_concurrency(agent_concurrency, backpressure=self.agent_backpressure)
-        self.agent_scope_concurrency = validate_agent_concurrency(scope_concurrency if scope_concurrency is not None else 1, backpressure=self.agent_concurrency)
+        self.agent_concurrency = validate_agent_concurrency(agent_concurrency)
+        self.agent_scope_concurrency = validate_agent_concurrency_at_most(
+            scope_concurrency if scope_concurrency is not None else 1,
+            self.agent_concurrency,
+            error_code="agent_scope_concurrency_exceeds_global",
+        )
         configured_resources = resource_concurrency if resource_concurrency is not None else getattr(worker_manager, "resource_concurrency", None)
         self.resource_concurrency = validate_lane_resource_concurrency(configured_resources, self.agent_concurrency)
         self.settings_version = settings_version
@@ -754,7 +762,7 @@ class PostgresTaskService:
             self._context_policy_conflict(payload, dedupe)
         with self.resources.environment(self.scope.scope_id) as environment:
             try:
-                record = environment.tasks.submit(task_type=task_type, payload=payload, lane=lane, dedupe_key=dedupe, settings_version=self.settings_version, max_attempts=self.max_attempts, lane_backpressure=_lane_backpressure if _lane_backpressure is not None else self.agent_backpressure if lane == "agent" else None, lane_backpressure_scope_id=_lane_backpressure_scope, lane_resource_key=_lane_resource_key, submission_mode=submission_mode, image_stage=image_stage, processing_job_id=processing_job_id)
+                record = environment.tasks.submit(task_type=task_type, payload=payload, lane=lane, dedupe_key=dedupe, settings_version=self.settings_version, max_attempts=self.max_attempts, lane_backpressure=_lane_backpressure, lane_backpressure_scope_id=_lane_backpressure_scope, lane_resource_key=_lane_resource_key, submission_mode=submission_mode, image_stage=image_stage, processing_job_id=processing_job_id)
             except DatabaseError as exc:
                 if exc.code == "agent_backpressure":
                     existing = environment.uow.session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.task_type == task_type, Task.dedupe_key == dedupe, Task.status.in_(("queued", "running"))))

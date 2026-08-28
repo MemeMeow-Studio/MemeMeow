@@ -27,7 +27,7 @@ class _SettingsRequestModel(BaseModel):
 class ConcurrencyUpdateRequest(_SettingsRequestModel):
     """后端设置页唯一允许持久化的安全参数。"""
 
-    # 公共请求模型只要求正整数；当前部署的背压容量由路由结合 Settings 校验。
+    # 公共请求模型只要求正整数；Agent 队列不设置有限容量门禁。
     opencode_concurrency: StrictInt = Field(
         ge=1,
         validation_alias=AliasChoices("opencode_concurrency", "agent_concurrency", "concurrency", "value"),
@@ -85,7 +85,6 @@ async def _update_backend_settings(request: Request, payload: ConcurrencyUpdateR
         update_dotenv_concurrency(
             settings.dotenv_path,
             payload.opencode_concurrency,
-            backpressure=settings.agent_backpressure,
         )
     except ValueError as exc:
         raise _error(400, "settings_update_invalid", str(exc)) from exc

@@ -205,10 +205,7 @@ class OpenCodeRunner:
         self.slots_root = self.runtime_root / "slots"
         self.lock_path = self.runtime_root / "worker.lock"
         self.log_root = self.runtime_root / "logs"
-        self.concurrency = validate_agent_concurrency(
-            settings.opencode_concurrency,
-            backpressure=getattr(settings, "agent_backpressure", None),
-        )
+        self.concurrency = validate_agent_concurrency(settings.opencode_concurrency)
         self._slot_semaphore = Semaphore(self.concurrency)
         self._slot_ids: Queue[int] = Queue()
         for slot_id in range(self.concurrency):

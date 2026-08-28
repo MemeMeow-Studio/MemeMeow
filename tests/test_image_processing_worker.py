@@ -119,7 +119,6 @@ def test_image_leaf_runner_inherits_resume_configuration(monkeypatch: pytest.Mon
     monkeypatch.setattr("backend.pg_services.PostgresTaskService", _CapturingTaskRunner)
     task_service = SimpleNamespace(
         agent_concurrency=2,
-        agent_backpressure=12,
         settings_version="settings-test",
         lease_seconds=45,
         max_attempts=4,

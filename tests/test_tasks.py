@@ -114,7 +114,7 @@ def test_agent_lane_runs_different_images_in_parallel_and_keeps_cache_lane_avail
     second = manager.submit("meme_context_generation", {"image_relative_path": "b.png"})
     queued = manager.submit("meme_context_generation", {"image_relative_path": "c.png"})
     manager.submit("cache_generation", {})
-    assert queued.message == "Agent lane 背压排队"
+    assert queued.message == "等待 Agent 运行槽位"
     assert cache_started.wait(1)
     release.set()
     assert wait_for_terminal(manager, first.task_id).status == "succeeded"
@@ -125,11 +125,10 @@ def test_agent_lane_runs_different_images_in_parallel_and_keeps_cache_lane_avail
 
 
 def test_local_agent_lane_preserves_configured_large_capacity(tmp_path):
-    """本地兼容任务服务保留大并发值并使用显式背压预算。"""
-    manager = PersistentTaskService(tmp_path / "tasks", agent_concurrency=128, agent_backpressure=128)
+    """本地兼容任务服务保留大运行容量，不依赖旧背压默认值。"""
+    manager = PersistentTaskService(tmp_path / "tasks", agent_concurrency=500, agent_backpressure=80)
     try:
-        assert manager.agent_concurrency == 128
-        assert manager.agent_backpressure == 128
+        assert manager.agent_concurrency == 500
     finally:
         manager.shutdown()
 

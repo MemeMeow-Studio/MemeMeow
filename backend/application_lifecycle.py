@@ -427,7 +427,6 @@ def _build_scope_runtime(
             app.state.database,
             agent_concurrency=settings.opencode_concurrency,
             scope_concurrency=getattr(settings, "agent_scope_concurrency", 1),
-            agent_backpressure=settings.agent_backpressure,
             settings_version=settings.settings_version,
             lease_seconds=settings.worker_lease_seconds,
             max_attempts=settings.worker_max_attempts,
@@ -457,7 +456,6 @@ def _build_scope_runtime(
                 scope_id=local_scope,
                 agent_concurrency=settings.opencode_concurrency,
                 scope_concurrency=getattr(settings, "agent_scope_concurrency", 1),
-                agent_backpressure=settings.agent_backpressure,
                 settings_version=settings.settings_version,
                 lease_seconds=settings.worker_lease_seconds,
                 max_attempts=settings.worker_max_attempts,
@@ -505,7 +503,6 @@ def _build_scope_runtime(
             task_config={
                 "agent_concurrency": settings.opencode_concurrency,
                 "scope_concurrency": getattr(settings, "agent_scope_concurrency", 1),
-                "agent_backpressure": settings.agent_backpressure,
                 "settings_version": settings.settings_version,
                 "lease_seconds": settings.worker_lease_seconds,
                 "max_attempts": settings.worker_max_attempts,
@@ -552,10 +549,7 @@ def _build_scope_runtime(
             task_service=local_services.tasks,
             policy=app.state.operation_policy_gateway,
             grant_store=app.state.operation_grants,
-            max_workers=validate_agent_concurrency(
-                getattr(settings, "opencode_concurrency", 1),
-                backpressure=getattr(settings, "agent_backpressure", None),
-            ),
+            max_workers=validate_agent_concurrency(getattr(settings, "opencode_concurrency", 1)),
             task_handlers=dict(task_handlers),
         )
         ownership.image_workers.append(app.state.image_processing_workers[local_services.scope.scope_id])
