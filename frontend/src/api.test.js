@@ -67,6 +67,10 @@ describe('请求封装', () => {
     })
   })
 
+  it('合集导出 URL 编码稳定合集 ID', () => {
+    expect(api.collectionExportUrl('collection/1')).toBe('/api/collections/collection%2F1/export')
+  })
+
   it('独立图片阶段请求只发送业务目标和阶段策略', async () => {
     await api.submitImageStage({ meme_id: 'meme-1', stage: 'agent', reverse_image_policy: 'forbid' })
 

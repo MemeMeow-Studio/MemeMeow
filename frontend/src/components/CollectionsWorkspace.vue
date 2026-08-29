@@ -16,8 +16,15 @@ const members = shallowRef<MemeImage[]>([])
 const collectionName = shallowRef('')
 const busy = shallowRef(false)
 const notice = shallowRef('')
+const noticeTone = shallowRef<'success' | 'error'>('success')
 const previewImage = shallowRef<MemeImage | null>(null)
 const previewTrigger = shallowRef<HTMLElement | null>(null)
+
+/** 更新合集操作提示及其视觉语义，避免失败反馈沿用成功颜色。 */
+function setNotice(message: string, tone: 'success' | 'error' = 'success'): void {
+  notice.value = message
+  noticeTone.value = tone
+}
 
 /** 加载合集列表，供初始进入和修改后刷新。 */
 async function loadCollections(): Promise<void> {
@@ -38,7 +45,7 @@ async function createCollection(): Promise<void> {
   try {
     await api.createCollection({ name: collectionName.value })
     collectionName.value = ''
-    notice.value = '合集已创建'
+    setNotice('合集已创建')
     await loadCollections()
   } catch (reason) {
     emit('error', errorMessage(reason))
@@ -54,7 +61,7 @@ async function renameCollection(item: CollectionSummary): Promise<void> {
   busy.value = true
   try {
     await api.renameCollection(item.collection_id, { name })
-    notice.value = '合集已重命名'
+    setNotice('合集已重命名')
     if (selectedCollection.value?.collection_id === item.collection_id) {
       selectedCollection.value = { ...selectedCollection.value, name }
     }
@@ -73,7 +80,7 @@ async function deleteCollection(item: CollectionSummary): Promise<void> {
   try {
     await api.deleteCollection(item.collection_id)
     if (selectedCollection.value?.collection_id === item.collection_id) selectedCollection.value = null
-    notice.value = '合集已删除'
+    setNotice('合集已删除')
     await loadCollections()
   } catch (reason) {
     emit('error', errorMessage(reason))
@@ -111,7 +118,7 @@ async function removeMember(item: MemeImage): Promise<void> {
     await api.removeCollectionMember(selectedCollection.value.collection_id, item.meme_id)
     selectedCollection.value = await api.collection(selectedCollection.value.collection_id)
     members.value = selectedCollection.value?.members || []
-    notice.value = '图片已从合集移除'
+    setNotice('图片已从合集移除')
   } catch (reason) {
     emit('error', errorMessage(reason))
   } finally {
@@ -123,6 +130,20 @@ async function removeMember(item: MemeImage): Promise<void> {
 function openImagePreview(item: MemeImage, event: MouseEvent): void {
   previewTrigger.value = event.currentTarget instanceof HTMLElement ? event.currentTarget : null
   previewImage.value = item
+}
+
+/** 复制当前合集的动态导出地址，不创建额外的分享记录。 */
+async function copyCollectionLink(): Promise<void> {
+  if (!selectedCollection.value) return
+  const path = api.collectionExportUrl(selectedCollection.value.collection_id)
+  const url = new URL(path, window.location.origin).toString()
+  try {
+    if (typeof navigator.clipboard?.writeText !== 'function') throw new Error('clipboard_unavailable')
+    await navigator.clipboard.writeText(url)
+    setNotice('下载链接已复制')
+  } catch {
+    setNotice('无法复制下载链接，请手动复制浏览器地址', 'error')
+  }
 }
 
 onMounted(loadCollections)
@@ -141,7 +162,9 @@ onMounted(loadCollections)
         </p>
       </div>
       <div v-if="selectedCollection" class="collection-detail-actions" role="group" aria-label="合集管理操作">
-        <button class="quiet" type="button" :disabled="busy" @click="renameCollection(selectedCollection)">重命名</button>
+        <a class="quiet collection-export" :href="api.collectionExportUrl(selectedCollection.collection_id)" title="下载合集 ZIP" aria-label="下载合集 ZIP">下载 ZIP</a>
+        <button class="quiet collection-copy-link" type="button" :disabled="busy" title="复制动态下载链接" aria-label="复制动态下载链接" @click="copyCollectionLink">复制链接</button>
+        <button class="quiet" type="button" :disabled="busy" aria-label="重命名合集" @click="renameCollection(selectedCollection)">重命名</button>
         <button class="quiet collection-danger" type="button" :disabled="busy" @click="deleteCollection(selectedCollection)">删除合集</button>
       </div>
     </div>
@@ -163,7 +186,7 @@ onMounted(loadCollections)
           <h2>这个合集还没有图片</h2>
         </div>
       </div>
-      <p v-if="notice" class="inline-notice" role="status">{{ notice }}</p>
+      <p v-if="notice" class="inline-notice" :class="{ error: noticeTone === 'error' }" role="status">{{ notice }}</p>
     </template>
     <template v-else>
       <form class="collection-create-form" aria-label="创建合集" @submit.prevent="createCollection">
@@ -173,7 +196,7 @@ onMounted(loadCollections)
           {{ busy ? '创建中...' : '创建合集' }}
         </button>
       </form>
-      <p v-if="notice" class="inline-notice" role="status">{{ notice }}</p>
+      <p v-if="notice" class="inline-notice" :class="{ error: noticeTone === 'error' }" role="status">{{ notice }}</p>
       <div v-if="busy && !collections.length" class="empty-state compact collection-loading" role="status">
         <h2>正在加载合集</h2>
       </div>

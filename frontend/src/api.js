@@ -80,6 +80,8 @@ export const api = {
   deleteCollection: (id) => request(`/collections/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   addCollectionItems: (id, memeIds) => request(`/collections/${encodeURIComponent(id)}/items`, { method: 'POST', body: JSON.stringify({ meme_ids: memeIds }) }),
   removeCollectionMember: (id, memeId) => request(`/collections/${encodeURIComponent(id)}/items/${encodeURIComponent(memeId)}`, { method: 'DELETE' }),
+  // 二进制下载交给浏览器处理，保留服务端的文件名和当前会话 Cookie。
+  collectionExportUrl: (id) => `${API_BASE}/collections/${encodeURIComponent(id)}/export`,
 }
 
 export async function pollTask(id, onUpdate, interval = 700) {

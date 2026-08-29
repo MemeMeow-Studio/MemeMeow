@@ -2,18 +2,19 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { collections, createCollection, collection, renameCollection, deleteCollection, removeCollectionMember, imageMetadata } = vi.hoisted(() => ({
+const { collections, createCollection, collection, renameCollection, deleteCollection, removeCollectionMember, collectionExportUrl, imageMetadata } = vi.hoisted(() => ({
   collections: vi.fn(),
   createCollection: vi.fn(),
   collection: vi.fn(),
   renameCollection: vi.fn(),
   deleteCollection: vi.fn(),
   removeCollectionMember: vi.fn(),
+  collectionExportUrl: vi.fn(),
   imageMetadata: vi.fn(),
 }))
 
 vi.mock('../api', () => ({
-  api: { collections, createCollection, collection, renameCollection, deleteCollection, removeCollectionMember, imageMetadata },
+  api: { collections, createCollection, collection, renameCollection, deleteCollection, removeCollectionMember, collectionExportUrl, imageMetadata },
 }))
 
 import CollectionsWorkspace from './CollectionsWorkspace.vue'
@@ -40,6 +41,7 @@ describe('CollectionsWorkspace', () => {
     renameCollection.mockReset().mockResolvedValue({ ...summary, name: '改名后的合集' })
     deleteCollection.mockReset().mockResolvedValue({})
     removeCollectionMember.mockReset().mockResolvedValue({})
+    collectionExportUrl.mockReset().mockReturnValue('/api/collections/collection-1/export')
     imageMetadata.mockReset().mockResolvedValue({})
     vi.stubGlobal('prompt', vi.fn())
     vi.stubGlobal('confirm', vi.fn(() => true))
@@ -73,7 +75,7 @@ describe('CollectionsWorkspace', () => {
 
     window.prompt = vi.fn(() => '改名后的合集')
     collections.mockResolvedValueOnce({ items: [summary] })
-    await wrapper.get('.collection-detail-actions .quiet').trigger('click')
+    await wrapper.get('[aria-label="重命名合集"]').trigger('click')
     await flushPromises()
     expect(renameCollection).toHaveBeenCalledWith('collection-1', { name: '改名后的合集' })
     expect(wrapper.get('h1').text()).toBe('改名后的合集')
@@ -91,6 +93,26 @@ describe('CollectionsWorkspace', () => {
     await flushPromises()
     expect(deleteCollection).toHaveBeenCalledWith('collection-1')
     expect(wrapper.get('h1').text()).toBe('合集')
+  })
+
+  it('详情提供 ZIP 下载和动态链接复制，并反馈剪贴板失败', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    const wrapper = mount(CollectionsWorkspace)
+    await flushPromises()
+    await wrapper.get('[aria-label="打开合集 会议反应"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[aria-label="下载合集 ZIP"]').attributes('href')).toBe('/api/collections/collection-1/export')
+    await wrapper.get('[aria-label="复制动态下载链接"]').trigger('click')
+    expect(writeText).toHaveBeenCalledWith(`${window.location.origin}/api/collections/collection-1/export`)
+    expect(wrapper.text()).toContain('下载链接已复制')
+
+    writeText.mockRejectedValueOnce(new Error('clipboard_denied'))
+    await wrapper.get('[aria-label="复制动态下载链接"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).toContain('无法复制下载链接，请手动复制浏览器地址')
+    expect(wrapper.get('.inline-notice').classes()).toContain('error')
   })
 
   it('在资产卡片内移除成员并刷新详情', async () => {
