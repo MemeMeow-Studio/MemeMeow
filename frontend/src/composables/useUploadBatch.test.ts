@@ -34,6 +34,33 @@ describe('splitUploadFiles', () => {
 })
 
 describe('useUploadBatch', () => {
+  it('追加文件时保留已有批次项并为新增项建立等待状态', () => {
+    const { batch } = setupBatch()
+    const first = makeFiles(1)[0]
+    const second = makeFiles(1)[0]
+
+    batch.setFiles([first])
+    const originalItem = batch.items.value[0]
+    batch.appendFiles([second])
+
+    expect(batch.items.value).toHaveLength(2)
+    expect(batch.items.value[0]).toBe(originalItem)
+    expect(batch.items.value[1]).toMatchObject({ file: second, status: 'pending', retryable: true, attempts: 0 })
+  })
+
+  it('重复传入同一 File 引用时仍为每个队列项发送一次', async () => {
+    upload.mockReset().mockResolvedValue({ results: [{ ok: true }, { ok: true }] })
+    const { batch } = setupBatch()
+    const file = makeFiles(1)[0]
+    batch.setFiles([file, file])
+
+    await batch.start([file, file], { reverse_image_policy: 'forbid', auto_name: false }, null)
+
+    expect(upload).toHaveBeenCalledTimes(1)
+    expect(upload.mock.calls[0][0]).toEqual([file, file])
+    expect(batch.summary.value.succeeded).toBe(2)
+  })
+
   it('上千文件保持最多两个活动请求并按分片完成', async () => {
     upload.mockReset()
     const pending: Array<{ files: File[]; resolve: (value: unknown) => void }> = []

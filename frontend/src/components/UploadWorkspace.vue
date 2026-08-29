@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /** 上传工作区：管理文件选择、选项确认与逐文件结果。 */
-import { computed, shallowRef } from 'vue'
+import { computed, onMounted, onUnmounted, shallowRef } from 'vue'
 import type { ImageProcessingOptions, ServiceConfig } from '../types'
 import { uploadErrorMessage } from '../utils/presentation'
 import ImageProcessingOptionsDialog from './ImageProcessingOptionsDialog.vue'
@@ -27,14 +27,101 @@ const batchSummary = batch.summary
 const busy = batch.busy
 const canRetryFailed = computed(() => !busy.value && batchItems.value.some((item) => item.status === 'failed' && item.retryable))
 
+/** 剪贴板图片的受支持 MIME 与扩展名，必须与后端上传格式保持一致。 */
+const clipboardImageExtensions: Readonly<Record<string, string>> = {
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/gif': '.gif',
+}
+/** 文件名已有受支持扩展名时允许保留，避免无意义地改名。 */
+const supportedImageExtensions = new Set(['.png', '.jpg', '.jpeg', '.gif'])
+/** 组件内的粘贴文件序号，配合时间戳生成可读且不重复的临时文件名。 */
+let pastedFileSequence = 0
+
 /** 读取原生文件输入，并以不可变数组保存用户选择。 */
 function onFiles(event: Event): void {
+  if (busy.value) return
   const input = event.target as HTMLInputElement
   files.value = [...(input.files || [])]
   batch.setFiles(files.value)
   preserveRetryOptions.value = false
   retryOptions.value = { reverse_image_policy: 'forbid', auto_name: false }
 }
+
+/**
+ * 判断剪贴板返回值是否具备 File 的跨 realm 数据形状。
+ * 输入来自 DataTransferItem.getAsFile；输出供上传队列消费的 File，不能依赖当前 window 的 instanceof。
+ */
+function isClipboardFile(value: unknown): value is File {
+  if (typeof value !== 'object' || value === null) return false
+  const candidate = value as Partial<File>
+  return typeof candidate.name === 'string'
+    && typeof candidate.type === 'string'
+    && typeof candidate.size === 'number'
+    && Number.isFinite(candidate.size)
+    && typeof candidate.slice === 'function'
+}
+
+/**
+ * 为剪贴板文件补齐后端接受的扩展名，并避免同一队列中的文件名冲突。
+ * 输入是剪贴板 File 与当前队列文件名；输出保留原对象或返回同内容的规范化 File。
+ */
+function normalizePastedFile(file: File, existingNames: Set<string>): File {
+  const fileType = file.type.trim().toLowerCase()
+  const originalName = file.name.trim()
+  const originalExtension = originalName.match(/\.[^.]+$/)?.[0]?.toLowerCase() || ''
+  const mimeExtension = clipboardImageExtensions[fileType]
+  const compatibleNameExtension = fileType === 'image/jpeg'
+    ? ['.jpg', '.jpeg'].includes(originalExtension)
+    : mimeExtension === originalExtension
+  const extension = compatibleNameExtension
+    ? originalExtension
+    : mimeExtension || (supportedImageExtensions.has(originalExtension) ? originalExtension : '.png')
+  const originalBase = (originalName.replace(/\.[^.]+$/, '') || 'pasted-image')
+    .replace(/[\\/\x00-\x1f\x7f:*?"<>|]/g, '_')
+    .trim()
+    .replace(/^[. ]+|[. ]+$/g, '')
+  const baseName = !originalName || !originalBase || originalBase.toLowerCase() === 'blob'
+    ? `pasted-${Date.now()}-${++pastedFileSequence}`
+    : originalBase
+  const existingNameKeys = new Set(Array.from(existingNames, (name) => name.trim().toLowerCase()))
+  let candidate = `${baseName}${extension}`
+  let suffix = 2
+  while (existingNameKeys.has(candidate.toLowerCase())) candidate = `${baseName}-${suffix++}${extension}`
+  existingNameKeys.add(candidate.toLowerCase())
+  existingNames.add(candidate)
+  const normalizedType = fileType || (extension === '.jpg' || extension === '.jpeg' ? 'image/jpeg' : `image/${extension.slice(1)}`)
+  return candidate === originalName && normalizedType === file.type ? file : new File([file], candidate, { type: normalizedType })
+}
+
+/**
+ * 读取当前剪贴板中的图片并追加到待上传队列。
+ * 输入是浏览器 paste 事件；上传过程中直接忽略，避免改写活动批次。
+ */
+function onPaste(event: ClipboardEvent): void {
+  if (busy.value || !event.clipboardData) return
+  const clipboardItems = event.clipboardData.items
+  if (!clipboardItems) return
+  const pasted = Array.from(clipboardItems)
+    .filter((item) => item.kind === 'file' && typeof item.type === 'string' && clipboardImageExtensions[item.type.trim().toLowerCase()])
+    .map((item) => {
+      try {
+        return item.getAsFile()
+      } catch {
+        return null
+      }
+    })
+    .filter(isClipboardFile)
+  if (!pasted.length) return
+  event.preventDefault()
+  const existingNames = new Set(batchItems.value.map((item) => item.file.name))
+  const normalized = pasted.map((file) => normalizePastedFile(file, existingNames))
+  files.value = [...files.value, ...normalized]
+  batch.appendFiles(normalized)
+}
+
+onMounted(() => window.addEventListener('paste', onPaste))
+onUnmounted(() => window.removeEventListener('paste', onPaste))
 
 /** 打开共享选项对话框；请求尚未发生时保留文件选择。 */
 function openOptions(event?: MouseEvent): void {
@@ -99,9 +186,10 @@ function itemDetail(item: UploadBatchItem): string {
     </div>
     <div class="upload-panel">
       <label class="drop-zone">
-        <input type="file" multiple accept=".png,.jpg,.jpeg,.gif" aria-label="选择图片文件" @change="onFiles" />
+        <input type="file" multiple accept=".png,.jpg,.jpeg,.gif" aria-label="选择图片文件" :disabled="busy" @change="onFiles" />
         <span class="drop-title">选择图片文件</span>
-        <span class="drop-sub">{{ files.length ? `已选择 ${files.length} 个文件` : '点击选择或拖入文件' }}</span>
+        <span class="drop-sub">{{ files.length ? `已选择 ${files.length} 个文件，可继续添加` : '点击选择或拖入文件' }}</span>
+        <span class="drop-hint">支持 Ctrl+V 连续添加图片，最后统一上传</span>
       </label>
       <button class="primary wide" type="button" :disabled="busy || !files.length" @click="openOptions">
         {{ busy ? '上传中...' : '上传所选图片' }}

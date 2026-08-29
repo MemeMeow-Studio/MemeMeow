@@ -153,6 +153,21 @@ export function useUploadBatch() {
     retryAt.value = null
   }
 
+  /** 追加一组尚未上传的本地文件，保留当前批次的逐项结果。 */
+  function appendFiles(files: File[]): void {
+    if (busy.value || !files.length) return
+    const offset = items.value.length
+    const additions = files.map((file, index) => ({
+      id: itemId(file, offset + index),
+      file,
+      status: 'pending' as const,
+      retryable: true,
+      attempts: 0,
+    }))
+    replaceItems([...items.value, ...additions])
+    retryAt.value = null
+  }
+
   function complete(run: UploadRun): void {
     if (activeRun !== run) return
     if (run.retryTimer) clearTimeout(run.retryTimer)
@@ -276,8 +291,13 @@ export function useUploadBatch() {
   /** 启动选中文件的逻辑批次；文件项只在该页面内复用，服务端不建立批次实体。 */
   function start(files: File[], options: ImageProcessingOptions, config: ServiceConfig | null): Promise<UploadBatchRunResult> {
     if (busy.value || !files.length) return Promise.resolve({})
-    const selected = files.map((file) => items.value.find((item) => item.file === file) || {
-      id: itemId(file, items.value.length), file, status: 'pending' as const, retryable: true, attempts: 0,
+    const availableItems = items.value.slice()
+    const selected = files.map((file, index) => {
+      const existingIndex = availableItems.findIndex((item) => item.file === file)
+      if (existingIndex >= 0) return availableItems.splice(existingIndex, 1)[0]
+      return {
+        id: itemId(file, items.value.length + index), file, status: 'pending' as const, retryable: true, attempts: 0,
+      }
     })
     updateItems((next) => {
       for (const item of selected) {
@@ -291,8 +311,13 @@ export function useUploadBatch() {
       }
     })
     const chunks = splitUploadFiles(files, config || {})
-    const itemByFile = new Map(selected.map((item) => [item.file, item]))
-    const queue: UploadChunk[] = chunks.map((chunk) => ({ items: chunk.map((file) => itemByFile.get(file) as UploadBatchItem), retryCount: 0 }))
+    // 同一 File 引用可能由调用方重复传入；按引用建立先进先出项队列，避免漏传或重复更新首项。
+    const itemsByFile = new Map<File, UploadBatchItem[]>()
+    for (const item of selected) itemsByFile.set(item.file, [...(itemsByFile.get(item.file) || []), item])
+    const queue: UploadChunk[] = chunks.map((chunk) => ({
+      items: chunk.map((file) => itemsByFile.get(file)?.shift() as UploadBatchItem),
+      retryCount: 0,
+    }))
     const maxConcurrent = Math.max(1, Math.min(MAX_CONCURRENT_REQUESTS, Number(config?.max_concurrent_upload_requests) || MAX_CONCURRENT_REQUESTS))
     const generation = ++nextGeneration
     busy.value = true
@@ -349,6 +374,7 @@ export function useUploadBatch() {
     activeRequests,
     summary,
     setFiles,
+    appendFiles,
     start,
     pause,
     resume,

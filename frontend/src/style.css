@@ -198,6 +198,7 @@ button, input, select, textarea { border-radius: var(--radius-control); }
 .drop-zone:focus-within { outline: 3px solid var(--focus); outline-offset: 2px; }
 .drop-title { color: var(--ink-soft); font-size: 17px; font-weight: 700; }
 .drop-sub { color: var(--muted); font-size: 15px; }
+.drop-hint { color: var(--muted-soft); font-size: 14px; }
 .wide { width: 100%; }
 .upload-results { display: grid; gap: 10px; margin-top: 20px; }
 .upload-result { display: flex; align-items: center; gap: 12px; min-height: 52px; border: 1px solid #b8d7c8; border-radius: 5px; padding: 10px 14px; color: var(--ink-soft); background: #f1f8f4; font-size: 15px; }
