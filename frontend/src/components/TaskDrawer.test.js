@@ -151,4 +151,22 @@ describe('TaskDrawer', () => {
     await nextTick()
     expect(wrapper.find('.task-image-preview').exists()).toBe(false)
   })
+
+  it('默认不显示任务诊断标识', async () => {
+    wrapper = mount(TaskDrawer, {
+      props: {
+        task: {
+          task_id: 'task-diagnostic-hidden',
+          task_type: 'visual_embedding_generation',
+          processing_job_id: 'job-diagnostic-hidden',
+          status: 'succeeded',
+          image: { meme_id: 'meme-diagnostic-hidden', filename: 'sample.png' },
+        },
+      },
+    })
+    await nextTick()
+
+    expect(wrapper.text()).not.toContain('task-diagnostic-hidden')
+    expect(wrapper.text()).not.toContain('job-diagnostic-hidden')
+  })
 })

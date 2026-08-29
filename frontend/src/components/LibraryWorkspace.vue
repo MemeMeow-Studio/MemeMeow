@@ -2,6 +2,7 @@
 /** 图片库工作区：管理筛选、选择、语境重试、缓存任务和加入合集流程。 */
 import { computed, onMounted, shallowRef, watch } from 'vue'
 import { api } from '../api'
+import { showTaskDiagnostics } from '../config/debug'
 import type { CollectionSummary, CoreImageProcessingStage, ImageProcessingOptions, ImageProcessingStage, MemeImage, SelectedImageRetryMode, ServiceConfig, TaskItem, UnreadyProcessingResponse } from '../types'
 import {
   embeddingLabel,
@@ -226,7 +227,7 @@ function retryResultMessage(result: RetryResult): string {
   if (category === 'conflict') return `选项冲突${result.error ? `：${result.error}` : ''}`
   if (category === 'failed') return `提交失败${result.error ? `：${result.error}` : ''}`
   if (category === 'reused') return '已复用处理任务'
-  return `已提交处理任务${result.processing_job_id ? `（${result.processing_job_id}）` : ''}`
+  return `已提交处理任务${showTaskDiagnostics && result.processing_job_id ? `（${result.processing_job_id}）` : ''}`
 }
 
 /** 只有父 Job 已将自动命名收束为 warning 时才显示独立恢复入口。 */
@@ -458,7 +459,7 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
     <div v-if="retryNotice" class="inline-notice" role="status">{{ retryNotice }}</div>
     <ul v-if="retryDetails.length" class="processing-result-details" aria-label="完整重试逐图结果">
       <li v-for="result in retryDetails" :key="result.meme_id" :class="retryResultCategory(result)">
-        <strong>{{ result.meme_id }}</strong>
+        <strong v-if="showTaskDiagnostics">{{ result.meme_id }}</strong>
         <span>{{ retryResultMessage(result) }}</span>
       </li>
     </ul>

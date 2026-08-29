@@ -2,6 +2,7 @@
 /** 处理任务工作区：管理筛选、分页、轮询和详情打开状态。 */
 import { computed, onBeforeUnmount, onMounted, shallowRef } from 'vue'
 import { api } from '../api'
+import { showTaskDiagnostics } from '../config/debug'
 import type { ImageProcessingJob, ImageProcessingTerminalEvent, TaskItem } from '../types'
 import {
   errorMessage,
@@ -253,7 +254,13 @@ onBeforeUnmount(() => {
       <details v-for="job in processingJobs" :key="job.job_id" class="processing-job">
         <summary class="processing-job-parent">
           <span class="task-status-cell"><i :class="`status-dot ${job.status}`" aria-hidden="true"></i>{{ taskStatusLabel(job.status) }}</span>
-          <span><strong>完整图片处理</strong><small> Job #{{ job.revision }} · {{ job.meme_id }}</small></span>
+          <span>
+            <strong>完整图片处理</strong>
+            <small>
+              <template v-if="showTaskDiagnostics">Job #{{ job.revision }} · 图片 ID {{ job.meme_id }} · Job ID {{ job.job_id }}</template>
+              <template v-else>第 {{ job.revision }} 次处理</template>
+            </small>
+          </span>
           <span class="task-source">{{ submissionModeLabel('pipeline') }}</span>
           <span>{{ job.current_stage ? imageStageLabel(job.current_stage) : processingPipelineLabel(job) }}</span>
           <span>{{ job.progress == null ? '—' : `${Math.round(job.progress * 100)}%` }}</span>
@@ -264,7 +271,8 @@ onBeforeUnmount(() => {
           <button v-for="stage in job.stages" :key="`${job.job_id}:${stage.stage}`" class="task-stage-row" type="button" :disabled="!stage.task_id" @click="stage.task_id && openTask(stage.task_id, $event)">
             <span><i :class="`status-dot ${stage.status}`" aria-hidden="true"></i>{{ imageStageLabel(stage.stage) }}</span>
             <span>{{ imageStageStatusLabel(stage.status) }}</span>
-            <span>{{ stage.task_id || (stage.status === 'skipped' ? '未启用' : '等待创建叶子任务') }}</span>
+            <span v-if="showTaskDiagnostics">{{ stage.task_id || (stage.status === 'skipped' ? '未启用' : '等待创建叶子任务') }}</span>
+            <span v-else>{{ stage.attempt != null ? `第 ${stage.attempt} 次尝试` : stage.status === 'skipped' ? '未启用' : '—' }}</span>
             <span v-if="stage.error" class="task-error">{{ stage.error.error || '阶段失败' }}</span>
             <span v-if="stage.status === 'warning'" class="task-error warning">处理完成，自动重命名未完成</span>
           </button>

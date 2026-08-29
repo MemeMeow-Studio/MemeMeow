@@ -113,7 +113,7 @@ describe('TasksWorkspace', () => {
       has_warnings: false,
       warnings: [],
       stages: [
-        { stage: 'visual', status: 'succeeded', task_id: 'visual-1' },
+        { stage: 'visual', status: 'succeeded', task_id: 'visual-1', attempt: 1 },
         { stage: 'agent', status: 'running', task_id: 'agent-1' },
         { stage: 'auto_rename', status: 'skipped' },
         { stage: 'text_embedding', status: 'succeeded', task_id: 'text-1' },
@@ -126,6 +126,10 @@ describe('TasksWorkspace', () => {
     expect(wrapper.text()).toContain('Agent 语境处理中')
     expect(wrapper.text()).toContain('自动重命名未启用')
     expect(wrapper.text()).toContain('未启用')
+    expect(wrapper.text()).toContain('第 1 次尝试')
+    expect(wrapper.text()).not.toContain('meme-1')
+    expect(wrapper.text()).not.toContain('job-1')
+    expect(wrapper.text()).not.toContain('visual-1')
     wrapper.unmount()
   })
 

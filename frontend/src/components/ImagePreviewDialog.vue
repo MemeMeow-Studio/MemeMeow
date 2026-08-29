@@ -3,6 +3,7 @@
 import { computed, shallowRef } from 'vue'
 import { api } from '../api'
 import { useModalDialog } from '../composables/useModalDialog'
+import { showTaskDiagnostics } from '../config/debug'
 import type { ImageProcessingStage, MemeImage } from '../types'
 import { formatTaskTime, imageStageLabel, imageStageStatusLabel, taskStatusLabel } from '../utils/presentation'
 
@@ -241,13 +242,16 @@ const metadataFile = computed(() => {
   const sha256 = shortenSha256(identity.sha256 ?? metadataPayload.value?.sha256)
   return { filename, relativePath, extension, size, sha256 }
 })
-const metadataFileDetails = computed<FileDetail[]>(() => [
-  { label: '文件名', value: metadataFile.value.filename },
-  { label: '相对路径', value: metadataFile.value.relativePath },
-  { label: '格式', value: metadataFile.value.extension },
-  { label: '大小', value: metadataFile.value.size },
-  { label: 'SHA-256', value: metadataFile.value.sha256 },
-].filter((item) => item.value))
+const metadataFileDetails = computed<FileDetail[]>(() => {
+  const details: FileDetail[] = [
+    { label: '文件名', value: metadataFile.value.filename },
+    { label: '相对路径', value: metadataFile.value.relativePath },
+    { label: '格式', value: metadataFile.value.extension },
+    { label: '大小', value: metadataFile.value.size },
+  ]
+  if (showTaskDiagnostics) details.push({ label: 'SHA-256', value: metadataFile.value.sha256 })
+  return details.filter((item) => item.value)
+})
 
 useModalDialog({
   dialog,
@@ -397,7 +401,7 @@ void loadMetadata()
                   </section>
                 </div>
               </details>
-              <details v-if="!loading && previewJsonText" class="metadata-details">
+              <details v-if="showTaskDiagnostics && !loading && previewJsonText" class="metadata-details">
                 <summary>原始 JSON</summary>
                 <pre class="metadata-json" tabindex="0" aria-label="原始元数据 JSON">{{ previewJsonText }}</pre>
               </details>
@@ -407,7 +411,7 @@ void loadMetadata()
             <div class="image-processing-details-head">
               <div>
                 <h3 id="image-processing-details-title">处理阶段</h3>
-                <p v-if="image.processing_job_id">完整处理 Job：{{ image.processing_job_id }}</p>
+                <p v-if="showTaskDiagnostics && image.processing_job_id">完整处理 Job：{{ image.processing_job_id }}</p>
               </div>
               <span v-if="image.processing_status" class="processing-overall-status">{{ taskStatusLabel(image.processing_status) }}</span>
             </div>

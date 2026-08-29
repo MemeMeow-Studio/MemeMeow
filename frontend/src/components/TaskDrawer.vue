@@ -2,6 +2,7 @@
 /** 任务详情抽屉：展示任务公共字段，并提供一致的模态键盘闭环。 */
 import { computed, shallowRef, watch } from 'vue'
 import { useModalDialog } from '../composables/useModalDialog'
+import { showTaskDiagnostics } from '../config/debug'
 import type { TaskItem } from '../types'
 import { formatTaskTime, imageStageLabel, imageStageStatusLabel, taskActivity, taskStatusLabel, taskTypeLabel } from '../utils/presentation'
 
@@ -75,6 +76,8 @@ useModalDialog({
         <div><dt>状态</dt><dd>{{ taskStatusLabel(task.status) }}</dd></div>
         <div><dt>类型</dt><dd>{{ taskTypeLabel(task.task_type) }}</dd></div>
         <div><dt>阶段</dt><dd>{{ taskStage ? `${imageStageLabel(taskStage)}：${imageStageStatusLabel(task.image_stage_status || (autoRenameRetryable ? 'warning' : task.status))}` : task.message || '—' }}</dd></div>
+        <div v-if="showTaskDiagnostics"><dt>任务 ID</dt><dd class="task-identifier">{{ task.task_id }}</dd></div>
+        <div v-if="showTaskDiagnostics && task.processing_job_id"><dt>处理 Job ID</dt><dd class="task-identifier">{{ task.processing_job_id }}</dd></div>
         <div v-if="activity" class="task-activity-detail">
           <dt>Agent 工作回合</dt>
           <dd>

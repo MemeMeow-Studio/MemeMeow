@@ -88,7 +88,7 @@ describe('ImagePreviewDialog', () => {
     wrapper.unmount()
   })
 
-  it('默认折叠更多信息和原始 JSON，并安全展示文件、来源与诊断', async () => {
+  it('默认折叠更多信息并隐藏技术标识，同时安全展示文件和来源', async () => {
     const payload = metadataPayload('ready', {
       title: '标题',
       source_urls: ['https://example.com/articles/meme', 'javascript:alert(1)', '/local/source'],
@@ -103,7 +103,7 @@ describe('ImagePreviewDialog', () => {
     const wrapper = await mountDialog(payload)
 
     const details = wrapper.findAll('.metadata-details')
-    expect(details).toHaveLength(2)
+    expect(details).toHaveLength(1)
     expect(details.every((item) => item.element.open)).toBe(false)
     expect(wrapper.findAll('button').some((button) => button.text().includes('复制元数据'))).toBe(false)
 
@@ -114,7 +114,7 @@ describe('ImagePreviewDialog', () => {
     expect(detailText).not.toContain('/srv/private/sample.png')
     expect(detailText).toContain('PNG')
     expect(detailText).toContain('2.0 KB')
-    expect(detailText).toContain('aaaaaaaaaaaa...')
+    expect(detailText).not.toContain('aaaaaaaaaaaa...')
     expect(detailText).toContain('外部来源')
     expect(detailText).toContain('example.com')
     expect(detailText).toContain('https://example.com/articles/meme')
@@ -135,9 +135,7 @@ describe('ImagePreviewDialog', () => {
     expect(source.attributes('href')).toBe('https://example.com/articles/meme')
     expect(source.attributes('title')).toBe('https://example.com/articles/meme')
 
-    await details[1].get('summary').trigger('click')
-    expect(wrapper.get('.metadata-json').text()).toContain('"context_status": "ready"')
-    expect(wrapper.get('.metadata-json').attributes('tabindex')).toBe('0')
+    expect(wrapper.find('.metadata-json').exists()).toBe(false)
     expect(wrapper.get('.image-processing-details').text()).toContain('Agent 语境')
     wrapper.unmount()
   })
