@@ -266,6 +266,10 @@ button, input, select, textarea { border-radius: var(--radius-control); }
 .task-drawer dl > div { display: grid; gap: 5px; }
 .task-drawer dt { color: var(--muted); font-size: 14px; }
 .task-drawer dd { margin: 0; overflow-wrap: anywhere; color: var(--ink-soft); font-size: 16px; }
+.task-image-preview { display: grid; gap: 8px; min-width: 0; margin: 0 0 24px; }
+.task-image-preview img { display: block; width: 100%; max-height: 240px; object-fit: contain; border: 1px solid var(--line); border-radius: 6px; background: var(--workspace); }
+.task-image-preview figcaption { min-width: 0; overflow-wrap: anywhere; color: var(--muted); font-size: 14px; line-height: 1.35; }
+.task-image-unavailable { margin: 0; border: 1px dashed var(--line-strong); padding: 18px 14px; color: var(--muted); background: var(--workspace); font-size: 14px; line-height: 1.4; text-align: center; }
 .task-activity-detail dd { display: grid; gap: 6px; }
 .task-activity-detail strong { color: var(--info); font-weight: 700; }
 .task-activity-detail time { color: var(--muted); font-size: 14px; }
@@ -412,6 +416,14 @@ button, input, select, textarea { border-radius: var(--radius-control); }
 
 @media (max-width: 1024px) {
   .task-head { display: none; }
+  /* 任务层级在窄屏改为两列可换行布局，保留状态与时间的扫描顺序。 */
+  .processing-job-parent { grid-template-columns: minmax(0, 1fr) auto; row-gap: 7px; min-height: 0; padding: 14px 6px; }
+  .processing-job-parent > span, .processing-job-parent time { min-width: 0; overflow-wrap: anywhere; white-space: normal; }
+  .processing-job-parent time { grid-column: 2; grid-row: 1; text-align: right; white-space: nowrap; }
+  .processing-job-stages { padding-left: 0; }
+  .task-stage-row { grid-template-columns: minmax(0, 1fr) auto; row-gap: 7px; min-width: 0; }
+  .task-stage-row > span { min-width: 0; overflow-wrap: anywhere; }
+  .task-stage-row > span:nth-child(n + 3) { grid-column: 1 / -1; }
   .task-row { grid-template-columns: minmax(0, 1fr) auto; row-gap: 7px; min-height: 0; padding: 14px 6px; }
   .task-row > span, .task-row time { grid-column: 1; white-space: normal; }
   .task-row time { grid-column: 2; grid-row: 1; padding: 0; text-align: right; font-size: 13px; white-space: nowrap; }

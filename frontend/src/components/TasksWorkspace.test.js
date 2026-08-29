@@ -1,5 +1,6 @@
 /** 任务工作区轮询终止和卸载竞态的行为测试。 */
 import { flushPromises, mount } from '@vue/test-utils'
+import { nextTick } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { tasks, task, context, processingJobs, retryProcessingJob, submitImageStage } = vi.hoisted(() => ({
@@ -125,6 +126,55 @@ describe('TasksWorkspace', () => {
     expect(wrapper.text()).toContain('Agent 语境处理中')
     expect(wrapper.text()).toContain('自动重命名未启用')
     expect(wrapper.text()).toContain('未启用')
+    wrapper.unmount()
+  })
+
+  it('父 Job 默认折叠，展开后点击子任务显示图片并恢复焦点', async () => {
+    tasks.mockResolvedValue({ items: [], next_cursor: null })
+    processingJobs.mockResolvedValue({ items: [{
+      task_id: 'job-task',
+      task_type: 'image_processing',
+      job_id: 'job-1',
+      meme_id: 'meme-1',
+      processing_job_id: 'job-1',
+      revision: 1,
+      image_sha256: 'sha',
+      reverse_image_policy: 'forbid',
+      status: 'succeeded',
+      stages: [{ stage: 'visual', status: 'succeeded', task_id: 'visual-1' }],
+    }] })
+    task.mockResolvedValue({
+      task_id: 'visual-1',
+      task_type: 'visual_embedding_generation',
+      submission_mode: 'pipeline',
+      image_stage: 'visual',
+      processing_job_id: 'job-1',
+      status: 'succeeded',
+      image: { meme_id: 'meme-1', filename: 'sample.png', media_url: '/media/meme-1' },
+    })
+
+    const wrapper = mount(TasksWorkspace, { attachTo: document.body })
+    await flushPromises()
+
+    const parent = wrapper.get('.processing-job')
+    expect(parent.element.open).toBe(false)
+    await parent.get('.processing-job-parent').trigger('click')
+    expect(parent.element.open).toBe(true)
+
+    const child = wrapper.get('.task-stage-row')
+    await child.trigger('click')
+    await flushPromises()
+
+    expect(task).toHaveBeenCalledWith('visual-1')
+    expect(wrapper.get('.task-image-preview img').attributes()).toMatchObject({
+      src: '/media/meme-1',
+      alt: '处理图片：sample.png',
+    })
+    expect(document.activeElement).toBe(wrapper.get('[aria-label="关闭任务详情"]').element)
+
+    await wrapper.get('[aria-label="关闭任务详情"]').trigger('click')
+    await nextTick()
+    expect(document.activeElement).toBe(child.element)
     wrapper.unmount()
   })
 

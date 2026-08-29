@@ -309,3 +309,68 @@ test('检索结果在延迟加载后仍只写入图片剪贴板', async ({ page,
   expect(clipboard.types).toEqual(['image/png'])
   expect(clipboard.imageBytes).toBeGreaterThan(0)
 })
+
+/** 使用真实浏览器核对父 Job 默认折叠、子任务图片抽屉和窄屏布局。 */
+test('处理任务父 Job 默认折叠并在子任务详情显示图片', async ({ page }) => {
+  const mediaUrl = 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs='
+  await page.route('**/api/tasks?**', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ items: [], next_cursor: null }),
+  }))
+  await page.route('**/api/images/processing?**', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ items: [{
+      task_id: 'job-task',
+      task_type: 'image_processing',
+      job_id: 'job-1',
+      meme_id: 'meme-1',
+      processing_job_id: 'job-1',
+      revision: 1,
+      image_sha256: 'a'.repeat(64),
+      reverse_image_policy: 'forbid',
+      status: 'succeeded',
+      stages: [{ stage: 'visual', status: 'succeeded', task_id: 'visual-1' }],
+    }] }),
+  }))
+  await page.route('**/api/tasks/visual-1', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      task_id: 'visual-1',
+      task_type: 'visual_embedding_generation',
+      submission_mode: 'pipeline',
+      image_stage: 'visual',
+      processing_job_id: 'job-1',
+      status: 'succeeded',
+      image: { meme_id: 'meme-1', filename: 'sample.png', media_url: mediaUrl },
+    }),
+  }))
+
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await page.goto('/')
+  await page.getByRole('button', { name: '处理任务' }).click()
+
+  const parent = page.locator('.processing-job').first()
+  await expect(parent).toBeVisible()
+  await expect.poll(() => parent.evaluate((element) => element.open)).toBe(false)
+  await parent.locator('summary').click()
+  await expect.poll(() => parent.evaluate((element) => element.open)).toBe(true)
+
+  await parent.locator('.task-stage-row').click()
+  const drawer = page.getByRole('dialog', { name: '任务详情' })
+  await expect(drawer).toBeVisible()
+  await expect(drawer.locator('.task-image-preview img')).toHaveAttribute('src', mediaUrl)
+  await expect(drawer.locator('.task-image-preview img')).toHaveAttribute('alt', '处理图片：sample.png')
+
+  const desktopBox = await drawer.boundingBox()
+  expect(desktopBox).not.toBeNull()
+  expect(desktopBox.x + desktopBox.width).toBeLessThanOrEqual(1440)
+
+  await page.setViewportSize({ width: 320, height: 844 })
+  const mobileBox = await drawer.boundingBox()
+  expect(mobileBox).not.toBeNull()
+  expect(mobileBox.x + mobileBox.width).toBeLessThanOrEqual(320)
+  await expect(page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).resolves.toBe(true)
+})

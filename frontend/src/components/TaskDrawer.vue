@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /** 任务详情抽屉：展示任务公共字段，并提供一致的模态键盘闭环。 */
-import { computed, shallowRef } from 'vue'
+import { computed, shallowRef, watch } from 'vue'
 import { useModalDialog } from '../composables/useModalDialog'
 import type { TaskItem } from '../types'
 import { formatTaskTime, imageStageLabel, imageStageStatusLabel, taskActivity, taskStatusLabel, taskTypeLabel } from '../utils/presentation'
@@ -21,6 +21,12 @@ const emit = defineEmits<{
 const drawer = shallowRef<HTMLElement | null>(null)
 const closeButton = shallowRef<HTMLElement | null>(null)
 const activity = computed(() => taskActivity(props.task))
+/** 只使用任务摘要中的受控媒体地址，历史图片缺少地址时不拼接路径。 */
+const imageUrl = computed(() => typeof props.task.image?.media_url === 'string' ? props.task.image.media_url : '')
+/** 为图片提供稳定的文件名或 Meme 标识，供替代文本和抽屉说明使用。 */
+const imageLabel = computed(() => props.task.image?.filename || props.task.image?.meme_id || '关联图片')
+const imageLoadFailed = shallowRef(false)
+const showTaskImage = computed(() => Boolean(imageUrl.value) && !imageLoadFailed.value)
 const isImageStage = computed(() => ['visual_embedding_generation', 'meme_context_generation', 'image_auto_rename', 'text_embedding_generation'].includes(props.task.task_type))
 const taskStage = computed(() => props.task.image_stage || (props.task.task_type === 'image_auto_rename' ? 'auto_rename' : null))
 const autoRenameRetryable = computed(() => {
@@ -35,6 +41,15 @@ const canRetryStage = computed(() => {
 })
 const canRetryFull = computed(() => props.task.submission_mode === 'pipeline' && props.task.task_type !== 'image_auto_rename' && taskStage.value !== 'auto_rename' && !!props.task.processing_job_id && ['failed', 'blocked', 'unknown_execution'].includes(props.task.status))
 const canRetryLegacy = computed(() => props.task.task_type === 'meme_context_generation' && props.task.status === 'failed' && props.task.submission_mode == null && !props.task.read_only)
+
+/** 图片媒体请求失败时显示缺图状态，避免抽屉保留破损图片图标。 */
+function handleImageError(): void {
+  imageLoadFailed.value = true
+}
+
+watch(() => props.task.task_id, () => {
+  imageLoadFailed.value = false
+})
 
 useModalDialog({
   dialog: drawer,
@@ -51,6 +66,11 @@ useModalDialog({
         <h2>任务详情</h2>
         <button ref="closeButton" class="quiet" type="button" aria-label="关闭任务详情" @click="emit('close')">关闭</button>
       </div>
+      <figure v-if="task.image" class="task-image-preview">
+        <img v-if="showTaskImage" :src="imageUrl" :alt="`处理图片：${imageLabel}`" @error="handleImageError" />
+        <figcaption v-if="showTaskImage">{{ imageLabel }}</figcaption>
+        <p v-else class="task-image-unavailable" role="status">关联图片暂不可用</p>
+      </figure>
       <dl>
         <div><dt>状态</dt><dd>{{ taskStatusLabel(task.status) }}</dd></div>
         <div><dt>类型</dt><dd>{{ taskTypeLabel(task.task_type) }}</dd></div>

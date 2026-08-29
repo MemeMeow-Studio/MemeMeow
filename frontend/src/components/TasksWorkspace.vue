@@ -250,7 +250,7 @@ onBeforeUnmount(() => {
     </div>
     <div class="task-table" :class="{ loading }" role="table" aria-label="处理任务列表">
       <div class="task-head" role="row"><span role="columnheader">状态</span><span role="columnheader">类型</span><span role="columnheader">来源</span><span role="columnheader">关联图片</span><span role="columnheader">进度</span><span role="columnheader">最近更新</span></div>
-      <details v-for="job in processingJobs" :key="job.job_id" class="processing-job" open>
+      <details v-for="job in processingJobs" :key="job.job_id" class="processing-job">
         <summary class="processing-job-parent">
           <span class="task-status-cell"><i :class="`status-dot ${job.status}`" aria-hidden="true"></i>{{ taskStatusLabel(job.status) }}</span>
           <span><strong>完整图片处理</strong><small> Job #{{ job.revision }} · {{ job.meme_id }}</small></span>
@@ -261,7 +261,7 @@ onBeforeUnmount(() => {
         </summary>
         <p v-if="job.has_warnings" class="inline-notice warning" role="status">处理已完成，自动重命名未完成</p>
         <div class="processing-job-stages">
-          <button v-for="stage in job.stages" :key="`${job.job_id}:${stage.stage}`" class="task-stage-row" type="button" :disabled="!stage.task_id" @click="stage.task_id && openTask(stage.task_id)">
+          <button v-for="stage in job.stages" :key="`${job.job_id}:${stage.stage}`" class="task-stage-row" type="button" :disabled="!stage.task_id" @click="stage.task_id && openTask(stage.task_id, $event)">
             <span><i :class="`status-dot ${stage.status}`" aria-hidden="true"></i>{{ imageStageLabel(stage.stage) }}</span>
             <span>{{ imageStageStatusLabel(stage.status) }}</span>
             <span>{{ stage.task_id || (stage.status === 'skipped' ? '未启用' : '等待创建叶子任务') }}</span>

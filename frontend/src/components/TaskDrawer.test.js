@@ -121,4 +121,34 @@ describe('TaskDrawer', () => {
     expect(wrapper.findAll('.task-drawer > .quiet').some((button) => !button.attributes('aria-label'))).toBe(false)
     expect(wrapper.find('.task-drawer > .primary').exists()).toBe(false)
   })
+
+  it('显示关联图片并在媒体地址缺失时安全降级', async () => {
+    const task = {
+      task_id: 'task-image',
+      task_type: 'visual_embedding_generation',
+      status: 'succeeded',
+      image: { meme_id: 'meme-1', filename: 'sample.png', media_url: '/media/meme-1' },
+    }
+    wrapper = mount(TaskDrawer, { props: { task } })
+    await nextTick()
+
+    expect(wrapper.get('.task-image-preview img').attributes()).toMatchObject({
+      src: '/media/meme-1',
+      alt: '处理图片：sample.png',
+    })
+
+    await wrapper.get('.task-image-preview img').trigger('error')
+    await nextTick()
+    expect(wrapper.find('.task-image-preview img').exists()).toBe(false)
+    expect(wrapper.get('.task-image-unavailable').text()).toContain('关联图片暂不可用')
+
+    await wrapper.setProps({ task: { ...task, task_id: 'task-missing-url', image: { meme_id: 'meme-1', filename: 'sample.png' } } })
+    await nextTick()
+    expect(wrapper.find('.task-image-preview img').exists()).toBe(false)
+    expect(wrapper.get('.task-image-unavailable').text()).toContain('关联图片暂不可用')
+
+    await wrapper.setProps({ task: { ...task, task_id: 'task-no-image', image: undefined } })
+    await nextTick()
+    expect(wrapper.find('.task-image-preview').exists()).toBe(false)
+  })
 })

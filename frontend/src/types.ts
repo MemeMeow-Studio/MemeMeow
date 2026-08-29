@@ -102,6 +102,13 @@ export interface AgentActivityView {
   ariaLabel: string
 }
 
+/** 任务详情关联图片的公开摘要，媒体地址缺省时表示图片当前不可读取。 */
+export interface TaskImage {
+  meme_id: string
+  filename?: string
+  media_url?: string
+}
+
 export interface TaskItem {
   task_id: string
   task_type: string
@@ -119,7 +126,7 @@ export interface TaskItem {
   created_at?: string
   updated_at?: string
   completed_at?: string
-  image?: Pick<MemeImage, 'meme_id' | 'filename'>
+  image?: TaskImage
   error?: { error?: string; message?: string }
   result?: {
     auto_named?: boolean
