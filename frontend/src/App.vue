@@ -3,13 +3,14 @@
 import { computed, onMounted, shallowRef } from 'vue'
 import { api, pollTask } from './api'
 import AppHeader from './components/AppHeader.vue'
+import AppFooter from './components/AppFooter.vue'
 import CollectionsWorkspace from './components/CollectionsWorkspace.vue'
 import LibraryWorkspace from './components/LibraryWorkspace.vue'
 import SearchWorkspace from './components/SearchWorkspace.vue'
 import TasksWorkspace from './components/TasksWorkspace.vue'
 import UploadWorkspace from './components/UploadWorkspace.vue'
 import WorkspaceNav from './components/WorkspaceNav.vue'
-import type { ImageProcessingTerminalEvent, NavigationItem, PageId, ServiceConfig, TaskItem } from './types'
+import type { ImageProcessingTerminalEvent, NavigationItem, PageId, RepositoryMetadata, ServiceConfig, TaskItem } from './types'
 import { errorMessage } from './utils/presentation'
 
 const pages: NavigationItem[] = [
@@ -23,6 +24,8 @@ const pages: NavigationItem[] = [
 const page = shallowRef<PageId>('search')
 const error = shallowRef('')
 const config = shallowRef<ServiceConfig | null>(null)
+const repositoryMetadata = shallowRef<RepositoryMetadata | null>(null)
+const repositoryMetadataLoading = shallowRef(true)
 const cacheTask = shallowRef<TaskItem | null>(null)
 const cacheBusy = shallowRef(false)
 const libraryRefreshToken = shallowRef(0)
@@ -97,7 +100,19 @@ async function generateCache(): Promise<void> {
   }
 }
 
+/** 加载页脚所需的 GitHub 公开元数据；失败时保持工作台可用并显示降级状态。 */
+async function loadRepositoryMetadata(): Promise<void> {
+  try {
+    repositoryMetadata.value = await api.repositoryMetadata() as RepositoryMetadata
+  } catch {
+    repositoryMetadata.value = null
+  } finally {
+    repositoryMetadataLoading.value = false
+  }
+}
+
 onMounted(async () => {
+  void loadRepositoryMetadata()
   try {
     config.value = await api.config()
   } catch (reason) {
@@ -138,5 +153,6 @@ onMounted(async () => {
         <TasksWorkspace v-else :initial-task-id="pendingTaskId" @error="showError" @image-processing-terminal="handleImageProcessingTerminal" />
       </main>
     </div>
+    <AppFooter :metadata="repositoryMetadata" :loading="repositoryMetadataLoading" />
   </div>
 </template>

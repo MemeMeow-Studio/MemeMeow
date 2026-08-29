@@ -141,7 +141,7 @@ async function runSearch(): Promise<void> {
   <section class="workspace search-workspace" :aria-busy="busy">
     <div class="section-head">
       <div>
-        <h1>找到合适的表达</h1>
+        <h1>通过自然语言检索表情包</h1>
       </div>
       <span class="cache-pill" :class="{ ready: config }">{{ config ? 'API 已连接' : '等待连接' }}</span>
     </div>

@@ -2,10 +2,11 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { search, images, imageMetadata, contextBatch, retryImageStagesBatch, unreadyProcessing, generateCache, pollTask, tasks, task } = vi.hoisted(() => ({ search: vi.fn(), images: vi.fn(), imageMetadata: vi.fn(), contextBatch: vi.fn(), retryImageStagesBatch: vi.fn(), unreadyProcessing: vi.fn(), generateCache: vi.fn(), pollTask: vi.fn(), tasks: vi.fn(), task: vi.fn() }))
+const { search, images, imageMetadata, contextBatch, retryImageStagesBatch, unreadyProcessing, generateCache, pollTask, tasks, task, repositoryMetadata } = vi.hoisted(() => ({ search: vi.fn(), images: vi.fn(), imageMetadata: vi.fn(), contextBatch: vi.fn(), retryImageStagesBatch: vi.fn(), unreadyProcessing: vi.fn(), generateCache: vi.fn(), pollTask: vi.fn(), tasks: vi.fn(), task: vi.fn(), repositoryMetadata: vi.fn() }))
 vi.mock('./api', () => ({
   api: {
     config: vi.fn(async () => ({ embedding_model: 'test-model', embedding_cache_ready: false })),
+    repositoryMetadata,
     search,
     images,
     imageMetadata,
@@ -32,6 +33,7 @@ describe('App', () => {
     unreadyProcessing.mockReset().mockResolvedValue({ target_count: 0, submitted_count: 0, reused_count: 0, conflict_count: 0, failed_count: 0, results: [] })
     tasks.mockReset().mockResolvedValue({ items: [], next_cursor: null })
     task.mockReset().mockResolvedValue(null)
+    repositoryMetadata.mockReset().mockResolvedValue({ stars: 1260, commitHash: '543d876521581ecf2baa88c80814e4cedae83252' })
     generateCache.mockReset()
     pollTask.mockReset()
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: vi.fn() } })
@@ -49,6 +51,16 @@ describe('App', () => {
     await flushPromises()
     expect(search).toHaveBeenCalledWith({ query: '开心', n_results: 8, llm_enhance: false })
     expect(wrapper.get('.result-item img').attributes('src')).toBe('/media/11111111-1111-4111-8111-111111111111')
+  })
+
+  it('页脚展示仓库链接、动态 Stars 和提交哈希', async () => {
+    const wrapper = mount(App)
+    await flushPromises()
+
+    expect(wrapper.get('.repository-link').attributes('href')).toBe('https://github.com/MemeMeow-Studio/MemeMeow')
+    expect(wrapper.get('.repository-stars').text()).toBe('1,260')
+    expect(wrapper.get('.repository-hash').text()).toBe('543d876')
+    expect(wrapper.get('.repository-hash').attributes('title')).toBe('543d876521581ecf2baa88c80814e4cedae83252')
   })
 
   it('检索失败后显示可关闭错误并恢复提交按钮', async () => {

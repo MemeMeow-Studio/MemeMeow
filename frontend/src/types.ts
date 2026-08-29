@@ -21,6 +21,12 @@ export interface ServiceConfig {
   max_request_bytes?: number | null
 }
 
+/** GitHub 仓库页脚展示的动态公开元数据；单项不可用时保留另一项。 */
+export interface RepositoryMetadata {
+  stars: number | null
+  commitHash: string | null
+}
+
 export interface ImageProcessingOptions {
   reverse_image_policy: 'forbid' | 'auto'
   auto_name: boolean

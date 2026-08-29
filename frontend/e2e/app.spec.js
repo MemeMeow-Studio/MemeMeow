@@ -17,6 +17,16 @@ test.beforeEach(async ({ page }) => {
     contentType: 'application/json',
     body: JSON.stringify({ items: [], next_cursor: null }),
   }))
+  await page.route('https://api.github.com/repos/MemeMeow-Studio/MemeMeow', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ stargazers_count: 1260 }),
+  }))
+  await page.route('https://api.github.com/repos/MemeMeow-Studio/MemeMeow/commits?per_page=1', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify([{ sha: '543d876521581ecf2baa88c80814e4cedae83252' }]),
+  }))
 })
 
 test('上传选项先取消再确认，并发送两项处理选项', async ({ page }) => {
@@ -160,10 +170,15 @@ test('重试选中默认可选择并按指定阶段提交', async ({ page }) => 
   await expect(page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).resolves.toBe(true)
   await page.screenshot({ path: '/home/infstellar/vscode/MemeMeow/frontend/test-results/retry-selected-mobile.png', fullPage: true })
   await dialog.getByRole('button', { name: '重试已选部分（2）' }).click()
+  const optionsDialog = page.getByRole('dialog', { name: '图片处理选项' })
+  await expect(optionsDialog).toBeVisible()
+  await optionsDialog.getByRole('button', { name: '确认并提交' }).click()
   await expect.poll(() => stageRequests.length).toBe(1)
   expect(stageRequests[0].postDataJSON()).toEqual({
     items: [{ meme_id: '55555555-5555-4555-8555-555555555555' }],
     stages: ['agent', 'text_embedding'],
+    reverse_image_policy: 'forbid',
+    auto_name: false,
   })
   expect(consoleErrors).toEqual([])
 })
@@ -172,7 +187,10 @@ test('首页可加载并切换核心工作区', async ({ page }) => {
   await page.goto('/')
   await expect(page).toHaveTitle('MemeMeow')
   await expect(page.getByText('API 已连接')).toBeVisible()
-  await expect(page.getByRole('heading', { name: '找到合适的表达' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '通过自然语言检索表情包' })).toBeVisible()
+  await expect(page.getByRole('link', { name: 'MemeMeow GitHub 仓库' })).toHaveAttribute('href', 'https://github.com/MemeMeow-Studio/MemeMeow')
+  await expect(page.locator('.repository-stars')).toHaveText('1,260')
+  await expect(page.locator('.repository-hash')).toHaveText('543d876')
   await page.getByRole('button', { name: '图片库' }).click()
   await expect(page.getByRole('heading', { name: '图片库', exact: true })).toBeVisible()
   await page.getByRole('button', { name: '上传' }).click()

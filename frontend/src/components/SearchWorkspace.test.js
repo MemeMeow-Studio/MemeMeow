@@ -46,6 +46,14 @@ describe('SearchWorkspace', () => {
     copyImage.mockReset()
   })
 
+  it('使用自然语言检索标题并移除辅助小字', () => {
+    const wrapper = mount(SearchWorkspace, { props: { config: null } })
+
+    expect(wrapper.get('h1').text()).toBe('通过自然语言检索表情包')
+    expect(wrapper.find('.section-head p').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
   it('按 result_media 关联缩略图，原图预加载成功后替换可见图片', async () => {
     const wrapper = mount(SearchWorkspace, { props: { config: null } })
     await runSearch(wrapper)

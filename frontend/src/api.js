@@ -1,5 +1,7 @@
 /** 统一封装后端请求、错误结构和任务轮询。 */
 const API_BASE = import.meta.env.VITE_API_BASE ?? (import.meta.env.DEV ? '/api' : '')
+const REPOSITORY_API_BASE = 'https://api.github.com/repos/MemeMeow-Studio/MemeMeow'
+const REPOSITORY_REQUEST_TIMEOUT_MS = 8_000
 
 /** 将客户端处理选项收束为服务端接受的安全形状，避免旧调用方传入非法值。 */
 function normalizeImageProcessingOptions(options = {}) {
@@ -7,6 +9,42 @@ function normalizeImageProcessingOptions(options = {}) {
     reverse_image_policy: options?.reverse_image_policy === 'auto' ? 'auto' : 'forbid',
     auto_name: options?.auto_name === true,
   }
+}
+
+/** 请求 GitHub 公开 JSON 接口；仓库统计不经过本地业务 API 代理。 */
+async function githubJson(path) {
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), REPOSITORY_REQUEST_TIMEOUT_MS)
+  try {
+    const response = await fetch(`${REPOSITORY_API_BASE}${path}`, {
+      headers: { Accept: 'application/vnd.github+json' },
+      signal: controller.signal,
+    })
+    const data = await response.json().catch(() => null)
+    if (!response.ok) throw new Error('repository_metadata_failed')
+    return data
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
+
+/** 判断 GitHub 返回的 star 数是否为可安全展示的非负整数。 */
+function validStarCount(value) {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0
+}
+
+/** 并行读取仓库 star 数和默认分支最新提交，允许单项失败时继续展示另一项。 */
+async function fetchRepositoryMetadata() {
+  const [repositoryResult, commitResult] = await Promise.allSettled([
+    githubJson(''),
+    githubJson('/commits?per_page=1'),
+  ])
+  const repository = repositoryResult.status === 'fulfilled' ? repositoryResult.value : null
+  const commits = commitResult.status === 'fulfilled' ? commitResult.value : null
+  const stars = validStarCount(repository?.stargazers_count) ? repository.stargazers_count : null
+  const commitHash = typeof commits?.[0]?.sha === 'string' && commits[0].sha.trim() ? commits[0].sha.trim() : null
+  if (stars === null && commitHash === null) throw new Error('repository_metadata_unavailable')
+  return { stars, commitHash }
 }
 
 export async function request(path, options = {}) {
@@ -35,6 +73,7 @@ export async function request(path, options = {}) {
 
 export const api = {
   config: () => request('/config'),
+  repositoryMetadata: () => fetchRepositoryMetadata(),
   search: (payload) => request('/search', { method: 'POST', body: JSON.stringify(payload) }),
   images: (params = {}) => request(`/images?${new URLSearchParams(params)}`),
   imageMetadata: (value) => {

@@ -71,6 +71,25 @@ describe('请求封装', () => {
     expect(api.collectionExportUrl('collection/1')).toBe('/api/collections/collection%2F1/export')
   })
 
+  it('并行读取 GitHub 仓库 star 数和最新提交哈希', async () => {
+    fetch
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ stargazers_count: 1260 }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ([{ sha: '543d876521581ecf2baa88c80814e4cedae83252' }]) })
+
+    await expect(api.repositoryMetadata()).resolves.toEqual({
+      stars: 1260,
+      commitHash: '543d876521581ecf2baa88c80814e4cedae83252',
+    })
+    const [repositoryUrl, repositoryOptions] = fetch.mock.calls[0]
+    const [commitUrl, commitOptions] = fetch.mock.calls[1]
+    expect(repositoryUrl).toBe('https://api.github.com/repos/MemeMeow-Studio/MemeMeow')
+    expect(repositoryOptions).toMatchObject({ headers: { Accept: 'application/vnd.github+json' } })
+    expect(repositoryOptions.signal).toBeInstanceOf(AbortSignal)
+    expect(commitUrl).toBe('https://api.github.com/repos/MemeMeow-Studio/MemeMeow/commits?per_page=1')
+    expect(commitOptions).toMatchObject({ headers: { Accept: 'application/vnd.github+json' } })
+    expect(commitOptions.signal).toBeInstanceOf(AbortSignal)
+  })
+
   it('独立图片阶段请求只发送业务目标和阶段策略', async () => {
     await api.submitImageStage({ meme_id: 'meme-1', stage: 'agent', reverse_image_policy: 'forbid' })
 

@@ -72,6 +72,16 @@ button, input, select, textarea { border-radius: var(--radius-control); }
 .content { width: min(100%, 1280px); min-width: 0; flex: 1; max-width: 1280px; padding: 48px 62px 80px; margin: 0 auto; }
 .workspace { max-width: 1080px; margin: 0 auto; }
 .workspace.narrow { max-width: 780px; margin-left: 0; }
+.app-footer { border-top: 1px solid var(--line); background: var(--surface); padding: 20px 34px 24px; }
+.app-footer-inner { width: min(100%, 1280px); display: flex; align-items: center; justify-content: space-between; gap: 16px 28px; margin: 0 auto; flex-wrap: wrap; }
+.repository-link { color: var(--ink-soft); font-size: 14px; font-weight: 700; line-height: 1.35; text-decoration: underline; text-decoration-color: var(--line-strong); text-underline-offset: 3px; }
+.repository-link:hover { color: var(--accent-deep); text-decoration-color: currentColor; }
+.repository-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; color: var(--muted); font-size: 14px; line-height: 1.35; }
+.repository-stat { display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; }
+.repository-stat-label { color: var(--muted-soft); }
+.repository-stat-value { color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+.repository-hash { overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 13px; }
+.repository-separator { color: var(--line-strong); }
 .section-head { position: relative; display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; min-height: 92px; margin-bottom: 30px; padding-bottom: 18px; }
 .section-head::after { content: ""; position: absolute; left: 0; bottom: 0; width: 56px; height: 4px; background: var(--accent); transform: skewX(-18deg); }
 .section-head h1 { margin: 0 0 9px; color: var(--ink); font-size: 36px; font-weight: 750; line-height: 1.15; letter-spacing: 0; }
@@ -446,6 +456,9 @@ button, input, select, textarea { border-radius: var(--radius-control); }
   .sidebar button { min-height: 50px; padding: 7px 3px; text-align: center; font-size: 15px; line-height: 1.25; }
   .sidebar button.active { box-shadow: inset 0 -4px var(--accent); }
   .content { padding: 28px 18px 58px; }
+  .app-footer { padding: 18px 18px 22px; }
+  .app-footer-inner { align-items: flex-start; gap: 12px 20px; }
+  .repository-meta { width: 100%; justify-content: space-between; gap: 10px 16px; }
   .section-head { min-height: 0; gap: 14px; margin-bottom: 26px; padding-bottom: 17px; }
   .section-head h1 { font-size: 32px; }
   .section-head p { font-size: 16px; }
@@ -513,6 +526,7 @@ button, input, select, textarea { border-radius: var(--radius-control); }
   .sidebar nav { gap: 2px; }
   .sidebar button { padding-inline: 1px; font-size: 14px; }
   .content { padding-inline: 14px; }
+  .app-footer { padding-inline: 14px; }
   .section-head { display: block; }
   .section-head::after { bottom: 0; }
   .cache-pill { display: inline-flex; margin-top: 14px; }
