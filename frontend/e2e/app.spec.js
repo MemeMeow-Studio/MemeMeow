@@ -107,6 +107,29 @@ test('上传选项先取消再确认，并发送两项处理选项', async ({ pa
   expect(body).toContain('true')
 })
 
+/** 使用真实键盘操作验证文件选择输入和待上传移除按钮均可访问。 */
+test('上传队列支持键盘选择和移除，并清空原生文件输入值', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: '上传' }).click()
+  const input = page.getByLabel('选择图片文件')
+  await input.focus()
+  await expect(input).toBeFocused()
+
+  const chooserPromise = page.waitForEvent('filechooser')
+  await input.press('Enter')
+  const chooser = await chooserPromise
+  await chooser.setFiles({ name: 'keyboard.png', mimeType: 'image/png', buffer: Buffer.from(ONE_PIXEL_PNG_BYTES) })
+
+  const pending = page.locator('.upload-pending-item')
+  await expect(pending).toHaveCount(1)
+  await expect(input).toHaveValue('')
+  const remove = pending.getByRole('button', { name: '移除待上传图片 keyboard.png' })
+  await remove.focus()
+  await expect(remove).toBeFocused()
+  await remove.press('Enter')
+  await expect(pending).toHaveCount(0)
+})
+
 /** 使用真实图片拖放核对按序追加、本地解码、确认前移除和窄屏可操作性。 */
 test('拖放图片按序追加本地预览，可删除待上传项并只提交剩余集合', async ({ page }) => {
   const uploadRequests = []
@@ -185,6 +208,24 @@ test('拖放图片按序追加本地预览，可删除待上传项并只提交�
   expect(body).not.toContain('filename="second.png"')
   await expect(page.locator('.upload-result')).toContainText('first.png')
   expect(mediaRequests).toHaveLength(0)
+})
+
+/** 以无空格长文件名验证 320px 视口下文件名换行且队列不产生横向溢出。 */
+test('窄屏长文件名待上传行不越界', async ({ page }) => {
+  await page.goto('/')
+  await page.setViewportSize({ width: 320, height: 844 })
+  await page.getByRole('button', { name: '上传' }).click()
+  const longName = `${'very-long-uploaded-image-name-'.repeat(8)}.png`
+  expect(await dispatchFileDrag(page, 'drop', [{ name: longName, type: 'image/png', bytes: ONE_PIXEL_PNG_BYTES }])).toBe(true)
+
+  const pending = page.locator('.upload-pending-item')
+  await expect(pending).toHaveCount(1)
+  await expect(pending.locator('strong')).toHaveText(longName)
+  const layout = await readUploadQueueLayout(page)
+  expect(layout.viewportWidth).toBe(320)
+  expect(layout.documentWidth).toBeLessThanOrEqual(320)
+  expect(layout.withinViewport).toBe(true)
+  expect(layout.noOverlap).toBe(true)
 })
 
 /** 坏图片只能使本地预览回退，不能抹掉文件名、移除能力或触发服务端媒体请求。 */

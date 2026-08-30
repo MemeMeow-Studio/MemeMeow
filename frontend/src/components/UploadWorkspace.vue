@@ -28,8 +28,6 @@ const submitFiles = batch.submittableFiles
 const busy = batch.busy
 const paused = batch.paused
 const isDragActive = shallowRef(false)
-const pendingItems = computed(() => batchItems.value.filter((item) => item.status === 'pending'))
-const resultItems = computed(() => batchItems.value.filter((item) => item.status !== 'pending'))
 const queuedItemCount = computed(() => batchItems.value.filter((item) => (
   item.status === 'pending'
   || item.status === 'uploading'
@@ -56,6 +54,8 @@ function onFiles(event: Event): void {
   if (busy.value) return
   const input = event.target as HTMLInputElement
   batch.setFiles([...(input.files || [])])
+  // 文件已复制到批次状态；清空原生值后，删除后再次选择同一文件仍会触发 change。
+  input.value = ''
   preserveRetryOptions.value = false
   retryOptions.value = { reverse_image_policy: 'forbid', auto_name: false }
 }
@@ -273,19 +273,21 @@ function itemDetail(item: UploadBatchItem): string {
       </div>
     </div>
     <div v-if="batchItems.length" class="upload-results" aria-live="polite">
-      <UploadPendingItem
-        v-for="item in pendingItems"
-        :key="item.id"
-        :item="item"
-        :removable="!busy"
-        @remove="batch.removePending"
-      />
-      <div v-for="item in resultItems" :key="item.id" v-memo="[item.status, item.error, item.result?.meme_id, item.result?.processing_status]" class="upload-result" :class="{ fail: item.status === 'failed' || item.status === 'cancelled' }">
-        <span>{{ statusLabel(item) }}</span>
-        <strong :title="item.file.name">{{ item.file.name }}</strong>
-        <button v-if="item.result?.processing_job_id || item.result?.metadata_job_id" class="quiet" type="button" @click="emit('openTask', item.result?.processing_job_id || item.result?.metadata_job_id || '')">查看任务</button>
-        <small>{{ itemDetail(item) }}</small>
-      </div>
+      <!-- 单次遍历让待上传项与活动结果始终保持原始拖放顺序。 -->
+      <template v-for="item in batchItems" :key="item.id" v-memo="[busy, item.file, item.status, item.error, item.file.name, item.result?.meme_id, item.result?.processing_status, item.result?.saved_filename, item.result?.processing_job_id, item.result?.metadata_job_id]">
+        <UploadPendingItem
+          v-if="item.status === 'pending'"
+          :item="item"
+          :removable="!busy"
+          @remove="batch.removePending"
+        />
+        <div v-else class="upload-result" :class="{ fail: item.status === 'failed' || item.status === 'cancelled' }">
+          <span>{{ statusLabel(item) }}</span>
+          <strong :title="item.file.name">{{ item.file.name }}</strong>
+          <button v-if="item.result?.processing_job_id || item.result?.metadata_job_id" class="quiet" type="button" @click="emit('openTask', item.result?.processing_job_id || item.result?.metadata_job_id || '')">查看任务</button>
+          <small>{{ itemDetail(item) }}</small>
+        </div>
+      </template>
     </div>
   </section>
 

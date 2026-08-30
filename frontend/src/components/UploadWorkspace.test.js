@@ -269,6 +269,28 @@ describe('UploadWorkspace', () => {
     await flushPromises()
   })
 
+  it('上传中混合状态仍按拖放批次顺序展示每个项目', async () => {
+    const requests = []
+    upload.mockImplementation((files) => new Promise((resolve) => requests.push({ files, resolve })))
+    const files = Array.from({ length: 21 }, (_, index) => new File([String(index)], `ordered-${index}.png`, { type: 'image/png' }))
+    const wrapper = mountWorkspace({ props: { config: { reverse_image_available: true } } })
+
+    await selectFiles(wrapper, files)
+    await wrapper.get('button.primary').trigger('click')
+    await wrapper.get('.processing-options-dialog form').trigger('submit')
+    await flushPromises()
+
+    expect(requests).toHaveLength(2)
+    expect(wrapper.findAll('.upload-results > * strong').map((item) => item.text())).toEqual(files.map((file) => file.name))
+    expect(wrapper.findAll('.upload-pending-remove')).toHaveLength(0)
+
+    while (requests.length) {
+      const request = requests.shift()
+      request.resolve({ results: request.files.map((file) => ({ filename: file.name, ok: true })) })
+      await flushPromises()
+    }
+  })
+
   it('暂停后显示继续并在继续后恢复暂停动作', async () => {
     let resolveUpload
     upload.mockImplementationOnce(() => new Promise((resolve) => { resolveUpload = resolve }))
