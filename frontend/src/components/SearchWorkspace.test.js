@@ -84,7 +84,7 @@ describe('SearchWorkspace', () => {
 
     await visible.trigger('error')
     await flushPromises()
-    expect(visible.attributes('src')).toBe('/media/meme-1')
+    expect(item.find('.image-load-fallback').text()).toBe('图片暂不可用')
     wrapper.unmount()
   })
 

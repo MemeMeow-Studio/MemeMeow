@@ -392,6 +392,8 @@ describe('LibraryWorkspace', () => {
     expect(listImage.attributes('src')).toBe('/media/meme-1/thumbnail')
     await listImage.trigger('error')
     expect(listImage.attributes('src')).toBe('/media/meme-1')
+    await listImage.trigger('error')
+    expect(wrapper.get('.resilient-image-placeholder').text()).toBe('图片暂不可用')
 
     await wrapper.get('.metadata-button').trigger('click')
     await flushPromises()

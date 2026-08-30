@@ -89,6 +89,12 @@ class _ThumbnailRepository:
         del for_update
         return self.row
 
+    def list_current(self, memes, _profile):
+        """返回测试页中与当前 Meme 绑定的派生事实。"""
+        if self.row is None:
+            return {}
+        return {meme.id: self.row for meme in memes if meme.id == self.row.meme_id}
+
     def ensure_pending(self, meme, profile, *, reset_failed: bool = False):
         """幂等创建 pending 测试事实。"""
         if self.row is None:
@@ -153,7 +159,7 @@ class _Environment:
 
     def __init__(self, meme, thumbnails):
         """绑定 Meme 和缩略图 repository。"""
-        self.memes = SimpleNamespace(get=lambda _meme_id, **_kwargs: meme)
+        self.memes = SimpleNamespace(get=lambda _meme_id, **_kwargs: meme, list=lambda **_kwargs: [meme])
         self.thumbnails = thumbnails
         session = SimpleNamespace(flush=lambda: None)
         session.scalars = lambda _statement: [thumbnails.row] if thumbnails.row is not None else []
@@ -386,6 +392,50 @@ def test_projection_reuses_verified_source_identity_without_rereading(tmp_path: 
     monkeypatch.setattr(service, "_identity", lambda _path: (_ for _ in ()).throw(AssertionError("identity should be reused")))
     projection = service.projection(meme, source_identity=(meme.size_bytes, meme.sha256))
     assert projection == {"status": "pending", "media_url": None}
+
+
+def test_projection_schedules_missing_thumbnail_after_fact_commit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """图片列表首次投影存量 Meme 时，pending 事实提交后会唤醒去重任务。"""
+    content = _image_bytes((16, 8))
+    service, meme, _repository, _source_store, _thumbnail_store = _service(tmp_path, content)
+    scheduled: list[UUID | str] = []
+    monkeypatch.setattr(service, "task_service", object())
+    monkeypatch.setattr(service, "enqueue", lambda meme_id: scheduled.append(meme_id) or object())
+
+    projection = service.projections([meme], source_identities={meme.id: (meme.size_bytes, meme.sha256)})
+
+    assert projection[meme.id] == {"status": "pending", "media_url": None}
+    assert scheduled == [meme.id]
+
+
+def test_single_projection_schedules_missing_thumbnail_for_collection_and_search(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """合集或检索的单图投影也会为没有历史任务的 Meme 触发生成。"""
+    content = _image_bytes((16, 8))
+    service, meme, _repository, _source_store, _thumbnail_store = _service(tmp_path, content)
+    scheduled: list[UUID | str] = []
+    monkeypatch.setattr(service, "task_service", object())
+    monkeypatch.setattr(service, "enqueue", lambda meme_id: scheduled.append(meme_id) or object())
+
+    projection = service.projection(meme, source_identity=(meme.size_bytes, meme.sha256))
+
+    assert projection == {"status": "pending", "media_url": None}
+    assert scheduled == [meme.id]
+
+
+def test_reconcile_resets_failed_thumbnail_before_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """受保护回填会清除失败状态，允许存量图片重新提交生成任务。"""
+    content = _image_bytes((16, 8))
+    service, meme, repository, _source_store, _thumbnail_store = _service(tmp_path, content)
+    repository.row = repository.ensure_pending(meme, service.config.profile)
+    repository.row.status = "failed"
+    calls: list[tuple[UUID | str, bool]] = []
+    monkeypatch.setattr(service, "task_service", object())
+    monkeypatch.setattr(service, "enqueue", lambda meme_id, *, reset_failed=False: calls.append((meme_id, reset_failed)) or object())
+
+    result = service.reconcile()
+
+    assert result == {"scanned": 1, "submitted": 1, "available": 0, "failed": 0}
+    assert calls == [(meme.id, True)]
 
 
 def test_media_path_only_validates_source_identity_and_does_not_use_generation_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

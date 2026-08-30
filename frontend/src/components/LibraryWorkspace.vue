@@ -7,7 +7,6 @@ import type { CollectionSummary, CoreImageProcessingStage, ImageProcessingOption
 import {
   embeddingLabel,
   errorMessage,
-  fallbackImageToOriginal,
   imageDisplayUrl,
   imageKey,
   metadataLabel,
@@ -17,6 +16,7 @@ import CollectionDialog from './CollectionDialog.vue'
 import ImagePreviewDialog from './ImagePreviewDialog.vue'
 import ImageProcessingOptionsDialog from './ImageProcessingOptionsDialog.vue'
 import ImageRetryDialog from './ImageRetryDialog.vue'
+import ResilientImage from './ResilientImage.vue'
 
 const props = defineProps<{
   config: ServiceConfig | null
@@ -477,7 +477,7 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
         </label>
         <div class="library-row-main">
           <button class="library-preview-trigger" type="button" :aria-label="`查看 ${item.filename} 图片与详情`" @click="openImagePreview(item, $event)">
-            <img :src="imageDisplayUrl(item)" :alt="`预览 ${item.filename}`" loading="lazy" @error="fallbackImageToOriginal($event, item.media_url)" />
+            <ResilientImage :src="imageDisplayUrl(item)" :fallback-src="item.media_url" :alt="`预览 ${item.filename}`" />
           </button>
           <div class="file-meta">
             <strong :title="item.filename">{{ item.filename }}</strong>

@@ -23,6 +23,7 @@ const resultMedia = shallowRef<SearchResultMedia[]>([])
 const originalLoaded = shallowRef(new Set<string>())
 const originalFailed = shallowRef(new Set<string>())
 const thumbnailFailed = shallowRef(new Set<string>())
+const visibleFailed = shallowRef(new Set<string>())
 const busy = shallowRef(false)
 const { copyNotice, copyImage } = useImageClipboard()
 
@@ -99,9 +100,13 @@ function handleResultImageError(event: Event, item: SearchResultMedia): void {
   if (item.thumbnail?.media_url && source === item.thumbnail.media_url) {
     addResultState(thumbnailFailed, item.meme_id)
     if (!originalFailed.value.has(item.meme_id)) image.src = item.media_url
+    else addResultState(visibleFailed, item.meme_id)
     return
   }
-  if (source === item.media_url) addResultState(originalFailed, item.meme_id)
+  if (source === item.media_url) {
+    addResultState(originalFailed, item.meme_id)
+    if (!hasThumbnail(item)) addResultState(visibleFailed, item.meme_id)
+  }
 }
 
 /** 清理上一次检索的结果媒体关联和渐进加载状态。 */
@@ -110,6 +115,7 @@ function resetResultState(): void {
   originalLoaded.value = new Set()
   originalFailed.value = new Set()
   thumbnailFailed.value = new Set()
+  visibleFailed.value = new Set()
 }
 
 /** 提交自然语言查询，并在工作区内维护独立加载状态。 */
@@ -127,6 +133,7 @@ async function runSearch(): Promise<void> {
     originalLoaded.value = new Set()
     originalFailed.value = new Set()
     thumbnailFailed.value = new Set()
+    visibleFailed.value = new Set()
   } catch (reason) {
     resetResultState()
     results.value = []
@@ -180,7 +187,10 @@ async function runSearch(): Promise<void> {
           title="复制图片"
           @click="copyImage(item.media_url)"
         >
-          <img :src="resultSource(item)" alt="检索结果" loading="lazy" @error="handleResultImageError($event, item)" />
+          <span class="result-media-frame">
+            <img v-if="!visibleFailed.has(item.meme_id)" :src="resultSource(item)" alt="检索结果" loading="lazy" @error="handleResultImageError($event, item)" />
+            <span v-else class="image-load-fallback" role="img" aria-label="图片暂不可用">图片暂不可用</span>
+          </span>
           <img
             v-if="shouldPreloadOriginal(item)"
             class="result-original-preload"

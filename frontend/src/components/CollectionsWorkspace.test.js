@@ -142,6 +142,8 @@ describe('CollectionsWorkspace', () => {
     expect(coverImage.attributes('src')).toBe('/media/meme-1/thumbnail')
     await coverImage.trigger('error')
     expect(coverImage.attributes('src')).toBe('/media/meme-1')
+    await coverImage.trigger('error')
+    expect(wrapper.get('.collection-cover .resilient-image-placeholder').text()).toBe('图片暂不可用')
 
     await wrapper.get('[aria-label="打开合集 会议反应"]').trigger('click')
     await flushPromises()
@@ -149,6 +151,8 @@ describe('CollectionsWorkspace', () => {
     expect(memberImage.attributes('src')).toBe('/media/meme-1/thumbnail')
     await memberImage.trigger('error')
     expect(memberImage.attributes('src')).toBe('/media/meme-1')
+    await memberImage.trigger('error')
+    expect(wrapper.get('.collection-asset-media .resilient-image-placeholder').text()).toBe('图片暂不可用')
 
     await wrapper.get('.collection-asset-media').trigger('click')
     await flushPromises()

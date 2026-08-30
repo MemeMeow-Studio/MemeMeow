@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import multiprocessing
 import re
 import time
@@ -34,6 +35,9 @@ from backend.thumbnail_config import (
     THUMBNAIL_OUTPUT_MEDIA_TYPE,
     ThumbnailConfig,
 )
+
+
+logger = logging.getLogger("backend.pg_services")
 
 
 class ThumbnailError(RuntimeError):
@@ -361,7 +365,14 @@ class DerivedThumbnailService:
         return payload
 
     def projection(self, meme: Meme, *, ensure: bool = True, source_identity: tuple[int, str] | None = None) -> dict[str, object]:
-        """返回当前 Meme 的有限缩略图状态，必要时持久化 pending。"""
+        """返回当前 Meme 的有限缩略图状态，并尽力唤醒缺失派生任务。
+
+        ``ensure`` 为真时，缺少派生事实会先持久化为 ``pending``，事务提交后再提交
+        一个去重任务。任务服务暂时不可用只记录日志，不影响当前 Meme 的原图列表和
+        访问；下次投影或受保护 reconciliation 会再次尝试。
+        """
+        projected: dict[str, object]
+        should_enqueue = False
         with self.resources.environment(self.scope) as environment:
             row = environment.thumbnails.current(meme, self.config.profile)
             source_error = self._source_identity_error(meme, source_identity)
@@ -380,12 +391,33 @@ class DerivedThumbnailService:
                 if row is not None:
                     self._mark_row_stale(row, source_error)
                     environment.uow.session.flush()
-                    return self._projection(row, meme_id=meme.id)
-                return {"status": "stale", "media_url": None}
-            if row is not None and row.status == "available" and not self._output_is_valid(meme, row):
-                self._mark_row_stale(row, "thumbnail_output_unavailable")
-                environment.uow.session.flush()
-            return self._projection(row, meme_id=meme.id)
+                    projected = self._projection(row, meme_id=meme.id)
+                else:
+                    projected = {"status": "stale", "media_url": None}
+                should_enqueue = False
+            else:
+                if row is not None and row.status == "available" and not self._output_is_valid(meme, row):
+                    self._mark_row_stale(row, "thumbnail_output_unavailable")
+                    environment.uow.session.flush()
+                projected = self._projection(row, meme_id=meme.id)
+                should_enqueue = ensure and projected["status"] in {"pending", "stale"}
+        if should_enqueue:
+            self._enqueue_from_projection(meme.id)
+        return projected
+
+    def _enqueue_from_projection(self, meme_id: UUID | str) -> None:
+        """在投影事务提交后尽力提交缺失派生任务，保持读请求对原图无阻断。"""
+        if self.task_service is None:
+            return
+        try:
+            self.enqueue(meme_id)
+        except (ThumbnailError, DatabaseError) as exc:
+            logger.warning(
+                "thumbnail_projection_enqueue_deferred scope=%s meme=%s error=%s",
+                self.scope.scope_id,
+                meme_id,
+                exc.code,
+            )
 
     def projection_for_meme_id(self, meme_id: UUID | str) -> dict[str, object]:
         """按稳定 Meme ID 读取当前 scope 的缩略图状态。"""
@@ -403,6 +435,7 @@ class DerivedThumbnailService:
     ) -> dict[UUID, dict[str, object]]:
         """按一页 Meme 批量投影并为缺失事实建立 pending 状态。"""
         result: dict[UUID, dict[str, object]] = {}
+        pending_ids: list[UUID] = []
         with self.resources.environment(self.scope) as environment:
             rows = environment.thumbnails.list_current(memes, self.config.profile)
             for meme in memes:
@@ -425,8 +458,13 @@ class DerivedThumbnailService:
                         self._mark_row_stale(row, source_error)
                 elif row is not None and row.status == "available" and not self._output_is_valid(meme, row):
                     self._mark_row_stale(row, "thumbnail_output_unavailable")
-                result[meme.id] = self._projection(row, meme_id=meme.id)
+                projected = self._projection(row, meme_id=meme.id)
+                result[meme.id] = projected
+                if source_error is None and projected["status"] in {"pending", "stale"}:
+                    pending_ids.append(meme.id)
             environment.uow.session.flush()
+        for meme_id in pending_ids:
+            self._enqueue_from_projection(meme_id)
         return result
 
     def _mark_failure(self, meme: Meme | None, code: str, *, elapsed_ms: int | None = None) -> None:
@@ -645,7 +683,7 @@ class DerivedThumbnailService:
                 if row["status"] == "available":
                     available += 1
                     continue
-                if self.enqueue(meme.id) is not None:
+                if self.enqueue(meme.id, reset_failed=True) is not None:
                     submitted += 1
             except ThumbnailError as exc:
                 if exc.code in {"thumbnail_backpressure", "thumbnail_task_unavailable"}:
