@@ -188,8 +188,17 @@ def within_total_timeout(started_at: datetime | None, *, timeout_seconds: int, n
     return current - started_at <= timedelta(seconds=limit)
 
 
-def sanitize_error(error: Mapping[str, Any] | None, *, fallback: str = "task_failed") -> dict[str, Any]:
-    """只保留稳定错误码、短消息和 HTTP 状态，拒绝 transcript/凭据泄漏。"""
+def sanitize_error(
+    error: Mapping[str, Any] | None,
+    *,
+    fallback: str = "task_failed",
+    include_reason_code: bool = False,
+) -> dict[str, Any]:
+    """只保留稳定错误码、短消息和 HTTP 状态，拒绝 transcript/凭据泄漏。
+
+    ``include_reason_code`` 仅供内部 attempt 审计持久化使用；公开任务投影保持默认
+    不返回该附加字段，避免扩大现有 HTTP 契约。
+    """
     source = error if isinstance(error, Mapping) else {}
     safe_fallback = fallback if isinstance(fallback, str) and _PUBLIC_CODE_PATTERN.fullmatch(fallback) else "task_failed"
     code = source.get("error")
@@ -214,6 +223,10 @@ def sanitize_error(error: Mapping[str, Any] | None, *, fallback: str = "task_fai
     status = source.get("http_status")
     if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
         result["http_status"] = status
+    if include_reason_code:
+        reason_code = source.get("reason_code")
+        if isinstance(reason_code, str) and _PUBLIC_CODE_PATTERN.fullmatch(reason_code):
+            result["reason_code"] = reason_code
     return result
 
 

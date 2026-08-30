@@ -39,20 +39,37 @@ from executor.model_capability import (
     validate_model_capability,
     validate_model_name,
 )
-from backend.opencode_workspace import (
-    SELECTOR_RE,
-    WorkspaceCapabilityError,
-    WorkspaceCapabilitySigner,
-    build_edit_permission_rules,
-    validate_directory_path,
-    validate_file_path,
-)
+try:
+    from backend.opencode_workspace import (
+        SELECTOR_RE,
+        WorkspaceCapabilityError,
+        WorkspaceCapabilitySigner,
+        build_edit_permission_rules,
+        validate_directory_path,
+        validate_file_path,
+    )
+except ModuleNotFoundError as exc:  # pragma: no cover - Agent 镜像只复制 executor 快照
+    if exc.name != "backend":
+        raise
+    from executor.opencode_workspace import (
+        SELECTOR_RE,
+        WorkspaceCapabilityError,
+        WorkspaceCapabilitySigner,
+        build_edit_permission_rules,
+        validate_directory_path,
+        validate_file_path,
+    )
 from executor.agent_limits import validate_agent_concurrency
 from executor.process_supervisor import ProcessSupervisor
 from executor.result_store import ExecutorResultStore, ExecutorResultStoreError
 from executor.task_queue import ExecutionQueue
 from executor.token import ExecutorTokenError, ensure_token_file, read_token_file
-from backend.public_dto import PublicDataError, secret_inventory_from_mapping, validate_agent_result
+try:
+    from backend.public_dto import PublicDataError, secret_inventory_from_mapping, validate_agent_result
+except ModuleNotFoundError as exc:  # pragma: no cover - Agent 镜像只复制 executor 快照
+    if exc.name != "backend":
+        raise
+    from executor.public_dto import PublicDataError, secret_inventory_from_mapping, validate_agent_result
 
 TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,254}\Z")
@@ -149,6 +166,15 @@ class _ProcessFailure(RuntimeError):
         self.http_status = http_status
 
 
+class _ResultFileValidationFailure(RuntimeError):
+    """携带结果文件内部原因码的稳定 executor 异常。"""
+
+    def __init__(self, code: str, *, reason_code: str | None = None) -> None:
+        """初始化结果文件失败；外部错误码仍保持原有协议。"""
+        super().__init__(code)
+        self.reason_code = reason_code
+
+
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     """读取并限制 executor 的整数配置，非法值使用安全默认值。"""
     try:
@@ -171,9 +197,12 @@ def _env_agent_concurrency(name: str, default: int) -> int:
     return validate_agent_concurrency(value)
 
 
-def _json_error(code: str, message: str) -> dict[str, object]:
+def _json_error(code: str, message: str, *, reason_code: str | None = None) -> dict[str, object]:
     """构造不包含本地路径、命令或秘密的稳定错误响应。"""
-    return {"error": code, "message": message}
+    error: dict[str, object] = {"error": code, "message": message}
+    if isinstance(reason_code, str) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,127}", reason_code):
+        error["reason_code"] = reason_code
+    return error
 
 
 def _redact_diagnostic(value: str, secrets: tuple[str, ...] = ()) -> str:
@@ -1188,6 +1217,7 @@ class Executor:
                 task.completed_at = time.time()
         except RuntimeError as exc:
             code, _, detail = str(exc).partition(":")
+            reason_code = getattr(exc, "reason_code", None)
             with self.lock:
                 # 取消与子进程自然退出可能同时发生；持锁后以取消为最终事实，避免把
                 # 用户明确取消的任务误记为普通进程失败。
@@ -1204,7 +1234,11 @@ class Executor:
                     "agent_timeout": "OpenCode 执行超时",
                     "task_interrupted": "任务已取消",
                 }.get(code, "任务执行失败")
-                task.error = _json_error(code, _redact_diagnostic(detail, (self.legacy_api_key, self.token, task.callback_token or "")) if detail else fallback)
+                task.error = _json_error(
+                    code,
+                    _redact_diagnostic(detail, (self.legacy_api_key, self.token, task.callback_token or "")) if detail else fallback,
+                    reason_code=reason_code,
+                )
                 task.completed_at = time.time()
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             with self.lock:
@@ -1284,7 +1318,7 @@ class Executor:
                 validator=lambda value: validate_agent_result(value, secret_inventory=secret_inventory_from_mapping(os.environ)),
             )
         except ExecutorResultStoreError as exc:
-            raise RuntimeError(exc.code) from exc
+            raise _ResultFileValidationFailure(exc.code, reason_code=exc.reason_code) from exc
 
     @staticmethod
     def _terminate(process: subprocess.Popen[bytes]) -> bool:

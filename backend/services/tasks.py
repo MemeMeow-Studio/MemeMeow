@@ -438,7 +438,8 @@ class PostgresTaskService:
         if payload.get("processing_config_hash") is not None and payload_config_hash is None:
             return False
         now = utcnow()
-        safe_error = sanitize_error(error) if error else None
+        # 原因码只保存在内部 attempt 记录；公开任务 DTO 默认会丢弃该附加字段。
+        safe_error = sanitize_error(error, include_reason_code=True) if error else None
         with self.resources.environment(self.scope.scope_id) as environment:
             session = environment.uow.session
             task = session.scalar(

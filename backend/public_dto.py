@@ -10,7 +10,7 @@ from __future__ import annotations
 import base64
 import ipaddress
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import Any, Iterable
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -18,6 +18,11 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 
 class PublicDataError(ValueError):
     """不可信结果不符合公开数据边界。异常消息不携带原始输入。"""
+
+    def __init__(self, code: str) -> None:
+        """保存稳定原因码，供调用方记录诊断而不暴露原始文本。"""
+        self.code = code
+        super().__init__(code)
 
 
 AGENT_RESULT_FIELDS = frozenset(
@@ -48,8 +53,24 @@ _INTERNAL_NAME_RE = re.compile(
     r"executor|callback|provider|account(?:[_-]?id)?|user(?:[_-]?id)?|subscription|plan(?:[_-]?id)?|"
     r"billing|quota|grant|traceback|stack)"
 )
-_ABSOLUTE_PATH_RE = re.compile(r"(?:^|[\s\"'(<])(?:/|~/|[A-Za-z]:[\\/]|\\\\)[^\s\"'<>)]*")
-_KNOWN_PATH_RE = re.compile(r"(?i)(?:^|[\s\"'(<])/(?:runtime|images|skills|app|home|tmp|var|etc|proc|sys|mnt|workspace)(?:/|$)")
+_ABSOLUTE_PATH_RE = re.compile(
+    r"(?:^|[\s\"'(<=:])(?:/|~/|[A-Za-z]:[\\/]|\\\\)(?=[^\s\"'<>)]|$)[^\s\"'<>)]*"
+)
+_KNOWN_PATH_RE = re.compile(
+    r"(?i)(?:^|[\s\"'(<=:])/(?:runtime|images|skills|app|home|tmp|var|etc|proc|sys|mnt|workspace)"
+    r"(?:[/\\]|$|[.,;!?，。！？；：)\]}])"
+)
+_URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s<>\"']+", re.IGNORECASE)
+# 公开文本常用 ``A /B`` 或 ``A / B`` 表示并列；只屏蔽一个词的分隔符，
+# 多级路径、已知运行目录和赋值/冒号形式仍交给绝对路径规则拒绝。
+_NATURAL_SLASH_SEPARATOR_RE = re.compile(
+    r"(?<=\s)/(?!"
+    r"(?:runtime|images|skills|app|home|tmp|var|etc|proc|sys|mnt|workspace)"
+    r"(?=$|\s|[/\\.,;!?，。！？；：)\]}])"
+    r")[^\s/\\\"'<>()[\]{}?,#，。！？；：、]+"
+    r"(?=\s|$|[,，。!?;：)\]}])",
+    re.IGNORECASE,
+)
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{12,}\b")
 _SENSITIVE_ASSIGNMENT_RE = re.compile(r"(?i)\b(?:secret|token|password|passwd|api[_-]?key|authorization|cookie|credential)\s*[:=]\s*[^\s,;]+")
 _CREDENTIAL_PATTERNS = (
@@ -73,6 +94,26 @@ _SENSITIVE_QUERY_KEYS = frozenset(
         "signature",
         "token",
     }
+)
+_INTERNAL_QUERY_KEYS = frozenset(
+    {
+        "account_id",
+        "attempt_id",
+        "executor_attempt_id",
+        "operation_grant",
+        "plan_id",
+        "scope_id",
+        "session_id",
+        "subscription_id",
+        "task_id",
+        "user_id",
+        "workspace_selector",
+    }
+)
+_INTERNAL_VALUE_RE = re.compile(
+    r"(?i)(?:^|[\s:/._=-])(?:/internal(?:/|$)|scope[_-]?id|workspace[_-]?selector|task[_-]?id|"
+    r"attempt[_-]?id|session[_-]?id|executor[_-]?attempt|account[_-]?id|user[_-]?id|"
+    r"subscription[_-]?id|plan[_-]?id|billing|quota|operation[_-]?grant)(?:$|[\s:/._=-])"
 )
 
 
@@ -119,8 +160,43 @@ def secret_inventory_from_settings(settings: object) -> tuple[str, ...]:
 
 def _urls(value: str) -> Iterable[str]:
     """提取字符串中的 URI，供 userinfo、内部目标和本地协议检查。"""
-    for match in re.finditer(r"\b[a-z][a-z0-9+.-]*://[^\s<>\"']+", value, re.IGNORECASE):
+    for match in _URL_RE.finditer(value):
         yield match.group(0).rstrip(".,;)]}")
+
+
+def _without_urls(value: str) -> str:
+    """用空格屏蔽 URI 区段，避免 URI 查询参数触发路径文本扫描。"""
+    return _URL_RE.sub(" ", value)
+
+
+def _strip_natural_slash_separators(value: str) -> str:
+    """屏蔽不带路径特征的自然语言斜杠，并保留赋值/冒号路径供后续检测。"""
+
+    def replace(match: re.Match[str]) -> str:
+        prefix = value[: match.start()]
+        # ``path = /foo`` 和 ``file: /foo`` 即使有空格也属于显式路径形式。
+        if re.search(r"[=:]\s*$", prefix):
+            return match.group(0)
+        return " "
+
+    return _NATURAL_SLASH_SEPARATOR_RE.sub(replace, value)
+
+
+def _transform_outside_urls(value: str, transform: Callable[[str], str]) -> str:
+    """只对 URI 之外的文本执行转换，避免查询参数被当作本地路径。"""
+    parts: list[str] = []
+    cursor = 0
+    for match in _URL_RE.finditer(value):
+        parts.append(transform(value[cursor : match.start()]))
+        parts.append(match.group(0))
+        cursor = match.end()
+    parts.append(transform(value[cursor:]))
+    return "".join(parts)
+
+
+def _replace_outside_urls(value: str, pattern: re.Pattern[str], replacement: str) -> str:
+    """仅在 URI 之外替换诊断文本中的路径，保留后续 URI 脱敏步骤。"""
+    return _transform_outside_urls(value, lambda segment: pattern.sub(replacement, segment))
 
 
 def _unsafe_url(value: str) -> bool:
@@ -135,7 +211,9 @@ def _unsafe_url(value: str) -> bool:
         return True
     if parsed.username is not None or parsed.password is not None:
         return True
-    if any(key.lower().replace("-", "_") in _SENSITIVE_QUERY_KEYS for key, _ in parse_qsl(parsed.query, keep_blank_values=True)):
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    normalized_query_keys = {key.lower().replace("-", "_") for key, _ in query_pairs}
+    if normalized_query_keys & _SENSITIVE_QUERY_KEYS or normalized_query_keys & _INTERNAL_QUERY_KEYS:
         return True
     try:
         hostname = parsed.hostname
@@ -147,7 +225,8 @@ def _unsafe_url(value: str) -> bool:
         # 域名不做 DNS 解析；已登记的内部命名仍通过固定标识检查拒绝。
         pass
     hostname = (parsed.hostname or "").lower().rstrip(".")
-    return hostname in {"localhost", "metadata.google.internal"} or hostname.endswith((".local", ".internal")) or "/internal/" in parsed.path.lower()
+    path = parsed.path.lower()
+    return hostname in {"localhost", "metadata.google.internal"} or hostname.endswith((".local", ".internal")) or path == "/internal" or path.startswith("/internal/")
 
 
 def _unsafe_text(value: str, *, secret_inventory: tuple[str, ...]) -> bool:
@@ -156,13 +235,17 @@ def _unsafe_text(value: str, *, secret_inventory: tuple[str, ...]) -> bool:
         return True
     if _BEARER_RE.search(value) or _SENSITIVE_ASSIGNMENT_RE.search(value) or any(pattern.search(value) for pattern in _CREDENTIAL_PATTERNS):
         return True
-    if _ABSOLUTE_PATH_RE.search(value) or _KNOWN_PATH_RE.search(value):
+    urls = tuple(_urls(value))
+    if any(_unsafe_url(url) or _INTERNAL_VALUE_RE.search(url) for url in urls):
         return True
-    if re.search(r"(?i)(?:^|[\s:/._-])(?:/internal/|scope[_-]?id|workspace[_-]?selector|task[_-]?id|attempt[_-]?id|session[_-]?id|executor[_-]?attempt|account[_-]?id|user[_-]?id|subscription[_-]?id|plan[_-]?id|billing|quota|operation[_-]?grant)(?:$|[\s:/._-])", value):
+    text = _without_urls(value)
+    if _INTERNAL_VALUE_RE.search(text):
         return True
-    for url in _urls(value):
-        if _unsafe_url(url):
-            return True
+    text = _strip_natural_slash_separators(text)
+    if _ABSOLUTE_PATH_RE.search(text) or _KNOWN_PATH_RE.search(text):
+        return True
+    if _INTERNAL_VALUE_RE.search(text):
+        return True
     return False
 
 
@@ -184,6 +267,18 @@ def _walk_untrusted(value: object, *, secret_inventory: tuple[str, ...], top_lev
     return value is not None and not isinstance(value, (bool, int, float))
 
 
+def scan_public_result(value: object, *, secret_inventory: Iterable[str] = ()) -> str | None:
+    """扫描公开结果的敏感数据边界并返回稳定原因码。
+
+    输入为待交付的 JSON 值；返回 ``None`` 表示未发现敏感内容。该轻量扫描供
+    Agent 预检和服务端最终校验共用，不负责顶层字段、JSON Schema 或领域模型校验。
+    """
+    if not isinstance(value, Mapping):
+        return "result_object_required"
+    inventory = tuple(item for item in secret_inventory if isinstance(item, str) and len(item) >= 8)
+    return "result_sensitive_data" if _walk_untrusted(dict(value), secret_inventory=inventory, top_level=True) else None
+
+
 def validate_agent_result(value: object, *, secret_inventory: Iterable[str] = ()) -> dict[str, Any]:
     """在 Agent 结果接收边界验证顶层字段和敏感数据，命中即整体拒绝。"""
     if not isinstance(value, Mapping):
@@ -191,9 +286,9 @@ def validate_agent_result(value: object, *, secret_inventory: Iterable[str] = ()
     unknown = set(value) - AGENT_RESULT_FIELDS
     if unknown or not AGENT_RESULT_REQUIRED_FIELDS.issubset(value):
         raise PublicDataError("result_schema_invalid")
-    inventory = tuple(item for item in secret_inventory if isinstance(item, str) and len(item) >= 8)
-    if _walk_untrusted(dict(value), secret_inventory=inventory, top_level=True):
-        raise PublicDataError("result_sensitive_data")
+    reason_code = scan_public_result(value, secret_inventory=secret_inventory)
+    if reason_code:
+        raise PublicDataError(reason_code)
     return dict(value)
 
 
@@ -242,9 +337,10 @@ def sanitize_public_message(value: object, *, fallback: str | None = None) -> st
     message = _BEARER_RE.sub("[REDACTED]", message)
     for pattern in _CREDENTIAL_PATTERNS:
         message = pattern.sub("[REDACTED]", message)
-    message = _ABSOLUTE_PATH_RE.sub("[PATH]", message)
-    message = _KNOWN_PATH_RE.sub("[PATH]", message)
-    message = re.sub(r"\b[a-z][a-z0-9+.-]*://[^\s<>\"']+", "[URL]", message, flags=re.IGNORECASE)
+    message = _transform_outside_urls(message, _strip_natural_slash_separators)
+    message = _replace_outside_urls(message, _ABSOLUTE_PATH_RE, "[PATH]")
+    message = _replace_outside_urls(message, _KNOWN_PATH_RE, "[PATH]")
+    message = _URL_RE.sub("[URL]", message)
     message = re.sub(r"(?i)(?:secret|token|password|api[_-]?key|authorization|cookie)\s*[:=]\s*[^\s,;]+", "[REDACTED]", message)
     message = re.sub(
         r"(?i)(?:scope(?:[_-]?id)?|workspace(?:[_-]?selector)?|task(?:[_-]?id)?|attempt(?:[_-]?id)?|session(?:[_-]?id)?|executor(?:[_-]?attempt)?|billing|quota)\s*[:=]\s*[^\s,;]+",

@@ -8,6 +8,7 @@ API 容器只依赖该模块的结构化请求，不导入 Docker SDK、调用 D
 from __future__ import annotations
 
 import json
+import re
 import socket
 import time
 import urllib.error
@@ -23,12 +24,13 @@ from executor.model_capability import MODEL_CAPABILITY_FIELD, ModelCapabilityErr
 class AgentExecutorError(RuntimeError):
     """executor 请求失败，携带稳定错误码和安全诊断。"""
 
-    def __init__(self, code: str, message: str | None = None, *, session_id: str | None = None, executor_attempt_id: str | None = None, http_status: int | None = None):
+    def __init__(self, code: str, message: str | None = None, *, session_id: str | None = None, executor_attempt_id: str | None = None, http_status: int | None = None, reason_code: str | None = None):
         super().__init__(message or code)
         self.code = code
         self.session_id = session_id
         self.executor_attempt_id = executor_attempt_id
         self.http_status = http_status
+        self.reason_code = reason_code if isinstance(reason_code, str) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,127}", reason_code) else None
 
 
 _PENDING_STATUSES = frozenset({"queued", "running"})
@@ -143,11 +145,12 @@ class AgentExecutorClient:
                 payload_value = {}
             code = payload_value.get("error") if isinstance(payload_value, dict) else None
             message = payload_value.get("message") if isinstance(payload_value, dict) else None
+            reason_code = payload_value.get("reason_code") if isinstance(payload_value, dict) else None
             if not isinstance(code, str):
                 code = "agent_executor_http_error"
             if exc.code in {401, 403}:
                 code = "agent_executor_unauthorized"
-            raise AgentExecutorError(code, str(message or "Agent executor 请求失败")[:500], http_status=exc.code) from exc
+            raise AgentExecutorError(code, str(message or "Agent executor 请求失败")[:500], http_status=exc.code, reason_code=reason_code) from exc
         except urllib.error.URLError as exc:
             if isinstance(getattr(exc, "reason", None), (TimeoutError, socket.timeout)):
                 raise AgentExecutorError("agent_timeout", "Agent executor 请求超时") from exc
@@ -317,6 +320,7 @@ class AgentExecutorClient:
                 session_id=exc.session_id,
                 executor_attempt_id=exc.executor_attempt_id or attempt_id,
                 http_status=exc.http_status,
+                reason_code=exc.reason_code,
             ) from exc
         response = self._for_task(self._response(value), task_id)
         if response.executor_attempt_id and response.executor_attempt_id != attempt_id:
@@ -333,6 +337,7 @@ class AgentExecutorClient:
                 session_id=exc.session_id or response.session_id,
                 executor_attempt_id=exc.executor_attempt_id or response.executor_attempt_id or attempt_id,
                 http_status=exc.http_status,
+                reason_code=exc.reason_code,
             ) from exc
         if response.status == "failed":
             code = self._failure_code(response)
@@ -345,6 +350,7 @@ class AgentExecutorClient:
                 session_id=response.session_id,
                 executor_attempt_id=response.executor_attempt_id or attempt_id,
                 http_status=http_status,
+                reason_code=error.get("reason_code"),
             )
         if response.status == "cancelled":
             raise AgentExecutorError("task_interrupted", "Agent 任务已取消", session_id=response.session_id, executor_attempt_id=response.executor_attempt_id or attempt_id)

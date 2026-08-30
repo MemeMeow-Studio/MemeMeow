@@ -73,4 +73,4 @@ python3 /skills/research-meme-context/scripts/validate_result.py \
   "/runtime/task-results/$MEMEMEOW_AGENT_TASK_ID"
 ```
 
-仅当脚本以零退出码结束时才能退出。若脚本报告发现 `result.json`，将其原子重命名为 `result.json.tmp` 后重新验证。该脚本检查交付路径、文件类型、大小和 JSON 格式；后端会继续执行完整 schema 与业务字段校验。
+仅当脚本以零退出码结束时才能退出。若脚本报告发现 `result.json`，将其原子重命名为 `result.json.tmp` 后重新验证。该脚本检查交付路径、文件类型、大小、JSON 格式和共享的公开结果安全边界；若报告 `result_sensitive_data`，应删除或改写对应敏感内容后重新验证。后端会继续执行完整 schema 与业务字段校验。

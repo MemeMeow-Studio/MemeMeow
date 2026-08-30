@@ -17,6 +17,9 @@ RUN npm install --global --no-fund --no-audit opencode-ai@1.18.18
 
 COPY skills/research-meme-context /skills/research-meme-context
 COPY executor /opt/mememeow/executor
+# executor 与 Skill 共享无状态协议快照，不把项目后端或数据库带入 Agent 镜像。
+COPY backend/public_dto.py /opt/mememeow/executor/public_dto.py
+COPY backend/opencode_workspace.py /opt/mememeow/executor/opencode_workspace.py
 
 RUN groupadd --system mememeow-agent \
     && useradd --system --gid mememeow-agent --create-home --shell /bin/bash mememeow-agent \

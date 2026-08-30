@@ -164,13 +164,14 @@ def _stream_sample(stream: BinaryIO, limit: int) -> bytes:
 class OpenCodeError(RuntimeError):
     """携带稳定错误码的 OpenCode 运行失败。"""
 
-    def __init__(self, code: str, message: str | None = None, *, session_id: str | None = None, executor_attempt_id: str | None = None, retryable: bool | None = None, http_status: int | None = None):
+    def __init__(self, code: str, message: str | None = None, *, session_id: str | None = None, executor_attempt_id: str | None = None, retryable: bool | None = None, http_status: int | None = None, reason_code: str | None = None):
         super().__init__(message or code)
         self.code = code
         self.session_id = normalize_identifier(session_id, kind="session")
         self.executor_attempt_id = normalize_identifier(executor_attempt_id, kind="attempt")
         self.retryable = retryable
         self.http_status = http_status
+        self.reason_code = reason_code if isinstance(reason_code, str) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,127}", reason_code) else None
 
 
 def _workspace_opencode_config(workspace: ResolvedWorkspace) -> dict[str, Any]:
@@ -498,7 +499,7 @@ class OpenCodeRunner:
                     # 健康探针失败也必须进入任务稳定错误协议，不能把客户端异常
                     # 直接交给长任务服务并退化成 task_failed。
                     code = self._executor_error_code(exc.code, health=True)
-                    raise OpenCodeError(code, str(exc)[:500]) from exc
+                    raise OpenCodeError(code, str(exc)[:500], reason_code=exc.reason_code) from exc
                 if not bool(health.get("ready")):
                     raise OpenCodeError("agent_runtime_unavailable", "Agent executor 健康检查未通过")
             else:
@@ -924,7 +925,7 @@ class OpenCodeRunner:
         try:
             candidate = validate_agent_result(candidate, secret_inventory=secret_inventory_from_settings(self.settings))
         except PublicDataError as exc:
-            raise OpenCodeError("agent_output_schema_invalid", "候选 JSON 超出公开结果边界") from exc
+            raise OpenCodeError("agent_output_schema_invalid", "候选 JSON 超出公开结果边界", reason_code=exc.code) from exc
         if not required.issubset(candidate):
             raise OpenCodeError("agent_output_schema_invalid", "候选 JSON 缺少必填字段")
         schema_path = self.project_root / "skills" / "research-meme-context" / "references" / "output-schema.json"
@@ -1267,14 +1268,18 @@ class OpenCodeRunner:
             raise OpenCodeError("agent_result_file_too_large", "Agent 结果文件超过大小限制")
         try:
             value = json.loads(payload.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
             raise OpenCodeError("agent_result_file_invalid_json", "Agent 结果文件不是有效 JSON") from exc
         if not isinstance(value, dict):
-            raise OpenCodeError("agent_result_file_schema_invalid", "Agent 结果文件必须是 JSON 对象")
+            raise OpenCodeError(
+                "agent_result_file_schema_invalid",
+                "Agent 结果文件必须是 JSON 对象",
+                reason_code="result_object_required",
+            )
         try:
             return self.validate_candidate(value)
         except OpenCodeError as exc:
-            raise OpenCodeError("agent_result_file_schema_invalid", str(exc)) from exc
+            raise OpenCodeError("agent_result_file_schema_invalid", str(exc), reason_code=exc.reason_code) from exc
 
     def read_result_file(self, result_path: Path, *, workspace: ResolvedWorkspace | None = None) -> dict[str, Any]:
         """读取并校验任务结果文件，供任务处理器和测试直接调用。"""
@@ -1515,8 +1520,15 @@ class OpenCodeRunner:
                             pass
                     decision = classify_resume_error(code, session_id=exc.session_id, target_unchanged=True, grant_state="committed")
                     if code == "agent_timeout":
-                        raise OpenCodeError("agent_timeout", "OpenCode 执行超时", session_id=exc.session_id, executor_attempt_id=exc.executor_attempt_id, http_status=exc.http_status) from exc
-                    raise OpenCodeError(code, str(exc)[:500], session_id=exc.session_id, executor_attempt_id=exc.executor_attempt_id, retryable=decision.retryable, http_status=exc.http_status) from exc
+                        raise OpenCodeError(
+                            "agent_timeout",
+                            "OpenCode 执行超时",
+                            session_id=exc.session_id,
+                            executor_attempt_id=exc.executor_attempt_id,
+                            http_status=exc.http_status,
+                            reason_code=exc.reason_code,
+                        ) from exc
+                    raise OpenCodeError(code, str(exc)[:500], session_id=exc.session_id, executor_attempt_id=exc.executor_attempt_id, retryable=decision.retryable, http_status=exc.http_status, reason_code=exc.reason_code) from exc
                 if self._take_pre_cancelled(task_id):
                     try:
                         self.executor.cancel(response.executor_attempt_id or task_id)
@@ -1634,12 +1646,12 @@ class OpenCodeRunner:
             progress(0.65, "正在读取研究结果文件")
             try:
                 candidate = self._read_result_file(result_path, workspace=resolved_workspace)
-            except OpenCodeError:
-                if resume_session_id:
-                    # 续跑必须以受控结果文件为边界；已有 draft/result 损坏时
-                    # 不能退回 transcript 解析，否则会绕过副作用和产物完整性判定。
+            except OpenCodeError as exc:
+                if resume_session_id or exc.code != "agent_result_file_missing":
+                    # 续跑或已有结果文件损坏时必须以文件校验为边界，不能退回
+                    # transcript 解析，否则会绕过副作用和产物完整性判定。
                     raise
-                # 显式 host 回滚继续兼容旧 session 结果读取；executor 任务在上方已直接失败。
+                # 仅在 host 未生成结果文件时兼容旧 session 读取；executor 任务在上方已直接失败。
                 try:
                     data = self._session_messages(session_id, environment, task_id, workspace=resolved_workspace)
                 except TypeError:

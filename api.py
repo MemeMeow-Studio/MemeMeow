@@ -865,9 +865,15 @@ async def lifespan(app: FastAPI):
             record_attempt = getattr(service.tasks, "record_agent_attempt", None)
             try:
                 if callable(record_attempt):
+                    attempt_error = {
+                        "error": exc.code,
+                        "message": str(exc),
+                        **({"http_status": exc.http_status} if getattr(exc, "http_status", None) else {}),
+                        **({"reason_code": exc.reason_code} if getattr(exc, "reason_code", None) else {}),
+                    }
                     recorded = record_attempt(
                         payload,
-                        error={"error": exc.code, "message": str(exc), **({"http_status": exc.http_status} if getattr(exc, "http_status", None) else {})},
+                        error=attempt_error,
                         session_id=failure_session_id,
                         executor_attempt_id=getattr(exc, "executor_attempt_id", None),
                         workspace_selector=payload.get("_workspace_selector") if isinstance(payload.get("_workspace_selector"), str) else None,

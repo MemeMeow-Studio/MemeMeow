@@ -23,6 +23,11 @@ def test_resume_backoff_and_error_history_are_bounded_and_deduplicated() -> None
     history = append_error_history(history, {"error": "agent_provider_rate_limited", "message": "later"}, attempt=1, executor_attempt_id="attempt-1", session_id="session-1")
     assert len(history) == 1
     assert sanitize_error({"error": "provider", "message": "x" * 1000, "http_status": 429})["message"] == "x" * 500
+    assert "reason_code" not in sanitize_error({"error": "provider", "message": "x", "reason_code": "result_sensitive_data"})
+    assert sanitize_error(
+        {"error": "agent_result_file_schema_invalid", "message": "任务执行失败", "reason_code": "result_sensitive_data"},
+        include_reason_code=True,
+    )["reason_code"] == "result_sensitive_data"
 
 
 def test_error_sanitization_redacts_json_secrets_and_generic_host_paths() -> None:

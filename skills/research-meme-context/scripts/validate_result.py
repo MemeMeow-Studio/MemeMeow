@@ -1,16 +1,30 @@
 """校验共享 Agent 容器的最终研究结果文件。
 
 本脚本位于 ``research-meme-context`` Skill 中，供 Agent 在结束任务前确认
-任务结果遵循后端的文件交付协议。后端仍会执行完整的 schema 与业务模型校验。
+任务结果遵循后端的文件交付协议，并提前执行共享的公开数据安全扫描。后端仍会
+执行完整的 schema 与业务模型校验。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import stat
 import sys
 from pathlib import Path
+
+try:
+    # Agent 镜像将同一份无状态 DTO 快照放在 executor 包中，避免复制整个后端。
+    from executor.public_dto import scan_public_result, secret_inventory_from_mapping
+except ModuleNotFoundError as exc:
+    if exc.name not in {"executor", "executor.public_dto"}:
+        raise
+    # 源码测试直接运行 Skill 脚本时，从项目根目录加载同一份实现。
+    project_root = Path(__file__).resolve().parents[3]
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    from backend.public_dto import scan_public_result, secret_inventory_from_mapping
 
 
 RESULT_FILE_NAME = "result.json.tmp"
@@ -38,7 +52,7 @@ def validate_result_file(task_directory: Path, *, max_bytes: int = DEFAULT_MAX_B
     """检查结果文件协议并返回诊断信息。
 
     输入为单个任务结果目录和大小上限；输出为空列表表示文件名、节点类型、大小和
-    JSON 语法均有效，否则返回可直接据此修复的错误列表。
+    JSON 语法和公开数据安全边界均有效，否则返回可直接据此修复的错误列表。
     """
     errors: list[str] = []
     if max_bytes <= 0:
@@ -76,6 +90,9 @@ def validate_result_file(task_directory: Path, *, max_bytes: int = DEFAULT_MAX_B
         return [f"{RESULT_FILE_NAME} 不是有效 UTF-8 JSON: {exc}"]
     if not isinstance(value, dict):
         return [f"{RESULT_FILE_NAME} 的根节点必须是 JSON 对象"]
+    reason_code = scan_public_result(value, secret_inventory=secret_inventory_from_mapping(os.environ))
+    if reason_code:
+        return [f"{RESULT_FILE_NAME} 未通过公开结果安全校验: {reason_code}"]
     return errors
 
 

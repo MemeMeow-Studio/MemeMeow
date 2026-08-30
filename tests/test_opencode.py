@@ -87,6 +87,32 @@ def test_candidate_validation_rejects_title_punctuation(tmp_path: Path):
     assert error.value.code == "agent_output_schema_invalid"
 
 
+def test_candidate_validation_preserves_public_boundary_reason(tmp_path: Path):
+    """host 候选和结果文件包装都应保留安全的公开边界原因码。"""
+    runner = OpenCodeRunner(make_settings(tmp_path))
+    invalid = candidate()
+    invalid["references"] = ["path=/runtime/secret"]
+
+    with pytest.raises(OpenCodeError) as candidate_error:
+        runner.validate_candidate(invalid)
+    assert candidate_error.value.code == "agent_output_schema_invalid"
+    assert candidate_error.value.reason_code == "result_sensitive_data"
+
+    _draft, result_path = runner.create_task_result_paths("reason-code")
+    result_path.write_text(json.dumps(invalid, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(OpenCodeError) as file_error:
+        runner.read_result_file(result_path)
+    assert file_error.value.code == "agent_result_file_schema_invalid"
+    assert file_error.value.reason_code == "result_sensitive_data"
+
+    _draft, object_result_path = runner.create_task_result_paths("object-reason-code")
+    object_result_path.write_text("[]", encoding="utf-8")
+    with pytest.raises(OpenCodeError) as object_error:
+        runner.read_result_file(object_result_path)
+    assert object_error.value.code == "agent_result_file_schema_invalid"
+    assert object_error.value.reason_code == "result_object_required"
+
+
 def test_missing_opencode_configuration_has_stable_error(tmp_path: Path):
     """没有可执行文件或模型时 worker 返回稳定诊断。"""
     with pytest.raises(OpenCodeError) as error:
@@ -347,6 +373,58 @@ def test_runner_accepts_large_cli_output_without_accumulating_pipe_bytes(tmp_pat
     assert result["title"] == "测试标题"
     log_path = runner.log_root / f"{hashlib.sha256(str(image).encode()).hexdigest()[:16]}.jsonl"
     assert log_path.stat().st_size == DIAGNOSTIC_LOG_BYTES
+
+
+def test_host_does_not_fallback_to_transcript_for_invalid_result_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """结果文件存在但越过公开边界时，host 不能用合法 transcript 绕过拒绝。"""
+    project = tmp_path / "project"
+    (project / "skills" / "research-meme-context").mkdir(parents=True)
+    modules = project / "node_modules"
+    (modules / "@ai-sdk" / "openai").mkdir(parents=True)
+    executable = tmp_path / "fake-opencode.py"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "if sys.argv[1] == 'run':\n"
+        "    sys.stdout.write('{\\\"type\\\":\\\"session.created\\\",\\\"session_id\\\":\\\"boundary-session\\\"}\\n')\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    settings = Settings(
+        **{
+            **make_settings(tmp_path).__dict__,
+            "opencode_executable": str(executable),
+            "opencode_model": "mememeow/gpt-5.6-luna",
+            "opencode_base_url": "https://example.invalid/v1",
+            "opencode_api_key": "test-key",
+            "opencode_node_modules": modules,
+        }
+    )
+    runner = OpenCodeRunner(settings, project_root=project)
+    invalid = candidate()
+    invalid["references"] = ["path=/runtime/secret"]
+
+    def write_invalid_result(_image: Path, _prompt: str, **kwargs: object) -> list[str]:
+        """在 CLI 启动前写入越过公开边界的结果文件。"""
+        result_path = kwargs["result_path"]
+        assert isinstance(result_path, Path)
+        result_path.write_text(json.dumps(invalid, ensure_ascii=False), encoding="utf-8")
+        return [str(executable), "run"]
+
+    monkeypatch.setattr(runner, "_run_command", write_invalid_result)
+    monkeypatch.setattr(
+        runner,
+        "_session_messages",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("invalid result must not use transcript fallback")),
+    )
+    image = tmp_path / "image.png"
+    image.write_bytes(b"image")
+
+    with pytest.raises(OpenCodeError) as error:
+        runner.run(image, lambda _value, _message: None, task_id="result-boundary")
+
+    assert error.value.code == "agent_result_file_schema_invalid"
+    assert error.value.reason_code == "result_sensitive_data"
 
 
 def test_session_messages_stream_large_response_without_read_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

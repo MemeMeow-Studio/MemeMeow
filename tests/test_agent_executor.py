@@ -118,6 +118,8 @@ def executor_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "    observation = {'cwd': os.getcwd(), 'db': os.environ['OPENCODE_DB'], 'config': os.environ['OPENCODE_CONFIG'], 'config_dir': os.environ['OPENCODE_CONFIG_DIR'], 'image': Path(image_arg).read_bytes().decode('utf-8')}\n"
         "    Path(os.environ['OPENCODE_CONFIG']).with_name('observation.json').write_text(json.dumps(observation), encoding='utf-8')\n"
         "    candidate = {'title':'executor 测试','summary':'受控任务结果','subjects':['主体'],'visible_text':[],'references':[],'meaning':None,'keywords':['测试'],'search_queries':[],'uncertainties':[],'source_urls':[]}\n"
+        "    if os.getenv('FAKE_MODE') == 'sensitive-result':\n"
+        "        candidate['references'] = ['path=/runtime/secret']\n"
         "    if os.getenv('FAKE_MODE') == 'provider429':\n"
         "        with open(directory / 'result.json.draft', 'w', encoding='utf-8') as handle: json.dump({'partial': True}, handle)\n"
         "        print(json.dumps({'type':'session.created','session_id':'session-' + task}), flush=True)\n"
@@ -198,6 +200,27 @@ def test_executor_runs_fixed_task_and_returns_result(executor_fixture) -> None:
     with pytest.raises(AgentExecutorError) as error:
         client._request("POST", "/v1/tasks", {"task_id": "task-path", "image_relative_path": "../outside.png", "wait": True})
     assert error.value.code == "agent_image_path_forbidden"
+
+
+def test_executor_preserves_result_validation_reason_code(executor_fixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    """结果公开边界失败时，外部错误码不变但 executor 保留内部原因码。"""
+    executor, client, runtime = executor_fixture
+    original_environment = executor._task_environment
+    monkeypatch.setattr(executor, "_task_environment", lambda task: {**original_environment(task), "FAKE_MODE": "sensitive-result"})
+
+    with pytest.raises(AgentExecutorError) as error:
+        client.run(task_id="sensitive-result", image_relative_path="sample.png", reverse_image_policy="forbid", timeout_seconds=5)
+
+    assert error.value.code == "agent_result_file_schema_invalid"
+    assert error.value.reason_code == "result_sensitive_data"
+    attempt = executor.tasks[error.value.executor_attempt_id]
+    assert attempt.error == {
+        "error": "agent_result_file_schema_invalid",
+        "message": "任务执行失败",
+        "reason_code": "result_sensitive_data",
+    }
+    metadata = json.loads((runtime / "task-results/sensitive-result/.executor-attempts.json").read_text(encoding="utf-8"))
+    assert metadata["attempts"][-1]["error"]["reason_code"] == "result_sensitive_data"
 
 
 def test_executor_captures_session_from_complete_large_stdout(executor_fixture, monkeypatch: pytest.MonkeyPatch) -> None:

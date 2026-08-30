@@ -44,12 +44,56 @@ def test_agent_result_rejects_unknown_fields_as_a_whole() -> None:
         validate_agent_result(value)
 
 
+def test_agent_result_allows_slash_as_natural_language_separator() -> None:
+    """普通文本中的斜杠不能被绝对路径扫描误判。"""
+    for reference in (
+        "动漫作品《工作细胞》（はたらく細胞 / Cells at Work!，清水茜原作漫画）",
+        "日本語 /English",
+        "A /B",
+        "日本語 /english",
+        "foo /bar",
+        "foo /bar.",
+        "https://example.com/?redirect=/docs",
+        "https://example.com/?path=/images/foo.jpg",
+    ):
+        result = _agent_result()
+        result["references"] = [reference]
+
+        assert validate_agent_result(result)["references"] == result["references"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "path=/runtime/secret",
+        "path:/runtime/secret",
+        "path = /runtime/secret",
+        "file: /runtime/task-results/a/result.json",
+        "path=/home/meme/result.json",
+        "file:/runtime/task-results/a/result.json",
+        r"path=C:\\Users\\meme\\result.json",
+        r"path=\\\\server\\share\\result.json",
+        "x=scope_id:secret",
+        "read /srv/app/result.json",
+    ],
+)
+def test_agent_result_rejects_assigned_paths_and_internal_identifiers(value: str) -> None:
+    """赋值形式的路径和内部标识同样不能绕过公开结果边界。"""
+    result = _agent_result()
+    result["summary"] = value
+
+    with pytest.raises(PublicDataError, match="result_sensitive_data"):
+        validate_agent_result(result)
+
+
 @pytest.mark.parametrize(
     "value",
     [
         "https://user:password@example.com/private",
         "http://127.0.0.1:8080/internal/result",
         "https://example.com/download?access_token=secret-value",
+        "https://example.com/?task_id=internal-task",
+        "https://example.com/?scope_id=internal-scope",
         "postgresql://db-user:db-password@example.internal:5432/app",
         "password=plain-text-secret",
     ],
@@ -104,6 +148,23 @@ def test_dirty_task_history_and_result_are_projected_without_type_errors() -> No
     assert "scope_id" not in public
     assert public["created_at"] is not None
     assert public["resume_started_at"] is None
+
+
+def test_public_task_error_drops_internal_reason_code() -> None:
+    """内部结果原因码不能扩大公开任务 DTO 的字段集合。"""
+    record = TaskRecord(
+        task_id="task-reason",
+        task_type="meme_context_generation",
+        error={
+            "error": "agent_result_file_schema_invalid",
+            "message": "任务执行失败",
+            "reason_code": "result_sensitive_data",
+        },
+    )
+
+    public = record.as_dict()
+
+    assert "reason_code" not in public["error"]
 
 
 def test_processing_dtos_fail_closed_for_non_string_enum_values() -> None:

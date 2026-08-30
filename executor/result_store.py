@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 from pathlib import Path
 from typing import Any, Callable
@@ -16,9 +17,10 @@ from typing import Any, Callable
 class ExecutorResultStoreError(RuntimeError):
     """结果文件无法安全读取或通过 schema 校验。"""
 
-    def __init__(self, code: str) -> None:
-        """创建稳定结果错误。"""
+    def __init__(self, code: str, *, reason_code: str | None = None) -> None:
+        """创建稳定结果错误，并可携带不含输入内容的内部原因码。"""
         self.code = code
+        self.reason_code = reason_code if isinstance(reason_code, str) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,127}", reason_code) else None
         super().__init__(code)
 
 
@@ -74,13 +76,16 @@ class ExecutorResultStore:
             value = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
             raise ExecutorResultStoreError("agent_result_file_invalid_json") from exc
-        if not isinstance(value, dict) or not required_fields.issubset(value):
-            raise ExecutorResultStoreError("agent_result_file_schema_invalid")
+        if not isinstance(value, dict):
+            raise ExecutorResultStoreError("agent_result_file_schema_invalid", reason_code="result_object_required")
+        if not required_fields.issubset(value):
+            raise ExecutorResultStoreError("agent_result_file_schema_invalid", reason_code="result_schema_invalid")
         if validator is not None:
             try:
                 validator(value)
             except Exception as exc:  # noqa: BLE001 - validator 只允许映射为稳定错误
-                raise ExecutorResultStoreError("agent_result_file_schema_invalid") from exc
+                reason_code = getattr(exc, "code", None)
+                raise ExecutorResultStoreError("agent_result_file_schema_invalid", reason_code=reason_code) from exc
         return value
 
 
