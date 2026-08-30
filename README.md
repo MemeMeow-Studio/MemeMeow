@@ -1,5 +1,35 @@
 <div align="center">
 
+<pre align="center">
+███╗   ███╗███████╗███╗   ███╗███████╗███╗   ███╗███████╗ ██████╗ ██╗    ██╗
+████╗ ████║██╔════╝████╗ ████║██╔════╝████╗ ████║██╔════╝██╔═══██╗██║    ██║
+██╔████╔██║█████╗  ██╔████╔██║█████╗  ██╔████╔██║█████╗  ██║   ██║██║ █╗ ██║
+██║╚██╔╝██║██╔══╝  ██║╚██╔╝██║██╔══╝  ██║╚██╔╝██║██╔══╝  ██║   ██║██║███╗██║
+██║ ╚═╝ ██║███████╗██║ ╚═╝ ██║███████╗██║ ╚═╝ ██║███████╗╚██████╔╝╚███╔███╔╝
+╚═╝     ╚═╝╚══════╝╚═╝     ╚═╝╚══════╝╚═╝     ╚═╝╚══════╝ ╚═════╝  ╚══╝╚══╝ 
+</pre>
+
+_✨ 通过自然语言检索表情包 ✨_
+
+[在线体验](https://zvv.quest) · [反馈问题](https://github.com/MemeMeow-Studio/MemeMeow/issues) · [参与贡献](https://github.com/MemeMeow-Studio/MemeMeow/pulls)
+
+[![License](https://img.shields.io/github/license/MemeMeow-Studio/MemeMeow)](LICENSE)
+[![Python Version](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org)
+[![Online Demo](https://img.shields.io/website?url=https%3A%2F%2Fzvv.quest&up_message=online&down_message=offline&label=demo)](https://zvv.quest)
+
+---
+
+<p align="center">
+    <a href="#-features">Features</a> •
+    <a href="#-screenshots">Screenshots</a> •
+    <a href="#-quick-start">Quick Start</a> •
+    <a href="#-usage">Usage</a> •
+    <a href="#-api">API</a> •
+    <a href="#-related-applications">Related Applications</a>
+</p>
+
+</div>
+
 MemeMeow 是一个基于自然语言的表情包检索工具。它能让你通过描述想要的场景或心情，快速找到合适的表情包（无需记住具体的文件名或标签）。
 
 > [!CAUTION]
