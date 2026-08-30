@@ -116,19 +116,34 @@ function retryDelaySeconds(reason: any): number {
   return reason?.status === 429 ? 1 : 0
 }
 
-/** 生成稳定的页面内文件项标识，避免同名文件互相覆盖状态。 */
-function itemId(file: File, index: number): string {
-  return `${index}:${file.name}:${file.size}:${file.lastModified}`
-}
-
 export function useUploadBatch() {
   const items = shallowRef<UploadBatchItem[]>([])
   const busy = shallowRef(false)
   const paused = shallowRef(false)
   const retryAt = shallowRef<number | null>(null)
   const activeRequests = shallowRef(0)
+  let nextItemSequence = 0
   let nextGeneration = 0
   let activeRun: UploadRun | null = null
+
+  /** 为当前页面批次生成单调递增标识，避免删除后新增项复用渲染 key。 */
+  function nextItemId(): string {
+    nextItemSequence += 1
+    return `upload-item-${nextItemSequence}`
+  }
+
+  /** 创建等待上传的批次项，保留每一次传入 File 的独立身份。 */
+  function createPendingItem(file: File): UploadBatchItem {
+    return { id: nextItemId(), file, status: 'pending', retryable: true, attempts: 0 }
+  }
+
+  /** 判断批次项是否仍属于下一次确认可以提交的集合。 */
+  function isSubmittableItem(item: UploadBatchItem): boolean {
+    return item.status === 'pending' || (item.status === 'failed' && item.retryable)
+  }
+
+  const submittableItems = computed(() => items.value.filter(isSubmittableItem))
+  const submittableFiles = computed(() => submittableItems.value.map((item) => item.file))
 
   const summary = computed<UploadBatchSummary>(() => {
     const counts = { total: items.value.length, succeeded: 0, failed: 0, cancelled: 0, pending: 0, uploading: 0 }
@@ -149,23 +164,27 @@ export function useUploadBatch() {
   /** 保存一次新的本地文件选择并清除上一次批次状态。 */
   function setFiles(files: File[]): void {
     if (busy.value) return
-    replaceItems(files.map((file, index) => ({ id: itemId(file, index), file, status: 'pending', retryable: true, attempts: 0 })))
+    replaceItems(files.map(createPendingItem))
     retryAt.value = null
   }
 
   /** 追加一组尚未上传的本地文件，保留当前批次的逐项结果。 */
   function appendFiles(files: File[]): void {
     if (busy.value || !files.length) return
-    const offset = items.value.length
-    const additions = files.map((file, index) => ({
-      id: itemId(file, offset + index),
-      file,
-      status: 'pending' as const,
-      retryable: true,
-      attempts: 0,
-    }))
+    const additions = files.map(createPendingItem)
     replaceItems([...items.value, ...additions])
     retryAt.value = null
+  }
+
+  /** 仅在批次空闲时按项目标识移除尚未发送的 pending 项。 */
+  function removePending(id: string): boolean {
+    if (busy.value) return false
+    const index = items.value.findIndex((item) => item.id === id && item.status === 'pending')
+    if (index < 0) return false
+    const next = items.value.slice()
+    next.splice(index, 1)
+    replaceItems(next)
+    return true
   }
 
   function complete(run: UploadRun): void {
@@ -181,8 +200,12 @@ export function useUploadBatch() {
 
   function schedule(run: UploadRun, delayMs: number): void {
     if (activeRun !== run || run.cancelled) return
+    const nextRetryAt = Date.now() + Math.max(0, delayMs)
+    // 多个并发分片可能同时收到 429；只能延后统一派发点，不能用较短的
+    // Retry-After 覆盖仍在等待的较长期限，否则会提前重试对应分片。
+    if (run.retryAt !== null && run.retryAt >= nextRetryAt && run.retryTimer) return
     if (run.retryTimer) clearTimeout(run.retryTimer)
-    run.retryAt = Date.now() + Math.max(0, delayMs)
+    run.retryAt = nextRetryAt
     retryAt.value = run.retryAt
     run.retryTimer = setTimeout(() => {
       run.retryTimer = null
@@ -291,13 +314,12 @@ export function useUploadBatch() {
   /** 启动选中文件的逻辑批次；文件项只在该页面内复用，服务端不建立批次实体。 */
   function start(files: File[], options: ImageProcessingOptions, config: ServiceConfig | null): Promise<UploadBatchRunResult> {
     if (busy.value || !files.length) return Promise.resolve({})
-    const availableItems = items.value.slice()
-    const selected = files.map((file, index) => {
+    // 只从待提交项匹配 File，避免重复引用重试时重新打开已成功项。
+    const availableItems = items.value.filter(isSubmittableItem)
+    const selected = files.map((file) => {
       const existingIndex = availableItems.findIndex((item) => item.file === file)
       if (existingIndex >= 0) return availableItems.splice(existingIndex, 1)[0]
-      return {
-        id: itemId(file, items.value.length + index), file, status: 'pending' as const, retryable: true, attempts: 0,
-      }
+      return createPendingItem(file)
     })
     updateItems((next) => {
       for (const item of selected) {
@@ -373,8 +395,11 @@ export function useUploadBatch() {
     retryAt,
     activeRequests,
     summary,
+    submittableItems,
+    submittableFiles,
     setFiles,
     appendFiles,
+    removePending,
     start,
     pause,
     resume,

@@ -1,6 +1,49 @@
 /** Vite 开发入口的浏览器级工作流冒烟测试。 */
 import { expect, test } from '@playwright/test'
 
+// 真实浏览器拖放需要构造可被 DataTransfer 接受的本地图片字节，而不是只伪造文件名。
+const ONE_PIXEL_PNG_BYTES = Array.from(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'))
+
+/** 在上传区域派发带有真实 File 对象的原生拖放事件，并返回默认行为是否已被阻止。 */
+async function dispatchFileDrag(page, type, files) {
+  return page.locator('.drop-zone').evaluate((element, payload) => {
+    const dataTransfer = new DataTransfer()
+    for (const entry of payload.files) {
+      dataTransfer.items.add(new File([Uint8Array.from(entry.bytes)], entry.name, { type: entry.type }))
+    }
+    const event = new DragEvent(payload.type, { bubbles: true, cancelable: true, dataTransfer })
+    element.dispatchEvent(event)
+    return event.defaultPrevented
+  }, { type, files })
+}
+
+/** 读取上传工作区在窄屏下的横向边界和关键行的矩形，避免只凭 CSS 类名判断布局。 */
+async function readUploadQueueLayout(page) {
+  return page.evaluate(() => {
+    const nodes = [
+      document.querySelector('.drop-zone'),
+      document.querySelector('.upload-panel > .primary'),
+      ...document.querySelectorAll('.upload-pending-item'),
+    ].filter(Boolean)
+    const rects = nodes.map((node) => {
+      const rect = node.getBoundingClientRect()
+      return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width, height: rect.height }
+    })
+    const overlaps = (left, right) => left.left < right.right - 1
+      && right.left < left.right - 1
+      && left.top < right.bottom - 1
+      && right.top < left.bottom - 1
+    const noOverlap = rects.every((rect, index) => rects.slice(index + 1).every((other) => !overlaps(rect, other)))
+    return {
+      documentWidth: document.documentElement.scrollWidth,
+      viewportWidth: window.innerWidth,
+      withinViewport: rects.every((rect) => rect.left >= -1 && rect.right <= window.innerWidth + 1 && rect.width > 0 && rect.height > 0),
+      noOverlap,
+      rects,
+    }
+  })
+}
+
 test.beforeEach(async ({ page }) => {
   await page.route('**/api/config', (route) => route.fulfill({
     status: 200,
@@ -62,6 +105,154 @@ test('上传选项先取消再确认，并发送两项处理选项', async ({ pa
   expect(body).toContain('name="auto_name"')
   expect(body).toContain('auto')
   expect(body).toContain('true')
+})
+
+/** 使用真实图片拖放核对按序追加、本地解码、确认前移除和窄屏可操作性。 */
+test('拖放图片按序追加本地预览，可删除待上传项并只提交剩余集合', async ({ page }) => {
+  const uploadRequests = []
+  const mediaRequests = []
+  page.on('request', (request) => {
+    if (new URL(request.url()).pathname.startsWith('/media/')) mediaRequests.push(request)
+  })
+  await page.route('**/api/images/upload', async (route) => {
+    uploadRequests.push(route.request())
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ results: [{ meme_id: 'meme-first', filename: 'first.png', ok: true, saved_filename: 'first.png' }] }),
+    })
+  })
+
+  await page.goto('/')
+  await page.getByRole('button', { name: '上传' }).click()
+  const first = { name: 'first.png', type: 'image/png', bytes: ONE_PIXEL_PNG_BYTES }
+  const second = { name: 'second.png', type: 'image/png', bytes: ONE_PIXEL_PNG_BYTES }
+  const dropZone = page.locator('.drop-zone')
+
+  expect(await dispatchFileDrag(page, 'dragenter', [first])).toBe(true)
+  await expect(dropZone).toHaveClass(/is-dragging/)
+  expect(await dispatchFileDrag(page, 'dragenter', [second])).toBe(true)
+  expect(await dispatchFileDrag(page, 'dragleave', [second])).toBe(true)
+  await expect(dropZone).toHaveClass(/is-dragging/)
+  expect(await dispatchFileDrag(page, 'dragover', [first, second])).toBe(true)
+  expect(await dispatchFileDrag(page, 'drop', [first, second])).toBe(true)
+  await expect(dropZone).not.toHaveClass(/is-dragging/)
+  expect(uploadRequests).toHaveLength(0)
+
+  const pending = page.locator('.upload-pending-item')
+  await expect(pending).toHaveCount(2)
+  await expect(pending.nth(0).locator('strong')).toHaveText('first.png')
+  await expect(pending.nth(1).locator('strong')).toHaveText('second.png')
+  for (let index = 0; index < 2; index += 1) {
+    const image = pending.nth(index).locator('img')
+    await expect(image).toHaveAttribute('src', /^blob:/)
+    await expect.poll(() => image.evaluate((element) => ({
+      complete: element.complete,
+      naturalWidth: element.naturalWidth,
+      naturalHeight: element.naturalHeight,
+    }))).toEqual({ complete: true, naturalWidth: 1, naturalHeight: 1 })
+  }
+
+  const desktopLayout = await readUploadQueueLayout(page)
+  expect(desktopLayout.documentWidth).toBeLessThanOrEqual(desktopLayout.viewportWidth)
+  expect(desktopLayout.withinViewport).toBe(true)
+  expect(desktopLayout.noOverlap).toBe(true)
+  await page.screenshot({ path: '/home/infstellar/vscode/MemeMeow/frontend/test-results/upload-queue-desktop.png', fullPage: true })
+
+  await pending.nth(1).getByRole('button', { name: '移除待上传图片 second.png' }).click()
+  await expect(pending).toHaveCount(1)
+  await expect(pending.first().locator('strong')).toHaveText('first.png')
+  await expect(page.getByText('second.png', { exact: true })).toHaveCount(0)
+  expect(uploadRequests).toHaveLength(0)
+
+  await page.setViewportSize({ width: 320, height: 844 })
+  const mobileLayout = await readUploadQueueLayout(page)
+  expect(mobileLayout.viewportWidth).toBe(320)
+  expect(mobileLayout.documentWidth).toBeLessThanOrEqual(320)
+  expect(mobileLayout.withinViewport).toBe(true)
+  expect(mobileLayout.noOverlap).toBe(true)
+  await expect(pending.first().locator('img')).toBeVisible()
+  await page.screenshot({ path: '/home/infstellar/vscode/MemeMeow/frontend/test-results/upload-queue-mobile.png', fullPage: true })
+
+  await page.getByRole('button', { name: '上传所选图片' }).click()
+  const dialog = page.getByRole('dialog', { name: '图片处理选项' })
+  await expect(dialog).toBeVisible()
+  expect(uploadRequests).toHaveLength(0)
+  await dialog.getByRole('button', { name: '确认并提交' }).click()
+  await expect.poll(() => uploadRequests.length).toBe(1)
+  const body = uploadRequests[0].postData() || ''
+  expect(body).toContain('filename="first.png"')
+  expect(body).not.toContain('filename="second.png"')
+  await expect(page.locator('.upload-result')).toContainText('first.png')
+  expect(mediaRequests).toHaveLength(0)
+})
+
+/** 坏图片只能使本地预览回退，不能抹掉文件名、移除能力或触发服务端媒体请求。 */
+test('预览解码失败仍保留文件名和移除动作且不请求服务端媒体', async ({ page }) => {
+  const uploadRequests = []
+  const mediaRequests = []
+  page.on('request', (request) => {
+    if (new URL(request.url()).pathname.startsWith('/media/')) mediaRequests.push(request)
+  })
+  await page.route('**/api/images/upload', (route) => {
+    uploadRequests.push(route.request())
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ results: [] }),
+    })
+  })
+
+  await page.goto('/')
+  await page.getByRole('button', { name: '上传' }).click()
+  const broken = { name: 'broken.png', type: 'image/png', bytes: [0, 1, 2, 3, 4, 5] }
+  expect(await dispatchFileDrag(page, 'drop', [broken])).toBe(true)
+  const pending = page.locator('.upload-pending-item')
+  await expect(pending).toHaveCount(1)
+  await expect(pending.getByRole('img', { name: '无法预览 broken.png' })).toBeVisible()
+  await expect(pending.locator('img')).toHaveCount(0)
+  await expect(pending.locator('strong')).toHaveText('broken.png')
+  await expect(pending.getByRole('button', { name: '移除待上传图片 broken.png' })).toBeEnabled()
+  expect(uploadRequests).toHaveLength(0)
+  expect(mediaRequests).toHaveLength(0)
+
+  await pending.getByRole('button', { name: '移除待上传图片 broken.png' }).click()
+  await expect(pending).toHaveCount(0)
+  expect(uploadRequests).toHaveLength(0)
+  expect(mediaRequests).toHaveLength(0)
+})
+
+/** 上传请求保持挂起时，拖放仍须阻止浏览器默认导航并冻结活动批次。 */
+test('上传中拖放不修改活动批次', async ({ page }) => {
+  const uploadRequests = []
+  let releaseUpload
+  const uploadGate = new Promise((resolve) => { releaseUpload = resolve })
+  await page.route('**/api/images/upload', async (route) => {
+    uploadRequests.push(route.request())
+    await uploadGate
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ results: [{ meme_id: 'meme-active', filename: 'active.png', ok: true, saved_filename: 'active.png' }] }),
+    })
+  })
+
+  await page.goto('/')
+  await page.getByRole('button', { name: '上传' }).click()
+  await page.setInputFiles('input[type="file"]', { name: 'active.png', mimeType: 'image/png', buffer: Buffer.from(ONE_PIXEL_PNG_BYTES) })
+  await page.getByRole('button', { name: '上传所选图片' }).click()
+  await page.getByRole('dialog', { name: '图片处理选项' }).getByRole('button', { name: '确认并提交' }).click()
+  await expect.poll(() => uploadRequests.length).toBe(1)
+
+  const activeDrop = { name: 'added-while-uploading.png', type: 'image/png', bytes: ONE_PIXEL_PNG_BYTES }
+  expect(await dispatchFileDrag(page, 'drop', [activeDrop])).toBe(true)
+  await expect(page.locator('input[type="file"]')).toBeDisabled()
+  await expect(page.locator('.upload-results')).toContainText('active.png')
+  await expect(page.locator('.upload-results')).not.toContainText('added-while-uploading.png')
+  expect(uploadRequests).toHaveLength(1)
+
+  releaseUpload()
+  await expect(page.locator('.upload-results')).toContainText('完成')
 })
 
 test('完整重试使用 scope 端点，取消不请求且 320px 弹层不越界', async ({ page }) => {

@@ -48,6 +48,50 @@ describe('useUploadBatch', () => {
     expect(batch.items.value[1]).toMatchObject({ file: second, status: 'pending', retryable: true, attempts: 0 })
   })
 
+  it('删除后追加仍使用不复用的项目 ID，并支持同名和重复引用独立存在', () => {
+    const { batch } = setupBatch()
+    const file = makeFiles(1)[0]
+
+    batch.setFiles([file, file])
+    const [first, second] = batch.items.value
+    expect(first.id).not.toBe(second.id)
+
+    expect(batch.removePending(first.id)).toBe(true)
+    batch.appendFiles([file])
+
+    expect(batch.items.value).toHaveLength(2)
+    expect(batch.items.value[0]).toBe(second)
+    expect(batch.items.value[1].file).toBe(file)
+    expect(batch.items.value[1].id).not.toBe(first.id)
+    expect(batch.items.value[1].id).not.toBe(second.id)
+  })
+
+  it('按项目 ID 只移除空闲 pending 项，不影响结果项或活动批次', async () => {
+    upload.mockReset().mockResolvedValue({ results: [{ ok: true, filename: 'ok.png' }] })
+    const { batch } = setupBatch()
+    const files = makeFiles(2)
+    batch.setFiles(files)
+    const succeededId = batch.items.value[0].id
+    const pendingId = batch.items.value[1].id
+
+    await batch.start([files[0]], { reverse_image_policy: 'forbid', auto_name: false }, null)
+    expect(batch.removePending(succeededId)).toBe(false)
+    expect(batch.removePending(pendingId)).toBe(true)
+    expect(batch.items.value.map((item) => item.id)).toEqual([succeededId])
+
+    let resolveUpload: ((value: unknown) => void) | undefined
+    upload.mockReset().mockImplementation(() => new Promise((resolve) => { resolveUpload = resolve }))
+    const activeFile = makeFiles(1)[0]
+    batch.setFiles([activeFile])
+    const activeId = batch.items.value[0].id
+    const done = batch.start([activeFile], { reverse_image_policy: 'forbid', auto_name: false }, null)
+    await flushPromises()
+    expect(batch.removePending(activeId)).toBe(false)
+    resolveUpload?.({ results: [{ ok: true }] })
+    await done
+    expect(batch.items.value[0]).toMatchObject({ id: activeId, status: 'succeeded' })
+  })
+
   it('重复传入同一 File 引用时仍为每个队列项发送一次', async () => {
     upload.mockReset().mockResolvedValue({ results: [{ ok: true }, { ok: true }] })
     const { batch } = setupBatch()
@@ -124,6 +168,27 @@ describe('useUploadBatch', () => {
     vi.useRealTimers()
   })
 
+  it('并发 429 使用最晚 Retry-After，不能提前重试较长等待的分片', async () => {
+    upload.mockReset()
+      .mockRejectedValueOnce(Object.assign(new Error('busy-long'), { status: 429, retryAfter: 3 }))
+      .mockRejectedValueOnce(Object.assign(new Error('busy-short'), { status: 429, retryAfter: 1 }))
+      .mockResolvedValue({ results: Array.from({ length: 20 }, () => ({ ok: true })) })
+    vi.useFakeTimers()
+    const { batch } = setupBatch()
+    const files = makeFiles(40)
+    const done = batch.start(files, { reverse_image_policy: 'forbid', auto_name: false }, null)
+
+    await flushPromises()
+    expect(upload).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(upload).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(2000)
+    await done
+    expect(upload).toHaveBeenCalledTimes(4)
+    expect(batch.summary.value.succeeded).toBe(40)
+    vi.useRealTimers()
+  })
+
   it('取消会中止活动请求并保留已完成项', async () => {
     upload.mockReset()
     let rejectPending: ((reason?: unknown) => void) | undefined
@@ -152,5 +217,25 @@ describe('useUploadBatch', () => {
     await batch.start(files, { reverse_image_policy: 'forbid', auto_name: false }, null)
     expect(batch.summary.value).toMatchObject({ succeeded: 1, failed: 1 })
     expect(batch.items.value.find((item) => item.file === files[1])?.retryable).toBe(false)
+  })
+
+  it('重复 File 引用部分成功后重试只更新失败项并保留成功结果', async () => {
+    upload.mockReset().mockResolvedValueOnce({ results: [
+      { ok: true, filename: 'same.png', meme_id: 'meme-1' },
+      { ok: false, filename: 'same.png', error: 'processing_failed' },
+    ] }).mockResolvedValueOnce({ results: [{ ok: true, filename: 'same.png', meme_id: 'meme-2' }] })
+    const { batch } = setupBatch()
+    const file = makeFiles(1)[0]
+    batch.setFiles([file, file])
+
+    await batch.start([file, file], { reverse_image_policy: 'forbid', auto_name: false }, null)
+    const [succeeded, failed] = batch.items.value
+    expect(batch.submittableFiles.value).toEqual([file])
+
+    await batch.start(batch.submittableFiles.value, { reverse_image_policy: 'forbid', auto_name: false }, null)
+
+    expect(batch.items.value).toHaveLength(2)
+    expect(batch.items.value[0]).toMatchObject({ id: succeeded.id, status: 'succeeded', result: { meme_id: 'meme-1' } })
+    expect(batch.items.value[1]).toMatchObject({ id: failed.id, status: 'succeeded', result: { meme_id: 'meme-2' } })
   })
 })

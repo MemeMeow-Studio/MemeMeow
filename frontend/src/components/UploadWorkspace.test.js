@@ -24,6 +24,14 @@ function pasteFiles(files, items = files.map((file) => ({ kind: 'file', type: fi
   return event
 }
 
+/** 向上传区域派发带有受控文件列表的拖放事件，供交互契约测试复用。 */
+function dragFiles(wrapper, type, files = []) {
+  const event = new Event(type, { bubbles: true, cancelable: true })
+  Object.defineProperty(event, 'dataTransfer', { configurable: true, value: { files } })
+  wrapper.get('.drop-zone').element.dispatchEvent(event)
+  return event
+}
+
 function mountWorkspace(options = {}) {
   const wrapper = mount(UploadWorkspace, options)
   mountedWrappers.push(wrapper)
@@ -207,6 +215,136 @@ describe('UploadWorkspace', () => {
 
     expect(upload).toHaveBeenCalledTimes(1)
     expect(upload.mock.calls[0][0]).toEqual([first, second])
+  })
+
+  it('拖放按顺序追加受控图片、抑制默认行为并显示激活态', async () => {
+    const selected = new File(['selected'], 'selected.png', { type: 'image/png' })
+    const first = new File(['first'], 'first.jpg', { type: '' })
+    const ignored = new File(['text'], 'notes.txt', { type: 'text/plain' })
+    const second = new File(['second'], 'second.gif', { type: 'image/gif' })
+    const wrapper = mountWorkspace({ props: { config: { reverse_image_available: true } } })
+
+    await selectFiles(wrapper, [selected])
+    const enter = dragFiles(wrapper, 'dragenter')
+    await wrapper.vm.$nextTick()
+    expect(enter.defaultPrevented).toBe(true)
+    expect(wrapper.get('.drop-zone').classes()).toContain('is-dragging')
+    dragFiles(wrapper, 'dragenter')
+    dragFiles(wrapper, 'dragleave')
+    expect(wrapper.get('.drop-zone').classes()).toContain('is-dragging')
+
+    const drop = dragFiles(wrapper, 'drop', [first, ignored, second])
+    await wrapper.vm.$nextTick()
+
+    expect(drop.defaultPrevented).toBe(true)
+    expect(wrapper.get('.drop-zone').classes()).not.toContain('is-dragging')
+    expect(wrapper.findAll('.upload-pending-item strong').map((item) => item.text())).toEqual([
+      'selected.png',
+      'first.jpg',
+      'second.gif',
+    ])
+    expect(upload).not.toHaveBeenCalled()
+  })
+
+  it('上传中拖放仍阻止浏览器默认行为且不改写活动批次', async () => {
+    let resolveUpload
+    upload.mockImplementationOnce(() => new Promise((resolve) => { resolveUpload = resolve }))
+    const first = new File(['first'], 'first.png', { type: 'image/png' })
+    const second = new File(['second'], 'second.png', { type: 'image/png' })
+    const wrapper = mountWorkspace({ props: { config: { reverse_image_available: true } } })
+
+    await selectFiles(wrapper, [first])
+    await wrapper.get('button.primary').trigger('click')
+    await wrapper.get('.processing-options-dialog form').trigger('submit')
+    expect(upload).toHaveBeenCalledTimes(1)
+
+    const drop = dragFiles(wrapper, 'drop', [second])
+    await wrapper.vm.$nextTick()
+    expect(drop.defaultPrevented).toBe(true)
+    expect(wrapper.get('input[type="file"]').element.disabled).toBe(true)
+    expect(wrapper.text()).toContain('已选择 1 个文件，可继续添加')
+    expect(wrapper.text()).not.toContain('second.png')
+
+    resolveUpload({ results: [{ filename: first.name, ok: true, meme_id: 'meme-1' }] })
+    await flushPromises()
+  })
+
+  it('暂停后显示继续并在继续后恢复暂停动作', async () => {
+    let resolveUpload
+    upload.mockImplementationOnce(() => new Promise((resolve) => { resolveUpload = resolve }))
+    const file = new File(['one'], 'pause.png', { type: 'image/png' })
+    const wrapper = mountWorkspace({ props: { config: { reverse_image_available: true } } })
+
+    await selectFiles(wrapper, [file])
+    await wrapper.get('button.primary').trigger('click')
+    await wrapper.get('.processing-options-dialog form').trigger('submit')
+    expect(wrapper.get('.upload-summary button.quiet').text()).toBe('暂停')
+
+    await wrapper.get('.upload-summary button.quiet').trigger('click')
+    expect(wrapper.get('.upload-summary button.quiet').text()).toBe('继续')
+    await wrapper.get('.upload-summary button.quiet').trigger('click')
+    expect(wrapper.get('.upload-summary button.quiet').text()).toBe('暂停')
+
+    resolveUpload({ results: [{ filename: file.name, ok: true, meme_id: 'meme-pause' }] })
+    await flushPromises()
+  })
+
+  it('待上传项使用本地预览，解码失败和移除均保留可管理性并回收对象 URL', async () => {
+    const createObjectURL = vi.fn((file) => `blob:${file.name}`)
+    const revokeObjectURL = vi.fn()
+    vi.stubGlobal('URL', { createObjectURL, revokeObjectURL })
+    const files = [
+      new File(['first'], 'first.png', { type: 'image/png' }),
+      new File(['broken'], 'broken.gif', { type: 'image/gif' }),
+      new File(['last'], 'last.jpg', { type: 'image/jpeg' }),
+    ]
+    const wrapper = mountWorkspace({ props: { config: { reverse_image_available: true } } })
+
+    try {
+      await selectFiles(wrapper, files)
+      expect(createObjectURL).toHaveBeenCalledTimes(3)
+      expect(wrapper.findAll('.upload-pending-item img')[0].attributes('src')).toBe('blob:first.png')
+      expect(wrapper.findAll('.upload-pending-item button')[0].attributes('aria-label')).toBe('移除待上传图片 first.png')
+
+      await wrapper.findAll('.upload-pending-item button')[0].trigger('click')
+      expect(revokeObjectURL).toHaveBeenCalledWith('blob:first.png')
+      expect(wrapper.text()).not.toContain('first.png')
+
+      const broken = wrapper.get('.upload-pending-item img')
+      await broken.trigger('error')
+      await wrapper.vm.$nextTick()
+      expect(revokeObjectURL).toHaveBeenCalledWith('blob:broken.gif')
+      expect(wrapper.get('.upload-pending-preview-fallback').attributes('aria-label')).toBe('无法预览 broken.gif')
+      expect(wrapper.text()).toContain('broken.gif')
+      expect(wrapper.get('[aria-label="移除待上传图片 broken.gif"]')).toBeTruthy()
+      expect(upload).not.toHaveBeenCalled()
+
+      wrapper.unmount()
+      mountedWrappers.splice(mountedWrappers.indexOf(wrapper), 1)
+      expect(revokeObjectURL).toHaveBeenCalledWith('blob:last.jpg')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('文件选择会替换粘贴产生的本地队列', async () => {
+    const pasted = new File(['pasted'], 'pasted.png', { type: 'image/png' })
+    const selected = new File(['selected'], 'selected.png', { type: 'image/png' })
+    upload.mockResolvedValue({ results: [{ filename: selected.name, ok: true, meme_id: 'meme-1' }] })
+    const wrapper = mountWorkspace({ props: { config: { reverse_image_available: true } } })
+
+    pasteFiles([pasted])
+    await wrapper.vm.$nextTick()
+    await selectFiles(wrapper, [selected])
+
+    expect(wrapper.get('.upload-results').text()).not.toContain('pasted.png')
+    expect(wrapper.get('.upload-results').text()).toContain('selected.png')
+    await wrapper.get('button.primary').trigger('click')
+    await wrapper.get('.processing-options-dialog form').trigger('submit')
+    await flushPromises()
+
+    expect(upload).toHaveBeenCalledTimes(1)
+    expect(upload.mock.calls[0][0]).toEqual([selected])
   })
 
   it('非图片粘贴不会阻止默认行为或加入队列', async () => {

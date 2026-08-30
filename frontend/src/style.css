@@ -182,7 +182,7 @@ button, input, select, textarea { border-radius: var(--radius-control); }
 .processing-result-details li.conflict { color: var(--warning); }
 .processing-result-details li.failed { color: var(--error); }
 
-.upload-panel { display: grid; gap: 22px; border: 1px solid var(--line); border-radius: var(--radius-surface); padding: 30px; background: var(--surface); }
+.upload-panel { display: grid; gap: 22px; min-width: 0; border: 1px solid var(--line); border-radius: var(--radius-surface); padding: 30px; background: var(--surface); }
 .reverse-policy { display: grid; gap: 10px; margin: 0; border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px 12px; color: var(--ink-soft); }
 .reverse-policy legend { padding-inline: 4px; color: var(--ink-soft); font-size: 15px; font-weight: 700; }
 .policy-options { display: flex; flex-wrap: wrap; gap: 12px 22px; }
@@ -195,8 +195,9 @@ button, input, select, textarea { border-radius: var(--radius-control); }
 .reverse-policy.compact .policy-options label { min-height: 34px; font-size: 14px; }
 .field { display: grid; gap: 8px; color: var(--muted); font-size: 15px; }
 .field select { width: 100%; }
-.drop-zone { min-height: 210px; display: grid; place-content: center; gap: 4px; border: 2px dashed var(--line-strong); border-radius: 6px; padding: 22px; text-align: center; cursor: pointer; background: #fbfcfc; }
+.drop-zone { min-width: 0; min-height: 210px; display: grid; place-content: center; gap: 4px; border: 2px dashed var(--line-strong); border-radius: 6px; padding: 22px; text-align: center; cursor: pointer; background: #fbfcfc; }
 .drop-zone:hover { border-color: var(--accent); background: #fffaf7; }
+.drop-zone.is-dragging { border-color: var(--accent-deep); background: #fff4ec; box-shadow: inset 0 0 0 1px var(--accent); }
 .drop-zone input { position: absolute; width: 1px; height: 1px; opacity: 0; }
 .drop-zone:focus-within { outline: 3px solid var(--focus); outline-offset: 2px; }
 .drop-title { color: var(--ink-soft); font-size: 17px; font-weight: 700; }
@@ -205,6 +206,15 @@ button, input, select, textarea { border-radius: var(--radius-control); }
 .wide { width: 100%; }
 .upload-results { display: grid; gap: 10px; margin-top: 20px; }
 .upload-result { display: flex; align-items: center; gap: 12px; min-height: 52px; border: 1px solid #b8d7c8; border-radius: 5px; padding: 10px 14px; color: var(--ink-soft); background: #f1f8f4; font-size: 15px; }
+/* 待上传行以本地缩略图为主，移除动作只在批次空闲时由组件显示。 */
+.upload-pending-item { display: grid; grid-template-columns: 72px minmax(0, 1fr) auto; align-items: center; border-color: var(--line-strong); background: var(--surface); }
+.upload-pending-preview { width: 72px; height: 72px; display: grid; place-items: center; overflow: hidden; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-muted); }
+.upload-pending-preview img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.upload-pending-preview-fallback { display: grid; place-items: center; width: 100%; height: 100%; padding: 6px; color: var(--muted); font-size: 12px; line-height: 1.2; text-align: center; }
+.upload-pending-meta { display: grid; gap: 3px; min-width: 0; }
+.upload-pending-status { color: var(--muted); font-size: 13px; font-weight: 700; }
+.upload-pending-meta strong { min-width: 0; overflow-wrap: anywhere; color: var(--ink-soft); }
+.upload-pending-remove { min-width: 44px; min-height: 44px; }
 .upload-result.fail { border-color: #e6b4ad; background: #fff4f2; }
 .upload-result > span { color: var(--success); font-weight: 700; }
 .upload-result.fail > span { color: var(--error); }
@@ -491,6 +501,9 @@ button, input, select, textarea { border-radius: var(--radius-control); }
   .reverse-policy.compact { width: 100%; min-width: 0; }
   .drop-zone { min-height: 190px; }
   .upload-result { align-items: flex-start; flex-wrap: wrap; }
+  .upload-pending-item { grid-template-columns: 64px minmax(0, 1fr) auto; align-items: center; gap: 10px; }
+  .upload-pending-preview { width: 64px; height: 64px; }
+  .upload-pending-remove { padding-inline: 10px; }
   .upload-result small { width: 100%; margin-left: 0; }
   .settings-grid { grid-template-columns: 1fr 1fr; gap: 16px; }
   .settings-edit-row { display: grid; align-items: stretch; }
