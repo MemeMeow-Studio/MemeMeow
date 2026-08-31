@@ -23,4 +23,4 @@
 
 - [x] 4.1 为旧 queued/running 语境任务提供 claim 时的一次性 protocol v2 迁移；旧已完成任务不重跑。
 - [x] 4.2 在开源仓库运行定向视觉、task、workspace、executor 和 Skill 测试、compileall、`git diff --check` 与 OpenSpec strict validate。
-- [ ] 4.3 记录公共 commit SHA、变更范围、验证结果，等待审核后再在 Server 通过精确 SHA 普通 merge。
+- [x] 4.3 记录公共 commit SHA、变更范围、验证结果，等待审核后再在 Server 通过精确 SHA 普通 merge。
