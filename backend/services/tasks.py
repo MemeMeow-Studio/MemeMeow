@@ -502,6 +502,13 @@ class PostgresTaskService:
                     row.executor_attempt_id = str(payload["_executor_attempt_id"])
                 if isinstance(payload.get("_workspace_selector"), str) and SELECTOR_RE.fullmatch(str(payload["_workspace_selector"])):
                     row.workspace_selector = str(payload["_workspace_selector"])
+                # 迁移前任务首次写 attempt 时可能尚无配置 hash；snapshot
+                # 前置器随后会在同一 claim 补齐该字段，恢复事实必须同步更新。
+                if getattr(row, "processing_config_hash", None) is None and payload.get("processing_config_hash") is not None:
+                    normalized_config_hash = normalize_config_hash(payload.get("processing_config_hash"))
+                    if normalized_config_hash is None:
+                        return
+                    row.processing_config_hash = normalized_config_hash
                 if snapshot_summary is not None:
                     # 首次 ``prepared`` 可能发生在 snapshot 生成之前；snapshot
                     # 身份补齐后必须更新摘要，避免 resume 查询不到原 attempt。

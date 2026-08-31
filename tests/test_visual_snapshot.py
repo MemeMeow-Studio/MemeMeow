@@ -262,6 +262,76 @@ def test_task_service_prepares_snapshot_once_and_reuses_it() -> None:
         service.shutdown()
 
 
+def test_task_service_migration_backfills_attempt_config_hash() -> None:
+    """旧任务先创建 attempt 后补齐 snapshot 配置时，恢复摘要必须同步 hash。"""
+    row = SimpleNamespace(claim_generation=1, workspace_selector=None, processing_config_hash=None)
+    current_task = SimpleNamespace()
+
+    class Session:
+        """按调用顺序返回当前 Task 和已有 attempt 的最小数据库夹具。"""
+
+        def __init__(self) -> None:
+            """初始化查询序号。"""
+            self.calls = 0
+
+        def scalar(self, _statement):
+            """返回 claim 与同一 attempt 的旧摘要行。"""
+            self.calls += 1
+            return current_task if self.calls == 1 else row
+
+        def commit(self) -> None:
+            """模拟提交 attempt 更新。"""
+
+    class Environment:
+        """提供任务状态写入所需的事务上下文。"""
+
+        def __init__(self, session: Session) -> None:
+            """保存最小 SQL session。"""
+            self.uow = SimpleNamespace(session=session)
+            self.tasks = SimpleNamespace(interrupt_owner=lambda _owner: None)
+
+        def __enter__(self):
+            """进入测试事务。"""
+            return self
+
+        def __exit__(self, *_args) -> bool:
+            """结束测试事务。"""
+            return False
+
+    class Resources:
+        """返回固定的 scope 事务。"""
+
+        def __init__(self) -> None:
+            """初始化 SQL session。"""
+            self.session = Session()
+
+        def environment(self, _scope: str):
+            """返回最小事务上下文。"""
+            return Environment(self.session)
+
+    service = PostgresTaskService(Resources(), agent_concurrency=1)
+    try:
+        claim = SimpleNamespace(
+            id="legacy-task",
+            task_type="meme_context_generation",
+            claim_generation=1,
+            attempt_count=1,
+        )
+        config_hash = "b" * 64
+        payload = {
+            "image_sha256": "a" * 64,
+            "processing_config_hash": config_hash,
+            "_claim_task_id": "legacy-task",
+            "_claim_generation": 1,
+            "_claim_owner": service.owner,
+            "_claim_attempt": 1,
+        }
+        service._image_attempt_state(claim, payload, "prepared")
+        assert row.processing_config_hash == config_hash
+    finally:
+        service.shutdown()
+
+
 def test_task_service_resume_without_snapshot_never_rematches() -> None:
     """protocol v2 恢复缺失 snapshot 时必须稳定失败且不调用视觉前置器。"""
     class Tasks:
