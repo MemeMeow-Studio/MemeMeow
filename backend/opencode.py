@@ -21,10 +21,10 @@ import time
 import uuid
 from dataclasses import replace
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from queue import Empty, Queue
 from threading import Event, Lock, RLock, Semaphore
-from typing import Any, BinaryIO, Callable, Iterator
+from typing import Any, BinaryIO, Callable, Iterator, Mapping
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -44,10 +44,16 @@ from backend.opencode_workspace import (
     build_edit_permission_rules,
     build_external_directory_rules,
     capability_for_provider,
+    prepare_candidates_for_provider,
     validate_directory_path,
     validate_file_path,
 )
 from backend.public_dto import PublicDataError, secret_inventory_from_settings, validate_agent_result
+from backend.visual_snapshot import (
+    VisualMatchSnapshotError,
+    validate_visual_match_snapshot_manifest,
+    visual_match_snapshot_manifest,
+)
 
 try:
     from jsonschema import Draft202012Validator, FormatChecker
@@ -123,6 +129,9 @@ STREAM_COPY_CHUNK_BYTES = 64 * 1024
 RESULT_FILE_NAME = "result.json.tmp"
 RESULT_DRAFT_NAME = "result.json.draft"
 RESULT_DEFAULT_MAX_BYTES = 1024 * 1024
+CANDIDATE_MANIFEST_MAX_BYTES = 4 * 1024 * 1024
+MAX_CANDIDATE_FILE_BYTES = 64 * 1024 * 1024
+MAX_CANDIDATE_ROOT_BYTES = 256 * 1024 * 1024
 EXECUTOR_IMAGE_ROOT = Path("/images")
 _SECRET_PATTERNS = (
     # 分开处理 JSON 字符串值和普通 header/日志格式，保留原有引号结构。
@@ -187,6 +196,7 @@ def _workspace_opencode_config(workspace: ResolvedWorkspace) -> dict[str, Any]:
                 config_dir=workspace.config_dir,
                 draft_path=workspace.draft_path,
                 result_path=workspace.result_path,
+                candidate_root=workspace.candidate_root,
             )
         },
     }
@@ -260,11 +270,164 @@ class OpenCodeRunner:
         if context.selector is not None and context.selector != resolved.selector:
             raise OpenCodeError("opencode_workspace_mismatch", "workspace selector 与可信任务事实不一致")
         try:
-            return self._validate_resolved_workspace(context, resolved)
+            validated = self._validate_resolved_workspace(context, resolved)
+            # 候选物化属于 provider 的受信适配层，必须在任何 OpenCode 进程或
+            # 结果文件副作用前完成；物化后再次校验固定 task 根和 manifest 节点。
+            prepare_candidates_for_provider(self.workspace_provider, context, validated)
+            materializer = callable(getattr(self.workspace_provider, "prepare_candidates", None))
+            if validated.candidate_root.exists() or validated.candidate_root.is_symlink():
+                validate_directory_path(validated.candidate_root, code="opencode_workspace_invalid")
+            else:
+                validate_directory_path(validated.candidate_root, allow_missing_leaf=True, code="opencode_workspace_invalid")
+            if context.visual_match_snapshot is not None:
+                if not materializer and not validated.local:
+                    raise WorkspaceResolutionError("visual_candidate_materialization_failed", "外部 workspace 缺少候选物化能力")
+                manifest = self._validate_candidate_manifest(validated, context.visual_match_snapshot)
+                self._validate_candidate_tree(validated, manifest)
+            return validated
         except WorkspaceResolutionError as exc:
             raise OpenCodeError(exc.code, str(exc)) from exc
         except (OSError, TypeError, ValueError) as exc:
             raise OpenCodeError("opencode_workspace_invalid", "workspace provider 返回值无法校验") from exc
+
+    @staticmethod
+    def _validate_candidate_manifest(workspace: ResolvedWorkspace, snapshot: Mapping[str, object]) -> dict[str, object]:
+        """在启动外部 Agent 前校验 manifest 文件内容与 Task snapshot 完全一致。"""
+        path = workspace.candidate_manifest_path
+        try:
+            validate_file_path(path, code="visual_candidate_materialization_failed")
+            info = path.lstat()
+            if info.st_size > CANDIDATE_MANIFEST_MAX_BYTES:
+                raise WorkspaceResolutionError("visual_candidate_materialization_failed", "候选 manifest 超过大小限制")
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                raw = os.read(descriptor, CANDIDATE_MANIFEST_MAX_BYTES + 1)
+            finally:
+                os.close(descriptor)
+            if len(raw) > CANDIDATE_MANIFEST_MAX_BYTES:
+                raise WorkspaceResolutionError("visual_candidate_materialization_failed", "候选 manifest 超过大小限制")
+            document = json.loads(raw.decode("utf-8"))
+            expected = visual_match_snapshot_manifest(snapshot)
+            validated = validate_visual_match_snapshot_manifest(
+                document,
+                expected_sha256=str(expected["snapshot_sha256"]),
+            )
+        except WorkspaceResolutionError:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError, TypeError, ValueError, VisualMatchSnapshotError) as exc:
+            raise WorkspaceResolutionError("visual_candidate_materialization_failed", "候选 manifest 无法校验") from exc
+        if validated != expected:
+            raise WorkspaceResolutionError("visual_candidate_materialization_failed", "候选 manifest 与 snapshot 不一致")
+        return validated
+
+    @staticmethod
+    def _validate_candidate_tree(workspace: ResolvedWorkspace, manifest: Mapping[str, object]) -> None:
+        """按 manifest 校验候选目录，拒绝额外节点、符号链接和可写文件。"""
+        root = workspace.candidate_root
+        try:
+            validate_directory_path(root, code="visual_candidate_materialization_failed")
+            root_info = root.lstat()
+            if root_info.st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH):
+                raise ValueError("visual_candidate_materialization_failed")
+            candidates = manifest.get("candidates")
+            if not isinstance(candidates, list):
+                raise ValueError("visual_candidate_materialization_failed")
+            expected_files = {"manifest.json"}
+            expected_directories: set[str] = set()
+            declared_bytes = 0
+            for candidate in candidates:
+                if not isinstance(candidate, Mapping):
+                    raise ValueError("visual_candidate_materialization_failed")
+                relative = candidate.get("relative_path")
+                if not isinstance(relative, str):
+                    raise ValueError("visual_candidate_materialization_failed")
+                size_bytes = candidate.get("size_bytes")
+                if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes < 0 or size_bytes > MAX_CANDIDATE_FILE_BYTES:
+                    raise ValueError("visual_candidate_materialization_failed")
+                declared_bytes += size_bytes
+                if declared_bytes > MAX_CANDIDATE_ROOT_BYTES:
+                    raise ValueError("visual_candidate_materialization_failed")
+                expected_files.add(relative)
+                parts = PurePosixPath(relative).parts
+                expected_directories.update("/".join(parts[:index]) for index in range(1, len(parts)))
+            for item in root.rglob("*"):
+                info = item.lstat()
+                relative = item.relative_to(root).as_posix()
+                if stat.S_ISLNK(info.st_mode) or info.st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH):
+                    raise ValueError("visual_candidate_materialization_failed")
+                if stat.S_ISDIR(info.st_mode):
+                    if relative not in expected_directories:
+                        raise ValueError("visual_candidate_materialization_failed")
+                elif stat.S_ISREG(info.st_mode):
+                    if relative not in expected_files:
+                        raise ValueError("visual_candidate_materialization_failed")
+                else:
+                    raise ValueError("visual_candidate_materialization_failed")
+            total_bytes = sum(item.lstat().st_size for item in root.rglob("*") if item.is_file())
+            if total_bytes > MAX_CANDIDATE_ROOT_BYTES:
+                raise ValueError("visual_candidate_materialization_failed")
+            for candidate in candidates:
+                relative = candidate.get("relative_path")
+                image_sha256 = candidate.get("image_sha256")
+                size_bytes = candidate.get("size_bytes")
+                if (
+                    not isinstance(relative, str)
+                    or not isinstance(image_sha256, str)
+                    or not isinstance(size_bytes, int)
+                    or isinstance(size_bytes, bool)
+                    or size_bytes < 0
+                    or size_bytes > MAX_CANDIDATE_FILE_BYTES
+                ):
+                    raise ValueError("visual_candidate_materialization_failed")
+                candidate_path = root.joinpath(*PurePosixPath(relative).parts)
+                validate_file_path(candidate_path, code="visual_candidate_materialization_failed")
+                info = candidate_path.lstat()
+                if info.st_size != size_bytes:
+                    raise ValueError("visual_candidate_materialization_failed")
+                digest = hashlib.sha256()
+                descriptor = os.open(candidate_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    while True:
+                        chunk = os.read(descriptor, 1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                finally:
+                    os.close(descriptor)
+                if digest.hexdigest() != image_sha256.lower():
+                    raise ValueError("visual_candidate_materialization_failed")
+        except WorkspaceResolutionError:
+            raise
+        except (OSError, TypeError, ValueError) as exc:
+            raise WorkspaceResolutionError("visual_candidate_materialization_failed", "候选文件无法校验") from exc
+
+    def prepare_candidates_for_task(
+        self,
+        *,
+        task_id: str,
+        attempt_id: str,
+        scope_id: str,
+        snapshot: Mapping[str, object],
+        selector: str | None = None,
+        session_id: str | None = None,
+        resume_of_attempt_id: str | None = None,
+        image_relative_path: str | None = None,
+    ) -> ResolvedWorkspace:
+        """在外部执行前按可信 claim 物化当前 Task 的候选 manifest。"""
+        try:
+            context = TrustedWorkspaceContext(
+                task_id=task_id,
+                attempt_id=attempt_id,
+                scope_id=scope_id,
+                selector=selector,
+                session_id=session_id,
+                resume_of_attempt_id=resume_of_attempt_id,
+                image_relative_path=image_relative_path,
+                visual_match_snapshot=snapshot,
+            )
+        except WorkspaceResolutionError as exc:
+            raise OpenCodeError(exc.code, str(exc)) from exc
+        return self.resolve_workspace(context)
 
     def _validate_resolved_workspace(self, context: TrustedWorkspaceContext, resolved: ResolvedWorkspace) -> ResolvedWorkspace:
         """固定 provider 输出的结果/DB 布局，并重建服务端权限规则。
@@ -284,6 +447,7 @@ class OpenCodeRunner:
         images_root = absolute(resolved.images_root)
         metadata_root = absolute(resolved.metadata_root)
         skill_root = absolute(resolved.skill_root)
+        candidate_root = absolute(resolved.candidate_root)
         task_results = absolute(resolved.task_results_root)
         expected_results = absolute(self.runtime_root / "task-results" / context.task_id)
         expected_db = absolute(self.db_path)
@@ -296,6 +460,8 @@ class OpenCodeRunner:
             raise WorkspaceResolutionError("opencode_workspace_invalid", "workspace 结果路径不受支持")
         if scratch != directory / "tasks" / context.task_id:
             raise WorkspaceResolutionError("opencode_workspace_invalid", "workspace 临时路径不受支持")
+        if candidate_root != directory.parent / "candidates" / context.task_id:
+            raise WorkspaceResolutionError("opencode_workspace_invalid", "workspace 候选路径不受支持")
         if config_file != scratch / "opencode.json" or config_dir != scratch / ".opencode":
             raise WorkspaceResolutionError("opencode_workspace_invalid", "workspace 配置路径不受支持")
         if resolved.local and context.scope_id != "local":
@@ -304,8 +470,10 @@ class OpenCodeRunner:
             raise WorkspaceResolutionError("opencode_workspace_invalid", "local workspace selector 无效")
         if not resolved.local and resolved.selector == "local":
             raise WorkspaceResolutionError("opencode_workspace_invalid", "external workspace selector 保留字无效")
-        for path in (directory, images_root, metadata_root):
+        for path in (directory, images_root, metadata_root, candidate_root.parent):
             validate_directory_path(path, code="opencode_workspace_invalid")
+        if candidate_root.exists() or candidate_root.is_symlink():
+            validate_directory_path(candidate_root, code="opencode_workspace_invalid")
         if resolved.local and skill_root.is_symlink():
             # local provider 为既有 checkout 保留相对 Skill 链接；链接目标仍须是普通目录。
             validate_directory_path(skill_root.resolve(strict=True), code="opencode_workspace_invalid")
@@ -322,6 +490,7 @@ class OpenCodeRunner:
             images_root=images_root,
             metadata_root=metadata_root,
             skill_root=skill_root,
+            candidate_root=candidate_root,
             task_scratch_root=scratch,
             task_results_root=task_results,
             db_path=expected_db,
@@ -599,16 +768,6 @@ class OpenCodeRunner:
         """返回 Agent 使用的反向图片回调地址，兼容旧版设置夹具。"""
         return str(getattr(self.settings, "agent_reverse_image_internal_url", None) or self.settings.reverse_image_internal_url)
 
-    def _agent_visual_search_url(self) -> str:
-        """返回 Agent 使用的 task-scoped 视觉匹配回调地址，兼容旧版设置夹具。"""
-        configured = getattr(self.settings, "agent_visual_search_internal_url", None)
-        if configured:
-            return str(configured)
-        visual_search = getattr(self.settings, "visual_search_internal_url", None)
-        if visual_search:
-            return str(visual_search)
-        return str(self.settings.visual_internal_url).replace("/visual-embedding", "/visual-search/match")
-
     def build_environment(
         self,
         slot_id: int | None = None,
@@ -629,18 +788,20 @@ class OpenCodeRunner:
             task_scratch_root=self.workspace / "tasks" / (task_id or "interactive"),
             task_results_root=self.runtime_root / "task-results" / (task_id or "interactive"),
             db_path=self.db_path,
+            candidate_root=self.runtime_root / "candidates" / (task_id or "interactive"),
             local=True,
         )
         if self.executor_mode:
             # API 不启动 OpenCode 子进程；该快照仅供诊断，绝不把 executor token、
-            # callback 根 secret 或长期模型凭据传给 Agent。
+            # callback 根 secret 或长期模型凭据传给 Agent。候选 manifest 是唯一
+            # 的本地视觉输入入口。
             values = {
                 "OPENCODE_DB": "/runtime/opencode.db",
                 "OPENCODE_CONFIG": str(active_workspace.config_file),
                 "OPENCODE_CONFIG_DIR": str(active_workspace.config_dir),
                 "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
                 "MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL": self._agent_reverse_image_url(),
-                "MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL": self._agent_visual_search_url(),
+                "MEMEMEOW_AGENT_CANDIDATE_MANIFEST": f"/runtime/candidates/{task_id or 'interactive'}/manifest.json",
                 "MEMEMEOW_DATA_ROOT": "/runtime",
             }
             if slot_id is not None:
@@ -665,8 +826,9 @@ class OpenCodeRunner:
             "MEMEMEOW_DATA_ROOT": str(runtime_root),
             "MEMEMEOW_REVERSE_IMAGE_CACHE_ROOT": str(runtime_root / "reverse_image_cache" / "serpapi_google_lens"),
             "MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL": self._agent_reverse_image_url(),
-            # 视觉 Skill 只接收 task-scoped 内部地址，不获得数据库或模型运行时权限。
-            "MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL": self._agent_visual_search_url(),
+            # 视觉 Skill 只接收 provider 物化的 task-scoped manifest，不获得
+            # 数据库、模型运行时或视觉 callback 权限。
+            "MEMEMEOW_AGENT_CANDIDATE_MANIFEST": str(active_workspace.candidate_manifest_path),
         }
         environment["MEMEMEOW_OPENCODE_BASE_URL"] = str(self.settings.opencode_base_url or "")
         environment["MEMEMEOW_OPENCODE_API_KEY"] = str(self.settings.opencode_api_key or "")
@@ -1286,42 +1448,48 @@ class OpenCodeRunner:
         return self._read_result_file(result_path, workspace=workspace)
 
     def cleanup_task_results(self, *, keep_task_id: str | None = None) -> int:
-        """按保留天数和最大任务数清理旧产物，不删除当前任务目录。"""
-        root = self.runtime_root / "task-results"
+        """按保留天数和最大任务数清理结果及候选目录。"""
+        roots = (self.runtime_root / "task-results", self.runtime_root / "candidates")
         with self._process_lock:
             # 清理逻辑不能让 root 或祖先的符号链接把删除范围带到 runtime 外部。
-            try:
-                self._ensure_no_symlink_path(root)
-                info = root.lstat()
-            except (FileNotFoundError, OSError, OpenCodeError):
-                return 0
-            if not stat.S_ISDIR(info.st_mode):
-                return 0
-            try:
-                entries_info = []
-                for item in root.iterdir():
-                    try:
-                        item_info = item.lstat()
-                    except OSError:
-                        continue
-                    if stat.S_ISDIR(item_info.st_mode) and not stat.S_ISLNK(item_info.st_mode):
-                        entries_info.append((item, item_info.st_mtime))
-            except OSError:
+            entries_by_root: list[tuple[Path, list[tuple[Path, float]]]] = []
+            for root in roots:
+                try:
+                    self._ensure_no_symlink_path(root)
+                    info = root.lstat()
+                except (FileNotFoundError, OSError, OpenCodeError):
+                    continue
+                if not stat.S_ISDIR(info.st_mode):
+                    continue
+                try:
+                    entries_info: list[tuple[Path, float]] = []
+                    for item in root.iterdir():
+                        try:
+                            item_info = item.lstat()
+                        except OSError:
+                            continue
+                        if stat.S_ISDIR(item_info.st_mode) and not stat.S_ISLNK(item_info.st_mode):
+                            entries_info.append((item, item_info.st_mtime))
+                    entries_by_root.append((root, entries_info))
+                except OSError:
+                    continue
+            if not entries_by_root:
                 return 0
             now = time.time()
             retention = int(getattr(self.settings, "agent_result_retention_days", 14)) * 86400
             active_task_ids = set(self._active_task_ids)
             active_task_ids.update(task_id for task_id in self._process_tasks.values() if task_id)
             protected_task_ids = active_task_ids | ({keep_task_id} if keep_task_id else set())
-            entries_info = [(item, mtime) for item, mtime in entries_info if item.name not in protected_task_ids]
-            entries_info.sort(key=lambda item: item[1], reverse=True)
             max_tasks = int(getattr(self.settings, "agent_result_max_tasks", 500))
-            removed = 0
-            for index, (entry, mtime) in enumerate(entries_info):
-                if index >= max_tasks or now - mtime > retention:
-                    shutil.rmtree(entry, ignore_errors=True)
-                    removed += 1
-            return removed
+            removed_task_ids: set[str] = set()
+            for _root, entries_info in entries_by_root:
+                entries_info = [(item, mtime) for item, mtime in entries_info if item.name not in protected_task_ids]
+                entries_info.sort(key=lambda item: item[1], reverse=True)
+                for index, (entry, mtime) in enumerate(entries_info):
+                    if index >= max_tasks or now - mtime > retention:
+                        shutil.rmtree(entry, ignore_errors=True)
+                        removed_task_ids.add(entry.name)
+            return len(removed_task_ids)
 
     def _run_command(
         self,
@@ -1350,6 +1518,7 @@ class OpenCodeRunner:
             task_scratch_root=self.workspace / "tasks" / (task_id or "interactive"),
             task_results_root=self.runtime_root / "task-results" / (task_id or "interactive"),
             db_path=self.db_path,
+            candidate_root=self.runtime_root / "candidates" / (task_id or "interactive"),
             local=True,
         )
         executable = str(self.settings.opencode_executable or "opencode")
@@ -1502,6 +1671,11 @@ class OpenCodeRunner:
                         session_id=resume_session_id,
                         resume_of_attempt_id=resume_of_attempt_id,
                         processing_config_hash=processing_config_hash,
+                        visual_snapshot_sha256=(
+                            str(context.visual_match_snapshot.get("snapshot_sha256"))
+                            if isinstance(context.visual_match_snapshot, Mapping)
+                            else None
+                        ),
                         executor_attempt_id=local_executor_attempt_id,
                         workspace_selector=None if resolved_workspace.local else resolved_workspace.selector,
                         workspace_capability=capability,
@@ -1553,7 +1727,8 @@ class OpenCodeRunner:
                 else "这是首次执行；先建立任务草稿并逐步完成研究。"
             )
             prompt = (
-                "使用 research-meme-context skill 分析这张表情包。"
+                "使用 research-meme-context skill 分析这张表情包；先读取当前任务固定候选 manifest，"
+                "候选只作为参考证据。"
                 "遇到错误时自行尝试可行的替代方案；确认无法解决时，简短说明原因并退出。"
                 f"本任务 reverse_image_policy={reverse_image_policy if reverse_image_policy in {'forbid', 'auto'} else 'forbid'}；只能通过项目内部反向图片接口使用能力，绝不读取或请求供应商密钥。"
                 f"{resume_instruction}"

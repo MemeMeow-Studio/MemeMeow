@@ -43,6 +43,10 @@ AGENT_RESULT_REQUIRED_FIELDS = AGENT_RESULT_FIELDS - {"source_urls"}
 PUBLIC_STAGE_NAMES = frozenset({"visual", "agent", "auto_rename", "text_embedding"})
 PUBLIC_STAGE_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "blocked", "unknown_execution", "skipped", "warning"})
 PUBLIC_TASK_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "blocked", "unknown_execution"})
+# 公开摘要只接受当前 snapshot 协议和服务端候选上限，避免历史/伪造 JSON
+# 被误当成可恢复的视觉事实。
+VISUAL_SNAPSHOT_PROTOCOL_VERSION = 2
+VISUAL_SNAPSHOT_MAX_CANDIDATES = 50
 
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,254}\Z")
 _CODE_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}\Z")
@@ -313,6 +317,31 @@ def normalize_public_digest(value: object) -> str | None:
     return None
 
 
+def sanitize_visual_snapshot_summary(value: object) -> dict[str, Any] | None:
+    """将视觉 snapshot 投影为固定 protocol v2 的公开摘要。"""
+    if not isinstance(value, Mapping):
+        return None
+    version = value.get("protocol_version")
+    candidate_count = value.get("candidate_count")
+    snapshot_hash = normalize_public_digest(value.get("snapshot_sha256"))
+    matched_at = sanitize_public_timestamp(value.get("matched_at"))
+    if (
+        version != VISUAL_SNAPSHOT_PROTOCOL_VERSION
+        or isinstance(candidate_count, bool)
+        or not isinstance(candidate_count, int)
+        or not 0 <= candidate_count <= VISUAL_SNAPSHOT_MAX_CANDIDATES
+        or snapshot_hash is None
+        or matched_at is None
+    ):
+        return None
+    return {
+        "protocol_version": VISUAL_SNAPSHOT_PROTOCOL_VERSION,
+        "snapshot_sha256": snapshot_hash,
+        "matched_at": matched_at,
+        "candidate_count": candidate_count,
+    }
+
+
 def sanitize_public_timestamp(value: object) -> str | None:
     """保留可解析的 ISO 时间，拒绝路径、换行和异常正文。"""
     if isinstance(value, datetime):
@@ -437,6 +466,9 @@ def sanitize_task_result(task_type: object, value: object) -> dict[str, Any] | N
                 public_audit["outcome"] = outcome
             if public_audit:
                 result["reverse_image"] = public_audit
+        snapshot = sanitize_visual_snapshot_summary(value.get("visual_match_snapshot"))
+        if snapshot is not None:
+            result["visual_match_snapshot"] = snapshot
     elif task_type == "visual_embedding_generation":
         for key in ("visual_model", "preprocess_version"):
             scalar = _safe_scalar(value.get(key))
@@ -524,6 +556,9 @@ def public_processing_stage(value: Mapping[str, object], *, job_id: str | None =
     reason = normalize_public_code(value.get("resume_reason"))
     if reason:
         result["resume_reason"] = reason
+    snapshot = sanitize_visual_snapshot_summary(value.get("visual_match_snapshot"))
+    if snapshot is not None:
+        result["visual_match_snapshot"] = snapshot
     return result
 
 

@@ -20,6 +20,7 @@ COPY executor /opt/mememeow/executor
 # executor 与 Skill 共享无状态协议快照，不把项目后端或数据库带入 Agent 镜像。
 COPY backend/public_dto.py /opt/mememeow/executor/public_dto.py
 COPY backend/opencode_workspace.py /opt/mememeow/executor/opencode_workspace.py
+COPY backend/visual_snapshot.py /opt/mememeow/executor/visual_snapshot.py
 
 RUN groupadd --system mememeow-agent \
     && useradd --system --gid mememeow-agent --create-home --shell /bin/bash mememeow-agent \

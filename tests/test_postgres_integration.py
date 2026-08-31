@@ -2345,3 +2345,42 @@ def test_visual_search_requires_running_task_and_returns_structured_candidates(p
     assert [item["meme_id"] for item in result["results"]] == [str(candidate.id)]
     assert result["results"][0]["media_url"] == f"/media/{candidate.id}"
     assert result["results"][0]["context"]["title"] == "Candidate"
+
+
+def test_visual_search_precompute_snapshot_freezes_candidate_context(postgres_resources) -> None:
+    """前置视觉候选应生成稳定 hash，并冻结匹配时的候选语境。"""
+    resources = postgres_resources
+    settings = Settings(_env_file=None, database_url=_test_database_url(), data_root=resources.data_root, image_root=resources.image_root)
+    coordinator = StorageCoordinator(resources)
+    query = coordinator.upload(b"snapshot-query", target_key="visual-snapshot-query.png", extension=".png", context={}, provenance={})
+    candidate = coordinator.upload(b"snapshot-candidate", target_key="visual-snapshot-candidate.png", extension=".png", context={"title": "Before"}, provenance={})
+    identity = {"model": settings.visual_model, "preprocess_version": settings.visual_preprocess_version, "dimensions": settings.visual_model_dimensions}
+    with resources.environment("local") as environment:
+        query_row = environment.memes.get(query.id, for_update=True)
+        candidate_row = environment.memes.get(candidate.id, for_update=True)
+        assert query_row and candidate_row
+        query_row.provenance = _agent_ready_provenance(query_row)
+        candidate_row.provenance = _agent_ready_provenance(candidate_row)
+        query_row.context_status = candidate_row.context_status = "ready"
+        environment.visual.upsert(query_row.id, **identity, image_sha256=query_row.sha256, embedding=[1.0] + [0.0] * (VISUAL_EMBEDDING_DIMENSIONS - 1))
+        environment.visual.upsert(candidate_row.id, **identity, image_sha256=candidate_row.sha256, embedding=[1.0] + [0.0] * (VISUAL_EMBEDDING_DIMENSIONS - 1))
+        task = environment.tasks.submit(
+            task_type="meme_context_generation",
+            payload={"meme_id": str(query.id), "image_sha256": query.sha256, "visual_model": identity["model"], "visual_dimensions": identity["dimensions"], "preprocess_version": identity["preprocess_version"]},
+            lane="agent",
+            dedupe_key=f"visual-snapshot-{uuid4().hex}",
+        )
+        task.status = "running"
+        task.lease_owner = "snapshot-owner"
+        task.claim_generation = 1
+        task.lease_expires_at = utcnow() + timedelta(minutes=5)
+    service = VisualSearchService(settings, resources)
+    snapshot = service.precompute_snapshot(task_id=task.id)
+    assert snapshot["protocol_version"] == 2
+    assert len(snapshot["candidates"]) == 1
+    assert snapshot["candidates"][0]["context"]["title"] == "Before"
+    with resources.environment("local") as environment:
+        candidate_row = environment.memes.get(candidate.id, for_update=True)
+        assert candidate_row is not None
+        candidate_row.meme_context = {"title": "After"}
+    assert snapshot["candidates"][0]["context"]["title"] == "Before"

@@ -283,12 +283,23 @@ def _prepare_lifecycle(
     configured_workspace_provider = getattr(app.state, "workspace_provider", None)
     if configured_workspace_provider is None and configured_factory is not None:
         configured_workspace_provider = getattr(configured_factory, "workspace_provider", None)
+
+    def local_candidate_materializer(context: Any, resolved: Any) -> None:
+        """调用当前生命周期的 scope-bound 数据资源物化 local 候选。"""
+        resources = getattr(app.state, "database", None)
+        if resources is None:
+            raise RuntimeError("visual_candidate_materialization_failed")
+        from backend.visual_candidates import materialize_local_candidates
+
+        materialize_local_candidates(resources, context, resolved)
+
     if local_mode:
         if configured_workspace_provider is None:
             configured_workspace_provider = LocalWorkspaceProvider(
                 settings.opencode_runtime_root,
                 image_root=settings.image_root,
                 skill_root=skill_root or Path(__file__).resolve().parents[1] / "skills" / "research-meme-context",
+                candidate_materializer=local_candidate_materializer,
             )
     elif configured_workspace_provider is None:
         # non-local 允许完成无业务副作用的装配；真实任务执行时由占位 provider 拒绝。
@@ -413,6 +424,28 @@ def _build_scope_runtime(
     shared_worker_executor: ThreadPoolExecutor | None = None
     worker_manager: PostgresTaskWorkerManager | None = None
     local_services: ScopeServices | None = None
+
+    def prepare_visual_candidates(claim: Any, payload: Mapping[str, object], snapshot: Mapping[str, object]) -> Any:
+        """在任务 grant 前委托 Runner/provider 物化当前 claim 的候选视图。"""
+        runner = setup.opencode
+        prepare = getattr(runner, "prepare_candidates_for_task", None)
+        if not callable(prepare):
+            raise RuntimeError("visual_candidate_materialization_failed")
+        generation = getattr(claim, "claim_generation", None)
+        attempt = getattr(claim, "attempt_count", None)
+        if not isinstance(generation, int) or generation < 1 or not isinstance(attempt, int) or attempt < 1:
+            raise RuntimeError("visual_candidate_materialization_failed")
+        return prepare(
+            task_id=str(claim.id),
+            attempt_id=f"claim-{generation}-{attempt}",
+            scope_id=str(claim.scope_id),
+            selector=payload.get("_workspace_selector") if isinstance(payload.get("_workspace_selector"), str) else None,
+            session_id=payload.get("_resume_session_id") if isinstance(payload.get("_resume_session_id"), str) else None,
+            resume_of_attempt_id=payload.get("_resume_of_attempt_id") if isinstance(payload.get("_resume_of_attempt_id"), str) else None,
+            image_relative_path=payload.get("image_relative_path") if isinstance(payload.get("image_relative_path"), str) else None,
+            snapshot=snapshot,
+        )
+
     if factory is not None:
         required_methods = ("for_scope", "for_task", "start_all", "shutdown")
         if any(not callable(getattr(factory, name, None)) for name in required_methods):
@@ -464,6 +497,8 @@ def _build_scope_runtime(
                 resume_backoff_seconds=int(getattr(settings, "agent_resume_backoff_seconds", 2)),
                 resume_max_backoff_seconds=int(getattr(settings, "agent_resume_max_backoff_seconds", 60)),
                 resume_timeout_seconds=int(getattr(settings, "agent_resume_timeout_seconds", 900)),
+                visual_snapshot_preparer=getattr(local_visual_search, "precompute_snapshot", None),
+                visual_candidate_preparer=prepare_visual_candidates,
                 worker_manager=worker_manager,
                 operation_policy=app.state.operation_policy_gateway,
                 grant_store=app.state.operation_grants,
@@ -514,6 +549,7 @@ def _build_scope_runtime(
                 "executor": shared_worker_executor,
                 "operation_policy": app.state.operation_policy_gateway,
                 "grant_store": app.state.operation_grants,
+                "visual_candidate_preparer": prepare_visual_candidates,
                 "register_handlers": register_handlers,
                 "start_services": start_scope_services,
             },

@@ -127,7 +127,6 @@ services:
       MEMEMEOW_OPENCODE_CONCURRENCY: ${MEMEMEOW_OPENCODE_CONCURRENCY:-1}
       MEMEMEOW_AGENT_RESULT_MAX_BYTES: ${MEMEMEOW_AGENT_RESULT_MAX_BYTES:-1048576}
       MEMEMEOW_AGENT_REVERSE_IMAGE_INTERNAL_URL: http://mememeow:8275/internal/reverse-image/search
-      MEMEMEOW_AGENT_VISUAL_SEARCH_INTERNAL_URL: http://mememeow:8275/internal/visual-search/match
     volumes:
       # named volume 的 owner 从镜像初始化，不会被全新 checkout 的 bind mount 覆盖为 root。
       - mememeow-agent-runtime-data:/runtime
@@ -200,7 +199,6 @@ services:
       MEMEMEOW_AGENT_CALLBACK_SECRET: ${MEMEMEOW_AGENT_CALLBACK_SECRET:-}
       MEMEMEOW_AGENT_CALLBACK_VERIFICATION_KEYS: ${MEMEMEOW_AGENT_CALLBACK_VERIFICATION_KEYS:-}
       MEMEMEOW_AGENT_REVERSE_IMAGE_INTERNAL_URL: http://mememeow:8275/internal/reverse-image/search
-      MEMEMEOW_AGENT_VISUAL_SEARCH_INTERNAL_URL: http://mememeow:8275/internal/visual-search/match
       MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL: http://mememeow:8275/internal/reverse-image/search
       MEMEMEOW_VISUAL_INTERNAL_URL: http://mememeow-visual:8276/internal/visual-embedding
       MEMEMEOW_VISUAL_HEALTH_URL: http://mememeow-visual:8276/health

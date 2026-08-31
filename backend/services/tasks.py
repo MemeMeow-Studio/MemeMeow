@@ -46,7 +46,7 @@ from backend.agent_resume import (
 )
 from backend.config import validate_agent_concurrency
 from executor.agent_limits import validate_agent_concurrency_at_most
-from backend.operation_policy import GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations
+from backend.operation_policy import GrantAssociation, GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations, require_allowed
 from backend.opencode_workspace import SELECTOR_RE
 from backend.public_dto import sanitize_task_result
 from backend.tasks import (
@@ -58,11 +58,20 @@ from backend.tasks import (
 from backend.scope import validate_scope_services
 from backend.services.worker_manager import PostgresTaskWorkerManager
 from backend.persistence.repositories.tasks import validate_lane_resource_key, validate_lane_resource_concurrency
+from backend.visual_snapshot import VisualMatchSnapshotError, validate_visual_match_snapshot, visual_match_snapshot_summary
 
 # 任务服务沿用旧 facade logger，确保失败/unknown 运营日志不改变来源。
 logger = logging.getLogger("backend.pg_services")
 # 任务 payload 只承载业务输入；范围事实始终来自持久 Task.scope_id。
 UNTRUSTED_SCOPE_FIELDS = frozenset({"scope_id", "scope-id", "user_id", "user-id"})
+
+
+def _is_explicit_image_task(record: object) -> bool:
+    """判断图片任务是否已经绑定新控制面的显式来源。"""
+    return (
+        getattr(record, "task_type", None) in IMAGE_PROCESSING_TASK_TYPES
+        and getattr(record, "submission_mode", None) in {"pipeline", "standalone"}
+    )
 
 
 def _iso(value: datetime | str | None) -> str:
@@ -79,7 +88,7 @@ class PostgresTaskService:
     恢复并校验 scope，避免普通 payload 或 Worker 的历史默认值成为归属事实。
     """
 
-    def __init__(self, resources: DatabaseResources, *, scope_id: str | ScopeContext = "local", agent_concurrency: int = 1, scope_concurrency: int | None = None, resource_concurrency: Mapping[str, int] | None = None, agent_backpressure: int | None = None, settings_version: str | None = None, lease_seconds: int = 120, max_attempts: int = 3, executor: ThreadPoolExecutor | None = None, worker_manager: PostgresTaskWorkerManager | None = None, finalize_image_tasks: bool = True, operation_policy: OperationPolicyGateway | None = None, grant_store: GrantAssociationStore | None = None, resume_enabled: bool = False, resume_max_attempts: int = 2, resume_backoff_seconds: int = 2, resume_max_backoff_seconds: int = 60, resume_timeout_seconds: int = 900):
+    def __init__(self, resources: DatabaseResources, *, scope_id: str | ScopeContext = "local", agent_concurrency: int = 1, scope_concurrency: int | None = None, resource_concurrency: Mapping[str, int] | None = None, agent_backpressure: int | None = None, settings_version: str | None = None, lease_seconds: int = 120, max_attempts: int = 3, executor: ThreadPoolExecutor | None = None, worker_manager: PostgresTaskWorkerManager | None = None, finalize_image_tasks: bool = True, operation_policy: OperationPolicyGateway | None = None, grant_store: GrantAssociationStore | None = None, visual_snapshot_preparer: Callable[..., Mapping[str, Any]] | None = None, visual_candidate_preparer: Callable[..., Any] | None = None, resume_enabled: bool = False, resume_max_attempts: int = 2, resume_backoff_seconds: int = 2, resume_max_backoff_seconds: int = 60, resume_timeout_seconds: int = 900):
         """绑定任务资源、scope、并发/租约配置和可选的进程级 Worker manager。
 
         ``agent_backpressure`` 仅为旧调用方保留，不参与 Agent 运行槽位或队列判定。
@@ -113,6 +122,8 @@ class PostgresTaskService:
         # 兼容任务服务仍可执行历史任务，但不会替客户端伪造计量事实。
         self._operation_policy = operation_policy
         self._grant_store = grant_store
+        self._visual_snapshot_preparer = visual_snapshot_preparer
+        self._visual_candidate_preparer = visual_candidate_preparer
         self._executor = worker_manager.executor if worker_manager is not None else executor or ThreadPoolExecutor(max_workers=max(2, self.agent_concurrency + 1), thread_name_prefix="mememeow-pg-task")
         self._owns_executor = worker_manager is None and executor is None
         self._lock = Lock()
@@ -255,8 +266,9 @@ class PostgresTaskService:
             queued = environment.tasks.recover_expired(
                 owner=self.owner,
                 limit=5000,
-                exclude_task_types=IMAGE_PROCESSING_TASK_TYPES if owned_types is None else None,
+                exclude_task_types=IMAGE_PROCESSING_TASK_TYPES if owned_types is not None else None,
                 include_task_types=owned_types,
+                exclude_image_pipeline=owned_types is None,
             )
             # 普通 facade 需要恢复旧批次 finalizer；图片专用 facade 禁止重新
             # 创建 scope 级 cache_generation。
@@ -267,7 +279,11 @@ class PostgresTaskService:
                 queued.extend(
                     record.id
                     for record in records
-                    if owned_types is None or record.task_type in owned_types
+                    if (
+                        record.task_type in owned_types
+                        if owned_types is not None
+                        else not _is_explicit_image_task(record)
+                    )
                 )
                 if cursor is None:
                     break
@@ -298,6 +314,10 @@ class PostgresTaskService:
             processing_job_id=str(getattr(record, "processing_job_id", "")) if getattr(record, "processing_job_id", None) else None,
             lane_resource_key=getattr(record, "lane_resource_key", GLOBAL_LANE_RESOURCE_KEY) or GLOBAL_LANE_RESOURCE_KEY,
             payload=dict(record.payload or {}),
+            visual_snapshot_sha256=getattr(record, "visual_snapshot_sha256", None),
+            visual_snapshot_protocol_version=getattr(record, "visual_snapshot_protocol_version", None),
+            visual_snapshot_matched_at=_iso(getattr(record, "visual_snapshot_matched_at", None)) if getattr(record, "visual_snapshot_matched_at", None) else None,
+            visual_snapshot_candidate_count=getattr(record, "visual_snapshot_candidate_count", None),
             status=record.status,
             progress=record.progress,
             message=record.message,
@@ -322,6 +342,72 @@ class PostgresTaskService:
             scope_id=record.scope_id,
         )
 
+    @staticmethod
+    def _image_attempt_input_digest(payload: Mapping[str, Any], snapshot: Mapping[str, Any] | None = None) -> str:
+        """计算图片 attempt 的稳定输入摘要，并补入 snapshot 已冻结的视觉身份。
+
+        ``_prepare_visual_snapshot`` 可能为旧任务补齐模型、维度和预处理版本；这些
+        字段属于同一业务输入，必须让首次 attempt 与后续 resume 使用完全相同的摘要。
+        """
+        stable_payload = {key: value for key, value in payload.items() if not key.startswith("_")}
+        if snapshot is not None:
+            query = snapshot.get("query")
+            if isinstance(query, Mapping):
+                for payload_key, query_key in (
+                    ("visual_model", "model"),
+                    ("visual_dimensions", "dimensions"),
+                    ("preprocess_version", "preprocess_version"),
+                ):
+                    if payload_key not in stable_payload and query_key in query:
+                        stable_payload[payload_key] = query[query_key]
+        return hashlib.sha256(
+            json.dumps(stable_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    @staticmethod
+    def _processing_config_hash(payload: Mapping[str, Any], query: Mapping[str, Any] | None = None) -> str:
+        """规范化任务处理配置指纹，并为旧任务补出稳定值。
+
+        新任务直接复用控制面写入的 SHA-256；迁移前任务可能只有少量模型配置字段，
+        此处按固定白名单和视觉 query 身份计算同一摘要，供 grant、attempt 和 resume
+        使用。不会把图片内容、claim 或恢复标识当作配置事实。
+        """
+        raw = payload.get("processing_config_hash")
+        if raw is not None:
+            normalized = normalize_config_hash(raw)
+            if normalized is None:
+                raise RuntimeError("visual_match_snapshot_invalid")
+            return normalized
+        config_fields = (
+            "model",
+            "agent_model",
+            "skill_hash",
+            "settings_version",
+            "visual_model",
+            "visual_dimensions",
+            "preprocess_version",
+            "embedding_model",
+            "embedding_dimensions",
+        )
+        config: dict[str, Any] = {
+            key: payload[key]
+            for key in config_fields
+            if key in payload and payload[key] is not None
+        }
+        if query is not None:
+            for payload_key, query_key in (
+                ("visual_model", "model"),
+                ("visual_dimensions", "dimensions"),
+                ("preprocess_version", "preprocess_version"),
+            ):
+                if payload_key not in config and query_key in query:
+                    config[payload_key] = query[query_key]
+        try:
+            encoded = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise RuntimeError("visual_match_snapshot_invalid") from exc
+        return hashlib.sha256(encoded).hexdigest()
+
     def _image_attempt_state(self, claim: Task, payload: dict[str, Any], state: str) -> None:
         """保存图片叶子当前 claim 的 attempt 状态，供重启恢复辨认未知执行。"""
         if claim.task_type not in IMAGE_PROCESSING_TASK_TYPES:
@@ -336,8 +422,19 @@ class PostgresTaskService:
             return
         # claim、resume 和 attempt 绑定字段都是运行时事实，不属于同一输入的
         # 业务摘要；排除全部内部字段才能让续跑 attempt 与原 attempt 对齐。
-        stable_payload = {key: value for key, value in payload.items() if not key.startswith("_")}
-        input_digest = hashlib.sha256(json.dumps(stable_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        snapshot_summary: dict[str, object] | None = None
+        raw_snapshot = payload.get("_visual_match_snapshot")
+        if raw_snapshot is not None:
+            try:
+                snapshot_summary = visual_match_snapshot_summary(raw_snapshot)
+            except VisualMatchSnapshotError:
+                # attempt 不能保存未经完整 hash 校验的视觉事实；上层会把任务
+                # 收束为稳定的 snapshot 错误，而不是留下可恢复的半成品。
+                return
+        input_digest = self._image_attempt_input_digest(
+            payload,
+            raw_snapshot if isinstance(raw_snapshot, Mapping) else None,
+        )
         now = utcnow()
         raw_selector = payload.get("_workspace_selector")
         if raw_selector is not None and (
@@ -385,6 +482,10 @@ class PostgresTaskService:
                     input_digest=input_digest,
                     target_sha256=target_sha.lower(),
                     claim_generation=claim.claim_generation,
+                    visual_snapshot_sha256=(str(snapshot_summary["snapshot_sha256"]) if snapshot_summary is not None else payload.get("_visual_snapshot_sha256") if isinstance(payload.get("_visual_snapshot_sha256"), str) else None),
+                    visual_snapshot_protocol_version=(int(snapshot_summary["protocol_version"]) if snapshot_summary is not None else payload.get("_visual_snapshot_protocol_version") if isinstance(payload.get("_visual_snapshot_protocol_version"), int) and not isinstance(payload.get("_visual_snapshot_protocol_version"), bool) else None),
+                    visual_snapshot_matched_at=(datetime.fromisoformat(str(snapshot_summary["matched_at"]).replace("Z", "+00:00")) if snapshot_summary is not None else payload.get("_visual_snapshot_matched_at") if isinstance(payload.get("_visual_snapshot_matched_at"), datetime) else None),
+                    visual_snapshot_candidate_count=(int(snapshot_summary["candidate_count"]) if snapshot_summary is not None else payload.get("_visual_snapshot_candidate_count") if isinstance(payload.get("_visual_snapshot_candidate_count"), int) and not isinstance(payload.get("_visual_snapshot_candidate_count"), bool) else None),
                 )
                 session.add(row)
             else:
@@ -401,6 +502,23 @@ class PostgresTaskService:
                     row.executor_attempt_id = str(payload["_executor_attempt_id"])
                 if isinstance(payload.get("_workspace_selector"), str) and SELECTOR_RE.fullmatch(str(payload["_workspace_selector"])):
                     row.workspace_selector = str(payload["_workspace_selector"])
+                if snapshot_summary is not None:
+                    # 首次 ``prepared`` 可能发生在 snapshot 生成之前；snapshot
+                    # 身份补齐后必须更新摘要，避免 resume 查询不到原 attempt。
+                    row.input_digest = input_digest
+                    row.visual_snapshot_sha256 = str(snapshot_summary["snapshot_sha256"])
+                    row.visual_snapshot_protocol_version = int(snapshot_summary["protocol_version"])
+                    row.visual_snapshot_matched_at = datetime.fromisoformat(str(snapshot_summary["matched_at"]).replace("Z", "+00:00"))
+                    row.visual_snapshot_candidate_count = int(snapshot_summary["candidate_count"])
+                else:
+                    if isinstance(payload.get("_visual_snapshot_sha256"), str):
+                        row.visual_snapshot_sha256 = payload["_visual_snapshot_sha256"]
+                    if isinstance(payload.get("_visual_snapshot_protocol_version"), int) and not isinstance(payload.get("_visual_snapshot_protocol_version"), bool):
+                        row.visual_snapshot_protocol_version = payload["_visual_snapshot_protocol_version"]
+                    if isinstance(payload.get("_visual_snapshot_matched_at"), datetime):
+                        row.visual_snapshot_matched_at = payload["_visual_snapshot_matched_at"]
+                    if isinstance(payload.get("_visual_snapshot_candidate_count"), int) and not isinstance(payload.get("_visual_snapshot_candidate_count"), bool):
+                        row.visual_snapshot_candidate_count = payload["_visual_snapshot_candidate_count"]
             session.commit()
 
     def record_agent_attempt(
@@ -529,11 +647,22 @@ class PostgresTaskService:
         target_sha = payload.get("image_sha256")
         if not isinstance(target_sha, str) or len(target_sha) != 64:
             return None
-        config_hash = normalize_config_hash(payload.get("processing_config_hash"))
-        if payload.get("processing_config_hash") is not None and config_hash is None:
-            return None
-        stable_payload = {key: value for key, value in payload.items() if not key.startswith("_")}
-        input_digest = hashlib.sha256(json.dumps(stable_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        try:
+            config_hash = self._processing_config_hash(payload)
+        except RuntimeError:
+            raise
+        snapshot_for_digest: Mapping[str, Any] | None = None
+        raw_snapshot = getattr(claim, "visual_match_snapshot", None)
+        if raw_snapshot is not None:
+            try:
+                snapshot_for_digest = validate_visual_match_snapshot(raw_snapshot)
+            except VisualMatchSnapshotError as exc:
+                raise RuntimeError("visual_match_snapshot_invalid") from exc
+        input_digest = self._image_attempt_input_digest(payload, snapshot_for_digest)
+        # 修复前的 Worker 曾在 snapshot 身份补齐前写入摘要；允许同一任务按旧
+        # 摘要找到该 attempt，但后续仍必须通过 snapshot hash 和 scope fencing。
+        legacy_input_digest = self._image_attempt_input_digest(payload)
+        input_digests = tuple(dict.fromkeys((input_digest, legacy_input_digest)))
         with self.resources.factory() as session:
             previous = session.scalar(
                 select(ImageProcessingAttempt)
@@ -544,7 +673,7 @@ class PostgresTaskService:
                     ImageProcessingAttempt.state == "failed",
                     ImageProcessingAttempt.resume_available.is_(True),
                     ImageProcessingAttempt.target_sha256 == target_sha.lower(),
-                    ImageProcessingAttempt.input_digest == input_digest,
+                    ImageProcessingAttempt.input_digest.in_(input_digests),
                 )
                 .order_by(ImageProcessingAttempt.attempt.desc())
             )
@@ -562,6 +691,35 @@ class PostgresTaskService:
             raise RuntimeError("opencode_workspace_mismatch")
         if normalize_config_hash(getattr(previous, "processing_config_hash", None)) != config_hash:
             return None
+        # 新任务和已装配前置器的生产任务只能复用当前 Task 已保存的 snapshot；
+        # 只有没有 v2 标记且未装配前置器的旧兼容 facade 才保留历史 resume 路径。
+        current_snapshot = getattr(claim, "visual_match_snapshot", None)
+        if current_snapshot is None:
+            if payload.get("visual_match_snapshot_protocol_version") == 2 or self._visual_snapshot_preparer is not None:
+                raise RuntimeError("visual_match_snapshot_invalid")
+            if any(
+                getattr(previous, field, None) is not None
+                for field in (
+                    "visual_snapshot_sha256",
+                    "visual_snapshot_protocol_version",
+                    "visual_snapshot_candidate_count",
+                )
+            ):
+                raise RuntimeError("visual_match_snapshot_invalid")
+        else:
+            try:
+                current_summary = visual_match_snapshot_summary(
+                    current_snapshot,
+                    expected_sha256=getattr(claim, "visual_snapshot_sha256", None),
+                )
+            except VisualMatchSnapshotError as exc:
+                raise RuntimeError("visual_match_snapshot_invalid") from exc
+            if (
+                getattr(previous, "visual_snapshot_sha256", None) != current_summary["snapshot_sha256"]
+                or getattr(previous, "visual_snapshot_protocol_version", None) != current_summary["protocol_version"]
+                or getattr(previous, "visual_snapshot_candidate_count", None) != current_summary["candidate_count"]
+            ):
+                raise RuntimeError("visual_match_snapshot_invalid")
         previous_reason = getattr(previous, "resume_reason", None) if previous is not None else None
         resume_reason = previous_reason if isinstance(previous_reason, str) and previous_reason else "session_resumable"
         return {
@@ -645,32 +803,77 @@ class PostgresTaskService:
 
     def _commit_agent_grant(self, claim: Task, payload: dict[str, Any]) -> None:
         """在 Agent 外部执行前幂等提交服务端 grant。"""
-        if claim.task_type != "meme_context_generation" or self._operation_policy is None or self._grant_store is None:
+        operation_policy = getattr(self, "_operation_policy", None)
+        grant_store = getattr(self, "_grant_store", None)
+        if claim.task_type != "meme_context_generation" or operation_policy is None or grant_store is None:
             return
         meme_id = payload.get("meme_id")
         image_sha256 = payload.get("image_sha256")
-        config_hash = payload.get("processing_config_hash")
+        config_hash = normalize_config_hash(payload.get("processing_config_hash"))
         revision = payload.get("job_revision")
         policy = payload.get("reverse_image_policy") or "forbid"
-        if not all(isinstance(value, str) and value for value in (meme_id, image_sha256, config_hash)):
+        if policy not in {"forbid", "auto"}:
+            raise OperationPolicyError("invalid_reverse_image_policy")
+        if not isinstance(image_sha256, str) or len(image_sha256) != 64 or any(char not in "0123456789abcdefABCDEF" for char in image_sha256):
+            raise OperationPolicyError("operation_grant_invalid")
+        image_sha256 = image_sha256.lower()
+        if not all(isinstance(value, str) and value for value in (meme_id, config_hash)):
             raise OperationPolicyError("operation_grant_invalid")
         mode = payload.get("submission_mode")
         if mode == "standalone":
             logical_key = payload.get("agent_grant_key")
             if not isinstance(logical_key, str) or not logical_key.startswith("standalone-agent:"):
-                raise OperationPolicyError("operation_grant_invalid")
+                # protocol v2 迁移前的 standalone Task 没有 nonce/key；使用 Task ID
+                # 作为同一业务任务内稳定的幂等后缀，随后把 key 写回受信 payload。
+                logical_key = f"standalone-agent:{claim.id}:{meme_id}:{image_sha256}:{config_hash}:{policy}"
+                payload["agent_grant_key"] = logical_key
             source = "image-processing-standalone"
         else:
-            logical_key = f"agent:{meme_id}:{image_sha256}:{config_hash}:{policy}:r{revision}"
+            logical_key = f"agent:{meme_id}:{image_sha256}:{config_hash}:{policy}:r{revision or 'legacy'}"
             source = "image-processing"
         request = self._operation_policy.request(self.scope, Operations.ANALYSIS_AGENT, logical_key, resource_id=meme_id, task_id=claim.id, source=source, input_digest=image_sha256)
-        association = self._grant_store.get(request)
-        if association is None or association.grant.scope != self.scope or association.grant.operation != Operations.ANALYSIS_AGENT:
+        association = None
+        try:
+            association = self._grant_store.get(request)
+        except OperationPolicyError as exc:
+            if exc.code != "operation_policy_unavailable":
+                raise
+            # 老 pipeline 可能先按 logical key acquire、再在 Task 创建后 bind，
+            # 因而持久行仍是 task_id=NULL；只允许把这种未绑定事实绑定到当前 claim。
+            unbound_request = self._operation_policy.request(
+                self.scope,
+                Operations.ANALYSIS_AGENT,
+                logical_key,
+                resource_id=meme_id,
+                task_id=None,
+                source=source,
+                input_digest=image_sha256,
+            )
+            association = self._grant_store.get(unbound_request)
+            if association is not None and association.state == "acquired":
+                if not callable(getattr(self._grant_store, "bind_task", None)) or not self._grant_store.bind_task(association.grant, claim.id):
+                    raise OperationPolicyError("operation_grant_invalid")
+                association = self._grant_store.get(request)
+        if association is None:
+            if callable(getattr(self._grant_store, "acquire", None)):
+                association = self._grant_store.acquire(request, self._operation_policy)
+            else:
+                grant = require_allowed(self._operation_policy.acquire(request))
+                association = self._grant_store.put(GrantAssociation(request, grant))
+        if association.grant.scope != self.scope or association.grant.operation != Operations.ANALYSIS_AGENT:
             raise OperationPolicyError("operation_grant_invalid")
+        if callable(getattr(self._grant_store, "bind_task", None)) and association.request.task_id != claim.id:
+            if not self._grant_store.bind_task(association.grant, claim.id):
+                raise OperationPolicyError("operation_grant_invalid")
+            association = self._grant_store.get(request) or association
         if association.state == "committed":
             return
         if association.state != "acquired":
             raise OperationPolicyError("operation_grant_invalid")
+        # standalone 迁移 key 必须在 commit 前持久化，否则重启后无法按同一 grant
+        # 事实恢复；兼容测试夹具没有该扩展点时仍使用当前内存 payload。
+        if mode == "standalone" and callable(getattr(self, "_persist_claim_payload_updates", None)):
+            self._persist_claim_payload_updates(claim, {"agent_grant_key": logical_key})
         try:
             result = self._operation_policy.commit(association.grant)
         except OperationPolicyError:
@@ -684,6 +887,218 @@ class PostgresTaskService:
         if not self._grant_store.transition(association.grant, "committed"):
             self._grant_store.transition(association.grant, "unknown")
             raise OperationPolicyError("operation_grant_invalid")
+
+    def _release_uncommitted_agent_grant(self, claim: Task, payload: Mapping[str, Any]) -> None:
+        """前置阶段失败时补偿释放当前 Task 尚未提交的 Agent grant。"""
+        operation_policy = getattr(self, "_operation_policy", None)
+        grant_store = getattr(self, "_grant_store", None)
+        if claim.task_type != "meme_context_generation" or operation_policy is None or grant_store is None:
+            return
+        meme_id = payload.get("meme_id")
+        image_sha256 = payload.get("image_sha256")
+        config_hash = normalize_config_hash(payload.get("processing_config_hash"))
+        if not isinstance(image_sha256, str) or len(image_sha256) != 64 or any(char not in "0123456789abcdefABCDEF" for char in image_sha256):
+            return
+        image_sha256 = image_sha256.lower()
+        if not all(isinstance(value, str) and value for value in (meme_id, config_hash)):
+            return
+        policy = payload.get("reverse_image_policy") or "forbid"
+        if policy not in {"forbid", "auto"}:
+            return
+        if payload.get("submission_mode") == "standalone":
+            logical_key = payload.get("agent_grant_key")
+            source = "image-processing-standalone"
+            if not isinstance(logical_key, str) or not logical_key.startswith("standalone-agent:"):
+                return
+        else:
+            logical_key = f"agent:{meme_id}:{image_sha256}:{config_hash}:{policy}:r{payload.get('job_revision') or 'legacy'}"
+            source = "image-processing"
+        try:
+            request = operation_policy.request(
+                self.scope,
+                Operations.ANALYSIS_AGENT,
+                logical_key,
+                resource_id=meme_id,
+                task_id=claim.id,
+                source=source,
+                input_digest=image_sha256,
+            )
+            try:
+                association = grant_store.get(request)
+            except OperationPolicyError as exc:
+                if exc.code != "operation_policy_unavailable":
+                    raise
+                # 旧 pipeline grant 可能仍未绑定 Task；释放前按同一 logical key
+                # 读取该未绑定 reservation，避免预计算失败遗留可执行额度。
+                unbound_request = operation_policy.request(
+                    self.scope,
+                    Operations.ANALYSIS_AGENT,
+                    logical_key,
+                    resource_id=meme_id,
+                    task_id=None,
+                    source=source,
+                    input_digest=image_sha256,
+                )
+                association = grant_store.get(unbound_request)
+            if association is None or association.state != "acquired":
+                return
+            result = operation_policy.release(association.grant)
+            if not result.ok or result.state not in {"released", "already_released"}:
+                grant_store.transition(association.grant, "unknown")
+                return
+            if not grant_store.transition(association.grant, "released"):
+                grant_store.transition(association.grant, "unknown")
+        except OperationPolicyError:
+            # release 结果不确定时不能再次尝试 acquire；unknown 会阻止后续盲目重放。
+            try:
+                if "association" in locals() and association is not None:
+                    grant_store.transition(association.grant, "unknown")
+            except OperationPolicyError:
+                pass
+        except Exception:
+            # 适配层无法证明补偿结果时主动收束 unknown，不能把 acquired 留给
+            # 后续恢复路径，否则视觉失败可能被再次误当成可执行授权。
+            try:
+                if "association" in locals() and association is not None:
+                    grant_store.transition(association.grant, "unknown")
+            except Exception:
+                pass
+
+    def _persist_claim_payload_updates(self, claim: Task, updates: Mapping[str, Any]) -> None:
+        """在当前 claim fencing 下持久化 protocol v2 迁移字段。"""
+        if not updates:
+            return
+        with self.resources.environment(self.scope.scope_id) as environment:
+            update_payload = getattr(environment.tasks, "update_payload_fenced", None)
+            if callable(update_payload) and not update_payload(claim.id, claim.claim_generation, self.owner, updates):
+                raise RuntimeError("claim_expired")
+
+    def _prepare_visual_snapshot(self, claim: Task, payload: dict[str, Any]) -> None:
+        """在 Agent grant 前准备并以 claim fencing 保存视觉候选 snapshot。"""
+        if claim.task_type != "meme_context_generation":
+            return
+        expected_sha = payload.get("image_sha256")
+        meme_id = payload.get("meme_id")
+        model = payload.get("visual_model")
+        dimensions = payload.get("visual_dimensions")
+        preprocess_version = payload.get("preprocess_version")
+        if not isinstance(expected_sha, str) or len(expected_sha) != 64 or not isinstance(meme_id, str) or not meme_id:
+            raise RuntimeError("visual_match_snapshot_invalid")
+        expected_sha = expected_sha.lower()
+        if (
+            (model is not None and (not isinstance(model, str) or not model))
+            or (dimensions is not None and (not isinstance(dimensions, int) or isinstance(dimensions, bool) or dimensions <= 0))
+            or (preprocess_version is not None and (not isinstance(preprocess_version, str) or not preprocess_version))
+        ):
+            raise RuntimeError("visual_match_snapshot_invalid")
+        snapshot_marker = payload.get("visual_match_snapshot_protocol_version")
+        if snapshot_marker is not None and (not isinstance(snapshot_marker, int) or isinstance(snapshot_marker, bool) or snapshot_marker != 2):
+            raise RuntimeError("visual_match_snapshot_invalid")
+        is_resume = bool(payload.get("_resume_available") or payload.get("_resume_session_id"))
+        try:
+            with self.resources.environment(self.scope.scope_id) as environment:
+                existing = environment.tasks.get_visual_snapshot(claim.id)
+            if existing is None:
+                if is_resume:
+                    # 恢复路径不能因 snapshot 缺失而再次查询视觉向量；这会使
+                    # 同一 session 得到不同候选并绕过原 attempt 的证据边界。
+                    if snapshot_marker == 2 or self._visual_snapshot_preparer is not None:
+                        raise RuntimeError("visual_match_snapshot_invalid")
+                    # 没有 v2 标记和前置器的历史 facade 继续走原兼容 handler；
+                    # 生产装配始终满足上面的严格分支。
+                    return
+                if self._visual_snapshot_preparer is None:
+                    if snapshot_marker == 2:
+                        raise RuntimeError("visual_match_snapshot_unavailable")
+                    # 没有协议标记的历史 facade 仍保留旧兼容路径；生产新任务始终
+                    # 由 scope factory 注入前置器并携带 protocol version。
+                    return
+                prepared = self._visual_snapshot_preparer(task_id=claim.id)
+                if not isinstance(prepared, Mapping):
+                    raise RuntimeError("visual_match_snapshot_invalid")
+                with self.resources.environment(self.scope.scope_id) as environment:
+                    if not environment.tasks.set_visual_snapshot_fenced(claim.id, claim.claim_generation, self.owner, prepared):
+                        raise RuntimeError("claim_expired")
+                    existing = environment.tasks.get_visual_snapshot(claim.id)
+            if existing is None:
+                raise RuntimeError("visual_match_snapshot_invalid")
+            snapshot = validate_visual_match_snapshot(existing)
+            query = snapshot.get("query")
+            if (
+                not isinstance(query, Mapping)
+                or query.get("meme_id") != meme_id
+                or str(query.get("image_sha256", "")).lower() != expected_sha.lower()
+                or (model is not None and query.get("model") != model)
+                or (dimensions is not None and query.get("dimensions") != dimensions)
+                or (preprocess_version is not None and query.get("preprocess_version") != preprocess_version)
+            ):
+                raise RuntimeError("visual_match_snapshot_invalid")
+            # resume 不能只相信旧 payload；Meme 或 BlobStore 在上次 attempt 后被
+            # 替换时，必须在 grant 前收束为 target_changed，避免对新图片运行旧事实。
+            with self.resources.environment(self.scope.scope_id) as environment:
+                memes = getattr(environment, "memes", None)
+                get_meme = getattr(memes, "get", None)
+                if callable(get_meme):
+                    current_meme = get_meme(meme_id)
+                    if current_meme is None or str(getattr(current_meme, "sha256", "")).lower() != expected_sha:
+                        raise RuntimeError("target_changed")
+                    blob_resolver = getattr(self.resources, "blob_store_for_scope", None)
+                    if callable(blob_resolver):
+                        try:
+                            blob = blob_resolver(self.scope.scope_id)
+                            if not blob.exists_with_identity(
+                                getattr(current_meme, "storage_key", None),
+                                sha256=expected_sha,
+                                size_bytes=getattr(current_meme, "size_bytes", None),
+                            ):
+                                raise RuntimeError("target_changed")
+                        except RuntimeError:
+                            raise
+                        except Exception as exc:  # noqa: BLE001 - 目标文件校验必须 fail-closed
+                            raise RuntimeError("target_changed") from exc
+            summary = visual_match_snapshot_summary(snapshot)
+            # 旧任务的 payload 可能没有视觉身份字段；迁移后将 snapshot 的已
+            # 校验身份放入当前 handler payload，并由 claim-fenced 更新持久迁移字段。
+            payload.setdefault("visual_model", query["model"])
+            payload.setdefault("visual_dimensions", query["dimensions"])
+            payload.setdefault("preprocess_version", query["preprocess_version"])
+            payload["processing_config_hash"] = self._processing_config_hash(payload, query)
+            payload["visual_match_snapshot_protocol_version"] = 2
+            payload["_visual_match_snapshot"] = snapshot
+            payload["_visual_snapshot_sha256"] = summary["snapshot_sha256"]
+            payload["_visual_snapshot_protocol_version"] = summary["protocol_version"]
+            payload["_visual_snapshot_matched_at"] = datetime.fromisoformat(str(summary["matched_at"]).replace("Z", "+00:00"))
+            payload["_visual_snapshot_candidate_count"] = summary["candidate_count"]
+            self._persist_claim_payload_updates(
+                claim,
+                {
+                    "visual_model": payload["visual_model"],
+                    "visual_dimensions": payload["visual_dimensions"],
+                    "preprocess_version": payload["preprocess_version"],
+                    "processing_config_hash": payload["processing_config_hash"],
+                    "visual_match_snapshot_protocol_version": 2,
+                },
+            )
+            if self._visual_candidate_preparer is not None:
+                try:
+                    self._visual_candidate_preparer(claim=claim, payload=payload, snapshot=snapshot)
+                except RuntimeError as exc:
+                    code = getattr(exc, "code", None) or str(exc).partition(":")[0]
+                    if code == "claim_expired":
+                        raise
+                    raise RuntimeError("visual_candidate_materialization_failed") from exc
+                except Exception as exc:  # noqa: BLE001 - 物化适配层失败必须阻止 grant
+                    raise RuntimeError("visual_candidate_materialization_failed") from exc
+        except (DatabaseError, VisualMatchSnapshotError) as exc:
+            code = getattr(exc, "code", "visual_match_snapshot_invalid")
+            raise RuntimeError(str(code)) from exc
+        except RuntimeError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 视觉适配层必须暴露稳定 code
+            code = getattr(exc, "code", None)
+            if isinstance(code, str) and code in STABLE_TASK_ERRORS:
+                raise RuntimeError(code) from exc
+            raise
 
     def submit(
         self,
@@ -916,14 +1331,19 @@ class PostgresTaskService:
                 resume_candidate = self._resume_candidate(claim, task_payload)
             except RuntimeError as exc:
                 code = str(exc).partition(":")[0]
-                if code != "opencode_workspace_mismatch":
+                if code not in {
+                    "opencode_workspace_mismatch",
+                    "visual_match_snapshot_invalid",
+                    "visual_match_snapshot_conflict",
+                    "visual_match_snapshot_unavailable",
+                }:
                     raise
                 self._image_attempt_state(claim, task_payload, "failed")
                 self._fenced_failure(
                     task_id,
                     generation,
-                    message="workspace 绑定无法恢复",
-                    error={"error": code, "message": "workspace selector 与持久恢复事实不一致"},
+                    message="视觉候选 snapshot 无法恢复" if code.startswith("visual_match_snapshot") else "workspace 绑定无法恢复",
+                    error={"error": code, "message": "视觉候选 snapshot 与持久恢复事实不一致" if code.startswith("visual_match_snapshot") else "workspace selector 与持久恢复事实不一致"},
                     retry=False,
                     resume_available=False,
                     resume_reason=code,
@@ -962,21 +1382,32 @@ class PostgresTaskService:
             heartbeat_thread.start()
             try:
                 if claim.task_type in IMAGE_PROCESSING_TASK_TYPES:
+                    if claim.task_type == "meme_context_generation":
+                        # 视觉候选失败发生在 grant 和 external_started 之前，不能被
+                        # 外部执行恢复逻辑误判为 unknown_execution。
+                        self._prepare_visual_snapshot(claim, task_payload)
+                        # 先把已校验的 snapshot 摘要绑定到当前 attempt；即使后续
+                        # grant 或 OpenCode 失败，恢复器也只能复用这一份事实。
+                        self._image_attempt_state(claim, task_payload, "prepared")
                     # 图片阶段均可能触发外部模型或持久副作用；Agent 先完成
                     # grant commit，再进入外部执行窗口，恢复者才能区分计量边界。
                     self._commit_agent_grant(claim, task_payload)
+                    task_payload["_agent_grant_committed"] = True
                     if claim.task_type == "meme_context_generation":
                         self._image_attempt_state(claim, task_payload, "grant_committed")
                     # 恢复者无法证明结果时必须收束 unknown_execution。
                     self._image_attempt_state(claim, task_payload, "external_started")
                 result = handler(task_payload, progress)
             except Exception as exc:  # noqa: BLE001
+                if not task_payload.get("_agent_grant_committed"):
+                    self._release_uncommitted_agent_grant(claim, task_payload)
                 if isinstance(exc, OperationPolicyError):
                     code = exc.code
                     diagnostic = code
                 else:
                     diagnostic = str(exc)[:500]
-                    code = diagnostic.partition(":")[0] if diagnostic.partition(":")[0] in STABLE_TASK_ERRORS else "task_failed"
+                    exception_code = getattr(exc, "code", None)
+                    code = exception_code if isinstance(exception_code, str) and exception_code in STABLE_TASK_ERRORS else diagnostic.partition(":")[0] if diagnostic.partition(":")[0] in STABLE_TASK_ERRORS else "task_failed"
                 resume_available = bool(task_payload.get("_resume_available"))
                 resume_reason = task_payload.get("_resume_reason") if isinstance(task_payload.get("_resume_reason"), str) else None
                 session_id = task_payload.get("_resume_session_id") if isinstance(task_payload.get("_resume_session_id"), str) else None
@@ -1039,6 +1470,11 @@ class PostgresTaskService:
                     "embedding_non_finite",
                     "embedding_zero_norm",
                     "query_embedding_not_ready",
+                    "visual_match_snapshot_invalid",
+                    "visual_match_snapshot_conflict",
+                    "visual_match_snapshot_unavailable",
+                    "visual_candidate_materialization_failed",
+                    "claim_expired",
                     "invalid_task",
                     "task_not_running",
                     "auto_rename_title_missing",
@@ -1098,7 +1534,11 @@ class PostgresTaskService:
         with self.resources.environment(self.scope.scope_id) as environment:
             records, _ = environment.tasks.list(statuses={"queued"}, limit=100)
         for record in records:
-            if self._finalize_image_tasks or record.task_type in IMAGE_PROCESSING_TASK_TYPES:
+            if (
+                (not _is_explicit_image_task(record))
+                if self._finalize_image_tasks
+                else record.task_type in IMAGE_PROCESSING_TASK_TYPES
+            ):
                 self._schedule(record.id)
 
     def _fenced_update(self, task_id: str, generation: int, **changes: Any) -> bool:

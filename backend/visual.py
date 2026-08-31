@@ -39,6 +39,7 @@ from backend.visual_models import (
     source_repository_valid,
     visual_model_spec,
 )
+from backend.visual_snapshot import build_visual_match_snapshot
 
 
 _ACTIVE_VISUAL_SPEC = active_visual_model_spec()
@@ -516,11 +517,20 @@ class VisualSearchService:
         self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
         self.identity = identity_from_settings(settings)
 
-    def match(self, *, task_id: str, top_k: int = 20, exclude_self: bool = True) -> dict[str, object]:
-        """仅允许 running ``meme_context_generation`` 任务查询同 scope Agent-ready 候选。"""
+    def match(self, *, task_id: str, top_k: int = 20, exclude_self: bool = True, require_storage: bool = False) -> dict[str, object]:
+        """仅允许 running 语境任务查询同 scope 候选，并可严格校验文件身份。
+
+        ``require_storage`` 只由任务前置 snapshot 使用；兼容 callback 查询仍可
+        跳过暂时不可用的候选，避免改变旧接口的筛选语义。
+        """
         if not isinstance(task_id, str) or not task_id.strip():
             raise VisualSearchError("invalid_task", "任务标识无效", status_code=404)
-        top_k = max(1, min(int(top_k), 50))
+        if isinstance(top_k, bool):
+            raise VisualSearchError("visual_match_snapshot_invalid", "视觉候选数量无效", status_code=409)
+        try:
+            top_k = max(1, min(int(top_k), 50))
+        except (TypeError, ValueError) as exc:
+            raise VisualSearchError("visual_match_snapshot_invalid", "视觉候选数量无效", status_code=409) from exc
         with self.resources.environment(self.scope.scope_id) as environment:
             task = environment.tasks.get(task_id)
             if task is None or task.task_type != "meme_context_generation":
@@ -531,11 +541,15 @@ class VisualSearchService:
             meme_id = payload.get("meme_id")
             if not isinstance(meme_id, str):
                 raise VisualSearchError("invalid_task", "任务缺少查询图片", status_code=409)
-            requested_identity = VisualModelIdentity(
-                model=str(payload.get("visual_model") or self.identity.model),
-                dimensions=int(payload.get("visual_dimensions") or self.identity.dimensions),
-                preprocess_version=str(payload.get("preprocess_version") or self.identity.preprocess_version),
-            )
+            try:
+                raw_dimensions = payload.get("visual_dimensions")
+                requested_identity = VisualModelIdentity(
+                    model=str(payload.get("visual_model") or self.identity.model),
+                    dimensions=int(raw_dimensions or self.identity.dimensions),
+                    preprocess_version=str(payload.get("preprocess_version") or self.identity.preprocess_version),
+                )
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise VisualSearchError("visual_model_identity_mismatch", "任务视觉模型身份无效", status_code=409) from exc
             # 任务身份必须与服务当前模型一致，避免 Agent 用旧 payload 跨空间查询。
             if requested_identity != self.identity:
                 raise VisualSearchError("visual_model_identity_mismatch", "任务视觉模型身份已过期", status_code=409)
@@ -543,21 +557,33 @@ class VisualSearchService:
             if query_meme is None:
                 raise VisualSearchError("invalid_task", "查询图片不存在", status_code=404)
             target_sha = payload.get("image_sha256")
-            if not isinstance(target_sha, str) or target_sha != query_meme.sha256:
+            if not isinstance(target_sha, str) or target_sha.lower() != str(query_meme.sha256).lower():
                 raise VisualSearchError("target_changed", "查询图片内容已变化", status_code=409)
             query_embedding = environment.visual.get(meme_id, model=self.identity.model, preprocess_version=self.identity.preprocess_version, dimensions=self.identity.dimensions)
-            if query_embedding is None or query_embedding.image_sha256 != query_meme.sha256:
+            if query_embedding is None or str(query_embedding.image_sha256).lower() != str(query_meme.sha256).lower():
                 raise VisualSearchError("query_embedding_not_ready", "查询图片视觉向量尚未就绪", status_code=409)
             rows = environment.visual.match(query_embedding.embedding, model=self.identity.model, preprocess_version=self.identity.preprocess_version, dimensions=self.identity.dimensions, limit=top_k, exclude_meme_id=meme_id if exclude_self else None)
             results: list[dict[str, object]] = []
+            blob = None
+            if require_storage:
+                try:
+                    blob = self.resources.blob_store_for_scope(self.scope.scope_id)
+                except (DatabaseError, OSError) as exc:
+                    raise VisualSearchError("visual_candidate_materialization_failed", "视觉候选存储不可用", status_code=409) from exc
             for _rank, (_embedding, meme, score) in enumerate(rows, start=1):
                 storage_key = str(meme.storage_key)
                 try:
-                    blob = self.resources.blob_store_for_scope(self.scope.scope_id)
+                    blob = blob or self.resources.blob_store_for_scope(self.scope.scope_id)
                     path = blob.resolve(storage_key)
                     if not blob.exists_with_identity(storage_key, sha256=meme.sha256, size_bytes=meme.size_bytes):
+                        if require_storage:
+                            raise VisualSearchError("visual_candidate_materialization_failed", "视觉候选图片身份不一致", status_code=409)
                         continue
-                except (DatabaseError, OSError):
+                except VisualSearchError:
+                    raise
+                except (DatabaseError, OSError) as exc:
+                    if require_storage:
+                        raise VisualSearchError("visual_candidate_materialization_failed", "视觉候选图片无法读取", status_code=409) from exc
                     continue
                 results.append(
                     {
@@ -570,3 +596,96 @@ class VisualSearchService:
                     }
                 )
             return {"query_meme_id": meme_id, **self.identity.as_dict(), "results": results}
+
+    def precompute_snapshot(self, *, task_id: str, top_k: int | None = None) -> dict[str, object]:
+        """为 Agent 任务生成固定视觉候选 snapshot，不接受 Agent 请求参数。
+
+        输入是已 claim 的语境任务标识和仅由服务端配置决定的候选上限；输出是可写入
+        Task JSONB 的 protocol v2 snapshot。候选图片的存储身份在捕获时再次校验，
+        任何不一致都以稳定错误阻止后续外部执行。
+        """
+        configured_limit = getattr(self.settings, "visual_match_top_k", 20)
+        try:
+            limit = int(configured_limit if top_k is None else top_k)
+        except (TypeError, ValueError) as exc:
+            raise VisualSearchError("visual_match_snapshot_invalid", "视觉候选数量配置无效", status_code=503) from exc
+        limit = max(1, min(limit, 50))
+        result = self.match(task_id=task_id, top_k=limit, exclude_self=True, require_storage=True)
+        query_meme_id = result.get("query_meme_id")
+        if not isinstance(query_meme_id, str):
+            raise VisualSearchError("visual_match_snapshot_invalid", "视觉任务缺少查询图片", status_code=409)
+        with self.resources.environment(self.scope.scope_id) as environment:
+            query_meme = environment.memes.get(query_meme_id)
+            if query_meme is None:
+                raise VisualSearchError("invalid_task", "查询图片不存在", status_code=404)
+            task = environment.tasks.get(task_id)
+            if task is None or task.task_type != "meme_context_generation":
+                raise VisualSearchError("invalid_task", "任务不存在或不是语境生成任务", status_code=404)
+            target_sha = query_meme.sha256
+            requested_sha = (task.payload or {}).get("image_sha256")
+            if not isinstance(requested_sha, str) or requested_sha.lower() != str(target_sha).lower():
+                raise VisualSearchError("target_changed", "查询图片内容已变化", status_code=409)
+            try:
+                blob = self.resources.blob_store_for_scope(self.scope.scope_id)
+                if not blob.exists_with_identity(query_meme.storage_key, sha256=query_meme.sha256, size_bytes=query_meme.size_bytes):
+                    raise VisualSearchError("target_changed", "查询图片内容已变化", status_code=409)
+            except (DatabaseError, OSError) as exc:
+                raise VisualSearchError("target_changed", "查询图片无法读取", status_code=409) from exc
+            candidates: list[dict[str, object]] = []
+            raw_results = result.get("results")
+            if not isinstance(raw_results, list):
+                raise VisualSearchError("visual_match_snapshot_invalid", "视觉匹配结果格式无效", status_code=503)
+            for item in raw_results:
+                if not isinstance(item, Mapping):
+                    raise VisualSearchError("visual_match_snapshot_invalid", "视觉候选格式无效", status_code=503)
+                meme_id = item.get("meme_id")
+                if not isinstance(meme_id, str):
+                    raise VisualSearchError("visual_match_snapshot_invalid", "视觉候选缺少图片标识", status_code=503)
+                meme = environment.memes.get(meme_id)
+                if meme is None or not blob.exists_with_identity(meme.storage_key, sha256=meme.sha256, size_bytes=meme.size_bytes):
+                    raise VisualSearchError("visual_candidate_materialization_failed", "视觉候选图片无法校验", status_code=409)
+                # match 返回的 score 可能跨越一个并发向量更新；重新读取同一模型空间
+                # 和图片 SHA，避免把旧向量的排序分数绑定到新图片/新空间。
+                current_embedding = environment.visual.get(
+                    meme_id,
+                    model=str(result.get("model")),
+                    preprocess_version=str(result.get("preprocess_version")),
+                    dimensions=result.get("dimensions"),
+                    image_sha256=meme.sha256,
+                )
+                if (
+                    current_embedding is None
+                    or current_embedding.embedding is None
+                    or str(current_embedding.image_sha256).lower() != str(meme.sha256).lower()
+                ):
+                    raise VisualSearchError("visual_candidate_materialization_failed", "视觉候选向量身份已变化", status_code=409)
+                suffix = str(meme.extension or ".bin").lower()
+                if not suffix.startswith(".") or len(suffix) > 16 or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789._-" for character in suffix[1:]):
+                    raise VisualSearchError("visual_candidate_materialization_failed", "视觉候选扩展名无效", status_code=409)
+                candidates.append(
+                    {
+                        "meme_id": meme_id,
+                        "image_sha256": meme.sha256,
+                        "size_bytes": int(meme.size_bytes),
+                        "score": item.get("score"),
+                        "relative_path": f"candidate-{len(candidates) + 1:02d}{suffix}",
+                        "context": copy.deepcopy(meme.meme_context or {}),
+                    }
+                )
+            # 匹配结果和 snapshot 生成之间可能发生图片更新；再次读取目标行，
+            # 避免把旧向量结果绑定到新图片 SHA。
+            latest_query = environment.memes.get(query_meme_id)
+            if latest_query is None or str(latest_query.sha256).lower() != str(target_sha).lower() or latest_query.size_bytes != query_meme.size_bytes:
+                raise VisualSearchError("target_changed", "查询图片内容已变化", status_code=409)
+            try:
+                return build_visual_match_snapshot(
+                    query_meme_id=query_meme_id,
+                    image_sha256=target_sha,
+                    model=result.get("model"),
+                    dimensions=result.get("dimensions"),
+                    preprocess_version=result.get("preprocess_version"),
+                    candidates=candidates,
+                    matched_at=utcnow(),
+                )
+            except ValueError as exc:
+                raise VisualSearchError("visual_match_snapshot_invalid", "视觉候选 snapshot 无法生成", status_code=503) from exc

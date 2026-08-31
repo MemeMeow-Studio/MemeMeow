@@ -9,7 +9,9 @@ from uuid import uuid4
 import pytest
 
 from backend.image_processing import ImageProcessingError, ImageProcessingOptions, ImageProcessingWorker, normalize_auto_name, normalize_reverse_image_policy
-from backend.operation_policy import AllowAllOperationPolicy, GrantAssociationStore, OperationPolicyGateway, PolicyDecision
+from backend.operation_policy import AllowAllOperationPolicy, GrantAssociationStore, OperationPolicyGateway, Operations, PolicyDecision
+from backend.persistence.models import ScopeContext
+from backend.services.tasks import PostgresTaskService
 
 
 class _CountingPolicy(AllowAllOperationPolicy):
@@ -72,14 +74,14 @@ def _job() -> SimpleNamespace:
     )
 
 
-def _worker(tasks: _TaskService, policy: _CountingPolicy) -> ImageProcessingWorker:
+def _worker(tasks: _TaskService, policy: _CountingPolicy, grants: GrantAssociationStore | None = None) -> ImageProcessingWorker:
     """构造不启动数据库 facade 的 Worker，并替换阶段绑定写入。"""
     worker = ImageProcessingWorker(
         object(),
         scope_id="local",
         task_service=tasks,
         policy=OperationPolicyGateway(policy),
-        grant_store=GrantAssociationStore(),
+        grant_store=grants or GrantAssociationStore(),
     )
     worker.jobs.attach_task = lambda job_id, stage, task_id: True
     return worker
@@ -156,6 +158,74 @@ def test_submit_failure_releases_only_uncommitted_grant() -> None:
         assert policy.release_count == 1
     finally:
         worker.shutdown()
+
+
+def test_pipeline_grant_bind_failure_releases_uncommitted_grant() -> None:
+    """pipeline 叶子任务绑定失败时必须释放 acquired grant，不能遗留可执行授权。"""
+
+    class _RejectingBindStore(GrantAssociationStore):
+        """模拟持久 grant store 无法绑定新建叶子任务。"""
+
+        def bind_task(self, _grant, _task_id: str) -> bool:
+            """拒绝绑定，触发 Worker 的补偿释放路径。"""
+            return False
+
+    tasks = _TaskService()
+    policy = _CountingPolicy()
+    grants = _RejectingBindStore()
+    worker = _worker(tasks, policy, grants)
+    job = _job()
+    try:
+        with pytest.raises(ImageProcessingError, match="stage_grant_bind_failed"):
+            worker._prepare_task(job, "agent")
+        logical_key = f"agent:{job.meme_id}:{job.image_sha256}:{job.processing_config_hash}:auto:r{job.revision}"
+        request = worker.policy.request(
+            worker.scope,
+            Operations.ANALYSIS_AGENT,
+            logical_key,
+            resource_id=str(job.meme_id),
+            source="image-processing",
+            input_digest=job.image_sha256,
+        )
+        association = grants.get(request)
+        assert association is not None
+        assert association.state == "released"
+        assert policy.release_count == 1
+    finally:
+        worker.shutdown()
+
+
+def test_task_service_commits_missing_legacy_grant_by_stable_key() -> None:
+    """旧 pipeline/standalone Task 缺少关联时仍按稳定 key 获取并提交 grant。"""
+    service = object.__new__(PostgresTaskService)
+    service.scope = ScopeContext("local")
+    service.owner = "legacy-owner"
+    service._operation_policy = OperationPolicyGateway(AllowAllOperationPolicy())
+    service._grant_store = GrantAssociationStore()
+    service._persist_claim_payload_updates = lambda _claim, _updates: None
+    claim = SimpleNamespace(id="legacy-task", task_type="meme_context_generation", claim_generation=1)
+    payload = {
+        "submission_mode": "standalone",
+        "meme_id": "legacy-meme",
+        "image_sha256": "a" * 64,
+        "processing_config_hash": "b" * 64,
+    }
+
+    service._commit_agent_grant(claim, payload)
+
+    assert payload["agent_grant_key"].startswith("standalone-agent:legacy-task:")
+    request = service._operation_policy.request(
+        service.scope,
+        Operations.ANALYSIS_AGENT,
+        payload["agent_grant_key"],
+        resource_id="legacy-meme",
+        task_id="legacy-task",
+        source="image-processing-standalone",
+        input_digest="a" * 64,
+    )
+    association = service._grant_store.get(request)
+    assert association is not None
+    assert association.state == "committed"
 
 
 def test_policy_denial_blocks_stage_without_task() -> None:

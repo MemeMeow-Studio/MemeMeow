@@ -53,6 +53,7 @@ from backend.opencode_activity import OpenCodeActivityReader
 from backend.reverse_image import ReverseImageService
 from backend.tasks import TaskRecord
 from backend.visual import VisualEmbeddingError, VisualInferenceClient, VisualSearchService, identity_from_settings
+from backend.visual_snapshot import visual_match_snapshot_summary
 from backend.scope import LocalScopeResolver, ScopeResolutionError, ScopeResolver, ScopeServiceFactory, ScopeServices, resolve_scope, validate_scope_services
 from backend.config_http import STORAGE_PREFLIGHT_BLOCKING_KEYS, _storage_preflight_summary, config_status as _config_status
 from backend.search_http import SearchRequest, search_images as _search_images
@@ -432,6 +433,7 @@ def _context_payload(request: Request, image: Path, *, auto_name: bool = False, 
     settings: Settings = request.app.state.settings
     runner: OpenCodeRunner = request.app.state.opencode
     metadata_service = _service(request, "metadata")
+    visual_identity = identity_from_settings(settings)
     relative = _service(request, "metadata").blob_store.relative(image)
     meme_id = str(metadata_service.meme_id_for_image(image))
     try:
@@ -446,8 +448,27 @@ def _context_payload(request: Request, image: Path, *, auto_name: bool = False, 
         "skill_hash": skill_hash,
         "settings_version": settings.settings_version,
         "agent_concurrency": settings.opencode_concurrency,
+        "visual_model": visual_identity.model,
+        "visual_dimensions": visual_identity.dimensions,
+        "preprocess_version": visual_identity.preprocess_version,
+        "visual_match_snapshot_protocol_version": 2,
         "reverse_image_policy": reverse_image_policy if reverse_image_policy in {"forbid", "auto"} else "forbid",
     }
+    payload["processing_config_hash"] = hashlib.sha256(
+        json.dumps(
+            {
+                "model": payload["model"],
+                "skill_hash": payload["skill_hash"],
+                "settings_version": payload["settings_version"],
+                "visual_model": visual_identity.model,
+                "visual_dimensions": visual_identity.dimensions,
+                "preprocess_version": visual_identity.preprocess_version,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     if batch_id:
         payload["batch_id"] = batch_id
     return payload
@@ -753,7 +774,9 @@ async def lifespan(app: FastAPI):
                     claim_generation=claim_generation,
                     owner=claim_owner,
                     attempt=claim_attempt,
-                    operation=",".join(sorted({"analysis.reverse_image_search", "analysis.visual_search"})),
+                    # 新任务的 callback 只授予独立的反向图片能力；视觉候选已经
+                    # 在 Agent 启动前由后端 snapshot 冻结，不再暴露视觉查询权限。
+                    operation="analysis.reverse_image_search",
                     target_sha256=expected_sha,
                     issuer=str(getattr(issuer, "issuer", "mememeow")),
                     audience=str(getattr(issuer, "audience", "mememeow-internal")),
@@ -807,6 +830,7 @@ async def lifespan(app: FastAPI):
                     session_id=payload.get("_resume_session_id") if isinstance(payload.get("_resume_session_id"), str) else None,
                     resume_of_attempt_id=payload.get("_resume_of_attempt_id") if isinstance(payload.get("_resume_of_attempt_id"), str) else None,
                     image_relative_path=relative if isinstance(relative, str) else None,
+                    visual_match_snapshot=payload.get("_visual_match_snapshot") if isinstance(payload.get("_visual_match_snapshot"), Mapping) else None,
                 )
             except WorkspaceResolutionError as exc:
                 raise OpenCodeError(exc.code, str(exc)) from exc
@@ -963,6 +987,9 @@ async def lifespan(app: FastAPI):
             "result_artifact": f"task-results/{payload.get('_claim_task_id', '')}/result.json.tmp",
             "reverse_image_policy": payload["reverse_image_policy"],
         }
+        snapshot = payload.get("_visual_match_snapshot")
+        if isinstance(snapshot, Mapping):
+            result["visual_match_snapshot"] = visual_match_snapshot_summary(snapshot)
         metadata_hash = service.metadata.embedding_record(image)["metadata_hash"]
         if mode == "standalone":
             # 独立 Agent 只使旧文本向量失效；这里不创建文本 Task，也不触碰

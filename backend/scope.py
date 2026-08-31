@@ -328,6 +328,8 @@ class ScopeServiceFactory:
                 resume_backoff_seconds=self._task_config.get("resume_backoff_seconds", getattr(self.settings, "agent_resume_backoff_seconds", 2)),
                 resume_max_backoff_seconds=self._task_config.get("resume_max_backoff_seconds", getattr(self.settings, "agent_resume_max_backoff_seconds", 60)),
                 resume_timeout_seconds=self._task_config.get("resume_timeout_seconds", getattr(self.settings, "agent_resume_timeout_seconds", 900)),
+                visual_snapshot_preparer=getattr(visual_search, "precompute_snapshot", None),
+                visual_candidate_preparer=self._task_config.get("visual_candidate_preparer"),
                 worker_manager=self._worker_manager,
             )
             thumbnail_store = getattr(self.resources, "thumbnail_store_for_scope", None)

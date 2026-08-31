@@ -6,9 +6,7 @@ import json
 import os
 import subprocess
 import sys
-import threading
 import types
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -220,57 +218,56 @@ def test_local_visual_cli_reports_missing_runtime_environment() -> None:
     assert json.loads(result.stderr)["error"] == "agent_task_id_missing"
 
 
-def _start_visual_cli_server(payload: dict[str, object], status: int = 200) -> tuple[ThreadingHTTPServer, threading.Thread, str]:
-    """启动返回固定 JSON 的本地 HTTP 夹具，供 CLI 子进程测试调用。"""
-    class Handler(BaseHTTPRequestHandler):
-        """为 CLI 提供单次视觉匹配响应的 HTTP handler。"""
-
-        def do_POST(self) -> None:  # noqa: N802
-            """返回预设状态和 JSON，不解析或保存请求图片。"""
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, _format: str, *_args: object) -> None:
-            """测试服务不向 stderr 写访问日志。"""
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server, thread, f"http://127.0.0.1:{server.server_port}/internal/visual-search/match"
-
-
-def test_local_visual_cli_prints_success_json() -> None:
-    """CLI 成功时只把后端 JSON 写到 stdout。"""
-    server, thread, url = _start_visual_cli_server({"query_meme_id": "query", "results": []})
-    try:
-        environment = dict(os.environ)
-        environment["MEMEMEOW_AGENT_TASK_ID"] = "task-123"
-        environment["MEMEMEOW_AGENT_CALLBACK_TOKEN"] = "test-callback-token"
-        environment["MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL"] = url
-        result = subprocess.run([sys.executable, "skills/research-meme-context/scripts/local_visual_match.py", "--top-k", "2"], capture_output=True, text=True, env=environment, check=False)
-    finally:
-        server.shutdown()
-        thread.join(timeout=2)
-    assert result.returncode == 0
-    assert json.loads(result.stdout) == {"query_meme_id": "query", "results": []}
-    assert result.stderr == ""
-
-
-def test_local_visual_cli_reports_stable_http_business_error() -> None:
-    """CLI 收到后端业务错误时以非零状态输出稳定 stderr JSON。"""
-    server, thread, url = _start_visual_cli_server({"error": "query_embedding_not_ready", "message": "not ready"}, status=409)
-    try:
-        environment = dict(os.environ)
-        environment["MEMEMEOW_AGENT_TASK_ID"] = "task-123"
-        environment["MEMEMEOW_AGENT_CALLBACK_TOKEN"] = "test-callback-token"
-        environment["MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL"] = url
-        result = subprocess.run([sys.executable, "skills/research-meme-context/scripts/local_visual_match.py"], capture_output=True, text=True, env=environment, check=False)
-    finally:
-        server.shutdown()
-        thread.join(timeout=2)
+def test_local_visual_cli_reports_missing_manifest() -> None:
+    """CLI 缺少固定 manifest 时返回稳定错误，不再尝试 callback。"""
+    environment = dict(os.environ)
+    environment["MEMEMEOW_AGENT_TASK_ID"] = "task-123"
+    environment.pop("MEMEMEOW_AGENT_CANDIDATE_MANIFEST", None)
+    environment.pop("MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL", None)
+    environment.pop("MEMEMEOW_AGENT_CALLBACK_TOKEN", None)
+    result = subprocess.run(
+        [sys.executable, "skills/research-meme-context/scripts/local_visual_match.py"],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
     assert result.returncode != 0
-    assert json.loads(result.stderr) == {"error": "query_embedding_not_ready", "message": "not ready", "status": 409}
+    assert json.loads(result.stderr)["error"] == "candidate_manifest_missing"
+
+
+def test_local_visual_cli_rejects_manifest_hash_mismatch(tmp_path: Path) -> None:
+    """CLI 发现 manifest hash 不一致时拒绝返回候选事实。"""
+    candidate_root = tmp_path / "candidates" / "task-123"
+    candidate_root.mkdir(parents=True)
+    (candidate_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "protocol_version": 2,
+                "snapshot_sha256": "f" * 64,
+                "matched_at": "2026-08-31T00:00:00+00:00",
+                "candidate_count": 0,
+                "query": {
+                    "meme_id": "query",
+                    "image_sha256": "a" * 64,
+                    "model": "dinov2_vitb14",
+                    "dimensions": 768,
+                    "preprocess_version": "dinov2-v1-gif-first-frame",
+                },
+                "candidates": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    environment = dict(os.environ)
+    environment["MEMEMEOW_AGENT_TASK_ID"] = "task-123"
+    environment["MEMEMEOW_AGENT_CANDIDATE_MANIFEST"] = str(candidate_root / "manifest.json")
+    result = subprocess.run(
+        [sys.executable, "skills/research-meme-context/scripts/local_visual_match.py"],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"] == "candidate_manifest_invalid"

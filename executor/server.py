@@ -70,6 +70,23 @@ except ModuleNotFoundError as exc:  # pragma: no cover - Agent 镜像只复制 e
     if exc.name != "backend":
         raise
     from executor.public_dto import PublicDataError, secret_inventory_from_mapping, validate_agent_result
+try:
+    from backend.visual_snapshot import VisualMatchSnapshotError, validate_visual_match_snapshot_manifest
+except ModuleNotFoundError as exc:  # pragma: no cover - Agent 镜像只复制无状态协议快照
+    if exc.name not in {"backend", "backend.visual_snapshot"}:
+        raise
+    try:
+        from executor.visual_snapshot import VisualMatchSnapshotError, validate_visual_match_snapshot_manifest
+    except ModuleNotFoundError:
+        # 最小验证镜像可能只复制 executor 公共快照；此时加载同一份无状态校验
+        # 实现，避免 executor 因可选视觉 manifest 文件缺失而无法启动。
+        class VisualMatchSnapshotError(ValueError):
+            """最小 executor 镜像中的视觉 manifest 校验错误。"""
+
+        def validate_visual_match_snapshot_manifest(value: object, *, expected_sha256: str | None = None) -> dict[str, object]:
+            """在无完整 backend 源码时拒绝无法验证的视觉 manifest。"""
+            del value, expected_sha256
+            raise VisualMatchSnapshotError("visual_match_snapshot_invalid")
 
 TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,254}\Z")
@@ -85,6 +102,8 @@ LOG_ROOT = RUNTIME_ROOT / "logs"
 SKILL_ROOT = Path(os.getenv("MEMEMEOW_EXECUTOR_SKILL_ROOT", "/skills/research-meme-context"))
 WORKSPACE_ROOT = Path(os.getenv("MEMEMEOW_EXECUTOR_WORKSPACE_ROOT", str(RUNTIME_ROOT / "workspaces")))
 DEFAULT_MAX_RESULT_BYTES = 1024 * 1024
+MAX_CANDIDATE_FILE_BYTES = 64 * 1024 * 1024
+MAX_CANDIDATE_ROOT_BYTES = 256 * 1024 * 1024
 # session 只解析完整 JSONL 行；单行超过上限时跳过，避免异常输出占满内存。
 SESSION_CAPTURE_LINE_BYTES = 1024 * 1024
 ALLOWED_REQUEST_FIELDS = frozenset(
@@ -102,6 +121,7 @@ ALLOWED_REQUEST_FIELDS = frozenset(
         "callback_token",
         "workspace_selector",
         "workspace_capability",
+        "visual_snapshot_sha256",
         MODEL_CAPABILITY_FIELD,
     }
 )
@@ -144,6 +164,8 @@ _EXECUTOR_ERROR_CODES = frozenset(
         "model_capability_unavailable",
         "model_broker_endpoint_invalid",
         "model_name_invalid",
+        "visual_candidate_materialization_failed",
+        "visual_match_snapshot_invalid",
     }
 )
 _SECRET_PATTERNS = (
@@ -311,6 +333,8 @@ class TaskState:
     images_root: Path | None = field(default=None, repr=False)
     metadata_root: Path | None = field(default=None, repr=False)
     skill_root: Path | None = field(default=None, repr=False)
+    candidate_root: Path | None = field(default=None, repr=False)
+    visual_snapshot_sha256: str | None = field(default=None, repr=False)
     task_scratch_root: Path | None = field(default=None, repr=False)
     config_file: Path | None = field(default=None, repr=False)
     config_dir: Path | None = field(default=None, repr=False)
@@ -357,10 +381,16 @@ class WorkspaceLayout:
     images_root: Path
     metadata_root: Path
     skill_root: Path
+    candidate_root: Path
     task_scratch_root: Path
     config_file: Path
     config_dir: Path
     local: bool = False
+
+    @property
+    def candidate_manifest_path(self) -> Path:
+        """返回当前 executor Task 固定的候选 manifest 路径。"""
+        return self.candidate_root / "manifest.json"
 
 
 class Executor:
@@ -431,7 +461,7 @@ class Executor:
     def _prepare_runtime(self) -> None:
         """创建共享 runtime 目录并确保 executor 以非 root 可写方式启动。"""
         try:
-            for path in (RUNTIME_ROOT, WORKSPACE, RESULT_ROOT, LOG_ROOT):
+            for path in (RUNTIME_ROOT, WORKSPACE, RESULT_ROOT, LOG_ROOT, RUNTIME_ROOT / "candidates"):
                 path.mkdir(parents=True, exist_ok=True)
             if any(not os.access(path, os.R_OK | os.W_OK) for path in (RUNTIME_ROOT, WORKSPACE, RESULT_ROOT, LOG_ROOT)):
                 self.ready_error = "runtime_not_writable"
@@ -513,12 +543,14 @@ class Executor:
                 skill_root = self._checked_directory(SKILL_ROOT)
                 local = True
                 task_scratch = directory / "tasks" / business_task_id
+                candidate_root = RUNTIME_ROOT / "candidates" / business_task_id
                 return WorkspaceLayout(
                     selector="local",
                     directory=directory,
                     images_root=images_root,
                     metadata_root=metadata_root,
                     skill_root=skill_root,
+                    candidate_root=candidate_root,
                     task_scratch_root=task_scratch,
                     config_file=task_scratch / "opencode.json",
                     config_dir=task_scratch / ".opencode",
@@ -542,12 +574,18 @@ class Executor:
         else:
             self._checked_directory(tasks_root)
         config_dir = task_scratch / ".opencode"
+        candidate_parent = (base / "candidates") if not local else (base.parent / "candidates")
+        self._checked_directory(candidate_parent, create=True)
+        candidate_root = candidate_parent / business_task_id
+        if candidate_root.exists() or candidate_root.is_symlink():
+            self._checked_directory(candidate_root)
         return WorkspaceLayout(
             selector=selector or "local",
             directory=directory,
             images_root=images_root,
             metadata_root=metadata_root,
             skill_root=skill_root,
+            candidate_root=candidate_root,
             task_scratch_root=task_scratch,
             config_file=task_scratch / "opencode.json",
             config_dir=config_dir,
@@ -671,6 +709,7 @@ class Executor:
             "image_relative_path": task.image_relative_path,
             "reverse_image_policy": task.reverse_image_policy,
             "processing_config_hash": task.processing_config_hash,
+            "visual_snapshot_sha256": task.visual_snapshot_sha256,
             "workspace_selector": task.workspace_selector,
             "session_id": task.session_id,
             "resume_of_attempt_id": task.resume_of_attempt_id,
@@ -711,6 +750,7 @@ class Executor:
                 or entry.get("image_relative_path") != values.get("image_relative_path")
                 or entry.get("reverse_image_policy") != values.get("reverse_image_policy")
                 or entry.get("processing_config_hash") != values.get("processing_config_hash")
+                or entry.get("visual_snapshot_sha256") != values.get("visual_snapshot_sha256")
                 or entry.get("workspace_selector", "local") != (values.get("workspace_selector") or "local")
                 or (resume_of is not None and entry.get("executor_attempt_id") != resume_of)
             ):
@@ -733,6 +773,7 @@ class Executor:
                 reverse_image_policy=str(entry["reverse_image_policy"]),
                 timeout_seconds=int(values["timeout_seconds"]),
                 processing_config_hash=values.get("processing_config_hash") if isinstance(values.get("processing_config_hash"), str) else None,
+                visual_snapshot_sha256=values.get("visual_snapshot_sha256") if isinstance(values.get("visual_snapshot_sha256"), str) else None,
                 session_id=session_id,
                 workspace_selector=str(values.get("workspace_selector") or "local"),
                 status="failed",
@@ -777,6 +818,11 @@ class Executor:
             not isinstance(processing_config_hash, str) or not CONFIG_HASH_RE.fullmatch(processing_config_hash)
         ):
             raise ValueError("invalid_task")
+        visual_snapshot_sha256 = payload.get("visual_snapshot_sha256")
+        if visual_snapshot_sha256 is not None and (
+            not isinstance(visual_snapshot_sha256, str) or not CONFIG_HASH_RE.fullmatch(visual_snapshot_sha256)
+        ):
+            raise ValueError("visual_match_snapshot_invalid")
         relative = _relative_image_path(payload.get("image_relative_path"))
         raw_selector = payload.get("workspace_selector")
         if raw_selector is None or raw_selector == "local":
@@ -839,6 +885,7 @@ class Executor:
             "resume_of_attempt_id": raw_resume_of,
             "session_id": session_id,
             "processing_config_hash": processing_config_hash.lower() if isinstance(processing_config_hash, str) else None,
+            "visual_snapshot_sha256": visual_snapshot_sha256.lower() if isinstance(visual_snapshot_sha256, str) else None,
             "image_relative_path": relative.as_posix(),
             "reverse_image_policy": str(policy),
             "timeout_seconds": timeout,
@@ -883,6 +930,7 @@ class Executor:
             and task.image_relative_path == values["image_relative_path"]
             and task.reverse_image_policy == values["reverse_image_policy"]
             and task.processing_config_hash == values.get("processing_config_hash")
+            and task.visual_snapshot_sha256 == values.get("visual_snapshot_sha256")
             and task.workspace_selector == (values.get("workspace_selector") or "local")
             and (resume_of is None or task.executor_attempt_id == resume_of)
         ]
@@ -944,6 +992,7 @@ class Executor:
                 reverse_image_policy=str(values["reverse_image_policy"]),
                 timeout_seconds=int(values["timeout_seconds"]),
                 processing_config_hash=values.get("processing_config_hash") if isinstance(values.get("processing_config_hash"), str) else None,
+                visual_snapshot_sha256=values.get("visual_snapshot_sha256") if isinstance(values.get("visual_snapshot_sha256"), str) else None,
                 session_id=values.get("session_id") if isinstance(values.get("session_id"), str) else None,
                 workspace_selector=str(values.get("workspace_selector") or "local"),
                 workspace_capability=values.get("workspace_capability") if isinstance(values.get("workspace_capability"), str) else None,
@@ -952,6 +1001,7 @@ class Executor:
                 images_root=(values.get("workspace_layout").images_root if isinstance(values.get("workspace_layout"), WorkspaceLayout) else None),
                 metadata_root=(values.get("workspace_layout").metadata_root if isinstance(values.get("workspace_layout"), WorkspaceLayout) else None),
                 skill_root=(values.get("workspace_layout").skill_root if isinstance(values.get("workspace_layout"), WorkspaceLayout) else None),
+                candidate_root=(values.get("workspace_layout").candidate_root if isinstance(values.get("workspace_layout"), WorkspaceLayout) else None),
                 task_scratch_root=(values.get("workspace_layout").task_scratch_root if isinstance(values.get("workspace_layout"), WorkspaceLayout) else None),
                 config_file=(values.get("workspace_layout").config_file if isinstance(values.get("workspace_layout"), WorkspaceLayout) else None),
                 config_dir=(values.get("workspace_layout").config_dir if isinstance(values.get("workspace_layout"), WorkspaceLayout) else None),
@@ -971,6 +1021,7 @@ class Executor:
         metadata = task.metadata_root or IMAGE_ROOT
         skills = task.skill_root or SKILL_ROOT
         scratch = task.task_scratch_root or (WORKSPACE / "tasks" / task.business_task_id)
+        candidate_root = task.candidate_root or (RUNTIME_ROOT / "candidates" / task.business_task_id)
         result_dir = RESULT_ROOT / task.business_task_id
         subtree = lambda path: f"{Path(os.path.abspath(path)).as_posix()}/**"
         return {
@@ -978,6 +1029,7 @@ class Executor:
             subtree(skills): "allow",
             subtree(images): "allow",
             subtree(metadata): "allow",
+            subtree(candidate_root): "allow",
             subtree(scratch): "allow",
             # 外部文件工具先检查结果目录的 ``<dir>/*`` 父级模式；写入范围
             # 由同一配置中的 ``edit`` 规则收窄到两个固定结果文件。
@@ -990,6 +1042,7 @@ class Executor:
     def _workspace_edit_permission_rules(task: TaskState) -> dict[str, str]:
         """生成只允许 Task 临时数据和两个结果文件的编辑规则。"""
         scratch = task.task_scratch_root or (WORKSPACE / "tasks" / task.business_task_id)
+        candidate_root = task.candidate_root or (RUNTIME_ROOT / "candidates" / task.business_task_id)
         config_file = task.config_file or scratch / "opencode.json"
         config_dir = task.config_dir or scratch / ".opencode"
         result_dir = RESULT_ROOT / task.business_task_id
@@ -1000,6 +1053,7 @@ class Executor:
                 config_dir=config_dir,
                 draft_path=result_dir / RESULT_DRAFT_NAME,
                 result_path=result_dir / RESULT_FILE_NAME,
+                candidate_root=candidate_root,
             )
         )
 
@@ -1039,6 +1093,98 @@ class Executor:
         except OSError as exc:
             raise RuntimeError("opencode_workspace_invalid") from exc
 
+    def _validate_candidate_view(self, task: TaskState) -> None:
+        """在启动 OpenCode 前复核候选根、manifest 和只读权限。"""
+        candidate_root = task.candidate_root or (RUNTIME_ROOT / "candidates" / task.business_task_id)
+        expected_sha256 = task.visual_snapshot_sha256
+        if not expected_sha256:
+            if candidate_root.exists() or candidate_root.is_symlink():
+                self._checked_directory(candidate_root, missing_code="visual_candidate_materialization_failed")
+            return
+        self._checked_directory(candidate_root, missing_code="visual_candidate_materialization_failed")
+        manifest = candidate_root / "manifest.json"
+        try:
+            root_info = candidate_root.lstat()
+            if root_info.st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH):
+                raise ValueError("visual_candidate_materialization_failed")
+            validate_file_path(manifest, code="visual_candidate_materialization_failed")
+            info = manifest.lstat()
+            if info.st_size > 4 * 1024 * 1024:
+                raise ValueError("visual_candidate_materialization_failed")
+            descriptor = os.open(manifest, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                raw = os.read(descriptor, 4 * 1024 * 1024 + 1)
+            finally:
+                os.close(descriptor)
+            if len(raw) > 4 * 1024 * 1024:
+                raise ValueError("visual_candidate_materialization_failed")
+            document = json.loads(raw.decode("utf-8"))
+            validated = validate_visual_match_snapshot_manifest(document, expected_sha256=expected_sha256)
+            candidates = validated.get("candidates")
+            if not isinstance(candidates, list):
+                raise ValueError("visual_candidate_materialization_failed")
+            expected_files = {"manifest.json"}
+            expected_directories: set[str] = set()
+            declared_bytes = 0
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    raise ValueError("visual_candidate_materialization_failed")
+                relative = candidate.get("relative_path")
+                if not isinstance(relative, str):
+                    raise ValueError("visual_candidate_materialization_failed")
+                size_bytes = candidate.get("size_bytes")
+                if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes < 0 or size_bytes > MAX_CANDIDATE_FILE_BYTES:
+                    raise ValueError("visual_candidate_materialization_failed")
+                declared_bytes += size_bytes
+                if declared_bytes > MAX_CANDIDATE_ROOT_BYTES:
+                    raise ValueError("visual_candidate_materialization_failed")
+                expected_files.add(relative)
+                parts = PurePosixPath(relative).parts
+                expected_directories.update("/".join(parts[:index]) for index in range(1, len(parts)))
+            for item in candidate_root.rglob("*"):
+                node = item.lstat()
+                relative = item.relative_to(candidate_root).as_posix()
+                if stat.S_ISLNK(node.st_mode) or node.st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH):
+                    raise ValueError("visual_candidate_materialization_failed")
+                if stat.S_ISDIR(node.st_mode):
+                    if relative not in expected_directories:
+                        raise ValueError("visual_candidate_materialization_failed")
+                elif stat.S_ISREG(node.st_mode):
+                    if relative not in expected_files:
+                        raise ValueError("visual_candidate_materialization_failed")
+                else:
+                    raise ValueError("visual_candidate_materialization_failed")
+            total_bytes = sum(item.lstat().st_size for item in candidate_root.rglob("*") if item.is_file())
+            if total_bytes > MAX_CANDIDATE_ROOT_BYTES:
+                raise ValueError("visual_candidate_materialization_failed")
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    raise ValueError("visual_candidate_materialization_failed")
+                relative = candidate.get("relative_path")
+                image_sha256 = candidate.get("image_sha256")
+                size_bytes = candidate.get("size_bytes")
+                if not isinstance(relative, str) or not isinstance(image_sha256, str) or not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes < 0 or size_bytes > MAX_CANDIDATE_FILE_BYTES:
+                    raise ValueError("visual_candidate_materialization_failed")
+                candidate_path = candidate_root.joinpath(*PurePosixPath(relative).parts)
+                validate_file_path(candidate_path, code="visual_candidate_materialization_failed")
+                candidate_info = candidate_path.lstat()
+                if candidate_info.st_size != size_bytes:
+                    raise ValueError("visual_candidate_materialization_failed")
+                digest = hashlib.sha256()
+                candidate_descriptor = os.open(candidate_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    while True:
+                        chunk = os.read(candidate_descriptor, 1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                finally:
+                    os.close(candidate_descriptor)
+                if digest.hexdigest() != image_sha256.lower():
+                    raise ValueError("visual_candidate_materialization_failed")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError, TypeError, ValueError, VisualMatchSnapshotError) as exc:
+            raise RuntimeError("visual_candidate_materialization_failed") from exc
+
     def _task_environment(self, task: TaskState) -> dict[str, str]:
         """构造 OpenCode 最小环境白名单，不继承 executor 容器中的无关变量。"""
         values = {
@@ -1056,7 +1202,7 @@ class Executor:
             "MEMEMEOW_AGENT_EXECUTOR_ATTEMPT_ID": task.executor_attempt_id,
             **({"MEMEMEOW_AGENT_CALLBACK_TOKEN": task.callback_token} if task.callback_token else {}),
             "MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL": os.getenv("MEMEMEOW_AGENT_REVERSE_IMAGE_INTERNAL_URL", ""),
-            "MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL": os.getenv("MEMEMEOW_AGENT_VISUAL_SEARCH_INTERNAL_URL", ""),
+            "MEMEMEOW_AGENT_CANDIDATE_MANIFEST": str((task.candidate_root or (RUNTIME_ROOT / "candidates" / task.business_task_id)) / "manifest.json"),
             "MEMEMEOW_DATA_ROOT": str(RUNTIME_ROOT),
             "MEMEMEOW_REVERSE_IMAGE_CACHE_ROOT": str(RUNTIME_ROOT / "reverse_image_cache" / "serpapi_google_lens"),
             # 依赖位于镜像只读目录，避免在 runtime volume 内创建 node_modules 链接。
@@ -1073,7 +1219,8 @@ class Executor:
             else "这是首次执行；先建立任务草稿并逐步完成研究。"
         )
         return (
-            "使用 research-meme-context skill 分析这张表情包；只通过项目内部接口使用可选反向图片能力。"
+            "使用 research-meme-context skill 分析这张表情包；先读取本任务固定候选 manifest，"
+            "候选只作为参考证据；只通过项目内部接口使用可选反向图片能力。"
             f"本任务 reverse_image_policy={task.reverse_image_policy}。"
             f"{resume_instruction}"
             f"结果必须写入 {result_dir / RESULT_FILE_NAME}；先写 {result_dir / RESULT_DRAFT_NAME}，"
@@ -1098,6 +1245,7 @@ class Executor:
                 self._verify_task_workspace_capability(task)
                 task.status = "running"
                 task.started_at = time.time()
+                self._validate_candidate_view(task)
                 self._prepare_task_workspace(task)
                 result_dir = RESULT_ROOT / task.task_id
                 if result_dir.is_symlink() or (result_dir.exists() and not result_dir.is_dir()):
@@ -1481,6 +1629,7 @@ class Handler(BaseHTTPRequestHandler):
                 "model_capability_unavailable": "模型 capability 未配置",
                 "model_broker_endpoint_invalid": "模型 broker 未配置",
                 "model_name_invalid": "模型标识无效",
+                "visual_match_snapshot_invalid": "视觉候选 snapshot 无效",
             }
             if code not in messages and code not in {"invalid_task"}:
                 code = "invalid_task"
@@ -1505,6 +1654,8 @@ class Handler(BaseHTTPRequestHandler):
                 "model_capability_unavailable",
                 "model_broker_endpoint_invalid",
                 "model_name_invalid",
+                "visual_match_snapshot_invalid",
+                "visual_candidate_materialization_failed",
             }:
                 code = "agent_runtime_unavailable"
             status = {

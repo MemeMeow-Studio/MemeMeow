@@ -64,9 +64,10 @@ class Settings(BaseSettings):
     visual_internal_url: str = Field(default="http://127.0.0.1:8276/internal/visual-embedding", validation_alias=AliasChoices("MEMEMEOW_VISUAL_INTERNAL_URL", "VISUAL_INTERNAL_URL", "visual_internal_url"))
     visual_health_url: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_VISUAL_HEALTH_URL", "VISUAL_HEALTH_URL", "visual_health_url"))
     visual_search_internal_url: str = Field(default="http://127.0.0.1:8275/internal/visual-search/match", validation_alias=AliasChoices("MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL", "VISUAL_SEARCH_INTERNAL_URL", "visual_search_internal_url"))
-    # Agent 容器内的回调地址与后端自身地址分离，Compose 模式使用服务 DNS。
+    # Agent 前置视觉候选的上限由服务端固定，Agent 不能通过请求扩大查询范围。
+    visual_match_top_k: int = Field(default=20, ge=1, le=50, validation_alias=AliasChoices("MEMEMEOW_VISUAL_MATCH_TOP_K", "VISUAL_MATCH_TOP_K", "visual_match_top_k"))
+    # Agent 容器内只保留独立的反向图片 capability 地址；视觉候选通过只读 manifest 提供。
     agent_reverse_image_internal_url: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_AGENT_REVERSE_IMAGE_INTERNAL_URL", "agent_reverse_image_internal_url"))
-    agent_visual_search_internal_url: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_AGENT_VISUAL_SEARCH_INTERNAL_URL", "agent_visual_search_internal_url"))
     # API 只通过 Compose 内网 executor URL 调用 Agent；不会启动 Docker CLI。
     agent_executor_url: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_AGENT_EXECUTOR_URL", "agent_executor_url"))
     agent_executor_token: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_AGENT_EXECUTOR_TOKEN", "agent_executor_token"), repr=False)
@@ -170,7 +171,6 @@ class Settings(BaseSettings):
         "visual_health_url",
         "visual_model_repo",
         "agent_reverse_image_internal_url",
-        "agent_visual_search_internal_url",
         "agent_executor_url",
         "agent_executor_token",
         "agent_executor_token_file",

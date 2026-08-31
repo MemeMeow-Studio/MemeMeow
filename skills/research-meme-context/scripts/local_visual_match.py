@@ -1,75 +1,153 @@
 #!/usr/bin/env python3
-"""research-meme-context 的 task-scoped 本地视觉匹配薄 CLI。
+"""读取后端已物化的 task-scoped 视觉候选 manifest。
 
-脚本只读取 Runner 注入的任务标识和内部 URL，输出后端已过滤的 JSON；它不连接
-数据库、不读取模型权重、不接受 scope 或任意图片 ID，也不触发即时推理。
+该脚本保留历史文件名以兼容既有 Skill 调用，但不再发起 HTTP 请求、读取 callback
+凭据或接受 top-k、scope 和图片标识。候选排序和数量在任务 claim 前已经冻结。
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
+import re
+import stat
 import sys
-import urllib.error
-import urllib.request
+from pathlib import Path
 from typing import Any
 
 
-def _error(code: str, message: str, *, status: int | None = None) -> int:
-    """将稳定错误写到 stderr 并返回非零退出码。"""
-    payload: dict[str, object] = {"error": code, "message": message}
-    if status is not None:
-        payload["status"] = status
-    print(json.dumps(payload, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+MANIFEST_NAME = "manifest.json"
+MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+SAFE_CONTEXT_FIELDS = frozenset({"title", "summary", "subjects", "visible_text", "references", "meaning", "keywords", "search_queries", "uncertainties"})
+CONTEXT_LIST_FIELDS = frozenset({"subjects", "visible_text", "references", "keywords", "search_queries", "uncertainties"})
+CONTEXT_URL_RE = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://")
+
+
+def _error(code: str, message: str) -> int:
+    """将 manifest 读取失败写到 stderr 并返回非零退出码。"""
+    print(json.dumps({"error": code, "message": message}, ensure_ascii=False, sort_keys=True), file=sys.stderr)
     return 2
 
 
-def _url() -> str | None:
-    """读取内部地址别名，拒绝从命令行传入任意 scope 端点。"""
-    return os.getenv("MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL") or os.getenv("MEMEMEOW_VISUAL_MATCH_INTERNAL_URL")
+def _manifest_path(task_id: str) -> Path:
+    """只解析 Runner 注入的固定 manifest 路径，拒绝命令行路径覆盖。"""
+    configured = os.getenv("MEMEMEOW_AGENT_CANDIDATE_MANIFEST")
+    path = Path(configured).expanduser() if configured else Path("/runtime/candidates") / task_id / MANIFEST_NAME
+    absolute = Path(os.path.abspath(path))
+    if absolute.name != MANIFEST_NAME or absolute.parent.name != task_id or absolute.parent.parent.name != "candidates":
+        raise ValueError("candidate_manifest_path_invalid")
+    return absolute
+
+
+def _read_manifest(path: Path) -> dict[str, Any]:
+    """逐级拒绝符号链接并读取有限大小的 JSON manifest。"""
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        info = current.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError("candidate_manifest_path_invalid")
+        if current != path and not stat.S_ISDIR(info.st_mode):
+            raise ValueError("candidate_manifest_path_invalid")
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ValueError("candidate_manifest_invalid")
+    if info.st_size > MAX_MANIFEST_BYTES:
+        raise ValueError("candidate_manifest_too_large")
+    with path.open("rb") as handle:
+        raw = handle.read(MAX_MANIFEST_BYTES + 1)
+    if len(raw) > MAX_MANIFEST_BYTES:
+        raise ValueError("candidate_manifest_too_large")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("candidate_manifest_invalid") from exc
+    if not isinstance(value, dict) or set(value) != {"protocol_version", "snapshot_sha256", "matched_at", "candidate_count", "query", "candidates"} or value.get("protocol_version") != 2 or not isinstance(value.get("query"), dict) or set(value["query"]) != {"meme_id", "image_sha256", "model", "dimensions", "preprocess_version"} or not isinstance(value.get("candidates"), list):
+        raise ValueError("candidate_manifest_invalid")
+    candidates = value["candidates"]
+    if not isinstance(value.get("candidate_count"), int) or isinstance(value["candidate_count"], bool) or value["candidate_count"] != len(candidates) or value["candidate_count"] > 50:
+        raise ValueError("candidate_manifest_invalid")
+    snapshot_hash = value.get("snapshot_sha256")
+    if not isinstance(snapshot_hash, str) or not SHA256_RE.fullmatch(snapshot_hash):
+        raise ValueError("candidate_manifest_invalid")
+    for expected_rank, candidate in enumerate(candidates, start=1):
+        if not isinstance(candidate, dict) or set(candidate) != {"rank", "meme_id", "image_sha256", "size_bytes", "score", "relative_path", "context"} or candidate.get("rank") != expected_rank:
+            raise ValueError("candidate_manifest_invalid")
+        candidate_id = candidate.get("meme_id")
+        image_sha = candidate.get("image_sha256")
+        relative = candidate.get("relative_path")
+        size = candidate.get("size_bytes")
+        score = candidate.get("score")
+        context = candidate.get("context")
+        if (
+            not isinstance(candidate_id, str)
+            or not candidate_id
+            or not isinstance(image_sha, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{64}", image_sha)
+            or not isinstance(relative, str)
+            or not relative
+            or relative == MANIFEST_NAME
+            or relative.startswith("/")
+            or "\\" in relative
+            or any(part in {"", ".", ".."} for part in relative.split("/"))
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or not isinstance(score, (int, float))
+            or isinstance(score, bool)
+            or not math.isfinite(float(score))
+            or not -1.000001 <= float(score) <= 1.000001
+            or not isinstance(context, dict)
+            or set(context) - SAFE_CONTEXT_FIELDS
+        ):
+            raise ValueError("candidate_manifest_invalid")
+        for context_key, context_value in context.items():
+            if context_key in CONTEXT_LIST_FIELDS:
+                if not isinstance(context_value, list) or any(
+                    not isinstance(item, str) or CONTEXT_URL_RE.search(item)
+                    for item in context_value
+                ):
+                    raise ValueError("candidate_manifest_invalid")
+            elif context_key not in {"title", "summary", "meaning"} or (
+                context_value is not None
+                and (not isinstance(context_value, str) or CONTEXT_URL_RE.search(context_value))
+            ):
+                raise ValueError("candidate_manifest_invalid")
+    try:
+        snapshot = {key: value[key] for key in ("protocol_version", "query", "matched_at", "candidates")}
+        digest = hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+    except (KeyError, TypeError, ValueError, UnicodeError) as exc:
+        raise ValueError("candidate_manifest_invalid") from exc
+    if digest != snapshot_hash:
+        raise ValueError("candidate_manifest_invalid")
+    return value
 
 
 def main(argv: list[str] | None = None) -> int:
-    """解析 top_k，使用当前 Runner task_id 请求后端视觉匹配。"""
-    parser = argparse.ArgumentParser(description="查询当前 Agent 任务 scope 内的已研究视觉近邻")
-    parser.add_argument("--top-k", type=int, default=20)
-    parser.add_argument("--include-self", action="store_true")
+    """读取当前 Agent 任务的固定候选 manifest 并输出 JSON。"""
+    parser = argparse.ArgumentParser(description="读取当前 Agent 任务的视觉候选 manifest")
+    # 兼容旧 Skill 传入的参数；候选数量不能在 Agent 端改变，参数值不参与读取。
+    parser.add_argument("--top-k", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--include-self", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    task_id = os.getenv("MEMEMEOW_AGENT_TASK_ID")
-    url = _url()
-    if not task_id:
-        return _error("agent_task_id_missing", "运行时未注入 MEMEMEOW_AGENT_TASK_ID")
-    if not url:
-        return _error("visual_search_url_missing", "运行时未注入视觉匹配内部地址")
-    if args.top_k < 1 or args.top_k > 50:
-        return _error("invalid_top_k", "top_k 必须在 1 至 50 之间")
-    callback_token = os.getenv("MEMEMEOW_AGENT_CALLBACK_TOKEN")
-    if not callback_token:
-        return _error("agent_callback_missing", "运行时未注入当前任务 callback 凭据")
-    request_payload = json.dumps({"task_id": task_id, "top_k": args.top_k, "exclude_self": not args.include_self}, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(url, data=request_payload, headers={"Content-Type": "application/json", "Accept": "application/json", "X-MemeMeow-Callback": callback_token}, method="POST")
+    del args
+    task_id = os.getenv("MEMEMEOW_AGENT_TASK_ID", "")
+    if not TASK_ID_RE.fullmatch(task_id):
+        return _error("agent_task_id_missing", "运行时未注入有效任务标识")
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            raw = response.read().decode("utf-8")
-            payload: Any = json.loads(raw)
-            if response.status >= 400:
-                code = payload.get("error") if isinstance(payload, dict) else "visual_search_http_error"
-                return _error(str(code), str(payload.get("message") or "视觉匹配请求失败") if isinstance(payload, dict) else "视觉匹配请求失败", status=response.status)
-    except urllib.error.HTTPError as exc:
-        try:
-            payload = json.loads(exc.read().decode("utf-8"))
-        except (OSError, ValueError):
-            payload = {}
-        code = payload.get("error") if isinstance(payload, dict) else "visual_search_http_error"
-        message = payload.get("message") if isinstance(payload, dict) else None
-        return _error(str(code), str(message or "视觉匹配请求失败"), status=exc.code)
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-        return _error("visual_search_unavailable", "视觉匹配内部服务暂时不可用")
-    if not isinstance(payload, dict):
-        return _error("visual_search_invalid_response", "视觉匹配服务返回格式无效")
+        payload = _read_manifest(_manifest_path(task_id))
+    except FileNotFoundError:
+        return _error("candidate_manifest_missing", "当前任务没有已准备的视觉候选 manifest")
+    except (OSError, ValueError) as exc:
+        return _error(str(exc) if str(exc).startswith("candidate_manifest_") else "candidate_manifest_invalid", "视觉候选 manifest 无法读取")
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

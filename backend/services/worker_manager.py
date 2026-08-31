@@ -36,6 +36,14 @@ from backend.persistence.repositories.tasks import validate_lane_resource_concur
 # Worker 的调度和恢复日志继续归入旧 facade logger。
 logger = logging.getLogger("backend.pg_services")
 
+
+def _generic_task_filter() -> Any:
+    """返回通用 Worker 可处理的任务条件，保留迁移前图片任务。"""
+    return ~(
+        Task.task_type.in_(IMAGE_PROCESSING_TASK_TYPES)
+        & Task.submission_mode.in_(("pipeline", "standalone"))
+    )
+
 class PostgresTaskWorkerManager:
     """进程级任务协调器，统一管理线程池、处理器注册和任务恢复扫描。
 
@@ -128,9 +136,9 @@ class PostgresTaskWorkerManager:
             with self.resources.factory() as session:
                 queued.extend(
                     session.scalars(
-                        select(Task.id).where(
+                    select(Task.id).where(
                             Task.status == "queued",
-                            ~Task.task_type.in_(IMAGE_PROCESSING_TASK_TYPES),
+                            _generic_task_filter(),
                         )
                     )
                 )
@@ -153,7 +161,7 @@ class PostgresTaskWorkerManager:
                     .where(
                         Task.status == "running",
                         Task.lease_expires_at < now,
-                        ~Task.task_type.in_(IMAGE_PROCESSING_TASK_TYPES),
+                        _generic_task_filter(),
                     )
                     .with_for_update(skip_locked=True)
                     .limit(5000)
@@ -233,7 +241,7 @@ class PostgresTaskWorkerManager:
                 session.scalars(
                     select(Task).where(
                         Task.status.in_(("queued", "running")),
-                        ~Task.task_type.in_(IMAGE_PROCESSING_TASK_TYPES),
+                        _generic_task_filter(),
                     )
                 )
             )
@@ -443,7 +451,7 @@ class PostgresTaskWorkerManager:
                     select(Task.id)
                     .where(
                         Task.status == "queued",
-                        ~Task.task_type.in_(IMAGE_PROCESSING_TASK_TYPES),
+                        _generic_task_filter(),
                     )
                     .limit(500)
                 )

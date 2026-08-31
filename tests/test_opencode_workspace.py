@@ -46,7 +46,10 @@ def test_external_selectors_share_db_but_not_workspace_paths(tmp_path: Path) -> 
     assert first.config_file != second.config_file
     assert first.config_dir != second.config_dir
     assert first.image_path("sample.png") != second.image_path("sample.png")
+    assert first.candidate_root == root / "scope-a" / "candidates" / "task-a"
+    assert not first.candidate_root.exists()
     assert dict(first.permission_rules)["*"] == "deny"
+    assert dict(first.permission_rules)[f"{first.candidate_root.absolute()}/**"] == "allow"
     assert dict(first.permission_rules)[f"{first.task_results_root.absolute()}/*"] == "allow"
     edit_rules = dict(
         build_edit_permission_rules(
@@ -55,11 +58,13 @@ def test_external_selectors_share_db_but_not_workspace_paths(tmp_path: Path) -> 
             config_dir=first.config_dir,
             draft_path=first.draft_path,
             result_path=first.result_path,
+            candidate_root=first.candidate_root,
         )
     )
     assert edit_rules["*"] == "deny"
     assert edit_rules[f"**/{first.config_file.as_posix().lstrip('/')}"] == "deny"
     assert edit_rules[f"**/{first.draft_path.as_posix().lstrip('/')}"] == "allow"
+    assert edit_rules[f"**/{first.candidate_root.as_posix().lstrip('/')}/**"] == "deny"
     assert not first.task_scratch_root.exists()
     assert not first.task_results_root.exists()
     repeat = provider.resolve(TrustedWorkspaceContext("task-a", "attempt-retry", "scope-a", selector="scope-a", image_relative_path="sample.png"))
@@ -224,6 +229,7 @@ def test_executor_resolves_signed_selector_to_current_image_root(tmp_path: Path,
         assert isinstance(layout, executor_server.WorkspaceLayout)
         assert layout.images_root == selector_root / "scope-a" / "images"
         assert layout.directory == selector_root / "scope-a" / "workspace"
+        assert layout.candidate_root == selector_root / "scope-a" / "candidates" / "task"
         assert layout.config_file == layout.directory / "tasks" / "task" / "opencode.json"
         assert layout.config_dir == layout.directory / "tasks" / "task" / ".opencode"
         assert not (runtime / "task-results" / "task").exists()

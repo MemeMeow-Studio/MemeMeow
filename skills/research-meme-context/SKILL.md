@@ -10,12 +10,14 @@ description: Research evidence-backed structured representations of image memes,
 
 将本流程用于表情包、反应图、截图、带配文图片，以及含义或传播状态可能随时间变化的视觉引用。当只需要纯粹的图片描述，且不关心出处和社群语义时，不要使用本流程。
 
-首次进行视觉观察前，读取 [references/observation-prompt.md](references/observation-prompt.md)。返回最终表示前，读取 [references/output-schema.json](references/output-schema.json)。当任务 payload 允许使用项目反向图片能力时，读取 [references/serpapi-google-lens.md](references/serpapi-google-lens.md)。供应商访问、缓存和计数由后端完成，Agent 只能调用带当前任务 callback 凭据的薄 CLI。
+首次进行视觉观察前，读取 [references/observation-prompt.md](references/observation-prompt.md)。返回最终表示前，读取 [references/output-schema.json](references/output-schema.json)。当任务 payload 允许使用项目反向图片能力时，读取 [references/serpapi-google-lens.md](references/serpapi-google-lens.md)。供应商访问、缓存和计数由后端完成；视觉候选由后端在 Agent 启动前冻结并物化，Agent 不调用视觉匹配接口。
 
-当需要利用当前图片库中已经研究完成的相似 Meme 时，读取本地视觉匹配 JSON：
-`python3 /skills/research-meme-context/scripts/local_visual_match.py --top-k 10`。该脚本只使用
-Runner 注入的 `MEMEMEOW_AGENT_TASK_ID`、当前任务 callback 凭据和内部 URL，不接受 scope、任意图片 ID、数据库连接或
-模型参数。先阅读返回的 `context`、图片 ID 和分数，再按需打开少量 `/images/...` 图片核验。
+当需要利用当前图片库中已经研究完成的相似 Meme 时，读取 Runner 注入的固定候选 manifest：
+`python3 /skills/research-meme-context/scripts/local_visual_match.py`。该脚本只读取
+`MEMEMEOW_AGENT_CANDIDATE_MANIFEST` 指向的当前 Task 文件；没有该变量时使用
+`/runtime/candidates/$MEMEMEOW_AGENT_TASK_ID/manifest.json`。它不接受 scope、任意图片 ID、数据库连接、
+模型参数或候选数量参数。先阅读 manifest 中的 `context`、图片 ID 和分数，再按需打开同一 manifest
+中 `relative_path` 对应的候选图片。
 
 ## 工作流
 
@@ -26,7 +28,7 @@ Runner 注入的 `MEMEMEOW_AGENT_TASK_ID`、当前任务 callback 凭据和内�
 
    使用首轮观察提示词。将直接可见事实与假设分开。原样保留 OCR 文字、语言和排版。记录不寻常的组合，例如成对主体、统一服装、姿势、裁剪构图、水印，或配文与画面之间的反差。
 
-   如果使用本地视觉匹配，必须把结果当作同一 scope 中的候选证据，不把相似度当作身份、出处、模板或梗义证明。
+   如果使用本地视觉候选，必须把 manifest 结果当作同一 scope 中的参考证据，不把相似度当作身份、出处、模板或梗义证明。候选为空时继续独立研究，不把空列表解释为图片不存在或视觉模型失败。
 3. 先补齐未知的检索锚点。
 
    当角色、模板、出处或外部引用的名称未知，或图片文字过于普通时，优先对整图进行 `reverse_image`。它的价值是从像素中发现可用于后续文字检索的名称、别名、传播页和相似变体，而不是直接判定梗义或出处。只有整图结果不足时，才对一个有区分度的主体裁剪图做受限重试。

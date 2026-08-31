@@ -426,6 +426,21 @@ class ImageProcessingRepository:
                         "executor_attempt_id": attempt_executor_id,
                         "resume_available": attempt_resume_available,
                         "resume_reason": attempt_resume_reason,
+                        "visual_match_snapshot": (
+                            {
+                                "protocol_version": attempt.visual_snapshot_protocol_version,
+                                "snapshot_sha256": attempt.visual_snapshot_sha256,
+                                "matched_at": attempt.visual_snapshot_matched_at,
+                                "candidate_count": attempt.visual_snapshot_candidate_count,
+                            }
+                            if attempt is not None
+                            and isinstance(attempt.visual_snapshot_sha256, str)
+                            and len(attempt.visual_snapshot_sha256) == 64
+                            and isinstance(attempt.visual_snapshot_protocol_version, int)
+                            and isinstance(attempt.visual_snapshot_candidate_count, int)
+                            and attempt.visual_snapshot_candidate_count >= 0
+                            else None
+                        ),
                     }
                 )
             stage_payload = tuple(stage_payload_items)
@@ -770,6 +785,8 @@ class ImageProcessingWorker:
                 finalize_image_tasks=False,
                 operation_policy=self.policy,
                 grant_store=self.grants,
+                visual_snapshot_preparer=getattr(task_service, "_visual_snapshot_preparer", None),
+                visual_candidate_preparer=getattr(task_service, "_visual_candidate_preparer", None),
                 # 图片叶子 facade 必须继承应用级恢复开关和边界，否则完整
                 # pipeline 会悄悄退回普通任务重试，绕过 session 续跑策略。
                 resume_enabled=bool(getattr(task_service, "resume_enabled", False)),
@@ -980,6 +997,8 @@ class ImageProcessingWorker:
             "embedding_dimensions",
         }
         payload.update({key: value for key, value in config_value.items() if str(key) in safe_config_keys})
+        if canonical == "agent":
+            payload["visual_match_snapshot_protocol_version"] = 2
         submitter = self._task_runner or self.tasks
         dedupe_key = self._task_dedupe_key(task_type, payload)
         active_task_id = self._find_active_task(submitter, task_type, dedupe_key)
@@ -1017,18 +1036,28 @@ class ImageProcessingWorker:
                 if callable(getattr(self.grants, "bind_task", None)) and not self.grants.bind_task(association.grant, task_id):
                     raise OperationPolicyError("operation_grant_invalid")
             except OperationPolicyError as exc:
+                self._release_uncommitted_grant(association)
                 self._fail_unclaimed_task(task_id, exc.code)
                 raise ImageProcessingError(exc.code, retry_at=exc.retry_at) from exc
+            except Exception as exc:  # noqa: BLE001 - grant 绑定适配层必须 fail-closed
+                self._release_uncommitted_grant(association)
+                self._fail_unclaimed_task(task_id, "operation_policy_unavailable")
+                raise ImageProcessingError("operation_policy_unavailable") from exc
             # 任务已创建后再把不透明 grant key 写入服务端 payload；key 不是 grant
             # 凭据，handler 仍会从服务端 grant store 取回真正授权。
             if callable(getattr(self.resources, "factory", None)):
-                with self.resources.factory() as session:
-                    task = session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.id == task_id).with_for_update())
-                    if task is not None:
-                        next_payload = dict(task.payload or {})
-                        next_payload["agent_grant_key"] = grant_key
-                        task.payload = next_payload
-                        session.commit()
+                try:
+                    with self.resources.factory() as session:
+                        task = session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.id == task_id).with_for_update())
+                        if task is not None:
+                            next_payload = dict(task.payload or {})
+                            next_payload["agent_grant_key"] = grant_key
+                            task.payload = next_payload
+                            session.commit()
+                except Exception as exc:  # noqa: BLE001 - grant key 未持久化时禁止排队执行
+                    self._release_uncommitted_grant(association)
+                    self._fail_unclaimed_task(task_id, "operation_policy_unavailable")
+                    raise ImageProcessingError("operation_policy_unavailable") from exc
 
         if schedule and callable(getattr(submitter, "schedule", None)):
             submitter.schedule(task_id)
@@ -1056,6 +1085,20 @@ class ImageProcessingWorker:
             self.grants.transition(association.grant, "unknown")
         except OperationPolicyError:
             logger.warning("image_processing_grant_transition_failed operation=%s", association.grant.operation)
+
+    def _release_uncommitted_grant(self, association: GrantAssociation | None) -> None:
+        """在叶子 Task 尚未进入外部执行前补偿释放 Agent grant。"""
+        if association is None or association.state != "acquired":
+            return
+        try:
+            result = self.policy.release(association.grant)
+            if not result.ok or result.state not in {"released", "already_released"}:
+                self._mark_grant_unknown(association)
+                return
+            if callable(getattr(self.grants, "transition", None)) and not self.grants.transition(association.grant, "released"):
+                self._mark_grant_unknown(association)
+        except Exception:  # noqa: BLE001 - 补偿结果不确定时必须禁止再次执行
+            self._mark_grant_unknown(association)
 
     @staticmethod
     def _metadata_hash(meme: Meme) -> str | None:
@@ -1451,6 +1494,8 @@ class ImageProcessingWorker:
                     "title_fingerprint": stable_input_digest(title),
                 }
             )
+        if stage == "agent":
+            payload["visual_match_snapshot_protocol_version"] = 2
         for key, value in dict(job.processing_config or {}).items():
             if key not in {
                 "scope",
@@ -1512,14 +1557,7 @@ class ImageProcessingWorker:
             record = submitter.submit(task_type, payload, schedule=False)
         except Exception:
             if association is not None and association.state == "acquired":
-                try:
-                    result = self.policy.release(association.grant)
-                    if not result.ok or result.state not in {"released", "already_released"}:
-                        self._mark_grant_unknown(association)
-                    elif callable(getattr(self.grants, "transition", None)) and not self.grants.transition(association.grant, "released"):
-                        self._mark_grant_unknown(association)
-                except OperationPolicyError:
-                    self._mark_grant_unknown(association)
+                self._release_uncommitted_grant(association)
             raise
         task_id = self._task_identifier(record)
         if task_id is None:
@@ -1532,9 +1570,9 @@ class ImageProcessingWorker:
                 logger.warning("image_processing_grant_bind_unknown task=%s error=%s", task_id, type(exc).__name__)
                 bound = False
             if not bound:
-                # Task 已经持久化，不能再释放 grant；只在确认 Task 仍属于当前
-                # Job 时收束 queued 孤儿，grant 本身继续保持 unknown。
-                self._mark_grant_unknown(association)
+                # Task 已经持久化但尚未 claim，仍未达到 Agent 副作用边界；先补偿
+                # 释放授权，释放不确定时再收束 unknown。
+                self._release_uncommitted_grant(association)
                 self._fail_unbound_pipeline_task(task_id, job, stage, "stage_grant_bind_failed")
                 raise ImageProcessingError("stage_grant_bind_failed")
         if not self._attach_task_for_worker(job, stage, task_id):

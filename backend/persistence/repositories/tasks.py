@@ -31,6 +31,11 @@ from backend.persistence.models import (
     GLOBAL_LANE_RESOURCE_KEY,
     utcnow,
 )
+from backend.visual_snapshot import (
+    VisualMatchSnapshotError,
+    validate_visual_match_snapshot,
+    visual_match_snapshot_summary,
+)
 
 
 # 图片 pipeline 的显式阶段任务由专用控制面推进；通用 Agent fair claim 不应抢走这些带
@@ -121,6 +126,210 @@ class TaskRepository:
         if for_update:
             statement = statement.with_for_update()
         return self.session.scalar(statement)
+
+    def get_visual_snapshot(self, task_id: str, *, expected_sha256: str | None = None) -> dict[str, Any] | None:
+        """读取并校验当前 scope 任务的视觉 snapshot，损坏内容直接报错。"""
+        task = self.get(task_id)
+        if task is None:
+            return None
+        if task.visual_match_snapshot is None:
+            if any(
+                getattr(task, field, None) is not None
+                for field in (
+                    "visual_snapshot_sha256",
+                    "visual_snapshot_protocol_version",
+                    "visual_snapshot_matched_at",
+                    "visual_snapshot_candidate_count",
+                )
+            ):
+                # JSONB 与摘要列必须作为同一事实写入；只剩摘要时不能被恢复路径
+                # 当作“尚未计算”并重新匹配，否则会掩盖部分事务写入或数据库损坏。
+                raise DatabaseError("visual_match_snapshot_invalid")
+            return None
+        try:
+            expected = expected_sha256 or task.visual_snapshot_sha256
+            if isinstance(expected, str):
+                expected = expected.lower()
+            snapshot = validate_visual_match_snapshot(task.visual_match_snapshot, expected_sha256=expected)
+            self._assert_visual_snapshot_summary(task, snapshot)
+            self._assert_visual_snapshot_task_identity(task, snapshot)
+            return snapshot
+        except VisualMatchSnapshotError as exc:
+            raise DatabaseError(exc.code) from exc
+
+    def update_payload_fenced(
+        self,
+        task_id: str,
+        claim_generation: int,
+        owner: str,
+        updates: Mapping[str, Any],
+    ) -> bool:
+        """在当前 claim 租约内合并任务迁移字段，避免旧 Worker 覆盖新输入。
+
+        该方法只用于后端为 protocol v2 补齐的稳定字段；调用方必须在同一 claim
+        内传入已校验的 JSON 值，事务提交由外层环境负责。
+        """
+        if not isinstance(updates, Mapping):
+            raise DatabaseError("visual_match_snapshot_invalid")
+        now = utcnow()
+        task = self.session.scalar(
+            select(Task)
+            .where(
+                Task.scope_id == self.scope.scope_id,
+                Task.id == task_id,
+                Task.claim_generation == claim_generation,
+                Task.lease_owner == owner,
+                Task.status == "running",
+                Task.lease_expires_at > now,
+            )
+            .with_for_update()
+        )
+        if task is None:
+            return False
+        if task.payload is not None and not isinstance(task.payload, Mapping):
+            raise DatabaseError("visual_match_snapshot_invalid")
+        payload = dict(task.payload or {})
+        payload.update(dict(updates))
+        task.payload = payload
+        task.updated_at = now
+        self.session.flush()
+        return True
+
+    @staticmethod
+    def _assert_visual_snapshot_summary(task: Task, snapshot: Mapping[str, Any]) -> None:
+        """确认 Task 摘要列与 JSONB snapshot 完全一致，拒绝部分更新。"""
+        summary = visual_match_snapshot_summary(snapshot)
+        try:
+            matched_at = datetime.fromisoformat(str(summary["matched_at"]).replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise VisualMatchSnapshotError("visual_match_snapshot_invalid", "snapshot 时间摘要无效") from exc
+        stored_matched_at = getattr(task, "visual_snapshot_matched_at", None)
+        if (
+            str(getattr(task, "visual_snapshot_sha256", "")).lower() != summary["snapshot_sha256"]
+            or getattr(task, "visual_snapshot_protocol_version", None) != summary["protocol_version"]
+            or getattr(task, "visual_snapshot_candidate_count", None) != summary["candidate_count"]
+            or stored_matched_at != matched_at
+        ):
+            raise VisualMatchSnapshotError("visual_match_snapshot_invalid", "snapshot 摘要列与内容不一致")
+
+    def _assert_visual_snapshot_task_identity(self, task: Task, snapshot: Mapping[str, Any]) -> None:
+        """确认 snapshot 查询、候选 Meme 和图片身份均属于当前 Task scope。
+
+        snapshot 的候选 context 允许在任务运行期间继续变化，因此这里只校验不可变的
+        Meme ID、图片 SHA 和文件大小；任何跨 scope 或内容指纹漂移都直接拒绝。
+        """
+        if task.task_type != "meme_context_generation":
+            raise VisualMatchSnapshotError("visual_match_snapshot_invalid", "非语境任务不能绑定视觉 snapshot")
+        payload = task.payload if isinstance(task.payload, Mapping) else {}
+        task_meme_id = payload.get("meme_id")
+        task_sha = payload.get("image_sha256")
+        query = snapshot.get("query")
+        candidates = snapshot.get("candidates")
+        if (
+            not isinstance(task_meme_id, str)
+            or not isinstance(task_sha, str)
+            or len(task_sha) != 64
+            or not isinstance(query, Mapping)
+            or not isinstance(candidates, list)
+        ):
+            raise VisualMatchSnapshotError("visual_match_snapshot_invalid", "snapshot 与 Task 输入不一致")
+        if str(query.get("image_sha256", "")).lower() != task_sha.lower():
+            raise VisualMatchSnapshotError("visual_match_snapshot_invalid", "snapshot 查询图片与 Task 不一致")
+        try:
+            task_meme_uuid = UUID(task_meme_id)
+            query_meme_uuid = UUID(str(query.get("meme_id")))
+        except (TypeError, ValueError) as exc:
+            raise VisualMatchSnapshotError("visual_match_snapshot_invalid", "snapshot 查询 Meme 标识无效") from exc
+        if task_meme_uuid != query_meme_uuid:
+            raise VisualMatchSnapshotError("visual_match_snapshot_invalid", "snapshot 查询 Meme 与 Task 不一致")
+        query_meme = self.session.scalar(
+            select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == query_meme_uuid)
+        )
+        if query_meme is None or str(query_meme.sha256).lower() != task_sha.lower():
+            raise VisualMatchSnapshotError("visual_match_snapshot_invalid", "snapshot 查询图片身份无效")
+        seen: set[UUID] = set()
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                raise VisualMatchSnapshotError("visual_match_snapshot_invalid", "snapshot 候选结构无效")
+            try:
+                candidate_uuid = UUID(str(candidate.get("meme_id")))
+            except (TypeError, ValueError) as exc:
+                raise VisualMatchSnapshotError("visual_match_snapshot_invalid", "snapshot 候选 Meme 标识无效") from exc
+            if candidate_uuid in seen or candidate_uuid == query_meme_uuid:
+                raise VisualMatchSnapshotError("visual_match_snapshot_invalid", "snapshot 候选 Meme 重复或包含查询图片")
+            seen.add(candidate_uuid)
+            candidate_meme = self.session.scalar(
+                select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == candidate_uuid)
+            )
+            candidate_sha = candidate.get("image_sha256")
+            candidate_size = candidate.get("size_bytes")
+            if (
+                candidate_meme is None
+                or not isinstance(candidate_sha, str)
+                or candidate_sha.lower() != str(candidate_meme.sha256).lower()
+                or not isinstance(candidate_size, int)
+                or isinstance(candidate_size, bool)
+                or candidate_size != int(candidate_meme.size_bytes)
+            ):
+                raise VisualMatchSnapshotError("visual_match_snapshot_invalid", "snapshot 候选图片身份无效")
+
+    def set_visual_snapshot_fenced(self, task_id: str, claim_generation: int, owner: str, snapshot: Mapping[str, Any]) -> bool:
+        """在当前 claim 租约内幂等写入视觉 snapshot 及其脱敏摘要。"""
+        try:
+            validated = validate_visual_match_snapshot(snapshot)
+        except VisualMatchSnapshotError as exc:
+            raise DatabaseError(exc.code) from exc
+        now = utcnow()
+        task = self.session.scalar(
+            select(Task)
+            .where(
+                Task.scope_id == self.scope.scope_id,
+                Task.id == task_id,
+                Task.claim_generation == claim_generation,
+                Task.lease_owner == owner,
+                Task.status == "running",
+                Task.lease_expires_at > now,
+            )
+            .with_for_update()
+        )
+        if task is None:
+            return False
+        try:
+            self._assert_visual_snapshot_task_identity(task, validated)
+        except VisualMatchSnapshotError as exc:
+            raise DatabaseError(exc.code) from exc
+        existing = None
+        if task.visual_match_snapshot is not None:
+            try:
+                expected = task.visual_snapshot_sha256.lower() if isinstance(task.visual_snapshot_sha256, str) else task.visual_snapshot_sha256
+                existing = validate_visual_match_snapshot(task.visual_match_snapshot, expected_sha256=expected)
+                self._assert_visual_snapshot_summary(task, existing)
+                self._assert_visual_snapshot_task_identity(task, existing)
+            except VisualMatchSnapshotError as exc:
+                raise DatabaseError(exc.code) from exc
+            if existing["snapshot_sha256"] != validated["snapshot_sha256"]:
+                raise DatabaseError("visual_match_snapshot_conflict")
+        elif any(
+            getattr(task, field, None) is not None
+            for field in (
+                "visual_snapshot_sha256",
+                "visual_snapshot_protocol_version",
+                "visual_snapshot_matched_at",
+                "visual_snapshot_candidate_count",
+            )
+        ):
+            # 摘要列与 JSONB 必须成组出现；部分写入不能被新 claim 静默覆盖。
+            raise DatabaseError("visual_match_snapshot_invalid")
+        if existing is None:
+            summary = visual_match_snapshot_summary(validated)
+            task.visual_match_snapshot = validated
+            task.visual_snapshot_sha256 = str(summary["snapshot_sha256"])
+            task.visual_snapshot_protocol_version = int(summary["protocol_version"])
+            task.visual_snapshot_matched_at = datetime.fromisoformat(str(summary["matched_at"]).replace("Z", "+00:00"))
+            task.visual_snapshot_candidate_count = int(summary["candidate_count"])
+            task.updated_at = now
+        self.session.flush()
+        return True
 
     def submit(
         self,
@@ -328,14 +537,21 @@ class TaskRepository:
         """读取当前 scope 任务占用的资源槽位，供内部恢复和诊断使用。"""
         return self.session.scalar(select(TaskLaneResourceSlot).where(TaskLaneResourceSlot.task_scope_id == self.scope.scope_id, TaskLaneResourceSlot.task_id == task_id))
 
-    def recover_expired(self, *, owner: str, limit: int = 1000, exclude_task_types: set[str] | frozenset[str] | None = None, include_task_types: set[str] | frozenset[str] | None = None) -> list[str]:
-        """恢复失效租约；可按任务类型限制专用 Worker 的恢复范围。"""
+    def recover_expired(self, *, owner: str, limit: int = 1000, exclude_task_types: set[str] | frozenset[str] | None = None, include_task_types: set[str] | frozenset[str] | None = None, exclude_image_pipeline: bool = False) -> list[str]:
+        """恢复失效租约，并可保留显式图片阶段给专用 Worker。"""
         now = utcnow()
         filters = [Task.scope_id == self.scope.scope_id, Task.status == "running", Task.lease_expires_at < now]
         if exclude_task_types:
             filters.append(~Task.task_type.in_(exclude_task_types))
         if include_task_types:
             filters.append(Task.task_type.in_(include_task_types))
+        if exclude_image_pipeline:
+            filters.append(
+                ~(
+                    Task.task_type.in_(IMAGE_PROCESSING_LANE_TYPES)
+                    & Task.submission_mode.in_(('pipeline', 'standalone'))
+                )
+            )
         rows = list(
             self.session.scalars(
                 select(Task)

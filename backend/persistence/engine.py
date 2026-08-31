@@ -25,7 +25,7 @@ from backend.persistence.models import (
 
 SCOPE_LOCAL = "local"
 # 当前代码要求的 Alembic head；数据库初始化脚本会显式传入同一 revision。
-CURRENT_SCHEMA_REVISION = "0019_task_lane_resource_scheduling"
+CURRENT_SCHEMA_REVISION = "0020_visual_match_snapshot"
 
 
 class DatabaseError(RuntimeError):
@@ -90,6 +90,11 @@ def ensure_optional_control_schema(engine: Engine) -> None:
             connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_started_at TIMESTAMPTZ"))
             connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS first_error JSONB"))
             connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS error_history JSONB NOT NULL DEFAULT '[]'::jsonb"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS visual_match_snapshot JSONB"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS visual_snapshot_sha256 VARCHAR(64)"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS visual_snapshot_protocol_version INTEGER"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS visual_snapshot_matched_at TIMESTAMPTZ"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS visual_snapshot_candidate_count INTEGER"))
             connection.execute(text("UPDATE tasks SET resume_attempt_count = COALESCE(resume_attempt_count, 0), error_history = COALESCE(error_history, '[]'::jsonb)"))
             connection.execute(text("ALTER TABLE tasks ALTER COLUMN resume_available SET DEFAULT FALSE, ALTER COLUMN resume_available SET NOT NULL, ALTER COLUMN resume_attempt_count SET DEFAULT 0, ALTER COLUMN resume_attempt_count SET NOT NULL, ALTER COLUMN error_history SET DEFAULT '[]'::jsonb, ALTER COLUMN error_history SET NOT NULL"))
             connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS executor_attempt_id VARCHAR(255)"))
@@ -99,6 +104,10 @@ def ensure_optional_control_schema(engine: Engine) -> None:
             connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS resume_available BOOLEAN NOT NULL DEFAULT FALSE"))
             connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS resume_reason VARCHAR(64)"))
             connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS error JSONB"))
+            connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS visual_snapshot_sha256 VARCHAR(64)"))
+            connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS visual_snapshot_protocol_version INTEGER"))
+            connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS visual_snapshot_matched_at TIMESTAMPTZ"))
+            connection.execute(text("ALTER TABLE image_processing_attempts ADD COLUMN IF NOT EXISTS visual_snapshot_candidate_count INTEGER"))
             connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_image_processing_attempt_executor_id ON image_processing_attempts(executor_attempt_id) WHERE executor_attempt_id IS NOT NULL"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_image_processing_attempts_resume ON image_processing_attempts(scope_id, task_id, resume_available, updated_at)"))
             connection.execute(text("ALTER TABLE image_processing_jobs ADD COLUMN IF NOT EXISTS auto_name BOOLEAN NOT NULL DEFAULT FALSE"))
@@ -184,6 +193,34 @@ def ensure_optional_control_schema(engine: Engine) -> None:
                     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_operation_grant_fingerprint') THEN
                         ALTER TABLE operation_grants ADD CONSTRAINT ck_operation_grant_fingerprint
                             CHECK(request_fingerprint IS NULL OR length(request_fingerprint) = 64);
+                    END IF;
+                END $$;
+            """))
+            connection.execute(text("""
+                DO $$ BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_task_visual_snapshot_sha256') THEN
+                        ALTER TABLE tasks ADD CONSTRAINT ck_task_visual_snapshot_sha256
+                            CHECK (visual_snapshot_sha256 IS NULL OR length(visual_snapshot_sha256) = 64);
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_task_visual_snapshot_protocol_version') THEN
+                        ALTER TABLE tasks ADD CONSTRAINT ck_task_visual_snapshot_protocol_version
+                            CHECK (visual_snapshot_protocol_version IS NULL OR visual_snapshot_protocol_version > 0);
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_task_visual_snapshot_candidate_count') THEN
+                        ALTER TABLE tasks ADD CONSTRAINT ck_task_visual_snapshot_candidate_count
+                            CHECK (visual_snapshot_candidate_count IS NULL OR visual_snapshot_candidate_count >= 0);
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_attempt_visual_snapshot_sha256') THEN
+                        ALTER TABLE image_processing_attempts ADD CONSTRAINT ck_attempt_visual_snapshot_sha256
+                            CHECK (visual_snapshot_sha256 IS NULL OR length(visual_snapshot_sha256) = 64);
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_attempt_visual_snapshot_protocol_version') THEN
+                        ALTER TABLE image_processing_attempts ADD CONSTRAINT ck_attempt_visual_snapshot_protocol_version
+                            CHECK (visual_snapshot_protocol_version IS NULL OR visual_snapshot_protocol_version > 0);
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_attempt_visual_snapshot_candidate_count') THEN
+                        ALTER TABLE image_processing_attempts ADD CONSTRAINT ck_attempt_visual_snapshot_candidate_count
+                            CHECK (visual_snapshot_candidate_count IS NULL OR visual_snapshot_candidate_count >= 0);
                     END IF;
                 END $$;
             """))

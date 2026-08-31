@@ -67,6 +67,8 @@ _KNOWN_TASK_ERRORS = frozenset(
         "opencode_workspace_capability_expired",
         "opencode_workspace_capability_unavailable",
         "opencode_workspace_provider_missing",
+        "visual_candidate_materialization_failed",
+        "visual_match_snapshot_invalid",
         "model_capability_invalid",
         "model_capability_unavailable",
         "model_broker_endpoint_invalid",
@@ -278,6 +280,7 @@ class AgentExecutorClient:
         workspace_selector: str | None = None,
         workspace_capability: str | None = None,
         model_capability: str | None = None,
+        visual_snapshot_sha256: str | None = None,
     ) -> ExecutorTaskResponse:
         """提交绑定模型 capability 的独立 executor attempt，并可按明确 session 续跑。"""
         timeout_value = int(timeout_seconds)
@@ -309,6 +312,7 @@ class AgentExecutorClient:
                     **({"workspace_selector": workspace_selector} if workspace_selector else {}),
                     **({"workspace_capability": workspace_capability} if workspace_capability else {}),
                     **({MODEL_CAPABILITY_FIELD: model_capability} if model_capability else {}),
+                    **({"visual_snapshot_sha256": visual_snapshot_sha256} if visual_snapshot_sha256 else {}),
                     **({"callback_token": callback_token} if callback_token else {}),
                 },
                 timeout=max(self.timeout, timeout_value + 10),

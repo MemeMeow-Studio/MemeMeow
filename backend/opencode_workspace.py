@@ -20,6 +20,13 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Callable, Mapping, Protocol
 
+try:
+    from backend.visual_snapshot import VisualMatchSnapshotError, validate_visual_match_snapshot
+except ModuleNotFoundError as exc:  # pragma: no cover - Agent 镜像只复制无状态协议快照
+    if exc.name != "backend":
+        raise
+    from executor.visual_snapshot import VisualMatchSnapshotError, validate_visual_match_snapshot
+
 SELECTOR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 ATTEMPT_ID_RE = TASK_ID_RE
@@ -56,6 +63,7 @@ class TrustedWorkspaceContext:
     session_id: str | None = None
     resume_of_attempt_id: str | None = None
     image_relative_path: str | None = None
+    visual_match_snapshot: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         """校验内部任务标识和恢复绑定，避免 provider 接收任意路径值。"""
@@ -71,6 +79,12 @@ class TrustedWorkspaceContext:
             raise WorkspaceResolutionError("opencode_workspace_mismatch", "恢复来源 attempt 无效")
         if self.image_relative_path is not None:
             _validate_relative_path(self.image_relative_path, code="opencode_workspace_mismatch")
+        if self.visual_match_snapshot is not None:
+            try:
+                snapshot = validate_visual_match_snapshot(self.visual_match_snapshot)
+            except VisualMatchSnapshotError as exc:
+                raise WorkspaceResolutionError("visual_match_snapshot_invalid", "视觉候选 snapshot 无效") from exc
+            object.__setattr__(self, "visual_match_snapshot", snapshot)
 
 
 @dataclass(frozen=True)
@@ -79,8 +93,9 @@ class ResolvedWorkspace:
 
     ``directory`` 同时是 CLI ``--dir`` 和子进程 ``cwd``；``config_file`` 和
     ``config_dir`` 位于当前 Task 临时目录，以便并发任务拥有各自的精确权限规则；
-    ``db_path`` 在同一 runtime 内对所有 selector 固定不变。其余根目录由 provider
-    装配，runner 只允许用它们解析当前图片、临时数据和结果文件。
+    ``candidate_root`` 是当前 Task 的只读视觉候选视图；``db_path`` 在同一 runtime
+    内对所有 selector 固定不变。其余根目录由 provider 装配，runner 只允许用它们
+    解析当前图片、候选、临时数据和结果文件。
     """
 
     selector: str
@@ -90,6 +105,7 @@ class ResolvedWorkspace:
     images_root: Path
     metadata_root: Path
     skill_root: Path
+    candidate_root: Path
     task_scratch_root: Path
     task_results_root: Path
     db_path: Path
@@ -119,12 +135,28 @@ class ResolvedWorkspace:
         """将 metadata 相对路径解析到当前 workspace 只读视图。"""
         return _safe_child(self.metadata_root, _validate_relative_path(relative, code="opencode_workspace_invalid"), file_required=False, code="opencode_workspace_invalid")
 
+    def candidate_path(self, relative: str) -> Path:
+        """将 snapshot 中的候选相对路径解析到当前 Task 只读视图。"""
+        return _safe_child(self.candidate_root, _validate_relative_path(relative, code="opencode_workspace_invalid"), file_required=True, code="opencode_workspace_invalid")
+
+    @property
+    def candidate_manifest_path(self) -> Path:
+        """返回当前 Task 固定的只读候选 manifest 路径。"""
+        return self.candidate_root / "manifest.json"
+
 
 class WorkspaceProvider(Protocol):
     """可信任务上下文到受控 OpenCode workspace 的最小 provider 协议。"""
 
     def resolve(self, context: TrustedWorkspaceContext) -> ResolvedWorkspace:
         """解析一次任务 workspace；失败时不得启动任何 OpenCode 子进程。"""
+
+
+class CandidateMaterializer(Protocol):
+    """可选的 task-scoped 候选物化扩展点。"""
+
+    def prepare_candidates(self, context: TrustedWorkspaceContext, resolved: ResolvedWorkspace) -> None:
+        """把可信 snapshot 物化为 resolved.candidate_root 下的只读视图。"""
 
 
 class MissingWorkspaceProvider:
@@ -267,6 +299,7 @@ def build_external_directory_rules(workspace: ResolvedWorkspace) -> tuple[tuple[
         (subtree(workspace.skill_root), "allow"),
         (subtree(workspace.images_root), "allow"),
         (subtree(workspace.metadata_root), "allow"),
+        (subtree(workspace.candidate_root), "allow"),
         (subtree(workspace.task_scratch_root), "allow"),
         # OpenCode 对外部文件先请求其父目录 ``<dir>/*``；仅写两个精确文件
         # 规则无法允许首次创建，因此这里只放行当前 Task 结果目录的父级检查，
@@ -284,6 +317,7 @@ def build_edit_permission_rules(
     config_dir: Path,
     draft_path: Path,
     result_path: Path,
+    candidate_root: Path | None = None,
 ) -> tuple[tuple[str, str], ...]:
     """限制 OpenCode ``edit``、``write`` 和 ``apply_patch`` 的可写路径。
 
@@ -322,6 +356,10 @@ def build_edit_permission_rules(
     rules.extend((value, "allow") for value in subtree(task_scratch_root))
     rules.extend((value, "allow") for value in exact(draft_path))
     rules.extend((value, "allow") for value in exact(result_path))
+    if candidate_root is not None:
+        # 候选由后端物化，Agent 只能读取，任何编辑工具都必须拒绝。
+        rules.extend((value, "deny") for value in exact(candidate_root))
+        rules.extend((value, "deny") for value in subtree(candidate_root))
     # 配置虽然位于 Task 临时目录，但必须保持由服务端原子生成，不能被
     # Agent 通过普通文件工具改写后影响后续 OpenCode 调用。
     rules.extend((value, "deny") for value in exact(config_file))
@@ -537,6 +575,10 @@ class _BaseProvider:
         task_scratch = directory / "tasks" / task_id
         config_file = task_scratch / "opencode.json"
         config_dir = task_scratch / ".opencode"
+        candidate_parent = directory.parent / "candidates"
+        validate_directory_path(candidate_parent, create=True)
+        candidate_root = candidate_parent / task_id
+        validate_directory_path(candidate_root, allow_missing_leaf=True)
         validate_directory_path(images_root, create=local)
         validate_directory_path(metadata_root, create=local)
         if allow_skill_symlink and skill_root.is_symlink():
@@ -557,6 +599,7 @@ class _BaseProvider:
             images_root=images_root,
             metadata_root=metadata_root,
             skill_root=skill_root,
+            candidate_root=candidate_root,
             task_scratch_root=task_scratch,
             task_results_root=task_results,
             db_path=db_path,
@@ -568,11 +611,12 @@ class _BaseProvider:
 class LocalWorkspaceProvider(_BaseProvider):
     """显式 local 单用户 provider，原地复用既有 runtime/workspace 历史。"""
 
-    def __init__(self, runtime_root: Path, *, image_root: Path, skill_root: Path | None = None, signer: WorkspaceCapabilitySigner | None = None) -> None:
-        """保存 local runtime、图片根和可选只读 Skill 根。"""
+    def __init__(self, runtime_root: Path, *, image_root: Path, skill_root: Path | None = None, signer: WorkspaceCapabilitySigner | None = None, candidate_materializer: Callable[[TrustedWorkspaceContext, ResolvedWorkspace], None] | None = None) -> None:
+        """保存 local runtime、图片根、Skill 根和候选物化回调。"""
         super().__init__(runtime_root=runtime_root, signer=signer)
         self.image_root = Path(image_root).expanduser()
         self.skill_root = Path(skill_root).expanduser() if skill_root is not None else None
+        self.candidate_materializer = candidate_materializer
 
     def resolve(self, context: TrustedWorkspaceContext) -> ResolvedWorkspace:
         """将 local scope 映射到旧 ``<runtime>/workspace``，拒绝其它 scope。"""
@@ -590,6 +634,19 @@ class LocalWorkspaceProvider(_BaseProvider):
             local=True,
             allow_skill_symlink=True,
         )
+
+    def prepare_candidates(self, context: TrustedWorkspaceContext, resolved: ResolvedWorkspace) -> None:
+        """调用 local 适配层物化当前 snapshot，缺失实现时失败关闭。"""
+        if context.visual_match_snapshot is None:
+            return
+        if not callable(self.candidate_materializer):
+            raise WorkspaceResolutionError("visual_candidate_materialization_failed", "local workspace 缺少候选物化能力")
+        try:
+            self.candidate_materializer(context, resolved)
+        except WorkspaceResolutionError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 物化边界只允许稳定失败
+            raise WorkspaceResolutionError("visual_candidate_materialization_failed", "视觉候选无法物化") from exc
 
 
 class DirectoryWorkspaceProvider(_BaseProvider):
@@ -662,6 +719,19 @@ def capability_for_provider(provider: object, context: TrustedWorkspaceContext, 
     return None
 
 
+def prepare_candidates_for_provider(provider: object, context: TrustedWorkspaceContext, resolved: ResolvedWorkspace) -> None:
+    """调用 provider 的候选物化扩展点，失败时统一为稳定错误。"""
+    prepare = getattr(provider, "prepare_candidates", None)
+    if not callable(prepare):
+        return
+    try:
+        prepare(context, resolved)
+    except WorkspaceResolutionError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 适配层失败必须阻止外部执行
+        raise WorkspaceResolutionError("visual_candidate_materialization_failed", "视觉候选无法物化") from exc
+
+
 __all__ = [
     "ATTEMPT_ID_RE",
     "CAPABILITY_AUDIENCE",
@@ -673,10 +743,12 @@ __all__ = [
     "TrustedWorkspaceContext",
     "WorkspaceCapabilityError",
     "WorkspaceCapabilitySigner",
+    "CandidateMaterializer",
     "WorkspaceProvider",
     "WorkspaceResolutionError",
     "build_edit_permission_rules",
     "build_external_directory_rules",
+    "prepare_candidates_for_provider",
     "capability_claims",
     "capability_for_provider",
     "validate_directory_path",

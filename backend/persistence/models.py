@@ -339,6 +339,12 @@ class Task(Base):
     lane: Mapped[str] = mapped_column(String(64), nullable=False, default="default")
     lane_resource_key: Mapped[str] = mapped_column(String(128), nullable=False, default=GLOBAL_LANE_RESOURCE_KEY, server_default=text("'__global__'"))
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    # Agent 启动前固定的视觉候选事实；旧任务允许为空，由 claim 前置迁移补齐。
+    visual_match_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    visual_snapshot_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    visual_snapshot_protocol_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    visual_snapshot_matched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    visual_snapshot_candidate_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     dedupe_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
     progress: Mapped[float | None] = mapped_column(nullable=True, default=0.0)
@@ -377,6 +383,9 @@ class Task(Base):
         CheckConstraint("submission_mode IS NULL OR (submission_mode = 'standalone' AND processing_job_id IS NULL) OR (submission_mode = 'pipeline' AND processing_job_id IS NOT NULL)", name="ck_task_submission_job_exclusivity"),
         CheckConstraint("task_type NOT IN ('visual_embedding_generation','meme_context_generation','image_auto_rename','text_embedding_generation') OR (submission_mode IS NULL OR (image_stage IS NOT NULL AND ((task_type = 'visual_embedding_generation' AND image_stage = 'visual') OR (task_type = 'meme_context_generation' AND image_stage = 'agent') OR (task_type = 'image_auto_rename' AND image_stage = 'auto_rename') OR (task_type = 'text_embedding_generation' AND image_stage = 'text_embedding'))))", name="ck_task_image_stage_type"),
         CheckConstraint("length(lane_resource_key) > 0", name="ck_task_lane_resource_key"),
+        CheckConstraint("visual_snapshot_sha256 IS NULL OR length(visual_snapshot_sha256) = 64", name="ck_task_visual_snapshot_sha256"),
+        CheckConstraint("visual_snapshot_protocol_version IS NULL OR visual_snapshot_protocol_version > 0", name="ck_task_visual_snapshot_protocol_version"),
+        CheckConstraint("visual_snapshot_candidate_count IS NULL OR visual_snapshot_candidate_count >= 0", name="ck_task_visual_snapshot_candidate_count"),
         UniqueConstraint("scope_id", "id", name="uq_task_scope_id"),
         Index("ix_tasks_image_submission", "scope_id", "submission_mode", "image_stage", "processing_job_id", "created_at"),
     )
@@ -599,12 +608,20 @@ class ImageProcessingAttempt(Base):
     input_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     target_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     claim_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # attempt 只保存 snapshot 摘要，完整候选仍由同一 Task 的 JSONB 事实提供。
+    visual_snapshot_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    visual_snapshot_protocol_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    visual_snapshot_matched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    visual_snapshot_candidate_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
     __table_args__ = (
         ForeignKeyConstraint(["scope_id", "task_id"], ["tasks.scope_id", "tasks.id"], ondelete="CASCADE"),
         CheckConstraint("state IN ('prepared','grant_committed','external_started','completed','failed','unknown_execution')", name="ck_image_processing_attempt_state"),
+        CheckConstraint("visual_snapshot_sha256 IS NULL OR length(visual_snapshot_sha256) = 64", name="ck_attempt_visual_snapshot_sha256"),
+        CheckConstraint("visual_snapshot_protocol_version IS NULL OR visual_snapshot_protocol_version > 0", name="ck_attempt_visual_snapshot_protocol_version"),
+        CheckConstraint("visual_snapshot_candidate_count IS NULL OR visual_snapshot_candidate_count >= 0", name="ck_attempt_visual_snapshot_candidate_count"),
         Index("ix_image_processing_attempts_task", "scope_id", "task_id", "attempt"),
         Index(
             "uq_image_processing_attempt_executor_id",

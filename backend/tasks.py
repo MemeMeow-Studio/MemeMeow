@@ -29,6 +29,7 @@ from backend.persistence.models import GLOBAL_LANE_RESOURCE_KEY
 from backend.public_dto import (
     PUBLIC_TASK_STATUSES,
     normalize_public_code,
+    sanitize_visual_snapshot_summary,
     normalize_public_identifier,
     sanitize_public_message,
     sanitize_public_timestamp,
@@ -129,6 +130,11 @@ STABLE_TASK_ERRORS = {
     "visual_embedding_sha256_invalid",
     "visual_embedding_sha256_mismatch",
     "query_embedding_not_ready",
+    "visual_match_snapshot_invalid",
+    "visual_match_snapshot_conflict",
+    "visual_match_snapshot_unavailable",
+    "visual_candidate_materialization_failed",
+    "claim_expired",
     "embedding_not_configured",
     "embedding_dimensions_mismatch",
     "embedding_non_finite",
@@ -193,6 +199,11 @@ class TaskRecord:
     # 数据库任务的资源归属事实；公开 DTO 不暴露调度内部 key。
     lane_resource_key: str = GLOBAL_LANE_RESOURCE_KEY
     payload: dict[str, Any] = field(default_factory=dict)
+    # 视觉候选只以摘要出现在公开任务记录，完整 snapshot 不离开后端控制面。
+    visual_snapshot_sha256: str | None = None
+    visual_snapshot_protocol_version: int | None = None
+    visual_snapshot_matched_at: str | None = None
+    visual_snapshot_candidate_count: int | None = None
     status: str = "queued"
     progress: float | None = 0.0
     message: str | None = None
@@ -243,6 +254,14 @@ class TaskRecord:
         attempts = self.attempts if isinstance(self.attempts, int) and not isinstance(self.attempts, bool) and 0 <= self.attempts <= 1_000_000 else 0
         resume_attempts = self.resume_attempts if isinstance(self.resume_attempts, int) and not isinstance(self.resume_attempts, bool) and 0 <= self.resume_attempts <= 1_000_000 else 0
         agent_concurrency = _public_agent_concurrency(self.agent_concurrency)
+        visual_snapshot = sanitize_visual_snapshot_summary(
+            {
+                "protocol_version": self.visual_snapshot_protocol_version,
+                "snapshot_sha256": self.visual_snapshot_sha256,
+                "matched_at": self.visual_snapshot_matched_at,
+                "candidate_count": self.visual_snapshot_candidate_count,
+            }
+        )
         result = {
             "task_id": task_id or "invalid-task",
             "task_type": task_type,
@@ -270,6 +289,7 @@ class TaskRecord:
             "result": sanitize_task_result(task_type, self.result),
             "settings_version": normalize_public_code(self.settings_version),
             "agent_concurrency": agent_concurrency,
+            "visual_match_snapshot": visual_snapshot,
         }
         # slot 是调度器内部事实，不属于任务公开契约；旧调用方仍可从内部对象读取。
         if include_payload:
@@ -312,6 +332,11 @@ class TaskRecord:
         raw_resume_attempts = value.get("resume_attempts", 0)
         resume_attempts = raw_resume_attempts if isinstance(raw_resume_attempts, int) and not isinstance(raw_resume_attempts, bool) and 0 <= raw_resume_attempts <= 1_000_000 else 0
         agent_concurrency = _public_agent_concurrency(value.get("agent_concurrency"))
+        snapshot = sanitize_visual_snapshot_summary(value.get("visual_match_snapshot"))
+        snapshot_sha256 = snapshot.get("snapshot_sha256") if snapshot is not None else None
+        snapshot_version = snapshot.get("protocol_version") if snapshot is not None else None
+        snapshot_matched_at = snapshot.get("matched_at") if snapshot is not None else None
+        snapshot_count = snapshot.get("candidate_count") if snapshot is not None else None
         return cls(
             task_id=task_id,
             task_type=task_type,
@@ -320,6 +345,10 @@ class TaskRecord:
             processing_job_id=processing_job_id,
             lane_resource_key=value.get("lane_resource_key") if isinstance(value.get("lane_resource_key"), str) and value.get("lane_resource_key") else GLOBAL_LANE_RESOURCE_KEY,
             payload=payload,
+            visual_snapshot_sha256=snapshot_sha256 if isinstance(snapshot_sha256, str) and len(snapshot_sha256) == 64 else None,
+            visual_snapshot_protocol_version=snapshot_version if isinstance(snapshot_version, int) and not isinstance(snapshot_version, bool) else None,
+            visual_snapshot_matched_at=snapshot_matched_at if isinstance(snapshot_matched_at, str) else None,
+            visual_snapshot_candidate_count=snapshot_count if isinstance(snapshot_count, int) and not isinstance(snapshot_count, bool) else None,
             status=safe_status,
             progress=value.get("progress") if isinstance(value.get("progress"), (int, float)) and not isinstance(value.get("progress"), bool) and 0 <= value.get("progress") <= 1 else None,
             message=sanitize_public_message(value.get("message")),
