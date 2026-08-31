@@ -13,8 +13,10 @@ from typing import Any
 
 THUMBNAIL_PROFILE = "thumbnail-v1"
 THUMBNAIL_MAX_EDGE = 320
-THUMBNAIL_OUTPUT_MEDIA_TYPE = "image/png"
-THUMBNAIL_OUTPUT_EXTENSION = ".png"
+THUMBNAIL_OUTPUT_MEDIA_TYPE = "image/jpeg"
+THUMBNAIL_OUTPUT_EXTENSION = ".jpg"
+# 缩略图优先控制体积；质量 70 在 320px 展示尺寸下保留可接受的细节。
+THUMBNAIL_JPEG_QUALITY = 70
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +74,7 @@ class ThumbnailConfig:
 
 __all__ = [
     "THUMBNAIL_MAX_EDGE",
+    "THUMBNAIL_JPEG_QUALITY",
     "THUMBNAIL_OUTPUT_EXTENSION",
     "THUMBNAIL_OUTPUT_MEDIA_TYPE",
     "THUMBNAIL_PROFILE",

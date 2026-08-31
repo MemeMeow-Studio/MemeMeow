@@ -1286,7 +1286,7 @@ def test_storage_recovery_removes_meme_after_file_applied_before_delete_commit(p
     coordinator = StorageCoordinator(resources)
     source_key = f"delete-recovery-{uuid4().hex}.png"
     meme = coordinator.upload(b"delete-recovery", target_key=source_key, extension=".png", context={}, provenance={})
-    thumbnail_key = f"{meme.id.hex}-{meme.sha256}-thumbnail-v1.png"
+    thumbnail_key = f"{meme.id.hex}-{meme.sha256}-thumbnail-v1.jpg"
     thumbnail_store = resources.thumbnail_store_for_scope("local")
     thumbnail_content = b"derived"
     thumbnail_store._key_path(thumbnail_key).write_bytes(thumbnail_content)
@@ -1306,7 +1306,7 @@ def test_storage_recovery_removes_meme_after_file_applied_before_delete_commit(p
                 output_size_bytes=len(thumbnail_content),
                 width=4,
                 height=4,
-                media_type="image/png",
+                media_type="image/jpeg",
                 status="available",
             )
         )
@@ -1428,7 +1428,7 @@ def test_storage_delete_collects_thumbnail_written_after_initial_snapshot(postgr
     meme = coordinator.upload(b"delete-window", target_key=source_key, extension=".png", context={}, provenance={})
     thumbnail_store = resources.thumbnail_store_for_scope("local")
     output = b"late-derived"
-    output_key = f"{meme.id.hex}-{meme.sha256}-thumbnail-v1.png"
+    output_key = f"{meme.id.hex}-{meme.sha256}-thumbnail-v1.jpg"
     original_quarantine = coordinator.blob_store.quarantine
 
     def quarantine_then_write_thumbnail(source: str, *, token):
@@ -1446,7 +1446,7 @@ def test_storage_delete_collects_thumbnail_written_after_initial_snapshot(postgr
                 output_size_bytes=len(output),
                 width=4,
                 height=4,
-                media_type="image/png",
+                media_type="image/jpeg",
             )
         return result
 
@@ -1463,7 +1463,7 @@ def test_storage_recovery_collects_unregistered_thumbnail_output(postgres_resour
     meme = coordinator.upload(b"recovery-window", target_key=source_key, extension=".png", context={}, provenance={})
     thumbnail_store = resources.thumbnail_store_for_scope("local")
     output = b"unregistered-derived"
-    output_key = f"{meme.id.hex}-{meme.sha256}-thumbnail-v1.png"
+    output_key = f"{meme.id.hex}-{meme.sha256}-thumbnail-v1.jpg"
     thumbnail_store._key_path(output_key).write_bytes(output)
     token = uuid4()
     quarantine_key = resources.blob_store.quarantine(source_key, token=token)
@@ -1496,7 +1496,7 @@ def test_storage_recovery_uses_delete_marker_after_meme_detached(postgres_resour
     meme = coordinator.upload(b"marker-recovery", target_key=source_key, extension=".png", context={}, provenance={})
     thumbnail_store = resources.thumbnail_store_for_scope("local")
     output = b"marker-derived"
-    output_key = f"{meme.id.hex}-{meme.sha256}-thumbnail-v1.png"
+    output_key = f"{meme.id.hex}-{meme.sha256}-thumbnail-v1.jpg"
     thumbnail_store._key_path(output_key).write_bytes(output)
     token = uuid4()
     quarantine_key = resources.blob_store.quarantine(source_key, token=token)

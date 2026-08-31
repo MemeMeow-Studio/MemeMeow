@@ -224,13 +224,29 @@ def test_render_thumbnail_keeps_ratio_and_does_not_upscale() -> None:
     assert (small.width, small.height) == (100, 80)
 
 
-def test_render_thumbnail_preserves_alpha_and_uses_gif_first_frame() -> None:
-    """透明 PNG 保留 RGBA，动画 GIF 只输出第一帧。"""
+def test_render_thumbnail_uses_compressed_jpeg_output() -> None:
+    """高细节输入应输出可解码且明显小于 PNG 的 JPEG。"""
+    source = Image.effect_noise((320, 320), 100).convert("RGB")
+    source_output = BytesIO()
+    source.save(source_output, format="PNG")
+    rendered = _render_thumbnail(source_output.getvalue(), ".png", ThumbnailConfig())
+
+    with Image.open(BytesIO(rendered.content)) as image:
+        assert image.format == "JPEG"
+        assert image.mode == "RGB"
+    assert len(rendered.content) < len(source_output.getvalue())
+
+
+def test_render_thumbnail_flattens_alpha_and_uses_gif_first_frame() -> None:
+    """透明输入铺白转为 JPEG，动画 GIF 只输出第一帧。"""
     transparent = _render_thumbnail(_image_bytes((12, 8), mode="RGBA", color=(255, 0, 0, 80)), ".png", ThumbnailConfig())
     with Image.open(BytesIO(transparent.content)) as image:
-        assert image.format == "PNG"
-        assert image.mode == "RGBA"
-        assert image.getpixel((0, 0))[3] == 80
+        assert image.format == "JPEG"
+        assert image.mode == "RGB"
+        red, green, blue = image.getpixel((0, 0))
+        assert red >= 250
+        assert abs(green - blue) <= 5
+        assert 160 <= green <= 190
 
     first = Image.new("RGB", (8, 8), "red")
     second = Image.new("RGB", (8, 8), "blue")
@@ -238,7 +254,9 @@ def test_render_thumbnail_preserves_alpha_and_uses_gif_first_frame() -> None:
     first.save(output, format="GIF", save_all=True, append_images=[second], duration=10, loop=0)
     rendered = _render_thumbnail(output.getvalue(), ".gif", ThumbnailConfig())
     with Image.open(BytesIO(rendered.content)) as image:
-        assert image.convert("RGB").getpixel((0, 0)) == (255, 0, 0)
+        assert image.format == "JPEG"
+        red, green, blue = image.convert("RGB").getpixel((0, 0))
+        assert red >= 240 and green <= 10 and blue <= 10
 
 
 def test_render_thumbnail_enforces_temp_and_output_limits() -> None:
@@ -267,7 +285,7 @@ def test_projection_rejects_changed_source_and_invalid_output(tmp_path: Path) ->
         output_size_bytes=len(output),
         width=32,
         height=16,
-        media_type="image/png",
+        media_type="image/jpeg",
         status="available",
     )
     assert service.projection(meme)["status"] == "available"
@@ -285,13 +303,13 @@ def test_projection_rejects_changed_source_and_invalid_output(tmp_path: Path) ->
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("output_key", "not-the-derived-key.png"),
+        ("output_key", "not-the-derived-key.jpg"),
         ("output_sha256", "0" * 64),
         ("output_size_bytes", 1),
         ("width", 321),
         ("height", 0),
         ("media_type", None),
-        ("media_type", "image/jpeg"),
+        ("media_type", "image/png"),
     ],
 )
 def test_projection_rejects_invalid_output_metadata(tmp_path: Path, field: str, value: object) -> None:
@@ -311,7 +329,7 @@ def test_projection_rejects_invalid_output_metadata(tmp_path: Path, field: str, 
         "output_size_bytes": len(output),
         "width": 32,
         "height": 16,
-        "media_type": "image/png",
+        "media_type": "image/jpeg",
         "status": "available",
     }
     values[field] = value
@@ -376,7 +394,7 @@ def test_failure_does_not_preserve_corrupt_available_fact(tmp_path: Path) -> Non
         output_size_bytes=len(b"different-output"),
         width=16,
         height=8,
-        media_type="image/png",
+        media_type="image/jpeg",
         status="available",
     )
 
@@ -455,13 +473,13 @@ def test_media_path_only_validates_source_identity_and_does_not_use_generation_r
         output_size_bytes=len(output),
         width=16,
         height=8,
-        media_type="image/png",
+        media_type="image/jpeg",
         status="available",
     )
     monkeypatch.setattr(service, "_meme_and_source", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("generation reader must not run")))
     path, media_type = service.media_path(meme.id)
     assert path.name == key
-    assert media_type == "image/png"
+    assert media_type == "image/jpeg"
 
 
 def test_cleanup_rejects_invalid_uuid_and_preserves_facts_on_file_failure(tmp_path: Path) -> None:

@@ -31,6 +31,7 @@ from backend.persistence.models import DerivedImageThumbnail, Meme, ScopeContext
 from backend.persistence.resources import DatabaseResources
 from backend.persistence.repositories.thumbnails import THUMBNAIL_STATUSES
 from backend.thumbnail_config import (
+    THUMBNAIL_JPEG_QUALITY,
     THUMBNAIL_OUTPUT_EXTENSION,
     THUMBNAIL_OUTPUT_MEDIA_TYPE,
     ThumbnailConfig,
@@ -58,7 +59,7 @@ class RenderedThumbnail:
 
 
 def _thumbnail_worker(content: bytes, extension: str, max_edge: int, output_limit: int, temp_limit: int, connection: Any) -> None:
-    """在独立进程中解码首帧并以小块消息返回 PNG 输出。"""
+    """在独立进程中解码首帧并以小块消息返回高压缩 JPEG 输出。"""
     try:
         expected = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".gif": "GIF"}.get(extension.lower())
         if expected is None:
@@ -73,10 +74,22 @@ def _thumbnail_worker(content: bytes, extension: str, max_edge: int, output_limi
             if width < 1 or height < 1 or width * height * channels > temp_limit:
                 raise ThumbnailError("thumbnail_temp_limit_exceeded")
             image.load()
-            converted = image.convert("RGBA" if channels == 4 else "RGB")
+            if channels == 4:
+                # JPEG 不支持透明通道，统一铺白后再编码，避免透明区域变成黑色。
+                rgba = image.convert("RGBA")
+                converted = Image.new("RGB", rgba.size, (255, 255, 255))
+                converted.paste(rgba, mask=rgba.getchannel("A"))
+            else:
+                converted = image.convert("RGB")
             converted.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
             output = BytesIO()
-            converted.save(output, format="PNG", optimize=True)
+            converted.save(
+                output,
+                format="JPEG",
+                quality=THUMBNAIL_JPEG_QUALITY,
+                optimize=True,
+                progressive=True,
+            )
             result = output.getvalue()
             if not result or len(result) > output_limit:
                 raise ThumbnailError("thumbnail_output_limit_exceeded")
