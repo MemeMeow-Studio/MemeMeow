@@ -275,7 +275,7 @@ class PostgresTaskService:
             pending_batches = environment.tasks.pending_finalizer_batches(limit=5000) if self._finalize_image_tasks else []
             cursor = None
             while True:
-                records, cursor = environment.tasks.list(statuses={"queued"}, cursor=cursor, limit=100)
+                records, cursor = environment.tasks.list_for_worker(cursor=cursor, limit=100)
                 queued.extend(
                     record.id
                     for record in records
@@ -1539,7 +1539,7 @@ class PostgresTaskService:
         if self._stopped.is_set():
             return
         with self.resources.environment(self.scope.scope_id) as environment:
-            records, _ = environment.tasks.list(statuses={"queued"}, limit=100)
+            records, _ = environment.tasks.list_for_worker(limit=100)
         for record in records:
             if (
                 (not _is_explicit_image_task(record))

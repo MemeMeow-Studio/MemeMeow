@@ -1532,12 +1532,24 @@ class TaskRepository:
         return True
 
     def list(self, *, statuses: set[str] | None = None, task_types: set[str] | None = None, cursor: str | None = None, limit: int = 50) -> tuple[list[Task], str | None]:
-        """按更新时间和 ID 稳定分页列出当前 scope 任务。"""
+        """按创建时间和 ID 稳定分页列出当前 scope 任务。"""
         statement = select(Task).where(Task.scope_id == self.scope.scope_id)
         if statuses:
             statement = statement.where(Task.status.in_(statuses))
         if task_types:
             statement = statement.where(Task.task_type.in_(task_types))
+        if cursor:
+            cursor_record = self.session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.id == cursor))
+            if cursor_record:
+                statement = statement.where((Task.created_at < cursor_record.created_at) | ((Task.created_at == cursor_record.created_at) & (Task.id < cursor_record.id)))
+        statement = statement.order_by(Task.created_at.desc(), Task.id.desc()).limit(max(1, min(limit, 100)) + 1)
+        records = list(self.session.scalars(statement))
+        next_cursor = records[-1].id if len(records) > limit else None
+        return records[:limit], next_cursor
+
+    def list_for_worker(self, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Task], str | None]:
+        """按更新时间和 ID 扫描排队任务，保持 Worker 发现顺序与工作台解耦。"""
+        statement = select(Task).where(Task.scope_id == self.scope.scope_id, Task.status == "queued")
         if cursor:
             cursor_record = self.session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.id == cursor))
             if cursor_record:

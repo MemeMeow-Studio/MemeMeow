@@ -631,7 +631,23 @@ class ImageProcessingRepository:
     def list(self, *, limit: int = 100) -> list[ImageProcessingSnapshot]:
         """分页读取当前 scope job，不返回其他 scope 的 existence。"""
         with self._session() as session:
-            ids = list(session.scalars(select(ImageProcessingJob.id).where(ImageProcessingJob.scope_id == self.scope.scope_id).order_by(ImageProcessingJob.updated_at.desc(), ImageProcessingJob.id.desc()).limit(max(1, min(limit, 500)))))
+            ids = list(session.scalars(select(ImageProcessingJob.id).where(ImageProcessingJob.scope_id == self.scope.scope_id).order_by(ImageProcessingJob.created_at.desc(), ImageProcessingJob.id.desc()).limit(max(1, min(limit, 500)))))
+        return [snapshot for identifier in ids if (snapshot := self.snapshot(identifier)) is not None]
+
+    def list_active(self, *, limit: int = 100) -> list[ImageProcessingSnapshot]:
+        """按最近更新时间读取未完成 Job，供 Worker 有界恢复扫描使用。"""
+        with self._session() as session:
+            ids = list(
+                session.scalars(
+                    select(ImageProcessingJob.id)
+                    .where(
+                        ImageProcessingJob.scope_id == self.scope.scope_id,
+                        ImageProcessingJob.status.in_(ACTIVE_JOB_STATUSES),
+                    )
+                    .order_by(ImageProcessingJob.updated_at.desc(), ImageProcessingJob.id.desc())
+                    .limit(max(1, min(limit, 500)))
+                )
+            )
         return [snapshot for identifier in ids if (snapshot := self.snapshot(identifier)) is not None]
 
     def latest_for_target(self, meme_id: UUID | str, image_sha256: str) -> ImageProcessingSnapshot | None:
@@ -1584,10 +1600,9 @@ class ImageProcessingWorker:
     def reconcile(self, *, limit: int = 100) -> int:
         """扫描当前 scope 未完成 job，逐图安排恢复。"""
         count = 0
-        for snapshot in self.jobs.list(limit=limit):
-            if snapshot.status in {"queued", "running"}:
-                self.schedule(snapshot.job_id)
-                count += 1
+        for snapshot in self.jobs.list_active(limit=limit):
+            self.schedule(snapshot.job_id)
+            count += 1
         return count
 
     def start(self) -> int:

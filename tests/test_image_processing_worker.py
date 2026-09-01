@@ -266,6 +266,22 @@ def test_unknown_standalone_stage_is_rejected() -> None:
         ImageProcessingWorker._canonical_stage("metadata_repair")
 
 
+def test_reconcile_uses_active_job_listing() -> None:
+    """Worker 恢复只消费活动 Job 查询，避免依赖用户工作台排序。"""
+    worker = _worker(_TaskService(), _CountingPolicy())
+    scheduled: list[str] = []
+    worker.jobs = SimpleNamespace(
+        list_active=lambda *, limit: [SimpleNamespace(job_id="active-job", status="queued")],
+        list=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("不得读取用户列表")),
+    )
+    worker.schedule = lambda job_id: scheduled.append(str(job_id))
+    try:
+        assert worker.reconcile(limit=7) == 1
+        assert scheduled == ["active-job"]
+    finally:
+        worker.shutdown()
+
+
 def test_processing_options_use_safe_defaults_but_reject_explicit_empty_values() -> None:
     """缺失选项使用安全默认值，显式空字符串和非布尔值不能静默改写语义。"""
     assert ImageProcessingOptions.normalize() == ImageProcessingOptions(reverse_image_policy="forbid", auto_name=False)

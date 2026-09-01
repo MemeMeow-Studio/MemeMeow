@@ -104,7 +104,7 @@ def test_task_domain_repository_modules_have_one_implementation_each() -> None:
     task_source = Path(persistence_tasks.__file__).read_text(encoding="utf-8")
     assert "claim_generation" in task_source
     assert "lease_expires_at" in task_source
-    assert "updated_at.desc()" in task_source
+    assert "created_at.desc()" in task_source
 
 
 def test_search_repository_package_exports_one_canonical_class() -> None:

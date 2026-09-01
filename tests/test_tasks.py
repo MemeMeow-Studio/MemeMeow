@@ -44,6 +44,47 @@ def test_duplicate_active_type_returns_same_task():
     manager.shutdown()
 
 
+def test_persistent_task_list_orders_by_created_at_and_keeps_cursor_stable(tmp_path):
+    """任务更新时间变化不会改变创建顺序，cursor 仍按创建键连续分页。"""
+    service = PersistentTaskService(tmp_path / "tasks")
+    older = TaskRecord(
+        task_id="task-old",
+        task_type="cache_generation",
+        created_at="2026-08-26T00:00:01Z",
+        updated_at="2026-08-26T00:10:00Z",
+    )
+    newer = TaskRecord(
+        task_id="task-new",
+        task_type="cache_generation",
+        created_at="2026-08-26T00:00:02Z",
+        updated_at="2026-08-26T00:00:03Z",
+    )
+    tie_low = TaskRecord(
+        task_id="task-a",
+        task_type="cache_generation",
+        created_at="2026-08-26T00:00:03Z",
+        updated_at="2026-08-26T00:00:04Z",
+    )
+    tie_high = TaskRecord(
+        task_id="task-z",
+        task_type="cache_generation",
+        created_at="2026-08-26T00:00:03Z",
+        updated_at="2026-08-26T00:00:01Z",
+    )
+    with service._lock:
+        service._records = {item.task_id: item for item in (older, newer, tie_low, tie_high)}
+
+    first_page, cursor = service.list(limit=1)
+    assert [item.task_id for item in first_page] == ["task-z"]
+    second_page, next_cursor = service.list(cursor=cursor, limit=1)
+    assert [item.task_id for item in second_page] == ["task-a"]
+    assert next_cursor == "task-a"
+
+    older.updated_at = "2026-08-26T23:00:00Z"
+    full_page, _ = service.list(limit=10)
+    assert [item.task_id for item in full_page] == ["task-z", "task-a", "task-new", "task-old"]
+
+
 def test_failure_is_diagnostic_and_shutdown_marks_pending_failed():
     """异常和服务关闭都生成稳定失败信息。"""
     manager = TaskManager(max_workers=1)

@@ -84,6 +84,96 @@ describe('TasksWorkspace', () => {
     wrapper.unmount()
   })
 
+  it('普通任务和图片处理 Job 按创建时间混排，不按更新时间排序', async () => {
+    tasks.mockResolvedValue({ items: [{
+      task_id: 'task-old',
+      task_type: 'cache_generation',
+      submission_mode: 'standalone',
+      status: 'succeeded',
+      created_at: '2026-08-26T00:00:01Z',
+      updated_at: '2026-08-26T00:10:00Z',
+    }], next_cursor: null })
+    processingJobs.mockResolvedValue({ items: [{
+      task_id: 'job-task',
+      task_type: 'image_processing',
+      job_id: 'job-new',
+      meme_id: 'meme-1',
+      processing_job_id: 'job-new',
+      submission_mode: 'pipeline',
+      revision: 1,
+      image_sha256: 'sha',
+      reverse_image_policy: 'forbid',
+      status: 'succeeded',
+      created_at: '2026-08-26T00:00:02Z',
+      updated_at: '2026-08-26T00:00:03Z',
+      stages: [],
+    }] })
+
+    const wrapper = mount(TasksWorkspace)
+    await flushPromises()
+
+    const entries = wrapper.findAll('.processing-job, .task-row')
+    expect(entries).toHaveLength(2)
+    expect(entries[0].classes()).toContain('processing-job')
+    expect(entries[1].classes()).toContain('task-row')
+    const headers = wrapper.findAll('[role="columnheader"]')
+    expect(headers[headers.length - 1].text()).toBe('创建时间')
+    expect(wrapper.text()).not.toContain('最近更新')
+    wrapper.unmount()
+  })
+
+  it('旧任务摘要缺少创建时间时，排序和时间显示使用同一回退值', async () => {
+    tasks
+      .mockResolvedValueOnce({ items: [
+        { task_id: 'task-old', task_type: 'cache_generation', status: 'running', updated_at: '2026-08-26T00:00:01Z' },
+        { task_id: 'task-new', task_type: 'metadata_repair', status: 'succeeded', updated_at: '2026-08-26T00:00:02Z' },
+      ], next_cursor: null })
+      .mockResolvedValueOnce({ items: [
+        { task_id: 'task-old', task_type: 'cache_generation', status: 'succeeded', updated_at: '2026-08-26T01:00:00Z' },
+        { task_id: 'task-new', task_type: 'metadata_repair', status: 'succeeded', updated_at: '2026-08-26T00:00:02Z' },
+      ], next_cursor: null })
+    const wrapper = mount(TasksWorkspace)
+    await flushPromises()
+
+    const rows = wrapper.findAll('.task-row')
+    expect(rows).toHaveLength(2)
+    const initialTypes = rows.map((row) => row.find('.task-type-cell').text())
+    expect(initialTypes[0]).toContain('元数据修复')
+    expect(initialTypes[1]).toContain('检索缓存')
+    const initialTimes = rows.map((row) => row.find('time').text())
+    expect(initialTimes.every((value) => value !== '—')).toBe(true)
+
+    await vi.advanceTimersByTimeAsync(2500)
+    await flushPromises()
+    const refreshedRows = wrapper.findAll('.task-row')
+    expect(refreshedRows.map((row) => row.find('.task-type-cell').text())).toEqual(initialTypes)
+    expect(refreshedRows.map((row) => row.find('time').text())).toEqual(initialTimes)
+    wrapper.unmount()
+  })
+
+  it('轮询更新任务的 updated_at 不改变创建顺序', async () => {
+    tasks
+      .mockResolvedValueOnce({ items: [
+        { task_id: 'task-old', task_type: 'cache_generation', status: 'running', created_at: '2026-08-26T00:00:01Z', updated_at: '2026-08-26T00:00:02Z' },
+        { task_id: 'task-new', task_type: 'metadata_repair', status: 'running', created_at: '2026-08-26T00:00:02Z', updated_at: '2026-08-26T00:00:03Z' },
+      ], next_cursor: null })
+      .mockResolvedValueOnce({ items: [
+        { task_id: 'task-old', task_type: 'cache_generation', status: 'succeeded', created_at: '2026-08-26T00:00:01Z', updated_at: '2026-08-26T01:00:00Z' },
+        { task_id: 'task-new', task_type: 'metadata_repair', status: 'running', created_at: '2026-08-26T00:00:02Z', updated_at: '2026-08-26T00:00:03Z' },
+      ], next_cursor: null })
+    const wrapper = mount(TasksWorkspace)
+    await flushPromises()
+    const before = wrapper.findAll('.task-row').map((row) => row.find('.task-type-cell').text())
+
+    await vi.advanceTimersByTimeAsync(2500)
+    await flushPromises()
+    const after = wrapper.findAll('.task-row').map((row) => row.find('.task-type-cell').text())
+    expect(after).toEqual(before)
+    const updatedRow = wrapper.findAll('.task-row').find((row) => row.find('.task-type-cell').text().includes('检索缓存'))
+    expect(updatedRow?.text()).toContain('已完成')
+    wrapper.unmount()
+  })
+
   it('初始请求未完成时卸载不会重新注册轮询', async () => {
     let resolveTasks
     tasks.mockImplementationOnce(() => new Promise((resolve) => { resolveTasks = resolve }))

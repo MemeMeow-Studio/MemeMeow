@@ -41,6 +41,7 @@ let listRequestId = 0
 let processingRequestId = 0
 let detailRequestId = 0
 const latestProcessingByMeme = new Map<string, ImageProcessingJob>()
+const fallbackCreatedAtByKey = new Map<string, string>()
 
 const terminalJobStatuses = new Set(['succeeded', 'failed', 'blocked', 'unknown_execution', 'warning', 'skipped'])
 
@@ -92,6 +93,50 @@ function applyProcessingJobs(nextJobs: ImageProcessingJob[]): void {
 const visibleTaskItems = computed(() => taskItems.value.filter((item) => !(item.submission_mode === 'pipeline' && item.processing_job_id)))
 const hasActiveTasks = computed(() => taskItems.value.some((item) => item.status === 'queued' || item.status === 'running') || processingJobs.value.some((item) => ['queued', 'running'].includes(item.status)))
 const activityById = computed(() => new Map(taskItems.value.map((item) => [item.task_id, taskActivity(item)])))
+
+type TaskListEntry =
+  | { kind: 'job'; key: string; identifier: string; timestamp: number; job: ImageProcessingJob }
+  | { kind: 'task'; key: string; identifier: string; timestamp: number; task: TaskItem }
+
+/** 读取列表条目的创建时间；旧摘要缺少创建时间时仅首次回退更新时间。 */
+function taskCreatedValue(item: { created_at?: string; updated_at?: string }, key: string): string | undefined {
+  if (item.created_at && Number.isFinite(Date.parse(item.created_at))) return item.created_at
+  const fallback = fallbackCreatedAtByKey.get(key)
+  if (fallback) return fallback
+  if (item.updated_at && Number.isFinite(Date.parse(item.updated_at))) {
+    fallbackCreatedAtByKey.set(key, item.updated_at)
+    return item.updated_at
+  }
+  return undefined
+}
+
+/** 将列表条目的创建时间转换为排序键，确保排序与展示使用同一回退语义。 */
+function taskCreatedTimestamp(item: { created_at?: string; updated_at?: string }, key: string): number {
+  const value = taskCreatedValue(item, key)
+  return value ? Date.parse(value) : Number.NaN
+}
+
+/** 合并父 Job 与可见任务，按创建时间倒序并以标识符稳定打破并列。 */
+const taskEntries = computed<TaskListEntry[]>(() => {
+  const entries: TaskListEntry[] = [
+    ...processingJobs.value.map((job) => {
+      const key = `job:${job.job_id}`
+      return { kind: 'job' as const, key, identifier: job.job_id, timestamp: taskCreatedTimestamp(job, key), job }
+    }),
+    ...visibleTaskItems.value.map((task) => {
+      const key = `task:${task.task_id}`
+      return { kind: 'task' as const, key, identifier: task.task_id, timestamp: taskCreatedTimestamp(task, key), task }
+    }),
+  ]
+  return entries.sort((left, right) => {
+    const leftValid = Number.isFinite(left.timestamp)
+    const rightValid = Number.isFinite(right.timestamp)
+    if (leftValid !== rightValid) return leftValid ? -1 : 1
+    if (leftValid && left.timestamp !== right.timestamp) return right.timestamp - left.timestamp
+    if (left.identifier === right.identifier) return 0
+    return left.identifier > right.identifier ? -1 : 1
+  })
+})
 
 /** 判断自动重命名叶子 Task 是否属于可降级 warning，兼容新旧响应字段。 */
 function canRetryAutoRename(task: TaskItem): boolean {
@@ -250,60 +295,61 @@ onBeforeUnmount(() => {
       <label>类型<select v-model="type" aria-label="按类型筛选" @change="loadTasks()"><option value="">全部</option><option value="meme_context_generation">语境生成</option><option value="visual_embedding_generation">图片向量</option><option value="image_auto_rename">自动重命名</option><option value="text_embedding_generation">文本 embedding</option><option value="cache_generation">检索缓存</option><option value="metadata_repair">元数据修复</option></select></label>
     </div>
     <div class="task-table" :class="{ loading }" role="table" aria-label="处理任务列表">
-      <div class="task-head" role="row"><span role="columnheader">状态</span><span role="columnheader">类型</span><span role="columnheader">来源</span><span role="columnheader">关联图片</span><span role="columnheader">进度</span><span role="columnheader">最近更新</span></div>
-      <details v-for="job in processingJobs" :key="job.job_id" class="processing-job">
-        <summary class="processing-job-parent">
-          <span class="task-status-cell"><i :class="`status-dot ${job.status}`" aria-hidden="true"></i>{{ taskStatusLabel(job.status) }}</span>
-          <span>
-            <strong>完整图片处理</strong>
-            <small>
-              <template v-if="showTaskDiagnostics">Job #{{ job.revision }} · 图片 ID {{ job.meme_id }} · Job ID {{ job.job_id }}</template>
-              <template v-else>第 {{ job.revision }} 次处理</template>
-            </small>
+      <div class="task-head" role="row"><span role="columnheader">状态</span><span role="columnheader">类型</span><span role="columnheader">来源</span><span role="columnheader">关联图片</span><span role="columnheader">进度</span><span role="columnheader">创建时间</span></div>
+      <template v-for="entry in taskEntries" :key="entry.key">
+        <details v-if="entry.kind === 'job'" class="processing-job">
+          <summary class="processing-job-parent">
+            <span class="task-status-cell"><i :class="`status-dot ${entry.job.status}`" aria-hidden="true"></i>{{ taskStatusLabel(entry.job.status) }}</span>
+            <span>
+              <strong>完整图片处理</strong>
+              <small>
+                <template v-if="showTaskDiagnostics">Job #{{ entry.job.revision }} · 图片 ID {{ entry.job.meme_id }} · Job ID {{ entry.job.job_id }}</template>
+                <template v-else>第 {{ entry.job.revision }} 次处理</template>
+              </small>
+            </span>
+            <span class="task-source">{{ submissionModeLabel('pipeline') }}</span>
+            <span>{{ entry.job.current_stage ? imageStageLabel(entry.job.current_stage) : processingPipelineLabel(entry.job) }}</span>
+            <span>{{ entry.job.progress == null ? '—' : `${Math.round(entry.job.progress * 100)}%` }}</span>
+            <time>{{ formatTaskTime(taskCreatedValue(entry.job, entry.key)) }}</time>
+          </summary>
+          <p v-if="entry.job.has_warnings" class="inline-notice warning" role="status">处理已完成，自动重命名未完成</p>
+          <div class="processing-job-stages">
+            <button v-for="stage in entry.job.stages" :key="`${entry.job.job_id}:${stage.stage}`" class="task-stage-row" type="button" :disabled="!stage.task_id" @click="stage.task_id && openTask(stage.task_id, $event)">
+              <span><i :class="`status-dot ${stage.status}`" aria-hidden="true"></i>{{ imageStageLabel(stage.stage) }}</span>
+              <span>{{ imageStageStatusLabel(stage.status) }}</span>
+              <span v-if="showTaskDiagnostics">{{ stage.task_id || (stage.status === 'skipped' ? '未启用' : '等待创建叶子任务') }}</span>
+              <span v-else>{{ stage.attempt != null ? `第 ${stage.attempt} 次尝试` : stage.status === 'skipped' ? '未启用' : '—' }}</span>
+              <span v-if="stage.error" class="task-error">{{ stage.error.error || '阶段失败' }}</span>
+              <span v-if="stage.status === 'warning'" class="task-error warning">处理完成，自动重命名未完成</span>
+            </button>
+          </div>
+        </details>
+        <button
+          v-else
+          class="task-row"
+          :class="{ selected: selectedTask?.task_id === entry.task.task_id }"
+          type="button"
+          role="row"
+          :aria-label="taskRowAriaLabel(entry.task)"
+          @click="openTask(entry.task.task_id, $event)"
+        >
+          <span class="task-status-cell" role="cell"><i :class="`status-dot ${entry.task.status}`" aria-hidden="true"></i>{{ taskStatusLabel(entry.task.status) }}</span>
+          <span class="task-type-cell" role="cell" data-label="类型">
+            <span>{{ taskTypeLabel(entry.task.task_type) }}</span>
+            <span v-if="activityById.get(entry.task.task_id)" class="task-activity" :aria-label="activityById.get(entry.task.task_id)?.ariaLabel">
+              <b>{{ activityById.get(entry.task.task_id)?.turns }}</b><time>{{ activityById.get(entry.task.task_id)?.lastActivity }}</time>
+            </span>
           </span>
-          <span class="task-source">{{ submissionModeLabel('pipeline') }}</span>
-          <span>{{ job.current_stage ? imageStageLabel(job.current_stage) : processingPipelineLabel(job) }}</span>
-          <span>{{ job.progress == null ? '—' : `${Math.round(job.progress * 100)}%` }}</span>
-          <time>{{ formatTaskTime(job.updated_at) }}</time>
-        </summary>
-        <p v-if="job.has_warnings" class="inline-notice warning" role="status">处理已完成，自动重命名未完成</p>
-        <div class="processing-job-stages">
-          <button v-for="stage in job.stages" :key="`${job.job_id}:${stage.stage}`" class="task-stage-row" type="button" :disabled="!stage.task_id" @click="stage.task_id && openTask(stage.task_id, $event)">
-            <span><i :class="`status-dot ${stage.status}`" aria-hidden="true"></i>{{ imageStageLabel(stage.stage) }}</span>
-            <span>{{ imageStageStatusLabel(stage.status) }}</span>
-            <span v-if="showTaskDiagnostics">{{ stage.task_id || (stage.status === 'skipped' ? '未启用' : '等待创建叶子任务') }}</span>
-            <span v-else>{{ stage.attempt != null ? `第 ${stage.attempt} 次尝试` : stage.status === 'skipped' ? '未启用' : '—' }}</span>
-            <span v-if="stage.error" class="task-error">{{ stage.error.error || '阶段失败' }}</span>
-            <span v-if="stage.status === 'warning'" class="task-error warning">处理完成，自动重命名未完成</span>
-          </button>
-        </div>
-      </details>
-      <button
-        v-for="item in visibleTaskItems"
-        :key="item.task_id"
-        class="task-row"
-        :class="{ selected: selectedTask?.task_id === item.task_id }"
-        type="button"
-        role="row"
-        :aria-label="taskRowAriaLabel(item)"
-        @click="openTask(item.task_id, $event)"
-      >
-        <span class="task-status-cell" role="cell"><i :class="`status-dot ${item.status}`" aria-hidden="true"></i>{{ taskStatusLabel(item.status) }}</span>
-        <span class="task-type-cell" role="cell" data-label="类型">
-          <span>{{ taskTypeLabel(item.task_type) }}</span>
-          <span v-if="activityById.get(item.task_id)" class="task-activity" :aria-label="activityById.get(item.task_id)?.ariaLabel">
-            <b>{{ activityById.get(item.task_id)?.turns }}</b><time>{{ activityById.get(item.task_id)?.lastActivity }}</time>
-          </span>
-        </span>
-        <span class="task-source" role="cell" data-label="来源">{{ submissionModeLabel(item.historical_unclassified ? 'unclassified' : item.submission_mode) }}<small v-if="item.image_stage || item.task_type === 'image_auto_rename'"> · {{ imageStageLabel(item.image_stage || 'auto_rename') }}</small></span>
-        <span class="task-image" role="cell" data-label="图片">{{ item.image?.filename || '—' }}</span>
-        <span class="task-progress" role="cell" data-label="进度">{{ item.progress == null ? '—' : `${Math.round(item.progress * 100)}%` }}</span>
-        <time role="cell">{{ formatTaskTime(item.updated_at) }}</time>
-      </button>
-      <template v-if="loading && !taskItems.length">
+          <span class="task-source" role="cell" data-label="来源">{{ submissionModeLabel(entry.task.historical_unclassified ? 'unclassified' : entry.task.submission_mode) }}<small v-if="entry.task.image_stage || entry.task.task_type === 'image_auto_rename'"> · {{ imageStageLabel(entry.task.image_stage || 'auto_rename') }}</small></span>
+          <span class="task-image" role="cell" data-label="图片">{{ entry.task.image?.filename || '—' }}</span>
+          <span class="task-progress" role="cell" data-label="进度">{{ entry.task.progress == null ? '—' : `${Math.round(entry.task.progress * 100)}%` }}</span>
+          <time role="cell">{{ formatTaskTime(taskCreatedValue(entry.task, entry.key)) }}</time>
+        </button>
+      </template>
+      <template v-if="loading && !taskEntries.length">
         <div v-for="n in 5" :key="n" class="task-skeleton"></div>
       </template>
-      <div v-if="!loading && !taskItems.length" class="empty-state compact"><h2>没有匹配的任务</h2></div>
+      <div v-if="!loading && !taskEntries.length" class="empty-state compact"><h2>没有匹配的任务</h2></div>
     </div>
     <button v-if="cursor" class="quiet load-more" type="button" @click="loadTasks({ append: true })">加载更多</button>
     <TaskDrawer

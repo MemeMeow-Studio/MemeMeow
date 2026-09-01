@@ -12,7 +12,7 @@ import hashlib
 import json
 import threading
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -1676,6 +1676,64 @@ def test_task_claim_fencing_and_global_lane_capacity(postgres_resources) -> None
     with postgres_resources.environment("local") as environment:
         assert environment.tasks.update_fenced(task_id, active[1] - 1, "worker-a", status="succeeded") is False
         assert environment.tasks.update_fenced(task_id, active[1], "worker-a" if active[0] else "worker-b", status="succeeded") in {True, False}
+
+
+def test_task_repository_list_orders_by_created_at_and_stable_cursor(postgres_resources) -> None:
+    """任务列表按创建键倒序分页，更新时间变化不会影响 cursor 续页。"""
+    with postgres_resources.environment("local") as environment:
+        older = environment.tasks.submit(task_type="list-probe", payload={}, task_id="task-list-old", dedupe_key="list-old")
+        newer = environment.tasks.submit(task_type="list-probe", payload={}, task_id="task-list-new", dedupe_key="list-new")
+        tie_low = environment.tasks.submit(task_type="list-probe", payload={}, task_id="task-list-a", dedupe_key="list-a")
+        tie_high = environment.tasks.submit(task_type="list-probe", payload={}, task_id="task-list-z", dedupe_key="list-z")
+        older.created_at = datetime(2026, 8, 26, 0, 0, 1, tzinfo=timezone.utc)
+        older.updated_at = datetime(2026, 8, 26, 0, 10, 0, tzinfo=timezone.utc)
+        newer.created_at = datetime(2026, 8, 26, 0, 0, 2, tzinfo=timezone.utc)
+        newer.updated_at = datetime(2026, 8, 26, 0, 0, 3, tzinfo=timezone.utc)
+        tie_low.created_at = datetime(2026, 8, 26, 0, 0, 3, tzinfo=timezone.utc)
+        tie_high.created_at = tie_low.created_at
+        environment.uow.session.flush()
+
+        first_page, cursor = environment.tasks.list(limit=2)
+        assert [item.id for item in first_page] == ["task-list-z", "task-list-a"]
+        assert cursor == "task-list-a"
+        second_page, next_cursor = environment.tasks.list(cursor=cursor, limit=2)
+        assert [item.id for item in second_page] == ["task-list-new", "task-list-old"]
+        assert next_cursor is None
+
+        older.updated_at = datetime(2026, 8, 26, 23, 0, 0, tzinfo=timezone.utc)
+        environment.uow.session.flush()
+        stable_page, _ = environment.tasks.list(limit=10)
+        assert [item.id for item in stable_page] == ["task-list-z", "task-list-a", "task-list-new", "task-list-old"]
+
+
+def test_image_processing_repository_list_orders_by_created_at(postgres_resources) -> None:
+    """图片处理父 Job 按创建时间倒序，状态更新时间不改变列表顺序。"""
+    coordinator = StorageCoordinator(postgres_resources)
+    old_meme = coordinator.upload(b"list-job-old", target_key="list-job-old.png", extension=".png", context={}, provenance={})
+    new_meme = coordinator.upload(b"list-job-new", target_key="list-job-new.png", extension=".png", context={}, provenance={})
+    repository = ImageProcessingRepository(postgres_resources, "local")
+    old_job = repository.create_or_reuse(old_meme.id, old_meme.sha256, config={"agent_model": "list-agent"})
+    new_job = repository.create_or_reuse(new_meme.id, new_meme.sha256, config={"agent_model": "list-agent"})
+    with postgres_resources.factory() as session:
+        old_row = session.get(ImageProcessingJob, old_job.id)
+        new_row = session.get(ImageProcessingJob, new_job.id)
+        assert old_row is not None and new_row is not None
+        old_row.created_at = datetime(2026, 8, 26, 0, 0, 1, tzinfo=timezone.utc)
+        old_row.updated_at = datetime(2026, 8, 26, 0, 10, 0, tzinfo=timezone.utc)
+        new_row.created_at = datetime(2026, 8, 26, 0, 0, 2, tzinfo=timezone.utc)
+        new_row.updated_at = datetime(2026, 8, 26, 0, 0, 3, tzinfo=timezone.utc)
+        session.commit()
+
+    snapshots = repository.list(limit=2)
+    assert [item.job_id for item in snapshots] == [str(new_job.id), str(old_job.id)]
+
+    with postgres_resources.factory() as session:
+        old_row = session.get(ImageProcessingJob, old_job.id)
+        assert old_row is not None
+        old_row.status = "succeeded"
+        session.commit()
+    active_snapshots = repository.list_active(limit=2)
+    assert [item.job_id for item in active_snapshots] == [str(new_job.id)]
 
 
 def test_fair_claim_rotates_four_scopes_and_orders_tasks(postgres_resources, postgres_engine: Engine) -> None:

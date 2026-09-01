@@ -686,14 +686,14 @@ class PersistentTaskService:
             return TaskRecord.from_dict(record.as_dict(include_payload=True))
 
     def list(self, *, statuses: set[str] | None = None, task_types: set[str] | None = None, cursor: str | None = None, limit: int = 50) -> tuple[list[TaskRecord], str | None]:
-        """按更新时间和 ID 稳定倒序分页，返回受调用方控制的记录快照。"""
+        """按创建时间和 ID 稳定倒序分页，返回受调用方控制的记录快照。"""
         with self._lock:
             records = list(self._records.values())
             if statuses:
                 records = [record for record in records if record.status in statuses]
             if task_types:
                 records = [record for record in records if record.task_type in task_types]
-            records.sort(key=lambda record: (record.updated_at, record.task_id), reverse=True)
+            records.sort(key=lambda record: (record.created_at, record.task_id), reverse=True)
             if cursor:
                 try:
                     position = next(index for index, record in enumerate(records) if record.task_id == cursor) + 1
