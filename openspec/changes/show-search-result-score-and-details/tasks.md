@@ -20,5 +20,5 @@
 
 - [x] 4.1 运行后端目标测试、Vue 目标测试、类型检查、生产构建、OpenSpec strict validate 和 `git diff --check`，记录实际结果。
 - [x] 4.2 对抗性复核分数错位、非有限值、scope/媒体访问边界、按钮嵌套、模态叠加和 320px 布局；修复所有 P0/P1 后重新验证。
-- [ ] 4.3 在开源仓库形成边界清晰的 Git commit，记录精确 SHA、变更范围和验证结果，并停在用户审核门禁，不访问或推送 `upstream`。
+- [x] 4.3 在开源仓库形成边界清晰的 Git commit，记录精确 SHA、变更范围和验证结果，并停在用户审核门禁，不访问或推送 `upstream`。
 - [ ] 4.4 用户审核且明确授权后，使已审核 commit 进入官方 `upstream`；随后仅在用户明确授权 Server 同步后 fetch 并核验精确 SHA，以普通 merge 进入 Server，验证祖先关系并记录 Server merge SHA。
