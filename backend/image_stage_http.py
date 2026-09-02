@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from backend.image_processing import ImageProcessingError, ImageProcessingWorker
 from backend.metadata import MetadataError
 from backend.operation_policy import OperationPolicyError
+from backend.public_dto import normalize_public_filename, normalize_public_identifier
 
 
 class _StrictRequestModel(BaseModel):
@@ -64,6 +65,34 @@ TaskSummary = Callable[[Request, Any], dict[str, object]]
 OperationError = Callable[[OperationPolicyError], HTTPException]
 
 
+def _job_snapshot_payload(request: Request, snapshot: Any, *, service: Service) -> dict[str, object]:
+    """为 Job 快照补充当前 scope 内可读取图片的公开摘要。
+
+    输入是 repository 返回的安全快照；输出增加与普通任务一致的 ``image`` 字段。
+    调用场景是 Job 列表、详情和重试响应，图片不可读取时只保留稳定 Meme 标识。
+    """
+    data = snapshot.as_dict()
+    meme_id = normalize_public_identifier(data.get("meme_id"))
+    if not meme_id:
+        return data
+    image_data: dict[str, object] = {"meme_id": meme_id}
+    try:
+        meme_record, image = service(request, "metadata").image_for_meme(meme_id)
+        image_data["media_url"] = f"/media/{meme_id}"
+        display_name = normalize_public_filename(getattr(meme_record, "display_name", None))
+        extension = getattr(meme_record, "extension", None)
+        saved_filename = normalize_public_filename(f"{display_name}{extension}") if display_name and isinstance(extension, str) else None
+        filename = saved_filename or normalize_public_filename(getattr(image, "name", None))
+        if filename:
+            image_data.update({"filename": filename, "saved_filename": filename})
+        if display_name:
+            image_data["display_name"] = display_name
+    except MetadataError:
+        pass
+    data["image"] = image_data
+    return data
+
+
 def _stage_error(
     exc: ImageProcessingError,
     *,
@@ -85,6 +114,7 @@ async def get_image_processing_job(
     request: Request,
     job_id: str,
     *,
+    service: Service,
     error: ErrorFactory,
     processing_repository: ProcessingRepository,
 ) -> dict[str, object]:
@@ -99,13 +129,14 @@ async def get_image_processing_job(
         snapshot = None
     if snapshot is None:
         raise error(404, "image_processing_job_not_found", "图片处理任务不存在")
-    return snapshot.as_dict()
+    return _job_snapshot_payload(request, snapshot, service=service)
 
 
 async def list_image_processing_jobs(
     request: Request,
     *,
     limit: int = Query(default=50, ge=1, le=200),
+    service: Service,
     processing_repository: ProcessingRepository,
 ) -> dict[str, object]:
     """列出当前 scope 的完整 pipeline Job。
@@ -114,7 +145,7 @@ async def list_image_processing_jobs(
     """
     repository = processing_repository(request)
     snapshots = repository.list(limit=limit)
-    return {"items": [snapshot.as_dict() for snapshot in snapshots], "next_cursor": None}
+    return {"items": [_job_snapshot_payload(request, snapshot, service=service) for snapshot in snapshots], "next_cursor": None}
 
 
 async def retry_image_processing_job(
@@ -122,6 +153,7 @@ async def retry_image_processing_job(
     job_id: str,
     payload: ProcessingRetryRequest | None = None,
     *,
+    service: Service,
     error: ErrorFactory,
     processing_repository: ProcessingRepository,
     processing_worker: ProcessingWorker,
@@ -163,7 +195,7 @@ async def retry_image_processing_job(
     snapshot = repository.snapshot(job.id)
     if snapshot is None:
         raise error(503, "image_processing_job_unavailable", "图片处理任务当前不可用")
-    return snapshot.as_dict()
+    return _job_snapshot_payload(request, snapshot, service=service)
 
 
 async def submit_image_stage(

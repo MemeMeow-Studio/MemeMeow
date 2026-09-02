@@ -27,9 +27,9 @@ def _error(status: int, code: str, message: str) -> HTTPException:
     return HTTPException(status_code=status, detail={"error": code, "message": message})
 
 
-def _snapshot(value: str) -> SimpleNamespace:
+def _snapshot(value: str, *, meme_id: str = "meme-1") -> SimpleNamespace:
     """构造只返回公开字段的 Job snapshot。"""
-    return SimpleNamespace(as_dict=lambda: {"job_id": value, "status": "queued"})
+    return SimpleNamespace(as_dict=lambda: {"job_id": value, "meme_id": meme_id, "status": "queued"})
 
 
 def test_image_stage_routes_keep_canonical_alias_snapshot_and_order() -> None:
@@ -109,11 +109,44 @@ def test_job_reads_use_the_injected_scope_repository_once() -> None:
         assert received is request
         return repository
 
-    detail = asyncio.run(image_stage_http.get_image_processing_job(request, "job-1", error=_error, processing_repository=repository_factory))
-    listing = asyncio.run(image_stage_http.list_image_processing_jobs(request, limit=7, processing_repository=repository_factory))
-    assert detail == {"job_id": "job-1", "status": "queued"}
-    assert listing == {"items": [{"job_id": "job-1", "status": "queued"}], "next_cursor": None}
-    assert calls == [("factory", request), ("snapshot", "job-1"), ("factory", request), ("list", 7)]
+    def service(received: object, name: str) -> object:
+        """返回当前 scope 图片，并记录安全摘要所需的元数据读取。"""
+        calls.append(("service", received, name))
+        assert received is request
+        assert name == "metadata"
+        return SimpleNamespace(image_for_meme=lambda meme_id: (SimpleNamespace(id=meme_id), Path("/runtime/sample.png")))
+
+    detail = asyncio.run(image_stage_http.get_image_processing_job(request, "job-1", service=service, error=_error, processing_repository=repository_factory))
+    listing = asyncio.run(image_stage_http.list_image_processing_jobs(request, limit=7, service=service, processing_repository=repository_factory))
+    expected = {"job_id": "job-1", "meme_id": "meme-1", "status": "queued", "image": {"meme_id": "meme-1", "filename": "sample.png", "saved_filename": "sample.png", "media_url": "/media/meme-1"}}
+    assert detail == expected
+    assert listing == {"items": [expected], "next_cursor": None}
+    assert calls == [
+        ("factory", request), ("snapshot", "job-1"), ("service", request, "metadata"),
+        ("factory", request), ("list", 7), ("service", request, "metadata"),
+    ]
+
+
+def test_job_image_summary_keeps_identifier_when_image_is_unreadable() -> None:
+    """图片被删除或指纹不匹配时不泄漏路径，并保留可关联的 Meme ID。"""
+    request = _request()
+    repository = SimpleNamespace(snapshot=lambda _job_id: _snapshot("job-1"))
+    service = lambda _request, _name: SimpleNamespace(
+        image_for_meme=lambda _meme_id: (_ for _ in ()).throw(MetadataError("metadata_missing"))
+    )
+
+    result = asyncio.run(
+        image_stage_http.get_image_processing_job(
+            request,
+            "job-1",
+            service=service,
+            error=_error,
+            processing_repository=lambda _request: repository,
+        )
+    )
+
+    assert result["image"] == {"meme_id": "meme-1"}
+    assert "/" not in str(result["image"])
 
 
 def test_retry_creates_new_revision_without_reactivating_old_job() -> None:
@@ -162,6 +195,7 @@ def test_retry_creates_new_revision_without_reactivating_old_job() -> None:
         image_stage_http.retry_image_processing_job(
             request,
             "old-job",
+            service=lambda _request, _name: SimpleNamespace(image_for_meme=lambda meme_id: (SimpleNamespace(id=meme_id), Path("sample.png"))),
             error=_error,
             processing_repository=lambda received: calls.append(("repository", received)) or Repository(),
             processing_worker=lambda received: calls.append(("worker", received)) or Worker(),
@@ -169,7 +203,7 @@ def test_retry_creates_new_revision_without_reactivating_old_job() -> None:
             processing_config=lambda received: calls.append(("config", received)) or {"version": "new"},
         )
     )
-    assert result == {"job_id": "new-job", "status": "queued"}
+    assert result == {"job_id": "new-job", "meme_id": "meme-1", "status": "queued", "image": {"meme_id": "meme-1", "filename": "sample.png", "saved_filename": "sample.png", "media_url": "/media/meme-1"}}
     assert [item[0] for item in calls] == ["repository", "get", "normalize", "config", "retry", "worker", "schedule", "snapshot"]
 
 
@@ -186,6 +220,7 @@ def test_retry_invalid_identifier_is_projected_as_missing_job() -> None:
             image_stage_http.retry_image_processing_job(
                 request,
                 "not-a-uuid",
+                service=lambda _request, _name: None,
                 error=_error,
                 processing_repository=repository_factory,
                 processing_worker=lambda _request: None,

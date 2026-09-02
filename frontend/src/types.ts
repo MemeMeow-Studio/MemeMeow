@@ -112,6 +112,8 @@ export interface AgentActivityView {
 export interface TaskImage {
   meme_id: string
   filename?: string
+  display_name?: string
+  saved_filename?: string
   media_url?: string
 }
 
@@ -160,6 +162,7 @@ export interface ImageProcessingJob {
   task_type: 'image_processing'
   job_id: string
   meme_id: string
+  image?: TaskImage
   submission_mode: 'pipeline'
   image_stage?: null
   processing_job_id: string

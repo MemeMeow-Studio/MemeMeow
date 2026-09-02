@@ -200,6 +200,8 @@ describe('TasksWorkspace', () => {
       reverse_image_policy: 'forbid',
       auto_name: false,
       status: 'succeeded',
+      current_stage: 'agent',
+      image: { meme_id: 'meme-1', filename: 'sample.png', media_url: '/media/meme-1' },
       has_warnings: false,
       warnings: [],
       stages: [
@@ -213,6 +215,8 @@ describe('TasksWorkspace', () => {
     await flushPromises()
 
     expect(wrapper.text()).toContain('四阶段流水线')
+    expect(wrapper.get('.processing-job-parent .task-image').text()).toBe('sample.png')
+    expect(wrapper.get('.processing-job-parent').text()).not.toContain('Agent 语境')
     expect(wrapper.text()).toContain('Agent 语境处理中')
     expect(wrapper.text()).toContain('自动重命名未启用')
     expect(wrapper.text()).toContain('未启用')

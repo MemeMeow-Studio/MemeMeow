@@ -1594,6 +1594,7 @@ async def list_image_processing_jobs(request: Request, limit: int = Query(defaul
     return await _list_image_processing_jobs_http(
         request,
         limit=limit,
+        service=_service,
         processing_repository=_processing_repository,
     )
 
@@ -1605,6 +1606,7 @@ async def get_image_processing_job(request: Request, job_id: str) -> dict[str, o
     return await _get_image_processing_job_http(
         request,
         job_id,
+        service=_service,
         error=_error,
         processing_repository=_processing_repository,
     )
@@ -1756,6 +1758,7 @@ async def retry_image_processing_job(request: Request, job_id: str, payload: Pro
         request,
         job_id,
         payload,
+        service=_service,
         error=_error,
         processing_repository=_processing_repository,
         processing_worker=_processing_worker,

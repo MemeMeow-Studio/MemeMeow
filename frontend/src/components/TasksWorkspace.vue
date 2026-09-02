@@ -304,11 +304,11 @@ onBeforeUnmount(() => {
               <strong>完整图片处理</strong>
               <small>
                 <template v-if="showTaskDiagnostics">Job #{{ entry.job.revision }} · 图片 ID {{ entry.job.meme_id }} · Job ID {{ entry.job.job_id }}</template>
-                <template v-else>第 {{ entry.job.revision }} 次处理</template>
+                <template v-else>第 {{ entry.job.revision }} 次处理 · {{ processingPipelineLabel(entry.job) }}</template>
               </small>
             </span>
             <span class="task-source">{{ submissionModeLabel('pipeline') }}</span>
-            <span>{{ entry.job.current_stage ? imageStageLabel(entry.job.current_stage) : processingPipelineLabel(entry.job) }}</span>
+            <span class="task-image">{{ entry.job.image?.filename || '—' }}</span>
             <span>{{ entry.job.progress == null ? '—' : `${Math.round(entry.job.progress * 100)}%` }}</span>
             <time>{{ formatTaskTime(taskCreatedValue(entry.job, entry.key)) }}</time>
           </summary>
