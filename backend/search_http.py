@@ -7,6 +7,7 @@ service、媒体解析和统一 HTTP 错误由入口通过 callback 注入，避
 from __future__ import annotations
 
 from collections.abc import Callable
+import math
 from typing import Any
 
 from fastapi import HTTPException, Request
@@ -72,12 +73,24 @@ async def search_images(
     mapped: list[str] = []
     result_media: list[dict[str, object]] = []
     for item in results or []:
-        media = media_for_meme(request, str(item)) if isinstance(item, str) else None
+        if isinstance(item, tuple) and len(item) == 2:
+            meme_id, raw_score = item
+            score = float(raw_score) if isinstance(raw_score, (int, float)) else None
+        elif isinstance(item, str):
+            meme_id, score = item, None
+        else:
+            continue
+        if not isinstance(meme_id, str):
+            continue
+        media = media_for_meme(request, meme_id)
         if media and media not in mapped:
             mapped.append(media)
             if thumbnail_for_meme is not None:
-                projection = thumbnail_for_meme(request, str(item))
-                result_media.append({"meme_id": str(item), "media_url": media, "thumbnail": projection or {"status": "pending", "media_url": None}})
+                projection = thumbnail_for_meme(request, meme_id)
+                entry: dict[str, object] = {"meme_id": meme_id, "media_url": media, "thumbnail": projection or {"status": "pending", "media_url": None}}
+                if score is not None and math.isfinite(score):
+                    entry["score"] = score
+                result_media.append(entry)
         if len(mapped) >= payload.n_results:
             break
     response: dict[str, object] = {"results": mapped}

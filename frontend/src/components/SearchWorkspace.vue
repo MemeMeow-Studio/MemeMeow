@@ -3,7 +3,9 @@
 import { computed, shallowRef } from 'vue'
 import { api } from '../api'
 import { useImageClipboard } from '../composables/useImageClipboard'
-import type { SearchResponse, SearchResultMedia, ServiceConfig } from '../types'
+import type { MemeImage, SearchResponse, SearchResultMedia, ServiceConfig } from '../types'
+import ImagePreviewDialog from './ImagePreviewDialog.vue'
+import SearchResultDetailsDialog from './SearchResultDetailsDialog.vue'
 import { errorMessage, resultIdentity } from '../utils/presentation'
 
 defineProps<{
@@ -25,6 +27,16 @@ const originalFailed = shallowRef(new Set<string>())
 const thumbnailFailed = shallowRef(new Set<string>())
 const visibleFailed = shallowRef(new Set<string>())
 const busy = shallowRef(false)
+interface SearchItem {
+  meme_id: string
+  media_url: string
+  thumbnail?: SearchResultMedia['thumbnail']
+  score?: number
+}
+const detailItem = shallowRef<SearchItem | null>(null)
+const detailTrigger = shallowRef<HTMLElement | null>(null)
+const previewImage = shallowRef<MemeImage | null>(null)
+const previewTrigger = shallowRef<HTMLElement | null>(null)
 const { copyNotice, copyImage } = useImageClipboard()
 
 const uniqueResults = computed(() => {
@@ -53,9 +65,39 @@ const searchItems = computed(() => {
       meme_id: candidate?.meme_id || identity || `result-${index}`,
       media_url: candidate?.media_url || url,
       thumbnail: candidate?.thumbnail,
+      score: candidate?.score,
     }
-  })
+  }) as SearchItem[]
 })
+
+/** 打开搜索结果轻量详情，并记住触发按钮以便关闭后恢复焦点。 */
+function openDetails(item: SearchItem, event: MouseEvent): void {
+  detailTrigger.value = event.currentTarget as HTMLElement
+  detailItem.value = item
+}
+
+/** 兼容旧结果卡片的直接点击；点击内部按钮时由按钮自身处理。 */
+function handleResultItemClick(event: MouseEvent, item: SearchItem): void {
+  if (event.target === event.currentTarget) copyImage(item.media_url)
+}
+
+/** 从轻量详情跳转到复用的图片库完整详情，确保两个模态不会同时存在。 */
+function openLibraryDetails(): void {
+  if (!detailItem.value) return
+  const item = detailItem.value
+  detailItem.value = null
+  previewTrigger.value = detailTrigger.value
+  previewImage.value = {
+    meme_id: item.meme_id,
+    filename: item.meme_id,
+    media_url: item.media_url,
+  }
+}
+
+/** 关闭完整图片详情并把焦点交还给搜索结果详情按钮。 */
+function closePreview(): void {
+  previewImage.value = null
+}
 
 /** 判断旁路缩略图是否可用于当前结果的初始展示。 */
 function hasThumbnail(item: SearchResultMedia): boolean {
@@ -178,19 +220,24 @@ async function runSearch(): Promise<void> {
     </div>
     <template v-if="uniqueResults.length">
       <div class="result-grid">
-        <button
+        <article
           v-for="(item, index) in searchItems"
           :key="`${item.meme_id}:${index}`"
           class="result-item"
-          type="button"
           :aria-label="`复制检索结果 ${index + 1}`"
-          title="复制图片"
-          @click="copyImage(item.media_url)"
+          @click="handleResultItemClick($event, item)"
         >
-          <span class="result-media-frame">
-            <img v-if="!visibleFailed.has(item.meme_id)" :src="resultSource(item)" alt="检索结果" loading="lazy" @error="handleResultImageError($event, item)" />
-            <span v-else class="image-load-fallback" role="img" aria-label="图片暂不可用">图片暂不可用</span>
-          </span>
+          <button class="result-image-button" type="button" :aria-label="`复制检索结果 ${index + 1}`" title="复制图片" @click="copyImage(item.media_url)">
+            <span class="result-media-frame">
+              <img v-if="!visibleFailed.has(item.meme_id)" :src="resultSource(item)" alt="检索结果" loading="lazy" @error="handleResultImageError($event, item)" />
+              <span v-else class="image-load-fallback" role="img" aria-label="图片暂不可用">图片暂不可用</span>
+            </span>
+          </button>
+          <div class="result-item-footer">
+            <span v-if="typeof item.score === 'number' && Number.isFinite(item.score)" class="result-score">匹配度 {{ item.score.toFixed(4) }}</span>
+            <span v-else class="result-score">匹配度不可用</span>
+            <button class="quiet result-details-button" type="button" @click="openDetails(item, $event)">查看详细信息</button>
+          </div>
           <img
             v-if="shouldPreloadOriginal(item)"
             class="result-original-preload"
@@ -200,7 +247,7 @@ async function runSearch(): Promise<void> {
             @load="markOriginalLoaded(item)"
             @error="markOriginalFailed(item)"
           />
-        </button>
+        </article>
       </div>
       <p v-if="copyNotice" class="copy-notice" role="status" aria-live="polite">{{ copyNotice }}</p>
     </template>
@@ -208,4 +255,20 @@ async function runSearch(): Promise<void> {
       <h2>{{ busy ? '正在分析你的描述' : '还没有检索结果' }}</h2>
     </div>
   </section>
+
+  <SearchResultDetailsDialog
+    v-if="detailItem"
+    :meme-id="detailItem.meme_id"
+    :media-url="detailItem.media_url"
+    :score="detailItem.score"
+    :return-focus="detailTrigger"
+    @close="detailItem = null"
+    @open-library="openLibraryDetails"
+  />
+  <ImagePreviewDialog
+    v-if="previewImage"
+    :image="previewImage"
+    :return-focus="previewTrigger"
+    @close="closePreview"
+  />
 </template>

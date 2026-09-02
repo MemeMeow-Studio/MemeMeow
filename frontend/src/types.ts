@@ -93,6 +93,7 @@ export interface CollectionSummary {
 export interface SearchResultMedia {
   meme_id: string
   media_url: string
+  score?: number
   thumbnail?: ThumbnailInfo
 }
 

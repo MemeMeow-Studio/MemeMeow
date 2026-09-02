@@ -154,8 +154,8 @@ class PostgresSearchService:
             raise RuntimeError("llm_enhance_invalid")
         return value.strip()
 
-    def search(self, query: str, top_k: int = 5, api_key: str | None = None, use_llm: bool = False) -> list[str]:
-        """按 meme_id 稳定排序查询并返回当前 scope 的稳定资源标识。"""
+    def search(self, query: str, top_k: int = 5, api_key: str | None = None, use_llm: bool = False) -> list[tuple[str, float]]:
+        """按余弦相似度稳定排序，返回当前 scope 的 meme_id 与匹配度。"""
         if use_llm:
             try:
                 query = self._enhance_query(query)
@@ -167,15 +167,17 @@ class PostgresSearchService:
                 ranked = environment.search.query_incremental(self.model, vector, top_k)
             else:
                 ranked = environment.search.query(self.model, vector, top_k)
-            result: list[str] = []
-            for meme_id, _score in ranked:
+            result: list[tuple[str, float]] = []
+            seen: set[str] = set()
+            for meme_id, score in ranked:
                 try:
                     _record, image = self.metadata.image_for_meme(meme_id)
                 except MetadataError:
                     continue
                 value = str(meme_id)
-                if value not in result:
-                    result.append(value)
+                if value not in seen:
+                    seen.add(value)
+                    result.append((value, float(score)))
                 if len(result) >= top_k:
                     break
             return result

@@ -88,13 +88,13 @@ def test_search_projection_preserves_llm_fallback_and_media_dedupe() -> None:
             """返回缓存已就绪。"""
             return True
 
-        def search(self, query: str, _limit: int, *, api_key: str, use_llm: bool) -> list[str]:
+        def search(self, query: str, _limit: int, *, api_key: str, use_llm: bool) -> list[tuple[str, float]]:
             """记录 query/LLM 开关并在增强模式抛出稳定模拟错误。"""
             assert api_key == "embedding-key"
             calls.append((query, use_llm))
             if use_llm:
                 raise RuntimeError("llm unavailable")
-            return ["meme-a", "meme-a", "unknown", 7]  # type: ignore[list-item]
+            return [("meme-a", 0.812345), ("meme-a", 0.7), ("unknown", 0.2), ("meme-a", float("nan"))]
 
     services = {"search": Search(), "metadata": object()}
     media_calls: list[str] = []
@@ -119,7 +119,41 @@ def test_search_projection_preserves_llm_fallback_and_media_dedupe() -> None:
     )
     assert calls == [("原始查询", True), ("原始查询", False)]
     assert payload == {"results": ["/media/meme-a"]}
-    assert media_calls == ["meme-a", "meme-a", "unknown"]
+    assert media_calls == ["meme-a", "meme-a", "unknown", "meme-a"]
+
+
+def test_search_projection_keeps_score_aligned_with_media() -> None:
+    """过滤未知图片和重复媒体后，匹配度仍与同一 Meme 对齐。"""
+    request = _request()
+
+    class Search:
+        """返回带分数的稳定排名结果。"""
+
+        def has_cache(self) -> bool:
+            """模拟缓存已就绪。"""
+            return True
+
+        def search(self, *_args, **_kwargs) -> list[tuple[str, float]]:
+            """提供两个可映射结果和一个不可映射结果。"""
+            return [("meme-b", 0.91), ("missing", 0.88), ("meme-a", 0.73)]
+
+    def service(_request: object, name: str) -> object:
+        """返回搜索或元数据占位 service。"""
+        return Search() if name == "search" else object()
+
+    def media_for_meme(_request: object, meme_id: str) -> str | None:
+        """仅允许两个当前 scope 媒体。"""
+        return {"meme-a": "/media/a", "meme-b": "/media/b"}.get(meme_id)
+
+    def thumbnail_for_meme(_request: object, meme_id: str) -> dict[str, object]:
+        """为每个 Meme 返回可识别的缩略图投影。"""
+        return {"status": "available", "media_url": f"/thumb/{meme_id}"}
+
+    payload = asyncio.run(search_http.search_images(request, search_http.SearchRequest(query="query", n_results=3), service=service, media_for_meme=media_for_meme, error=_error, thumbnail_for_meme=thumbnail_for_meme))
+    assert payload["result_media"] == [
+        {"meme_id": "meme-b", "media_url": "/media/b", "thumbnail": {"status": "available", "media_url": "/thumb/meme-b"}, "score": 0.91},
+        {"meme_id": "meme-a", "media_url": "/media/a", "thumbnail": {"status": "available", "media_url": "/thumb/meme-a"}, "score": 0.73},
+    ]
 
 
 @pytest.mark.parametrize(

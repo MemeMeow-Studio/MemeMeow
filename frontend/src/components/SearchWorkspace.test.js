@@ -23,6 +23,7 @@ const response = {
     {
       meme_id: 'meme-1',
       media_url: '/media/meme-1',
+      score: 0.823456,
       thumbnail: { status: 'available', media_url: '/media/meme-1/thumbnail', width: 320, height: 160, media_type: 'image/png' },
     },
     {
@@ -109,6 +110,31 @@ describe('SearchWorkspace', () => {
     await runSearch(wrapper)
     await wrapper.find('.result-item').trigger('click')
     expect(copyImage).toHaveBeenCalledWith('/media/meme-1')
+    wrapper.unmount()
+  })
+
+  it('显示匹配度，详情按钮不触发复制并可打开图库详情', async () => {
+    const wrapper = mount(SearchWorkspace, { props: { config: null } })
+    await runSearch(wrapper)
+    expect(wrapper.find('.result-score').text()).toContain('0.8235')
+    await wrapper.find('.result-details-button').trigger('click')
+    expect(copyImage).not.toHaveBeenCalled()
+    expect(wrapper.find('.search-result-dialog').exists()).toBe(true)
+    expect(wrapper.find('.search-result-dialog').text()).toContain('0.8235')
+    await wrapper.find('.search-result-dialog .primary').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('.search-result-dialog').exists()).toBe(false)
+    expect(wrapper.find('.image-dialog').exists()).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('缺失匹配度时显示不可用而不是 NaN', async () => {
+    search.mockResolvedValue({ results: ['/media/meme-1'], result_media: [{ meme_id: 'meme-1', media_url: '/media/meme-1', score: Number.NaN }] })
+    const wrapper = mount(SearchWorkspace, { props: { config: null } })
+    await runSearch(wrapper)
+    expect(wrapper.find('.result-score').text()).toContain('不可用')
+    await wrapper.find('.result-details-button').trigger('click')
+    expect(wrapper.find('.search-result-dialog').text()).toContain('不可用')
     wrapper.unmount()
   })
 })
