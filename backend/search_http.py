@@ -58,6 +58,8 @@ async def search_images(
     try:
         results = engine.search(query, payload.n_results, api_key=settings.embedding_api_key, use_llm=payload.llm_enhance)
     except Exception as exc:  # noqa: BLE001 - 搜索 provider 的诊断不直接暴露给客户端
+        if "cache_not_ready" in str(exc):
+            raise error(503, "cache_not_ready", "检索缓存尚未就绪") from exc
         if "embedding_not_configured" in str(exc):
             raise error(503, "configuration_missing", "嵌入模型配置未完成") from exc
         if not payload.llm_enhance:
@@ -65,6 +67,8 @@ async def search_images(
         try:
             results = engine.search(query, payload.n_results, api_key=settings.embedding_api_key, use_llm=False)
         except Exception as fallback_exc:  # noqa: BLE001 - fallback 失败仍使用稳定错误码
+            if "cache_not_ready" in str(fallback_exc):
+                raise error(503, "cache_not_ready", "检索缓存尚未就绪") from fallback_exc
             if "embedding_not_configured" in str(fallback_exc):
                 raise error(503, "configuration_missing", "嵌入模型配置未完成") from fallback_exc
             raise error(500, "search_failed", "检索失败") from fallback_exc

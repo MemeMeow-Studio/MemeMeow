@@ -38,6 +38,7 @@ from backend.metadata import (
     Provenance,
     SidecarMetadata,
     semantic_document,
+    semantic_document_hash,
 )
 from backend.paths import SUPPORTED_EXTENSIONS
 from backend.visual import VisualEmbeddingError, VisualInferenceClient, identity_from_settings
@@ -381,9 +382,8 @@ class PostgresMetadataService:
             return {"text": "", "indexable": False, "skip_reason": "metadata_invalid", "status": "repair_required", "metadata_schema_version": None, "metadata_hash": None, "image_sha256": image_sha, "error": exc.code}
         context = metadata.meme_context
         text = semantic_document(context) if metadata.context_status in {"partial", "ready"} else ""
-        serialized = json.dumps(metadata.model_dump(mode="json", exclude_none=False), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         reason = None if metadata.context_status in {"partial", "ready"} and text else ("metadata_pending" if metadata.context_status == "pending" else "semantic_text_empty" if metadata.context_status in {"partial", "ready"} else "metadata_unavailable")
-        return {"text": text, "indexable": reason is None, "skip_reason": reason, "status": metadata.context_status, "metadata_schema_version": metadata.schema_version, "metadata_hash": hashlib.sha256(serialized.encode("utf-8")).hexdigest(), "image_sha256": image_sha}
+        return {"text": text, "indexable": reason is None, "skip_reason": reason, "status": metadata.context_status, "metadata_schema_version": metadata.schema_version, "metadata_hash": semantic_document_hash(context), "image_sha256": image_sha}
 
     def repair(self, progress: Any | None = None) -> dict[str, object]:
         """执行数据库与文件双向完整性扫描，不把孤立文件隐式导入业务列表。"""

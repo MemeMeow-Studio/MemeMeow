@@ -42,7 +42,7 @@ from backend.image_stage_plan import (
     ImageStagePlan,
     normalize_stage,
 )
-from backend.metadata import MemeContext, Provenance, SidecarMetadata
+from backend.metadata import MemeContext, semantic_document_hash
 from backend.agent_resume import normalize_identifier
 from backend.operation_policy import (
     GrantAssociation,
@@ -671,6 +671,33 @@ class ImageProcessingRepository:
             job_id = job.id
         return self.snapshot(job_id)
 
+    def latest_for_targets(self, targets: Iterable[tuple[UUID | str, str]]) -> dict[UUID, ImageProcessingSnapshot]:
+        """批量读取当前页每个 `(meme_id, image_sha256)` 的最新处理快照。"""
+        normalized: dict[UUID, str] = {}
+        for meme_id, image_sha256 in targets:
+            try:
+                normalized[UUID(str(meme_id))] = str(image_sha256).lower()
+            except (TypeError, ValueError):
+                continue
+        if not normalized:
+            return {}
+        with self._session() as session:
+            jobs = list(
+                session.scalars(
+                    select(ImageProcessingJob)
+                    .where(
+                        ImageProcessingJob.scope_id == self.scope.scope_id,
+                        ImageProcessingJob.meme_id.in_(tuple(normalized)),
+                    )
+                    .order_by(ImageProcessingJob.meme_id.asc(), ImageProcessingJob.revision.desc(), ImageProcessingJob.created_at.desc())
+                )
+            )
+            selected: dict[UUID, UUID] = {}
+            for job in jobs:
+                if job.meme_id not in selected and normalized.get(job.meme_id) == str(job.image_sha256).lower():
+                    selected[job.meme_id] = job.id
+        return {meme_id: snapshot for meme_id, job_id in selected.items() if (snapshot := self.snapshot(job_id)) is not None}
+
     def attach_task(
         self,
         job_id: UUID | str,
@@ -1118,26 +1145,14 @@ class ImageProcessingWorker:
 
     @staticmethod
     def _metadata_hash(meme: Meme) -> str | None:
-        """按元数据服务相同的规范化模型计算当前 Meme metadata hash。"""
+        """按七个语义字段计算当前 Meme metadata hash。"""
+        stored = getattr(meme, "search_metadata_hash", None)
+        if isinstance(stored, str) and len(stored) == 64:
+            return stored
         try:
-            payload: dict[str, object] = {
-                "schema_version": meme.metadata_schema_version,
-                "image": {
-                    "relative_path": meme.storage_key,
-                    "extension": meme.extension,
-                    "size_bytes": meme.size_bytes,
-                    "sha256": meme.sha256,
-                },
-                "context_status": meme.context_status,
-                "meme_context": MemeContext.model_validate(meme.meme_context or {}).model_dump(mode="json", exclude_none=False),
-                "provenance": Provenance.model_validate(meme.provenance or {}).model_dump(mode="json", exclude_none=False),
-            }
-            payload.update(meme.extensions or {})
-            metadata = SidecarMetadata.model_validate(payload)
-            serialized = json.dumps(metadata.model_dump(mode="json", exclude_none=False), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            return semantic_document_hash(MemeContext.model_validate(meme.meme_context or {}))
         except Exception:  # noqa: BLE001 - 非法历史元数据只表示阶段尚未有效
             return None
-        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
     def _stage_valid(self, job: ImageProcessingJob, stage: str) -> bool:
         """重新校验目标和阶段产物，返回当前阶段是否可以安全复用。"""

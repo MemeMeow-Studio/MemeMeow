@@ -17,8 +17,8 @@ def _vector(value: float, *, index: int = 0) -> list[float]:
     return vector
 
 
-def test_query_uses_only_the_selected_migration_source(monkeypatch) -> None:
-    """query 只能调用 source_mode 选中的一套向量查询。"""
+def test_query_uses_only_incremental_source(monkeypatch) -> None:
+    """query 只允许当前增量来源，旧 generation 不再作为运行时回退。"""
     repository = object.__new__(SearchRepository)
     vector = _vector(1.0)
     calls: list[str] = []
@@ -35,8 +35,9 @@ def test_query_uses_only_the_selected_migration_source(monkeypatch) -> None:
     monkeypatch.setattr(repository, "_query_legacy_validated", lambda *_args: calls.append("legacy") or [(UUID(int=2), 0.5)])
     monkeypatch.setattr(repository, "query_incremental", lambda *_args: calls.append("incremental") or [])
 
-    assert repository.query("model", vector) == [(UUID(int=2), 0.5)]
-    assert calls == ["legacy"]
+    with pytest.raises(DatabaseError, match="cache_not_ready"):
+        repository.query("model", vector)
+    assert calls == []
 
 
 def test_legacy_query_keeps_score_then_meme_id_order_and_limit() -> None:

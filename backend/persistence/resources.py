@@ -107,6 +107,14 @@ class DatabaseResources:
             raise DatabaseError("scope_required")
         return StorageCoordinator(self, scope_id=scope_id).flat_preflight()
 
+    def search_rebuild_preflight(self, scope_id: str | ScopeContext | None = None) -> dict[str, Any]:
+        """返回检索重建门禁；结构性问题阻断，原图缺失或指纹漂移仅报告。"""
+        report = self.flat_preflight(scope_id)
+        structural_keys = ("non_flat_keys", "nested_images", "active_operations")
+        report["blocking"] = any(bool(report.get(key)) for key in structural_keys)
+        report["blocking_keys"] = [key for key in structural_keys if report.get(key)]
+        return report
+
     def blob_store_for_scope(self, scope_id: str | ScopeContext) -> BlobStore:
         """读取 scope 的不可变 storage_namespace 并创建绑定 BlobStore。"""
         context = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)

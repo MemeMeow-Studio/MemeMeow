@@ -46,6 +46,9 @@ type ProcessingOptionsTarget = 'unready' | 'selected'
 
 const images = shallowRef<MemeImage[]>([])
 const filter = shallowRef('')
+const page = shallowRef(1)
+const pageSize = 50
+const total = shallowRef(0)
 const busy = shallowRef(false)
 const selectedImages = shallowRef(new Set<string>())
 const retryBusy = shallowRef(false)
@@ -96,6 +99,7 @@ const cacheTaskStatusLabel = computed(() => {
   if (props.cacheTask?.status === 'failed') return props.cacheTask.message || '缓存生成失败'
   return ''
 })
+const pageCount = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
 
 /** 加载当前筛选下的图片，并清理不再存在的选中项。 */
 async function loadLibrary(): Promise<void> {
@@ -103,9 +107,10 @@ async function loadLibrary(): Promise<void> {
   emit('clearError')
   busy.value = true
   try {
-    const data = await api.images({ search: filter.value })
+    const data = await api.images({ search: filter.value, page: page.value, page_size: pageSize })
     if (requestId !== libraryRequestId) return
     images.value = data.items
+    total.value = Number.isInteger(data.total) ? data.total : data.items.length
     if (previewImage.value) {
       previewImage.value = data.items.find((item: MemeImage) => item.meme_id === previewImage.value?.meme_id) || null
     }
@@ -116,6 +121,21 @@ async function loadLibrary(): Promise<void> {
   } finally {
     if (requestId === libraryRequestId) busy.value = false
   }
+}
+
+/** 将筛选结果切回第一页，避免旧页码超出新结果范围。 */
+function applyFilter(): void {
+  page.value = 1
+  void loadLibrary()
+}
+
+/** 翻页时清理当前页之外的选择，避免跨页误操作。 */
+function changePage(next: number): void {
+  const target = Math.max(1, Math.min(pageCount.value, next))
+  if (target === page.value) return
+  page.value = target
+  selectedImages.value = new Set()
+  void loadLibrary()
 }
 
 /** 切换一张图片的选择状态，并用新 Set 触发浅层响应式更新。 */
@@ -426,7 +446,7 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
       <div><h1>图片库</h1></div>
     </div>
     <div class="toolbar" aria-label="图片库工具">
-      <input v-model="filter" aria-label="筛选文件名" placeholder="筛选文件名" @keyup.enter="loadLibrary" />
+      <input v-model="filter" aria-label="筛选文件名" placeholder="筛选文件名" @keyup.enter="applyFilter" />
       <button type="button" @click="loadLibrary">刷新</button>
       <span class="toolbar-spacer"></span>
       <div class="toolbar-group library-operations">
@@ -497,6 +517,11 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
       <div v-if="!images.length" class="empty-state compact"><h2>图片库还没有图片</h2></div>
     </div>
     <p v-if="collectionNotice" class="inline-notice" role="status">{{ collectionNotice }}</p>
+    <nav class="library-pagination" aria-label="图片库分页">
+      <button type="button" :disabled="busy || page <= 1" @click="changePage(page - 1)">上一页</button>
+      <span>第 {{ page }} / {{ pageCount }} 页，共 {{ total }} 张</span>
+      <button type="button" :disabled="busy || page >= pageCount" @click="changePage(page + 1)">下一页</button>
+    </nav>
   </section>
 
   <ImagePreviewDialog

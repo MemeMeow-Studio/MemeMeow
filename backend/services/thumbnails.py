@@ -432,6 +432,20 @@ class DerivedThumbnailService:
                 exc.code,
             )
 
+    def _enqueue_from_projection_batch(self, meme_ids: list[UUID]) -> None:
+        """在页投影事务提交后批量提交缺失缩略图任务，失败只记录日志。"""
+        if not meme_ids:
+            return
+        try:
+            self.enqueue_many(meme_ids)
+        except (ThumbnailError, DatabaseError) as exc:
+            logger.warning(
+                "thumbnail_projection_enqueue_batch_failed scope=%s count=%s error=%s",
+                self.scope.scope_id,
+                len(meme_ids),
+                exc.code,
+            )
+
     def projection_for_meme_id(self, meme_id: UUID | str) -> dict[str, object]:
         """按稳定 Meme ID 读取当前 scope 的缩略图状态。"""
         with self.resources.environment(self.scope) as environment:
@@ -473,11 +487,10 @@ class DerivedThumbnailService:
                     self._mark_row_stale(row, "thumbnail_output_unavailable")
                 projected = self._projection(row, meme_id=meme.id)
                 result[meme.id] = projected
-                if source_error is None and projected["status"] in {"pending", "stale"}:
+                if source_error is None and projected["status"] == "pending":
                     pending_ids.append(meme.id)
             environment.uow.session.flush()
-        for meme_id in pending_ids:
-            self._enqueue_from_projection(meme_id)
+        self._enqueue_from_projection_batch(pending_ids)
         return result
 
     def _mark_failure(self, meme: Meme | None, code: str, *, elapsed_ms: int | None = None) -> None:
@@ -680,6 +693,54 @@ class DerivedThumbnailService:
             return self.task_service.submit(self.TASK_TYPE, payload)
         except (DatabaseError, RuntimeError) as exc:
             raise ThumbnailError(str(getattr(exc, "code", None) or str(exc).split(":", 1)[0])) from exc
+
+    def enqueue_many(self, meme_ids: Iterable[UUID | str]) -> int:
+        """在一个短事务中幂等补齐当前页 pending 事实，提交任务后返回提交数量。"""
+        if self.task_service is None:
+            raise ThumbnailError("thumbnail_task_unavailable")
+        if not callable(getattr(self.task_service, "submit_thumbnail", None)) and not callable(getattr(self.task_service, "submit", None)):
+            submitted = 0
+            for meme_id in meme_ids:
+                try:
+                    if self.enqueue(meme_id) is not None:
+                        submitted += 1
+                except (ThumbnailError, DatabaseError, RuntimeError, AttributeError) as exc:
+                    logger.warning("thumbnail_enqueue_failed scope=%s meme=%s error=%s", self.scope.scope_id, meme_id, getattr(exc, "code", None) or str(exc))
+            return submitted
+        payloads: list[dict[str, object]] = []
+        with self.resources.environment(self.scope) as environment:
+            for meme_id in meme_ids:
+                meme = environment.memes.get(meme_id)
+                if meme is None:
+                    continue
+                row = environment.thumbnails.ensure_pending(meme, self.config.profile)
+                if row.status in {"failed", "stale"}:
+                    continue
+                if row.status == "available" and self._output_is_valid(meme, row):
+                    continue
+                payloads.append({
+                    "meme_id": str(meme.id),
+                    "image_sha256": str(meme.sha256).lower(),
+                    "source_size_bytes": meme.size_bytes,
+                    "profile": self.config.profile,
+                })
+        submitted = 0
+        for payload in payloads:
+            try:
+                submit_thumbnail = getattr(self.task_service, "submit_thumbnail", None)
+                if callable(submit_thumbnail):
+                    submit_thumbnail(payload, backpressure=self.config.backpressure)
+                else:
+                    self.task_service.submit(self.TASK_TYPE, payload)
+                submitted += 1
+            except (DatabaseError, RuntimeError, ThumbnailError) as exc:
+                logger.warning(
+                    "thumbnail_enqueue_failed scope=%s meme=%s error=%s",
+                    self.scope.scope_id,
+                    payload.get("meme_id"),
+                    getattr(exc, "code", None) or str(exc),
+                )
+        return submitted
 
     def reconcile(self, *, page: int = 1, page_size: int | None = None, limit: int | None = None) -> dict[str, int]:
         """按当前 scope 分页建立存量缩略图任务，重复调用保持幂等。"""

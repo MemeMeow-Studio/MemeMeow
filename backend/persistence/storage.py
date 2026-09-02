@@ -440,7 +440,10 @@ class StorageCoordinator:
                 existing = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.storage_key == target_key).with_for_update())
                 if existing is not None:
                     raise DatabaseError("target_exists")
-                record = Meme(id=meme_id or uuid.uuid4(), scope_id=self.scope.scope_id, storage_key=target_key, extension=extension.lower(), size_bytes=len(content), sha256=digest, context_status="pending", meme_context=context, provenance=provenance, extensions={}, revision=1)
+                from backend.metadata import MemeContext, semantic_document_hash
+
+                parsed_context = MemeContext.model_validate(context)
+                record = Meme(id=meme_id or uuid.uuid4(), scope_id=self.scope.scope_id, storage_key=target_key, extension=extension.lower(), size_bytes=len(content), sha256=digest, context_status="pending", search_metadata_hash=semantic_document_hash(parsed_context), meme_context=parsed_context.model_dump(mode="json", exclude_none=False), provenance=provenance, extensions={}, revision=1)
                 session.add(record)
                 session.flush()
                 session.add(StorageOperation(scope_id=self.scope.scope_id, meme_id=record.id, operation_type="upload", operation_token=token, target_key=target_key, staging_key=staging_key, after_sha256=digest, after_size=len(content), status="prepared"))

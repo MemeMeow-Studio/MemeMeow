@@ -122,6 +122,33 @@ class VisualEmbeddingRepository:
         self.session.flush()
         return row
 
+    def ready_ids(
+        self,
+        memes: Sequence[Meme],
+        *,
+        model: str,
+        preprocess_version: str,
+        dimensions: int = VISUAL_EMBEDDING_DIMENSIONS,
+    ) -> set[UUID]:
+        """批量返回当前页中 SHA、模型空间和维度均匹配的视觉向量 ID。"""
+        model, preprocess_version, dimensions = self._identity(model, preprocess_version, dimensions)
+        ids = {item.id for item in memes if isinstance(getattr(item, "id", None), UUID) and item.scope_id == self.scope.scope_id}
+        if not ids:
+            return set()
+        rows = self.session.execute(
+            select(MemeVisualEmbedding.meme_id)
+            .join(Meme, (Meme.scope_id == MemeVisualEmbedding.scope_id) & (Meme.id == MemeVisualEmbedding.meme_id))
+            .where(
+                MemeVisualEmbedding.scope_id == self.scope.scope_id,
+                MemeVisualEmbedding.meme_id.in_(ids),
+                MemeVisualEmbedding.model == model,
+                MemeVisualEmbedding.preprocess_version == preprocess_version,
+                MemeVisualEmbedding.dimensions == dimensions,
+                MemeVisualEmbedding.image_sha256 == Meme.sha256,
+            )
+        )
+        return {row[0] for row in rows}
+
     @staticmethod
     def agent_ready(meme: Meme) -> bool:
         """验证候选图片具有当前 SHA 对应的 research Agent provenance。"""

@@ -102,6 +102,7 @@ class Meme(Base):
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     metadata_schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     context_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    search_metadata_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     meme_context: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     provenance: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     extensions: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
@@ -114,6 +115,7 @@ class Meme(Base):
         UniqueConstraint("scope_id", "storage_key", name="uq_memes_scope_storage"),
         CheckConstraint("size_bytes >= 0", name="ck_memes_size_nonnegative"),
         CheckConstraint("context_status IN ('pending','partial','ready','repair_required')", name="ck_memes_context_status"),
+        CheckConstraint("search_metadata_hash IS NULL OR length(search_metadata_hash) = 64", name="ck_memes_search_metadata_hash"),
         CheckConstraint("storage_key <> '' AND storage_key NOT IN ('.', '..', '.staging', '.quarantine') AND position('/' in storage_key) = 0 AND position(chr(92) in storage_key) = 0 AND storage_key !~ '[[:cntrl:]]'", name="ck_memes_storage_key_flat"),
     )
 

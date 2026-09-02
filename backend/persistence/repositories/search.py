@@ -175,28 +175,15 @@ class SearchRepository:
 
     @staticmethod
     def _metadata_hash(meme: Meme) -> str | None:
-        """按数据库语境模型计算可 embedding metadata hash。"""
+        """读取 Meme 事务性维护的七字段语义 hash。"""
+        if isinstance(meme.search_metadata_hash, str) and len(meme.search_metadata_hash) == 64:
+            return meme.search_metadata_hash
         try:
-            from backend.metadata import MemeContext, Provenance, SidecarMetadata
+            from backend.metadata import MemeContext, semantic_document_hash
 
-            payload: dict[str, Any] = {
-                "schema_version": meme.metadata_schema_version,
-                "image": {
-                    "relative_path": meme.storage_key,
-                    "extension": meme.extension,
-                    "size_bytes": meme.size_bytes,
-                    "sha256": meme.sha256,
-                },
-                "context_status": meme.context_status,
-                "meme_context": MemeContext.model_validate(meme.meme_context or {}).model_dump(mode="json", exclude_none=False),
-                "provenance": Provenance.model_validate(meme.provenance or {}).model_dump(mode="json", exclude_none=False),
-            }
-            payload.update(meme.extensions or {})
-            metadata = SidecarMetadata.model_validate(payload)
-            serialized = json.dumps(metadata.model_dump(mode="json", exclude_none=False), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            return semantic_document_hash(MemeContext.model_validate(meme.meme_context or {}))
         except (TypeError, ValueError):
             return None
-        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
     def _incremental_rows(self, model: str) -> list[tuple[MemeTextEmbedding, Meme]]:
         """读取当前 scope 中通过 SHA、语境和 metadata hash 校验的单图向量。"""
@@ -211,6 +198,7 @@ class SearchRepository:
                 MemeTextEmbedding.embedding.is_not(None),
                 Meme.context_status.in_(("partial", "ready")),
                 Meme.sha256 == MemeTextEmbedding.image_sha256,
+                Meme.search_metadata_hash == MemeTextEmbedding.metadata_hash,
             )
             # 不在去重和 metadata 校验前截断结果；历史 hash 或损坏行可能占据
             # 前部，固定 limit 会让后面的有效 Meme 永远无法参与查询。
@@ -279,21 +267,36 @@ class SearchRepository:
         return valid
 
     def source_mode(self, model: str) -> str:
-        """选择一次查询唯一的数据来源，不混合 legacy 与增量向量。"""
+        """返回当前唯一运行时来源；回填期间不暴露旧 generation。"""
         state = self.migration_state(model)
-        if state is not None:
-            return "incremental" if state.mode == "incremental_only" else "legacy"
-        # 新控制面尚未建立迁移行时，以实际存在的增量向量作为安全来源；
-        # 没有增量向量则兼容读取旧 active generation。
-        return "incremental" if self._incremental_rows(model) else "legacy"
+        if state is not None and state.mode != "incremental_only":
+            return "not_ready"
+        return "incremental"
 
     def has_incremental(self, model: str) -> bool:
         """判断当前 scope 是否至少有一条可检索的单图向量。"""
-        return bool(self._incremental_rows(model))
+        if self.source_mode(model) != "incremental":
+            return False
+        statement = (
+            select(MemeTextEmbedding.meme_id)
+            .join(Meme, (Meme.scope_id == MemeTextEmbedding.scope_id) & (Meme.id == MemeTextEmbedding.meme_id))
+            .where(
+                MemeTextEmbedding.scope_id == self.scope.scope_id,
+                MemeTextEmbedding.embedding_model_version == model,
+                MemeTextEmbedding.dimensions == EMBEDDING_DIMENSIONS,
+                MemeTextEmbedding.status == "ready",
+                MemeTextEmbedding.embedding.is_not(None),
+                Meme.context_status.in_(("partial", "ready")),
+                Meme.sha256 == MemeTextEmbedding.image_sha256,
+                Meme.search_metadata_hash == MemeTextEmbedding.metadata_hash,
+            )
+            .limit(1)
+        )
+        return self.session.scalar(statement) is not None
 
     def has_legacy(self, model: str) -> bool:
-        """判断迁移回退 generation 是否仍有逐条校验通过的条目。"""
-        return bool(self._legacy_rows(model))
+        """兼容控制面查询；旧 generation 永不作为运行时来源。"""
+        return False
 
     def valid_text_embedding_ids(self, model: str, memes: Sequence[Meme]) -> set[UUID]:
         """返回给定图片中具有当前有效文本向量的 Meme ID。
@@ -307,15 +310,24 @@ class SearchRepository:
         if not meme_ids:
             return set()
 
-        state = self.migration_state(model)
-        if state is not None:
-            rows = self._incremental_rows(model) if state.mode == "incremental_only" else self._legacy_rows(model)
-        else:
-            # 与 source_mode 保持同一选择顺序，同时避免为同一请求重复读取增量来源。
-            rows = self._incremental_rows(model)
-            if not rows:
-                rows = self._legacy_rows(model)
-        return {meme.id for _row, meme in rows if meme.id in meme_ids}
+        if not hasattr(self, "session"):
+            return {meme.id for _row, meme in self._incremental_rows(model) if meme.id in meme_ids}
+        rows = self.session.execute(
+            select(MemeTextEmbedding.meme_id)
+            .join(Meme, (Meme.scope_id == MemeTextEmbedding.scope_id) & (Meme.id == MemeTextEmbedding.meme_id))
+            .where(
+                MemeTextEmbedding.scope_id == self.scope.scope_id,
+                MemeTextEmbedding.meme_id.in_(meme_ids),
+                MemeTextEmbedding.embedding_model_version == model.strip(),
+                MemeTextEmbedding.dimensions == EMBEDDING_DIMENSIONS,
+                MemeTextEmbedding.status == "ready",
+                MemeTextEmbedding.embedding.is_not(None),
+                Meme.context_status.in_(("partial", "ready")),
+                Meme.sha256 == MemeTextEmbedding.image_sha256,
+                Meme.search_metadata_hash == MemeTextEmbedding.metadata_hash,
+            )
+        )
+        return {row[0] for row in rows}
 
     def create_generation(self, model: str, source_snapshot_hash: str) -> SearchGeneration:
         """创建 building generation，维度固定为 1024。"""
@@ -464,15 +476,16 @@ class SearchRepository:
         self.session.flush()
 
     def query(self, model: str, vector: Sequence[float], limit: int = 5) -> list[tuple[UUID, float]]:
-        """执行 scope/head 限定的精确余弦距离查询并按 meme_id 稳定排序。"""
+        """执行当前增量来源的 pgvector 余弦距离查询。"""
         if len(vector) != EMBEDDING_DIMENSIONS:
             raise DatabaseError("embedding_dimensions_mismatch")
-        if self.source_mode(model) == "incremental":
-            return self.query_incremental(model, vector, limit)
-        ranked = self._query_legacy_validated(model, vector, limit)
-        if not ranked:
+        values = [float(value) for value in vector]
+        norm = math.sqrt(sum(value * value for value in values))
+        if not math.isfinite(norm) or norm <= 0:
+            raise DatabaseError("embedding_zero_norm")
+        if self.source_mode(model) != "incremental":
             raise DatabaseError("cache_not_ready")
-        return ranked
+        return self.query_incremental(model, vector, limit)
 
     def _query_legacy_validated(self, model: str, vector: Sequence[float], limit: int) -> list[tuple[UUID, float]]:
         """对通过旧 generation 逐条校验的向量执行单一来源排序。"""
@@ -495,25 +508,47 @@ class SearchRepository:
         return ranked[: max(1, min(int(limit), 100))]
 
     def query_incremental(self, model: str, vector: Sequence[float], limit: int = 5) -> list[tuple[UUID, float]]:
-        """对当前有效单图向量执行稳定余弦排序，历史 hash 自动排除。"""
+        """让 pgvector 在数据库内完成当前有效向量的有界余弦排序。"""
         if len(vector) != EMBEDDING_DIMENSIONS:
             raise DatabaseError("embedding_dimensions_mismatch")
         values = [float(value) for value in vector]
         norm = math.sqrt(sum(value * value for value in values))
         if not math.isfinite(norm) or norm <= 0:
             raise DatabaseError("embedding_zero_norm")
-        ranked: list[tuple[UUID, float]] = []
-        for row, meme in self._incremental_rows(model):
-            try:
-                candidate = [float(item) for item in row.embedding or []]
-                candidate_norm = math.sqrt(sum(item * item for item in candidate))
-                if len(candidate) != EMBEDDING_DIMENSIONS or not math.isfinite(candidate_norm) or candidate_norm <= 0:
-                    continue
-                score = sum(left * right for left, right in zip(values, candidate)) / (norm * candidate_norm)
-            except (TypeError, ValueError, ZeroDivisionError):
-                continue
-            ranked.append((meme.id, float(score)))
-        if not ranked:
+        state = self.migration_state(model) if hasattr(self, "session") else None
+        if state is not None and state.mode != "incremental_only":
             raise DatabaseError("cache_not_ready")
-        ranked.sort(key=lambda item: (-item[1], str(item[0])))
-        return ranked[: max(1, min(int(limit), 100))]
+        if not hasattr(self, "session"):
+            ranked: list[tuple[UUID, float]] = []
+            for row, meme in self._incremental_rows(model):
+                candidate = [float(item) for item in row.embedding or []]
+                if len(candidate) != EMBEDDING_DIMENSIONS:
+                    continue
+                candidate_norm = math.sqrt(sum(item * item for item in candidate))
+                if not math.isfinite(candidate_norm) or candidate_norm <= 0:
+                    continue
+                ranked.append((meme.id, sum(left * right for left, right in zip(values, candidate)) / (norm * candidate_norm)))
+            ranked.sort(key=lambda item: (-item[1], str(item[0])))
+            if not ranked:
+                raise DatabaseError("cache_not_ready")
+            return ranked[: max(1, min(int(limit), 100))]
+        distance = MemeTextEmbedding.embedding.cosine_distance(values).label("distance")
+        rows = self.session.execute(
+            select(Meme.id, distance)
+            .join(Meme, (Meme.scope_id == MemeTextEmbedding.scope_id) & (Meme.id == MemeTextEmbedding.meme_id))
+            .where(
+                MemeTextEmbedding.scope_id == self.scope.scope_id,
+                MemeTextEmbedding.embedding_model_version == model,
+                MemeTextEmbedding.dimensions == EMBEDDING_DIMENSIONS,
+                MemeTextEmbedding.status == "ready",
+                MemeTextEmbedding.embedding.is_not(None),
+                Meme.context_status.in_(("partial", "ready")),
+                Meme.sha256 == MemeTextEmbedding.image_sha256,
+                Meme.search_metadata_hash == MemeTextEmbedding.metadata_hash,
+            )
+            .order_by(distance.asc(), Meme.id.asc())
+            .limit(max(1, min(int(limit), 100)))
+        ).all()
+        if not rows:
+            raise DatabaseError("cache_not_ready")
+        return [(meme_id, float(1.0 - distance_value)) for meme_id, distance_value in rows]

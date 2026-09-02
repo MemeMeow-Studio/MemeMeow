@@ -185,6 +185,14 @@ def semantic_document(context: MemeContext) -> str:
     return "\n".join(chunks)[:MAX_SEMANTIC_DOCUMENT_LENGTH]
 
 
+def semantic_document_hash(context: MemeContext) -> str | None:
+    """返回七个语义字段规范文本的 SHA-256；空文本不产生可检索指纹。"""
+    text = semantic_document(context)
+    if not text:
+        return None
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 class MetadataService:
     """管理图片 sidecar 的读写、校验、生命周期和检索文本。"""
 

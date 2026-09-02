@@ -1,35 +1,25 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 from uuid import UUID
 
 import numpy as np
 from openai import OpenAI
-from sqlalchemy import select
 
 from backend.persistence.models import (
     EMBEDDING_DIMENSIONS,
-    ImageProcessingAttempt,
     Meme,
-    MemeEmbedding,
-    MemeVisualEmbedding,
     ScopeContext,
-    SearchGeneration,
-    StorageOperation,
-    Task,
-    TaskBatch,
-    TaskLaneSlot,
 )
 from backend.persistence.engine import DatabaseError
 from backend.persistence.resources import DatabaseResources
 from backend.metadata import (
-    EMBEDDING_FIELDS,
-    MAX_SEMANTIC_DOCUMENT_LENGTH,
     MetadataError,
     MemeContext,
     semantic_document,
+    semantic_document_hash,
 )
 from backend.services.metadata import PostgresMetadataService
 
@@ -66,11 +56,7 @@ class PostgresSearchService:
     def has_cache(self) -> bool:
         """检查当前 scope/model 的唯一检索来源是否已有有效数据。"""
         with self.resources.environment(self.scope.scope_id) as environment:
-            if environment.search.source_mode(self.model) == "incremental":
-                return environment.search.has_incremental(self.model)
-            # active generation 只说明控制面存在一代索引，不能证明其中仍有
-            # 与当前 Meme SHA、语境 hash、维度和文件身份一致的可检索条目。
-            return environment.search.has_legacy(self.model)
+            return environment.search.source_mode(self.model) == "incremental" and environment.search.has_incremental(self.model)
 
     def invalidate_cache(self) -> None:
         """数据库索引不在进程内缓存；此方法保留兼容调用但无副作用。"""
@@ -84,18 +70,16 @@ class PostgresSearchService:
             return environment.search.valid_text_embedding_ids(self.model, memes)
 
     def generate_cache(self, progress: Callable[[float | None, str | None], None], claim: tuple[str, int, str] | None = None) -> dict[str, object]:
-        """短事务固化源快照，在事务外调用 embedding，完成后原子激活。"""
+        """按当前可索引候选回填增量文本向量，完成后切换 scope 迁移状态。"""
         with self._generation_lock:
+            preflight = self.resources.search_rebuild_preflight(self.scope)
+            if preflight["blocking"]:
+                logger.warning("search_rebuild_blocked scope=%s keys=%s", self.scope.scope_id, preflight["blocking_keys"])
+                raise RuntimeError("search_rebuild_preflight_failed")
             candidates: list[tuple[UUID, int, str, str, str]] = []
             skipped = 0
             with self.resources.environment(self.scope.scope_id) as environment:
-                # 源集合必须在同一个短 REPEATABLE READ 事务中固化，避免刷新期间
-                # 读取到跨事务的 Meme revision/语境组合。
-                environment.uow.session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
                 environment.search.assert_claim(claim)
-                # 同一 scope/model 的 building generation 可能来自上次 Worker 崩溃；
-                # 新 claim 先将其隔离，再创建本次不可变 generation。
-                environment.search.abandon_building(self.model, claim=claim)
                 for meme in environment.memes.list_all():
                     try:
                         image = self.metadata.blob_store.resolve(meme.storage_key)
@@ -111,38 +95,31 @@ class PostgresSearchService:
                     if not text_value:
                         skipped += 1
                         continue
-                    serialized = json.dumps(self.metadata._to_sidecar(meme).model_dump(mode="json", exclude_none=False), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-                    metadata_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+                    metadata_hash = meme.search_metadata_hash or semantic_document_hash(context)
+                    if metadata_hash is None:
+                        skipped += 1
+                        continue
                     candidates.append((meme.id, meme.revision, meme.sha256, text_value, metadata_hash))
                 if not candidates:
                     raise RuntimeError("no_indexable_images")
                 candidates.sort(key=lambda item: str(item[0]))
-                source = [(str(meme_id), revision, image_sha, metadata_hash, hashlib.sha256(text.encode()).hexdigest()) for meme_id, revision, image_sha, text, metadata_hash in candidates]
-                source_hash = hashlib.sha256(json.dumps(source, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
-                generation = environment.search.create_generation(self.model, source_hash)
-                generation_id = generation.id
-                for meme_id, revision, image_sha, text_value, metadata_hash in candidates:
-                    environment.search.assert_claim(claim)
-                    environment.search.add_snapshot_item(generation_id, meme_id=meme_id, meme_revision=revision, image_sha256=image_sha, semantic_document=text_value[:MAX_SEMANTIC_DOCUMENT_LENGTH], metadata_hash=metadata_hash)
+                state = environment.search.begin_incremental_backfill(self.model, total_count=len(candidates))
+                epoch = state.epoch
             total = len(candidates)
-            try:
-                for index, (meme_id, _revision, _image_sha, text_value, _metadata_hash) in enumerate(candidates, start=1):
-                    vector = self._embedding(text_value)
-                    with self.resources.environment(self.scope.scope_id) as environment:
-                        environment.search.set_item_embedding(generation_id, meme_id, vector, claim=claim)
-                    if progress:
-                        progress(index / total, f"正在生成 pgvector 索引 {index}/{total}")
+            from backend.image_processing import SingleImageEmbeddingService
+
+            embedding_service = SingleImageEmbeddingService(self.resources, scope_id=self.scope, model=self.model, embedder=self._embedding)
+            for index, (meme_id, _revision, image_sha, text_value, metadata_hash) in enumerate(candidates, start=1):
+                embedding_service.upsert(meme_id, image_sha256=image_sha, metadata_hash=metadata_hash, semantic_document=text_value)
                 with self.resources.environment(self.scope.scope_id) as environment:
-                    environment.search.activate(generation, expected_source_hash=source_hash, expected_items=source, claim=claim)
-                return {"indexed_count": total, "skipped_count": skipped, "generation_id": str(generation_id), "model": self.model, "dimensions": EMBEDDING_DIMENSIONS}
-            except Exception as exc:
-                with self.resources.environment(self.scope.scope_id) as environment:
-                    try:
-                        environment.search.fail_generation(generation_id, error=str(exc)[:500], claim=claim)
-                    except DatabaseError:
-                        # 租约已被新 Worker 接管时，旧 Worker 不得修改 generation 状态。
-                        pass
-                raise
+                    if not environment.search.record_incremental_backfill(epoch=epoch, completed_count=index, model=self.model):
+                        raise DatabaseError("migration_epoch_changed")
+                if progress:
+                    progress(index / total, f"正在生成 pgvector 索引 {index}/{total}")
+            with self.resources.environment(self.scope.scope_id) as environment:
+                if not environment.search.switch_incremental_only(epoch=epoch, model=self.model):
+                    raise DatabaseError("migration_incomplete")
+            return {"indexed_count": total, "skipped_count": skipped, "epoch": epoch, "model": self.model, "dimensions": EMBEDDING_DIMENSIONS}
 
     def _enhance_query(self, query: str) -> str:
         """使用可选 LLM 改写查询；失败由 API 回退普通查询。"""
@@ -163,10 +140,7 @@ class PostgresSearchService:
                 pass
         vector = self._embedding(query)
         with self.resources.environment(self.scope.scope_id) as environment:
-            if environment.search.source_mode(self.model) == "incremental":
-                ranked = environment.search.query_incremental(self.model, vector, top_k)
-            else:
-                ranked = environment.search.query(self.model, vector, top_k)
+            ranked = environment.search.query(self.model, vector, top_k)
             result: list[tuple[str, float]] = []
             seen: set[str] = set()
             for meme_id, score in ranked:

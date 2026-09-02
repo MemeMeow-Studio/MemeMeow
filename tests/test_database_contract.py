@@ -32,9 +32,10 @@ def test_search_query_dispatches_to_one_migration_source(monkeypatch):
     assert len(SearchRepository.query(repository, "model", vector)) == 1
 
     monkeypatch.setattr(repository, "source_mode", lambda _model: "legacy")
-    monkeypatch.setattr(repository, "_query_legacy_validated", lambda _model, _vector, _limit: [(uuid4(), 0.5)])
+    monkeypatch.setattr(repository, "_query_legacy_validated", lambda *_args: pytest.fail("旧 generation 不再作为运行时来源"))
     monkeypatch.setattr(repository, "query_incremental", lambda *_args: pytest.fail("不应查询增量向量"))
-    assert len(SearchRepository.query(repository, "model", vector)) == 1
+    with pytest.raises(DatabaseError, match="cache_not_ready"):
+        SearchRepository.query(repository, "model", vector)
 
 
 def test_scope_context_rejects_empty_scope():

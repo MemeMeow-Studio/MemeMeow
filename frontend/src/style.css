@@ -164,6 +164,8 @@ button, input, select, textarea { border-radius: var(--radius-control); }
 .inline-notice.error { color: var(--error); }
 
 .library-list { border-top: 1px solid var(--line); }
+.library-pagination { display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 18px; color: var(--muted); font-size: 14px; }
+.library-pagination button { min-width: 76px; }
 .library-row { min-height: 82px; display: grid; grid-template-columns: 24px minmax(0, 1fr) minmax(min-content, max-content) max-content; grid-template-areas: "select main status actions"; align-items: center; gap: 14px; padding: 9px 0; border-bottom: 1px solid var(--line); }
 .library-row img { display: block; width: 64px; height: 64px; object-fit: contain; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); }
 .resilient-image { display: block; width: 100%; height: 100%; }
@@ -508,6 +510,7 @@ button, input, select, textarea { border-radius: var(--radius-control); }
   .image-status-summary { width: 100%; gap: 6px; }
   .image-row-actions { width: 100%; min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); justify-content: stretch; }
   .image-row-actions .quiet { width: 100%; }
+  .library-pagination { justify-content: space-between; flex-wrap: wrap; }
   .upload-panel { padding: 22px 18px; gap: 20px; }
   .policy-options { display: grid; gap: 4px; }
   .reverse-policy.compact { width: 100%; min-width: 0; }

@@ -52,23 +52,20 @@ async def list_images(
     with environment(request) as database_environment:
         records = database_environment.memes.list(search=search, page=page, page_size=page_size)
         total = database_environment.memes.count(search=search)
-    valid_records: list[Any] = []
-    source_images: dict[Any, Any] = {}
-    source_metadata: dict[Any, dict[str, object]] = {}
-    source_identities: dict[Any, tuple[int, str]] = {}
-    for record in records:
-        try:
-            image = scoped_services.metadata.blob_store.resolve(record.storage_key)
-            image_identity = scoped_services.metadata._identity(image)
-        except (DatabaseError, MetadataError):
-            # 与旧入口一致：无法证明文件指纹的记录不进入公开列表。
-            continue
-        valid_records.append(record)
-        source_images[record.id] = image
-        source_metadata[record.id] = image_identity
-        source_sha256 = image_identity.get("sha256")
-        if isinstance(source_sha256, str) and len(source_sha256) == 64:
-            source_identities[record.id] = (int(image_identity["size_bytes"]), source_sha256)
+    valid_records = records
+    source_identities = {record.id: (int(getattr(record, "size_bytes", 0)), str(record.sha256)) for record in records if hasattr(record, "size_bytes")}
+    compatibility_identities: dict[Any, dict[str, object]] = {}
+    # 旧测试夹具或兼容 facade 没有物化大小时仍可读取一次身份；生产 ORM 路径不进入此分支。
+    if len(source_identities) != len(records):
+        for record in records:
+            if record.id in source_identities:
+                continue
+            try:
+                image = scoped_services.metadata.blob_store.resolve(record.storage_key)
+                compatibility_identities[record.id] = scoped_services.metadata._identity(image)
+                source_identities[record.id] = (int(compatibility_identities[record.id]["size_bytes"]), str(record.sha256))
+            except (DatabaseError, MetadataError, KeyError, TypeError, ValueError):
+                source_identities[record.id] = (0, str(record.sha256))
     items: list[dict[str, object]] = []
     identity = visual_identity(request)
     thumbnails = getattr(scoped_services, "thumbnails", None)
@@ -92,40 +89,46 @@ async def list_images(
     ready_text_embedding_ids_fn = getattr(scoped_services.search, "valid_text_embedding_ids", None)
     if callable(ready_text_embedding_ids_fn) and valid_records:
         ready_text_embedding_ids = set(ready_text_embedding_ids_fn(valid_records))
-    metadata_status_fn = scoped_services.metadata.status
-    accepts_identity = False
-    try:
-        accepts_identity = "identity" in inspect.signature(metadata_status_fn).parameters
-    except (TypeError, ValueError):
-        pass
+    ready_visual_embedding_ids: set[object] = set()
+    with environment(request) as database_environment:
+        ready_ids_fn = getattr(database_environment.visual, "ready_ids", None)
+        if callable(ready_ids_fn) and valid_records:
+            ready_visual_embedding_ids = set(ready_ids_fn(valid_records, model=identity.model, preprocess_version=identity.preprocess_version, dimensions=identity.dimensions))
+    processing = processing_repository(request)
+    latest_processing_by_meme: dict[object, Any] = {}
+    latest_for_targets = getattr(processing, "latest_for_targets", None)
+    if callable(latest_for_targets) and valid_records:
+        latest_processing_by_meme = latest_for_targets((record.id, record.sha256) for record in valid_records)
     for record in valid_records:
-        image = source_images[record.id]
-        image_identity = source_metadata[record.id]
-        if accepts_identity:
-            metadata_status = metadata_status_fn(image, identity=image_identity)
+        if hasattr(record, "context_status"):
+            metadata_status = {"status": record.context_status}
         else:
-            metadata_status = metadata_status_fn(image)
-        with environment(request) as database_environment:
-            visual_row = database_environment.visual.get(
-                record.id,
-                model=identity.model,
-                preprocess_version=identity.preprocess_version,
-                dimensions=identity.dimensions,
-                image_sha256=record.sha256,
-            )
+            image = scoped_services.metadata.blob_store.resolve(record.storage_key)
+            metadata_status_fn = scoped_services.metadata.status
+            try:
+                if "identity" in inspect.signature(metadata_status_fn).parameters:
+                    metadata_status = metadata_status_fn(image, identity=compatibility_identities.get(record.id))
+                else:
+                    metadata_status = metadata_status_fn(image)
+            except (TypeError, ValueError):
+                metadata_status = metadata_status_fn(image)
+        visual_ready = record.id in ready_visual_embedding_ids
+        if not callable(getattr(database_environment.visual, "ready_ids", None)):
+            with environment(request) as fallback_environment:
+                visual_ready = fallback_environment.visual.get(record.id, model=identity.model, preprocess_version=identity.preprocess_version, dimensions=identity.dimensions, image_sha256=record.sha256) is not None
         item: dict[str, object] = {
             "meme_id": str(record.id),
             "filename": record.storage_key,
             "extension": record.extension,
-            "size": image_identity["size_bytes"],
+            "size": getattr(record, "size_bytes", 0),
             "media_url": f"/media/{record.id}",
             "metadata": metadata_status,
             "embedding_status": "blocked" if metadata_status.get("status") == "repair_required" else "ready" if record.id in ready_text_embedding_ids else "pending",
-            "visual_embedding_status": "ready" if visual_row is not None else "pending",
+            "visual_embedding_status": "ready" if visual_ready else "pending",
         }
         if thumbnails is not None:
             item["thumbnail"] = thumbnail_projections.get(record.id, {"status": "pending", "media_url": None})
-        latest_processing = processing_repository(request).latest_for_target(record.id, record.sha256)
+        latest_processing = latest_processing_by_meme.get(record.id) if latest_processing_by_meme else processing.latest_for_target(record.id, record.sha256)
         if latest_processing is not None:
             processing_public = latest_processing.as_dict()
             item.update(
