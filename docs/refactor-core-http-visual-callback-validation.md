@@ -7,7 +7,7 @@
 
 - 实现 commit：`7c1b68d2e1dde6d129e89e6f528656c4baf8c1ff`
 - 实现父提交：`39d182d31a8b2f9ea59a1789bdd874f3632498cc`
-- 变更范围：新增 `backend/visual_callback_http.py`、`tests/test_visual_callback_http.py`、
+- 历史记录：曾新增 `backend/visual_callback_http.py`、`tests/test_visual_callback_http.py`；
   本 change artifacts；`api.py` 删除视觉匹配 callback 的重复模型/编排，只保留 canonical
   route、legacy model/handler 和显式宿主 callback 注入。未修改 callback token 生成、数据库
   repository/schema、VisualSearchService、scope middleware、Server adapter 或 frontend。
@@ -27,7 +27,7 @@
 
 ## 对抗性复核
 
-- `/internal/visual-search/match` 保持单个 `POST`、`internal` tag、route 名称和旧 model/handler
+- 后续边界收束已删除旧视觉 callback、对应 model、handler 和测试；当前 Agent 只能读取服务端在启动前冻结的候选图片清单。
   import；新模块 AST 依赖不包含 `api` 或 `server_api`。
 - 请求模型继续 `extra="forbid"`，客户端不能提交 scope、path 或其它执行事实；注入 binding
   还必须是真实 `CallbackBinding`，header/body request id 均按既有格式校验。

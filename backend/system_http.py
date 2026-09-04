@@ -32,7 +32,7 @@ from backend.rate_limiter import RateLimiter
 from backend.scope import ScopeResolutionError, resolve_scope_async, validate_scope_services
 
 
-INTERNAL_SCOPE_CALLBACK_PATHS = frozenset({"/internal/reverse-image/search", "/internal/visual-search/match"})
+INTERNAL_SCOPE_CALLBACK_PATHS = frozenset({"/internal/reverse-image/search"})
 SCOPE_SELECTOR_FIELDS = frozenset({"scope_id", "scope-id", "user_id", "user-id"})
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 

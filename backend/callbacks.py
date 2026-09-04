@@ -26,7 +26,7 @@ from backend.database import ScopeContext
 logger = logging.getLogger(__name__)
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
-_CALLBACK_OPERATIONS = frozenset({"analysis.reverse_image_search", "analysis.visual_search"})
+_CALLBACK_OPERATIONS = frozenset({"analysis.reverse_image_search"})
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 # callback 会随当前 claim 继续做数据库复核，因此签名凭据可以覆盖最长 Agent 执行窗口。
@@ -269,7 +269,7 @@ class HMACCallbackCredentials:
             raise CallbackError() from exc
         if expires <= now or expires > now + timedelta(seconds=self.ttl_seconds):
             raise CallbackError()
-        if path is not None and path not in {"/internal/reverse-image/search", "/internal/visual-search/match"}:
+        if path is not None and path != "/internal/reverse-image/search":
             raise CallbackError("agent_callback_invalid_execution")
         return binding
 
@@ -312,7 +312,6 @@ class CallbackRegistry:
 
 DEFAULT_CALLBACK_REGISTRY = CallbackRegistry()
 DEFAULT_CALLBACK_REGISTRY.register(CallbackRegistration("/internal/reverse-image/search", frozenset({"meme_context_generation"}), frozenset({"analysis.reverse_image_search"}), side_effect="provider_and_usage", target_validator="task_image_sha256"))
-DEFAULT_CALLBACK_REGISTRY.register(CallbackRegistration("/internal/visual-search/match", frozenset({"meme_context_generation"}), frozenset({"analysis.visual_search"}), target_validator="task_visual_embedding"))
 
 
 def verify_content_length(headers: Mapping[str, str], *, limit: int) -> None:

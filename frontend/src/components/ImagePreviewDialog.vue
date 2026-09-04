@@ -182,7 +182,7 @@ function producerLabel(value: unknown): string {
     human: '人工',
     research: '外部研究',
     agent: 'Agent 分析',
-    visual: '视觉分析',
+    visual: '视觉向量生成',
   }
   return Object.prototype.hasOwnProperty.call(labels, producer) ? labels[producer] : (producer ? '自动分析' : '')
 }
@@ -284,7 +284,7 @@ function canRetryStage(stage: ImageProcessingStage): boolean {
 /** 给恢复按钮返回稳定中文文案，避免把后端枚举暴露给用户。 */
 function stageRetryLabel(stage: ImageProcessingStage): string {
   if (stage.stage === 'auto_rename') return '恢复自动命名'
-  if (stage.stage === 'visual') return '仅视觉'
+  if (stage.stage === 'visual') return '仅生成视觉向量'
   if (stage.stage === 'agent') return '仅 Agent'
   return '仅文本'
 }

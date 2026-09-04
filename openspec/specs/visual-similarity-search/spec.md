@@ -34,7 +34,7 @@
 - **THEN** 系统不得比较这些向量，并返回稳定错误或排除不一致候选
 
 ### Requirement: 匹配必须受任务 scope 和候选资格约束
-系统 MUST 从可信的运行中 Agent 任务推导查询 `scope_id` 和查询 `meme_id`，不得接受脚本自行指定任意 scope。候选 MUST 属于同一 scope、图片记录和存储对象仍有效、视觉向量对应当前图片 SHA-256，并且当前图片内容已经由 research Agent 成功生成 `ready` 语境；`pending`、`partial`、`repair_required`、已删除和跨 scope 图片 MUST NOT 参与匹配。
+系统 MUST 在 Agent 启动前从可信任务上下文推导查询 `scope_id` 和查询 `meme_id`，并冻结候选图片清单。候选 MUST 属于同一 scope、图片记录和存储对象仍有效、视觉向量对应当前图片 SHA-256，并且当前图片内容已经由 research Agent 成功生成 `ready` 语境；`pending`、`partial`、`repair_required`、已删除和跨 scope 图片 MUST NOT 参与匹配。Agent 运行期间不得通过接口重新提交 scope 或候选数量。
 
 #### Scenario: 返回同 scope 的 Agent-ready 候选
 - **WHEN** 查询图向量有效且同 scope 中存在视觉相似、当前 Agent 语境已成功生成的图片
@@ -59,13 +59,15 @@
 - **WHEN** 多个候选具有相同相似度分数
 - **THEN** 系统按稳定 `meme_id` 返回可重复的顺序
 
-### Requirement: Skill 必须通过薄客户端调用内部匹配能力
-`research-meme-context` Skill MUST 提供只负责参数解析、调用内部接口和输出统一 JSON 的视觉匹配脚本。脚本 MUST 使用运行时注入的任务标识和内部接口地址，不得读取数据库凭据、视觉模型权重或任意 scope 参数。
+### Requirement: Agent 只能读取服务端冻结的候选清单
+服务端 MUST 在 Agent 启动前生成并校验当前任务的候选图片清单。Skill 只能读取运行时注入的清单文件，不得调用本地视觉匹配 callback，不得提交 scope、候选数量或任意图片标识来扩大候选范围。
 
-#### Scenario: Agent 调用视觉匹配脚本
-- **WHEN** research Agent 在语境任务中调用视觉匹配脚本并指定结果数量
-- **THEN** 脚本使用当前任务身份完成受控查询，并将成功 JSON 输出到标准输出
+#### Scenario: Agent 读取候选清单
+- **WHEN** Agent 需要参考本地相似图片
+- **THEN** Skill 从当前任务清单读取候选及其语境、分数和受控图片引用
+- **AND** 不创建新的本地匹配请求
 
-#### Scenario: 内部接口拒绝请求
-- **WHEN** 当前任务不存在、不是运行中的 Agent 语境任务或接口返回稳定业务错误
-- **THEN** 脚本将稳定错误写到标准错误并以非零状态退出
+#### Scenario: 候选清单缺失
+- **WHEN** Agent 任务缺少服务端候选清单或清单校验失败
+- **THEN** Skill 返回稳定错误或空候选诊断
+- **AND** 不自行查询数据库或调用旧 callback

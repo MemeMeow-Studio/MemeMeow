@@ -3,7 +3,7 @@
 为用户提供通过自然语言查找本地表情图片的稳定行为契约，并在普通语义检索与可选 LLM 查询增强之间保持简单、可回退的使用体验。
 ## Requirements
 ### Requirement: 系统必须执行受缓存保护的语义检索
-系统 MUST 使用当前 scope 已激活的数据库向量索引执行查询，并返回不超过请求数量的可访问图片引用。当前 scope 没有可用索引时，系统 MUST 不执行不完整检索，并返回明确的索引未就绪错误。查询不得返回其他 scope 的候选结果。生成索引时 MUST 从 PostgreSQL 中非空的 `title`、`summary`、`subjects`、`visible_text`、已确认 `references`、非空 `meaning` 和 `keywords` 按固定格式构造语义文本；`search_queries`、`uncertainties` 和 `source_urls` MUST 不得进入 embedding。
+系统 MUST 将 `POST /search` 定义为文本语义检索，使用当前 scope 已激活的数据库向量索引执行查询，并返回不超过请求数量的可访问图片引用。当前 scope 没有可用索引时，系统 MUST 不执行不完整检索，并返回明确的索引未就绪错误。查询不得返回其他 scope 的候选结果。生成索引时 MUST 从 PostgreSQL 中非空的 `title`、`summary`、`subjects`、`visible_text`、已确认 `references`、非空 `meaning` 和 `keywords` 按固定格式构造语义文本；`search_queries`、`uncertainties` 和 `source_urls` MUST 不得进入 embedding。
 
 #### Scenario: 缓存就绪时返回结果
 - **WHEN** 客户端提交非空查询且当前 scope 的向量索引已激活

@@ -23,7 +23,7 @@ const stages = ref<CoreImageProcessingStage[]>([])
 const stageOptions: Array<{ value: CoreImageProcessingStage; label: string; description: string }> = [
   { value: 'agent', label: '图片语境', description: '重新分析图片表达的内容和含义' },
   { value: 'text_embedding', label: '文本索引', description: '根据当前语境重新生成检索索引' },
-  { value: 'visual', label: '图片向量', description: '重新生成图片的视觉向量' },
+  { value: 'visual', label: '视觉向量生成', description: '重新生成图片的视觉向量' },
 ]
 
 const confirmLabel = computed(() => mode.value === 'full' ? '完整重试' : `重试已选部分（${stages.value.length}）`)

@@ -63,7 +63,6 @@ class Settings(BaseSettings):
     visual_weights_sha256: str | None = Field(default=None, min_length=64, max_length=64, validation_alias=AliasChoices("MEMEMEOW_VISUAL_WEIGHTS_SHA256", "VISUAL_WEIGHTS_SHA256", "visual_weights_sha256"))
     visual_internal_url: str = Field(default="http://127.0.0.1:8276/internal/visual-embedding", validation_alias=AliasChoices("MEMEMEOW_VISUAL_INTERNAL_URL", "VISUAL_INTERNAL_URL", "visual_internal_url"))
     visual_health_url: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_VISUAL_HEALTH_URL", "VISUAL_HEALTH_URL", "visual_health_url"))
-    visual_search_internal_url: str = Field(default="http://127.0.0.1:8275/internal/visual-search/match", validation_alias=AliasChoices("MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL", "VISUAL_SEARCH_INTERNAL_URL", "visual_search_internal_url"))
     # Agent 前置视觉候选的上限由服务端固定，Agent 不能通过请求扩大查询范围。
     visual_match_top_k: int = Field(default=20, ge=1, le=50, validation_alias=AliasChoices("MEMEMEOW_VISUAL_MATCH_TOP_K", "VISUAL_MATCH_TOP_K", "visual_match_top_k"))
     # Agent 容器内只保留独立的反向图片 capability 地址；视觉候选通过只读 manifest 提供。

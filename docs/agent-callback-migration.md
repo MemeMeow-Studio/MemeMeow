@@ -69,8 +69,8 @@ callback 版本出现故障时，回滚步骤是“禁用 callback 和新 Agent 
 
 1. 停止新的图片处理/Agent claim，保留 PostgreSQL Task、attempt、usage、grant 和结果
    artifact；不要清空表或把未知执行改成可重试成功。
-2. 让 `/internal/reverse-image/search` 与 `/internal/visual-search/match` 在没有完整
-   服务凭据和当前 claim 时继续返回稳定拒绝；网络隔离和端口隐藏不能替代认证。
+2. 让 `/internal/reverse-image/search` 在没有完整服务凭据和当前 claim 时继续返回稳定
+   拒绝；网络隔离和端口隐藏不能替代认证。视觉候选没有 callback 回滚路径。
 3. 只在恢复到同时支持服务认证、当前 claim fencing、scope/目标 SHA 校验的版本后重新
    开放 callback。旧任务由新 claim 或显式重试收束，不为旧执行恢复兼容旁路。
 

@@ -230,7 +230,9 @@ async function retryTask(): Promise<void> {
     } else if (selected?.task_type !== 'image_auto_rename' && selected?.submission_mode === 'pipeline' && selected.image_stage !== 'auto_rename' && selected.processing_job_id && typeof api.retryProcessingJob === 'function') {
       response = await api.retryProcessingJob(selected.processing_job_id)
     } else if (selected?.task_type !== 'image_auto_rename' && selected?.submission_mode === 'standalone' && selected.image_stage && typeof api.submitImageStage === 'function') {
-      response = await api.submitImageStage({ meme_id: image.meme_id, stage: selected.image_stage, reverse_image_policy: 'forbid' })
+      const stageRequest: Record<string, unknown> = { meme_id: image.meme_id, stage: selected.image_stage }
+      if (selected.image_stage !== 'visual') stageRequest.reverse_image_policy = 'forbid'
+      response = await api.submitImageStage(stageRequest)
     } else if (selected?.task_type === 'meme_context_generation' && selected.submission_mode == null) {
       // 未归类历史只保留旧诊断兼容，不把新的图片任务送入通用 retry。
       response = await api.context({ meme_id: image.meme_id })
@@ -292,7 +294,7 @@ onBeforeUnmount(() => {
     </div>
     <div class="task-toolbar">
       <label>状态<select v-model="status" aria-label="按状态筛选" @change="loadTasks()"><option value="">全部</option><option value="queued">排队中</option><option value="running">处理中</option><option value="succeeded">已完成</option><option value="failed">失败</option><option value="blocked">已阻止</option><option value="unknown_execution">执行状态未知</option></select></label>
-      <label>类型<select v-model="type" aria-label="按类型筛选" @change="loadTasks()"><option value="">全部</option><option value="meme_context_generation">语境生成</option><option value="visual_embedding_generation">图片向量</option><option value="image_auto_rename">自动重命名</option><option value="text_embedding_generation">文本 embedding</option><option value="cache_generation">检索缓存</option><option value="metadata_repair">元数据修复</option></select></label>
+      <label>类型<select v-model="type" aria-label="按类型筛选" @change="loadTasks()"><option value="">全部</option><option value="meme_context_generation">图片语境分析</option><option value="visual_embedding_generation">视觉向量生成</option><option value="image_auto_rename">自动重命名</option><option value="text_embedding_generation">文本语义检索</option><option value="cache_generation">检索缓存</option><option value="metadata_repair">元数据修复</option></select></label>
     </div>
     <div class="task-table" :class="{ loading }" role="table" aria-label="处理任务列表">
       <div class="task-head" role="row"><span role="columnheader">状态</span><span role="columnheader">类型</span><span role="columnheader">来源</span><span role="columnheader">关联图片</span><span role="columnheader">进度</span><span role="columnheader">创建时间</span></div>

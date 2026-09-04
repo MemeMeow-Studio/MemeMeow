@@ -448,7 +448,7 @@ def sanitize_task_result(task_type: object, value: object) -> dict[str, Any] | N
         return None
     result: dict[str, Any] = {}
     if task_type == "meme_context_generation":
-        audit = value.get("reverse_image")
+        audit = value.get("network_reverse_image_search")
         if isinstance(audit, Mapping):
             public_audit: dict[str, Any] = {}
             policy = audit.get("policy")
@@ -457,15 +457,19 @@ def sanitize_task_result(task_type: object, value: object) -> dict[str, Any] | N
             for key in ("attempted", "used"):
                 if isinstance(audit.get(key), bool):
                     public_audit[key] = audit[key]
-            for key in ("cache_hits", "provider_calls", "request_count"):
-                safe = _safe_int(audit.get(key))
+            for source, target in (
+                ("cache_hits", "network_cache_hits"),
+                ("provider_calls", "network_provider_calls"),
+                ("request_count", "network_request_count"),
+            ):
+                safe = _safe_int(audit.get(source))
                 if safe is not None:
-                    public_audit[key] = safe
+                    public_audit[target] = safe
             outcome = normalize_public_code(audit.get("outcome"))
             if outcome:
                 public_audit["outcome"] = outcome
             if public_audit:
-                result["reverse_image"] = public_audit
+                result["network_reverse_image_search"] = public_audit
         snapshot = sanitize_visual_snapshot_summary(value.get("visual_match_snapshot"))
         if snapshot is not None:
             result["visual_match_snapshot"] = snapshot

@@ -520,8 +520,8 @@ class VisualSearchService:
     def match(self, *, task_id: str, top_k: int = 20, exclude_self: bool = True, require_storage: bool = False) -> dict[str, object]:
         """仅允许 running 语境任务查询同 scope 候选，并可严格校验文件身份。
 
-        ``require_storage`` 只由任务前置 snapshot 使用；兼容 callback 查询仍可
-        跳过暂时不可用的候选，避免改变旧接口的筛选语义。
+        ``require_storage`` 只由任务启动前的候选清单准备使用；独立查询接口不再对
+        Agent 开放，避免运行期间重新读取图片库。
         """
         if not isinstance(task_id, str) or not task_id.strip():
             raise VisualSearchError("invalid_task", "任务标识无效", status_code=404)

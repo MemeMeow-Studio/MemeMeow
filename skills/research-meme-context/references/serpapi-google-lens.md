@@ -29,13 +29,13 @@ python skills/research-meme-context/scripts/serpapi_google_lens.py \
 callback/usage 事实，provider 已开始但结果未知时返回 `reverse_image_unknown_execution`
 且不会自动重放。
 
-脚本只调用携带当前任务 callback 凭据的内部 multipart 接口并输出统一 JSON；缓存、供应商访问、脱敏和 usage event 由后端负责。输出结果不包含 `image_id`、SerpApi 归档地址和其他内部标识，但会保留候选网页及图片的公开链接供 Agent 核验。
+脚本只调用携带当前任务 callback 凭据的内部 multipart 接口并输出统一 JSON；缓存、供应商访问、脱敏和 usage event 由后端负责。输出结果不包含供应商临时标识、SerpApi 归档地址和其他内部标识，但会保留候选网页及图片的公开链接供 Agent 核验。
 
 ### 手动调试：公开 URL
 
 生产 Agent 不得使用以下供应商直连调试命令；它们仅作为后端适配器开发参考。
 
-供应商直连调试命令不属于 Agent 契约；后端适配器开发应使用离线 fake provider 或受控测试环境，避免在 Skill 文档、日志或任务环境中出现密钥和 `image_id`。
+供应商直连调试命令不属于 Agent 契约；后端适配器开发应使用离线 fake provider 或受控测试环境，避免在 Skill 文档、日志或任务环境中出现密钥和供应商临时标识。
 
 参数参考：`type=all`、`hl`、`country`、`q` 和 `auto_crop` 由薄客户端提交，后端负责供应商映射。
 
@@ -66,7 +66,7 @@ callback/usage 事实，provider 已开始但结果未知时返回 `reverse_imag
 ## 安全与调用策略
 
 - 不传包含用户隐私、内部内容或无权发送给第三方的图片。
-- 不记录或输出 `api_key`、`image_id`、完整上传响应或 SerpApi 搜索归档 URL。`image_id` 是短期传输凭据，不是表情包元数据。
+- 不记录或输出 `api_key`、供应商临时标识、完整上传响应或 SerpApi 搜索归档 URL。
 - 不设置固定的每图请求上限。只要仍有明确、可验证且尚未解决的证据问题，就可以继续搜索；当连续结果不再增加信息时停止。优先检查缓存，并避免提交重复参数的请求。
 - SerpApi 的 Google Lens 是第三方对 Google Lens 结果的封装。字段、召回结果和可用性可能变化；将空结果和候选结果都视为有限证据。
 

@@ -6,8 +6,8 @@
 
 | 工具 | 用途 | Ubuntu 包 |
 |---|---|---|
-| `curl` | 调用 SerpApi 和下载候选资源 | `curl` |
-| `jq` | 校验并提取 API JSON 字段，例如 `image_id` | `jq` |
+| `curl` | 下载候选资源或调试网络连接 | `curl` |
+| `jq` | 校验并提取 JSON 字段 | `jq` |
 | `file` | 在上传前确认 MIME 类型 | `file` |
 
 ## 建议

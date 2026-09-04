@@ -1,9 +1,7 @@
-"""公共 HTTP 能力和内部 callback 装配边界。
+"""公共 HTTP 能力和联网反向图片 callback 装配边界。
 
-本模块承载 operation availability 以及两个内部 callback 入口的薄 HTTP glue。反向图片
-和视觉匹配的 task、claim、scope、provider/service 逻辑继续位于各自领域模块；入口通过
-显式 callback 注入 database、registry、binding、错误工厂和 delegate，禁止反向导入
-``api.py`` 或 ``server_api.py``。
+本模块承载 operation availability 以及联网反向图片 callback 的薄 HTTP glue。task、
+claim、scope、provider/service 逻辑位于各自领域模块；入口通过显式 callback 注入依赖。
 """
 
 from __future__ import annotations
@@ -17,7 +15,6 @@ from fastapi import HTTPException, Request
 from backend.callbacks import DEFAULT_CALLBACK_REGISTRY
 from backend.operation_policy import Operations, OperationPolicyError
 from backend.reverse_image_http import internal_reverse_image_search as _reverse_image_search_http
-from backend.visual_callback_http import internal_visual_search_match as _visual_search_match_http
 
 
 ErrorFactory = Callable[[int, str, str], HTTPException]
@@ -115,34 +112,6 @@ async def internal_reverse_image_search(
     )
 
 
-async def internal_visual_search_match(
-    request: Request,
-    payload: Any,
-    *,
-    binding: Callable[[Request], Any],
-    registration: Callable[[Request], Any],
-    database: Callable[[Request], Any],
-    scope_services: Callable[[Request, Any], Any],
-    error: ErrorFactory,
-    delegate: Callable[..., Awaitable[dict[str, object]]] = _visual_search_match_http,
-) -> dict[str, object]:
-    """通过显式依赖委托内部视觉匹配 callback。
-
-    输入是 callback JSON payload 和 binding/registry/database/service/error callback；输出是
-    视觉领域模块的稳定结果。调用场景是内部 callback 路由，所有 task、claim、scope、事实
-    幂等和错误状态仍由领域 delegate 负责，入口不重复维护安全事实。
-    """
-    return await delegate(
-        request,
-        payload,
-        binding=binding,
-        registration=registration,
-        database=database,
-        scope_services=scope_services,
-        error=error,
-    )
-
-
 def callback_registration(request: Request) -> Any:
     """读取当前 callback path 的 registry 注册项。
 
@@ -156,6 +125,5 @@ def callback_registration(request: Request) -> Any:
 __all__ = [
     "callback_registration",
     "internal_reverse_image_search",
-    "internal_visual_search_match",
     "operation_availability",
 ]

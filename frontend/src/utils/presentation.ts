@@ -129,7 +129,7 @@ export function taskTypeLabel(type?: string): string {
     derived_thumbnail_generation: '缩略图生成',
     visual_embedding_generation: '图片向量生成',
     image_auto_rename: '自动重命名',
-    text_embedding_generation: '文本 embedding',
+    text_embedding_generation: '文本语义检索',
     image_processing: '完整图片处理',
   }[type || ''] || type || '未知任务'
 }
@@ -141,7 +141,7 @@ export function submissionModeLabel(mode?: string | null): string {
 
 /** 将图片阶段转换为工作台标签。 */
 export function imageStageLabel(stage?: string | null): string {
-  return { visual: '视觉向量', agent: 'Agent 语境', auto_rename: '自动重命名', text_embedding: '文本 embedding' }[stage || ''] || '图片阶段'
+  return { visual: '视觉向量生成', agent: '图片语境分析', auto_rename: '自动重命名', text_embedding: '文本语义检索' }[stage || ''] || '图片阶段'
 }
 
 /** 将图片处理 Job 阶段状态转换为短标签。 */

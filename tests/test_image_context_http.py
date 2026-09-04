@@ -37,21 +37,17 @@ def _snapshot(job_id: str, *, stage: str = "agent", task_id: str | None = None) 
     )
 
 
-def test_image_context_routes_keep_order_and_legacy_imports() -> None:
-    """五个图片语境路由保持 method/status/tag/order 与旧符号。"""
+def test_image_context_routes_keep_only_current_processing_entries() -> None:
+    """图片语境路由保留完整处理入口，旧视觉向量入口已经删除。"""
     expected_paths = [
         "/images/context",
         "/images/context/batch",
-        "/images/visual-embedding",
-        "/images/visual-embedding/batch",
         "/images/metadata/repair",
     ]
     routes = [route for route in api.app.routes if getattr(route, "path", None) in expected_paths]
     assert [(route.path, route.methods, route.status_code) for route in routes] == [
         ("/images/context", {"POST"}, 202),
         ("/images/context/batch", {"POST"}, None),
-        ("/images/visual-embedding", {"POST"}, 202),
-        ("/images/visual-embedding/batch", {"POST"}, 202),
         ("/images/metadata/repair", {"POST"}, 202),
     ]
     assert all(route.tags == ["images", "tasks"] for route in routes)
@@ -59,8 +55,6 @@ def test_image_context_routes_keep_order_and_legacy_imports() -> None:
     assert api.ContextBatchRequest is image_context_http.ContextBatchRequest
     assert api.generate_context.__name__ == "generate_context"
     assert api.generate_context_batch.__name__ == "generate_context_batch"
-    assert api.generate_visual_embedding.__name__ == "generate_visual_embedding"
-    assert api.generate_visual_embedding_batch.__name__ == "generate_visual_embedding_batch"
     assert api.repair_metadata.__name__ == "repair_metadata"
 
 

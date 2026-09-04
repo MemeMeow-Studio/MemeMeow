@@ -204,7 +204,7 @@ def test_local_visual_match_script_reads_manifest_without_callback(tmp_path: Pat
     environment.pop("MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL", None)
     environment.pop("MEMEMEOW_AGENT_CALLBACK_TOKEN", None)
     result = subprocess.run(
-        [sys.executable, "skills/research-meme-context/scripts/local_visual_match.py", "--top-k", "1"],
+        [sys.executable, "skills/research-meme-context/scripts/local_visual_match.py"],
         cwd=Path(__file__).resolve().parent.parent,
         env=environment,
         capture_output=True,

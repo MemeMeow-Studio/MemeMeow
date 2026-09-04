@@ -29,7 +29,6 @@ def test_system_internal_route_snapshot_and_legacy_aliases() -> None:
         "/config",
         "/operations/availability",
         "/internal/reverse-image/search",
-        "/internal/visual-search/match",
     }
     routes = [route for route in api.app.routes if getattr(route, "path", None) in paths]
     assert [route.path for route in routes] == [
@@ -38,7 +37,6 @@ def test_system_internal_route_snapshot_and_legacy_aliases() -> None:
         "/health",
         "/config",
         "/internal/reverse-image/search",
-        "/internal/visual-search/match",
     ]
     assert [(route.path, route.methods, route.tags) for route in routes] == [
         ("/operations/availability", {"GET"}, ["capabilities"]),
@@ -46,7 +44,6 @@ def test_system_internal_route_snapshot_and_legacy_aliases() -> None:
         ("/health", {"GET"}, ["system"]),
         ("/config", {"GET"}, ["system"]),
         ("/internal/reverse-image/search", {"POST"}, ["internal"]),
-        ("/internal/visual-search/match", {"POST"}, ["internal"]),
     ]
     assert api.root is system_http.root
     assert api.health is system_http.health
@@ -54,7 +51,6 @@ def test_system_internal_route_snapshot_and_legacy_aliases() -> None:
     assert api._error is system_http.error
     assert sum(route.path == "/operations/availability" for route in api.app.routes) == 1
     assert sum(route.path == "/internal/reverse-image/search" for route in api.app.routes) == 1
-    assert sum(route.path == "/internal/visual-search/match" for route in api.app.routes) == 1
 
 
 def test_canonical_system_modules_do_not_import_entrypoints() -> None:

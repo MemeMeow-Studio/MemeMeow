@@ -34,8 +34,9 @@ handler registry、Agent lane 背压和恢复扫描；scope facade 只在请求�
 创建，不按历史 scope 数量启动 Worker。无效 Task scope 由启动诊断标记为
 `task_scope_invalid`，不会猜测为 local。
 
-反向图片和视觉 callback 只接收 task ID，跳过公共用户 request scope 绑定，先从任务
-控制面恢复 scope，再按任务类型、运行状态和 claim 条件处理。callback 不信任自报 scope，
+联网反向图片 callback 只接收 task ID，跳过公共用户 request scope 绑定，先从任务
+控制面恢复 scope，再按任务类型、运行状态和 claim 条件处理。视觉候选不再通过 callback，
+而是在 Agent 启动前由服务端冻结候选图片清单。callback 不信任自报 scope，
 并要求独立 callback verifier 验证短期任务凭据；认证发生在读取 multipart/JSON body、
 查询 Task 或创建临时文件之前。开源入口可使用显式配置的 HMAC callback secret，secret
 缺失或 verifier 异常时 callback 保持不可用，不回退到无认证。宿主公网部署仍必须在代理

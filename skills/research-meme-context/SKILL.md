@@ -33,7 +33,7 @@ description: Research evidence-backed structured representations of image memes,
 
    当角色、模板、出处或外部引用的名称未知，或图片文字过于普通时，优先对整图进行 `reverse_image`。它的价值是从像素中发现可用于后续文字检索的名称、别名、传播页和相似变体，而不是直接判定梗义或出处。只有整图结果不足时，才对一个有区分度的主体裁剪图做受限重试。
 
-   如果 OCR 已含精确且有区分度的专名、固定引语或作品名，可先使用 `exact_text`，以节省图片检索请求。不要把宽泛的文字配文当作足以替代以图搜图的锚点。
+   如果 OCR 已含精确且有区分度的专名、固定引语或作品名，可先使用 `exact_text`，以节省联网反向图片检索请求。不要把宽泛的文字配文当作足以替代联网反向图片检索的锚点。
 4. 从证据选择查询。
 
    组合有区分度的事实，而不是只搜索宽泛的主体。每条查询都要标注查询意图和支持它的观察。
@@ -55,7 +55,7 @@ description: Research evidence-backed structured representations of image memes,
 
 ## 图片搜索工具
 
-SerpApi Google Lens 是可选的反向图片检索工具，不是本 Skill 的唯一信息源。只有任务 payload 的 `reverse_image_policy` 为 `auto` 时，才可使用项目提供的 `serpapi_google_lens.py` 薄客户端；客户端通过 Runner 注入的 `MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL`、`MEMEMEOW_AGENT_TASK_ID` 和 `MEMEMEOW_AGENT_CALLBACK_TOKEN` 调用内部 multipart 接口。Agent 不读取、不传递也不应拥有 `SERPAPI_API_KEY`。调用、本地上传限制、结果字段和重试边界见 [references/serpapi-google-lens.md](references/serpapi-google-lens.md)。
+SerpApi Google Lens 是可选的联网反向图片检索工具，不是本 Skill 的唯一信息源。只有任务 payload 的 `reverse_image_policy` 为 `auto` 时，才可使用项目提供的 `serpapi_google_lens.py` 薄客户端；客户端通过 Runner 注入的 `MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL`、`MEMEMEOW_AGENT_TASK_ID` 和 `MEMEMEOW_AGENT_CALLBACK_TOKEN` 调用内部接口。Agent 不读取、不传递也不应拥有 `SERPAPI_API_KEY`。调用、结果字段和重试边界见 [references/serpapi-google-lens.md](references/serpapi-google-lens.md)。
 
 ## 判断规则
 

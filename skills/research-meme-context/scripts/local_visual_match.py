@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """读取后端已物化的 task-scoped 视觉候选 manifest。
 
-该脚本保留历史文件名以兼容既有 Skill 调用，但不再发起 HTTP 请求、读取 callback
-凭据或接受 top-k、scope 和图片标识。候选排序和数量在任务 claim 前已经冻结。
+该脚本只读取当前任务的候选清单，不发起 HTTP 请求、读取 callback 凭据或接受 top-k、
+scope 和图片标识。候选排序和数量在任务 claim 前已经冻结。
 """
 
 from __future__ import annotations
@@ -130,15 +130,17 @@ def _read_manifest(path: Path) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     """读取当前 Agent 任务的固定候选 manifest 并输出 JSON。"""
-    parser = argparse.ArgumentParser(description="读取当前 Agent 任务的视觉候选 manifest")
-    # 兼容旧 Skill 传入的参数；候选数量不能在 Agent 端改变，参数值不参与读取。
-    parser.add_argument("--top-k", type=int, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--include-self", action="store_true", help=argparse.SUPPRESS)
-    args = parser.parse_args(argv)
-    del args
     task_id = os.getenv("MEMEMEOW_AGENT_TASK_ID", "")
     if not TASK_ID_RE.fullmatch(task_id):
         return _error("agent_task_id_missing", "运行时未注入有效任务标识")
+    parser = argparse.ArgumentParser(description="读取当前 Agent 任务的视觉候选 manifest")
+    # 不定义候选数量、scope 或图片标识参数，避免 Agent 在运行中扩大候选范围。
+    try:
+        _args, unknown = parser.parse_known_args(argv)
+    except SystemExit:
+        return _error("candidate_manifest_arguments_invalid", "候选清单读取不接受候选数量或范围参数")
+    if unknown:
+        return _error("candidate_manifest_arguments_invalid", "候选清单读取不接受候选数量或范围参数")
     try:
         payload = _read_manifest(_manifest_path(task_id))
     except FileNotFoundError:

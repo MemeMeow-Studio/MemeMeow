@@ -79,7 +79,7 @@ app = create_app(scope_resolver=LocalScopeResolver("local"))
 
 - `POST /images/context`：请求 `{ "meme_id": "...", "reverse_image_policy": "forbid|auto", "auto_name": false }`，异步创建或复用单图处理 job，返回 `processing_job_id` 和当前 Agent 阶段摘要。缺省策略为 `forbid`，自动命名缺省关闭。
 - `POST /images/context/batch`：请求 `{ "items": [{"meme_id":"..."}], "include_unready": true, "reverse_image_policy": "forbid|auto", "auto_name": false }`，逐图返回处理 job 结果；省略 `items` 时不隐式扫描孤立文件。
-- `POST /images/visual-embedding` 和 `/images/visual-embedding/batch`：为既有图片提交完整图片处理 Job 的视觉前置；视觉任务失败必须使用完整 Job 重试或受限独立阶段入口。
+- 视觉向量生成使用 `POST /images/stages`，请求为 `{ "meme_id": "...", "stage": "visual" }`；它只创建视觉阶段 Task，不创建 Agent、自动命名或文本向量 Task。视觉阶段不得携带 `reverse_image_policy`，携带该字段直接返回参数错误。
 - `POST /images/metadata/repair`：异步执行数据库记录、图片文件和指纹完整性扫描；不读取 sidecar、不默认调用模型或外部搜索。
 - 图片库的“选择图片”“重试选中”和“完整重试所有未就绪”会调用上述逐图处理接口；有效文本向量写回后会立即具备当前 scope 的搜索资格，不需要为每次上传重建全库缓存。模型切换和存量迁移的显式回填见 [`docs/image-processing-migration.md`](docs/image-processing-migration.md)。
 
@@ -93,7 +93,7 @@ app = create_app(scope_resolver=LocalScopeResolver("local"))
 
 `GET /images/processing` 返回当前 scope 的完整 Job 父项及 visual、agent、auto_rename、text_embedding 四个阶段；Job 和叶子 Task 的 `submission_mode` 明确为 `pipeline`。历史三阶段 Job 读取时合成 `auto_name=false` 和 `auto_rename=skipped`，不回写历史。
 
-`POST /images/stages` 请求仅接受 `{ "meme_id": "...", "stage": "visual|agent|auto_rename|text_embedding", "reverse_image_policy": "forbid|auto" }`，创建或复用无父 Job 的独立阶段 Task。scope、图片 SHA、配置、grant、标题指纹和目标文件名均由服务端派生；返回 `submission_mode=standalone` 与 `processing_job_id=null`。`image_auto_rename` 不得通过通用 `/tasks/{task_id}/retry` 重试。
+`POST /images/stages` 请求接受 `{ "meme_id": "...", "stage": "visual|agent|auto_rename|text_embedding", "reverse_image_policy": "forbid|auto" }`，创建或复用无父 Job 的独立阶段 Task。视觉阶段不得提供 `reverse_image_policy`；Agent 阶段的策略由服务端校验。scope、图片 SHA、配置、grant、标题指纹和目标文件名均由服务端派生；返回 `submission_mode=standalone` 与 `processing_job_id=null`。`image_auto_rename` 不得通过通用 `/tasks/{task_id}/retry` 重试。
 
 `POST /images/stages/batch` 请求 `{ "items": [{"meme_id":"..."}], "stages": ["visual", "agent", "text_embedding"], "reverse_image_policy": "forbid|auto", "auto_name": false }`，为每个选中图片和所选阶段创建或复用独立 Task；阶段列表至少一项、最多三项且不得重复，只接受三个核心阶段。完整重试仍使用 `/images/context/batch` 的完整流水线契约。
 
@@ -130,7 +130,7 @@ app = create_app(scope_resolver=LocalScopeResolver("local"))
 
 ## 内部 Agent callback
 
-`POST /internal/reverse-image/search` 与 `POST /internal/visual-search/match` 不是公共接口。它们在读取 multipart/JSON body 前要求 Runner 注入的短期 HMAC callback token，通过 `X-MemeMeow-Callback`、`X-MemeMeow-Callback-Token` 或 Bearer 头传递；token 绑定当前 Task、scope、claim generation、owner、attempt、目标 SHA、operation、issuer/audience、key id 和过期时间。路由还会从 PostgreSQL 复核 Task 类型、运行状态、租约和目标图片，调用方不能自报 scope、策略或任意图片。反向图片请求的 `request_id` 和 `input_digest` 都可省略；服务端在 Task/目标校验和受控裁剪后规范化 search type、language、country、query、布尔值和实际图片 SHA，返回持久化的权威 request ID。Skill 薄 CLI 默认不发送 `request_id`，仍支持 `--request-id` 兼容旧脚本，并原样输出服务端 JSON。相同当前 claim、规范化输入和 `refresh` 的重试（即使更换 request ID）只恢复同一 callback、usage、provider 和 grant 事实；provider 已开始但结果未知时保持 `reverse_image_unknown_execution`，禁止自动重放。发布、轮换、旧任务收束和禁用式回滚见 [`docs/agent-callback-migration.md`](docs/agent-callback-migration.md)。
+`POST /internal/reverse-image/search` 是唯一的内部联网反向图片检索 callback，不是公共接口。它在读取 multipart body 前要求 Runner 注入的短期 HMAC callback token，通过 `X-MemeMeow-Callback`、`X-MemeMeow-Callback-Token` 或 Bearer 头传递；token 绑定当前 Task、scope、claim generation、owner、attempt、目标 SHA、operation、issuer/audience、key id 和过期时间。路由还会从 PostgreSQL 复核 Task 类型、运行状态、租约和目标图片，调用方不能自报 scope、策略或任意图片。反向图片请求的 `request_id` 和 `input_digest` 都可省略；服务端在 Task/目标校验和受控裁剪后规范化 search type、language、country、query、布尔值和实际图片 SHA，返回持久化的权威 request ID。视觉候选不会通过 callback 查询，而是在 Agent 启动前由服务端冻结候选清单。
 
 Agent 只获得当前任务 token、内部地址和 executor token，不获得 callback 根 secret、`SERPAPI_API_KEY` 或数据库凭据，也不得绕过 callback 直接访问 provider。callback secret 由 `MEMEMEOW_AGENT_CALLBACK_SECRET` 配置，生产部署必须通过独立服务身份和网络隔离保护；`MEMEMEOW_AGENT_CALLBACK_VERIFICATION_KEYS` 可用 `kid=secret,kid=secret` 提供轮换期间的旧 key 验证窗口。根 secret 缺失、格式错误、必需 callback 复合索引未就绪或 verifier 异常时 callback 保持不可用，不回退到 request-ID-only 逻辑。凭据轮换后旧 claim 应收束并显式重试。无凭据、旧 claim、租约过期、目标 SHA 变化和超限 body 都以稳定错误拒绝。迁移会先扫描历史逻辑重复或字段缺失并 fail-closed，不删除、合并或猜测覆盖既有事实；无 callback 的 local 直连仍使用原有缓存和显式 request ID 语义。
 
@@ -139,7 +139,7 @@ Agent 只获得当前任务 token、内部地址和 executor token，不获得 c
 - `GET /config`：只返回模型名、provider 是否配置和 `*_api_key_configured` 布尔状态；完整 URL、路径和密钥不返回。上传能力字段包含服务端强制的 `max_files_per_request: 20`、仅供客户端调度提示的 `max_concurrent_upload_requests: 2` 和可选 `max_request_bytes: null|正整数`；服务端不以并发提示字段执行在途请求 admission，文件数和总字节预算仍由服务端执行。
 - 本地视觉活动模型固定为 `dinov2_vitb14`、768 维和 `dinov2_vitb14-rgb224-first-frame-v1`；Compose API 从 `mememeow-visual:8276/health` 读取真实模型状态，权重只在视觉容器内只读挂载并按 `MEMEMEOW_VISUAL_WEIGHTS_SHA256` 校验，未配置时任务返回 `visual_model_not_configured`。历史 DINOv3 向量表保留但不会参与活动匹配。
 - 视觉源码目录由 `MEMEMEOW_VISUAL_MODEL_REPO` 配置，仅服务端读取；源码提交和权重许可要求见 [`docs/visual-model-baseline.md`](docs/visual-model-baseline.md)。
-- Agent 通过内部 `POST /internal/visual-search/match` 发送 `{ "task_id": "...", "top_k": 20, "exclude_self": true }`。scope、查询图片和向量空间均从运行中的 Agent 任务推导；候选必须同 scope、当前 SHA 有效并有成功 research provenance。
+- Agent 只读取任务启动前由服务端写入的候选图片清单。清单已经固定 scope、图片指纹、候选数量、排序和可读取的图片引用，Agent 不能提交 `scope` 或 `top_k` 重新查询图片库。
 - `.env` 关键字段：`EMBEDDING_API_KEY`、`EMBEDDING_BASE_URL`、`EMBEDDING_MODEL`、`MEMEMEOW_OPENCODE_BASE_URL`、`MEMEMEOW_OPENCODE_API_KEY`、`MEMEMEOW_OPENCODE_MODEL`、`MEMEMEOW_OPENCODE_RUNTIME_ROOT`、`MEMEMEOW_IMAGE_ROOT`、`MEMEMEOW_AGENT_CALLBACK_SECRET`。Compose 首次启动会在 `mememeow-agent-executor-secret` named volume 中生成 0600 的随机 executor token，API 以只读方式读取；旧版 host 运维模式仍可显式设置 `MEMEMEOW_AGENT_EXECUTOR_TOKEN`。生产 API 通过 Compose DNS 调用 executor，不使用 Docker CLI 或 socket。
 - Agent 运行模式只接受 `auto`、`executor` 和 `host`。`auto` 在 executor URL 与 token 同时可用时选择 executor，否则选择 host；显式 `executor` 缺少配置时失败关闭。旧 Docker runtime、容器名和运行时字段不能启用任何执行分支；回滚使用显式 host，运维诊断使用当前 project 的 `docker compose exec <service>`。
 - `MEMEMEOW_PROTECTED_MODE=true` 时仅放行 `MEMEMEOW_ALLOWED_ENDPOINTS`；限流由 `MEMEMEOW_RATE_LIMIT_*` 控制，超限返回 `429` 和 `Retry-After`。

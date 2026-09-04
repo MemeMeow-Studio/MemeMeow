@@ -83,8 +83,6 @@ from backend.image_context_http import (
     ContextRequest,
     generate_context as _generate_context_http,
     generate_context_batch as _generate_context_batch_http,
-    generate_visual_embedding as _generate_visual_embedding_http,
-    generate_visual_embedding_batch as _generate_visual_embedding_batch_http,
     repair_metadata as _repair_metadata_http,
 )
 from backend.image_library_http import (
@@ -110,10 +108,6 @@ from backend.collection_http import (
     list_collections as _list_collections_http,
     remove_collection_item as _remove_collection_item_http,
     rename_collection as _rename_collection_http,
-)
-from backend.visual_callback_http import (
-    VisualMatchRequest,
-    internal_visual_search_match as _internal_visual_search_match_http,
 )
 from backend.reverse_image_http import internal_reverse_image_search as _internal_reverse_image_search_http
 from backend.settings_http import (
@@ -170,7 +164,6 @@ from backend.image_upload_http import (
 from backend.internal_capability_http import (
     callback_registration as _callback_registration,
     internal_reverse_image_search as _internal_capability_reverse_image_search,
-    internal_visual_search_match as _internal_capability_visual_search_match,
     operation_availability as _operation_availability_http,
 )
 from backend.system_http import (
@@ -493,7 +486,7 @@ def _submit_context_task(request: Request, image: Path, *, auto_name: bool = Fal
     return _service(request, "tasks").submit("meme_context_generation", _context_payload(request, image, auto_name=auto_name, batch_id=batch_id, expected_sha256=expected_sha256, reverse_image_policy=reverse_image_policy), schedule=schedule)
 
 
-def _visual_payload(request: Request, image: Path, *, batch_id: str | None = None, expected_sha256: str | None = None, reverse_image_policy: str = "forbid") -> dict[str, object]:
+def _visual_payload(request: Request, image: Path, *, batch_id: str | None = None, expected_sha256: str | None = None) -> dict[str, object]:
     """构造视觉任务可序列化 payload，模型身份始终来自服务端配置。"""
     settings: Settings = request.app.state.settings
     identity = identity_from_settings(settings)
@@ -508,16 +501,15 @@ def _visual_payload(request: Request, image: Path, *, batch_id: str | None = Non
         "visual_dimensions": identity.dimensions,
         "preprocess_version": identity.preprocess_version,
         "settings_version": settings.settings_version,
-        "reverse_image_policy": reverse_image_policy if reverse_image_policy in {"forbid", "auto"} else "forbid",
     }
     if batch_id:
         payload["batch_id"] = batch_id
     return payload
 
 
-def _submit_visual_task(request: Request, image: Path, *, batch_id: str | None = None, expected_sha256: str | None = None, reverse_image_policy: str = "forbid", schedule: bool = True) -> TaskRecord:
+def _submit_visual_task(request: Request, image: Path, *, batch_id: str | None = None, expected_sha256: str | None = None, schedule: bool = True) -> TaskRecord:
     """在图片 durable upload 提交后创建或复用异步视觉任务。"""
-    return _service(request, "tasks").submit("visual_embedding_generation", _visual_payload(request, image, batch_id=batch_id, expected_sha256=expected_sha256, reverse_image_policy=reverse_image_policy), schedule=schedule)
+    return _service(request, "tasks").submit("visual_embedding_generation", _visual_payload(request, image, batch_id=batch_id, expected_sha256=expected_sha256), schedule=schedule)
 
 
 def _context_enqueue_error(exc: Exception) -> str:
@@ -1457,21 +1449,6 @@ async def internal_reverse_image_search(
     )
 
 
-@app.post("/internal/visual-search/match", tags=["internal"])
-async def internal_visual_search_match(request: Request, payload: VisualMatchRequest) -> dict[str, object]:
-    """兼容内部视觉匹配 callback，并注入 binding、scope database 与 service。"""
-    return await _internal_capability_visual_search_match(
-        request,
-        payload,
-        binding=lambda received: getattr(received.state, "callback_binding", None),
-        registration=_callback_registration,
-        database=lambda received: received.app.state.database,
-        scope_services=lambda received, scope: validate_scope_services(scope, received.app.state.service_factory.for_scope(scope)),
-        error=_error,
-        delegate=_internal_visual_search_match_http,
-    )
-
-
 # Settings HTTP 路由独立注册到模板应用；直接展开 APIRouter 路由以保持既有路由表顺序，
 # 并让模块级 app 和宿主 create_app() 都复用同一组 APIRoute 对象。
 _route_template.router.routes.extend(settings_router.routes)
@@ -2105,31 +2082,6 @@ async def generate_context_batch(request: Request, payload: ContextBatchRequest)
         service=_service,
         submit_processing_job=_submit_processing_job_for_image,
         error=_error,
-        enqueue_error=_context_enqueue_error,
-    )
-
-
-@app.post("/images/visual-embedding", status_code=202, tags=["images", "tasks"])
-async def generate_visual_embedding(request: Request, payload: ContextRequest) -> dict[str, object]:
-    """兼容视觉向量入口，并注入当前 scope 处理 Job callback。"""
-    return await _generate_visual_embedding_http(
-        request,
-        payload,
-        service=_service,
-        submit_processing_job=_submit_processing_job_for_image,
-        error=_error,
-        enqueue_error=_context_enqueue_error,
-    )
-
-
-@app.post("/images/visual-embedding/batch", status_code=202, tags=["images", "tasks"])
-async def generate_visual_embedding_batch(request: Request, payload: ContextBatchRequest) -> dict[str, object]:
-    """兼容批量视觉向量入口，并注入当前 scope 处理 Job callback。"""
-    return await _generate_visual_embedding_batch_http(
-        request,
-        payload,
-        service=_service,
-        submit_processing_job=_submit_processing_job_for_image,
         enqueue_error=_context_enqueue_error,
     )
 

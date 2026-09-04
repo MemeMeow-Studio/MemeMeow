@@ -691,7 +691,7 @@ def test_many_scope_facades_share_one_process_worker_manager(monkeypatch) -> Non
 def test_internal_callback_does_not_require_user_request_scope() -> None:
     """内部 callback 由 task 控制面恢复 scope，不应被公共 resolver 提前拦截。"""
     state = SimpleNamespace(service_factory=SimpleNamespace(for_task=lambda _task_id: None))
-    request = SimpleNamespace(url=SimpleNamespace(path="/internal/visual-search/match"), app=SimpleNamespace(state=state))
+    request = SimpleNamespace(url=SimpleNamespace(path="/internal/reverse-image/search"), app=SimpleNamespace(state=state))
     called: list[bool] = []
 
     async def call_next(_request):
