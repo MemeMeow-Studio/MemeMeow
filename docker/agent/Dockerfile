@@ -4,7 +4,7 @@ WORKDIR /opt/mememeow
 
 # Agent 镜像只包含运行时工具和项目 Skill，不复制项目源码、配置或数据库凭据。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash ca-certificates curl file jq \
+    bash bubblewrap ca-certificates curl file jq \
     imagemagick ffmpeg \
     tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim tesseract-ocr-chi-tra \
     python3 python3-pip python3-venv python3-dotenv \

@@ -210,12 +210,23 @@ def test_local_visual_cli_reports_missing_runtime_environment() -> None:
     """CLI 缺少 task id 时只写稳定 JSON 错误到 stderr。"""
     script = Path("skills/research-meme-context/scripts/local_visual_match.py")
     environment = dict(os.environ)
-    environment.pop("MEMEMEOW_AGENT_TASK_ID", None)
+    environment["MEMEMEOW_AGENT_TASK_ID"] = "task-123"
     environment.pop("MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL", None)
     environment.pop("MEMEMEOW_VISUAL_MATCH_INTERNAL_URL", None)
     result = subprocess.run([sys.executable, str(script), "--top-k", "2"], capture_output=True, text=True, env=environment, check=False)
     assert result.returncode != 0
-    assert json.loads(result.stderr)["error"] == "agent_task_id_missing"
+    assert json.loads(result.stderr)["error"] == "candidate_manifest_arguments_invalid"
+
+
+def test_local_visual_cli_rejects_removed_include_self_argument() -> None:
+    """候选清单脚本不再兼容会改变候选范围的旧参数。"""
+    script = Path("skills/research-meme-context/scripts/local_visual_match.py")
+    environment = dict(os.environ)
+    environment["MEMEMEOW_AGENT_TASK_ID"] = "task-123"
+    environment.pop("MEMEMEOW_AGENT_CANDIDATE_MANIFEST", None)
+    result = subprocess.run([sys.executable, str(script), "--include-self"], capture_output=True, text=True, env=environment, check=False)
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"] == "candidate_manifest_arguments_invalid"
 
 
 def test_local_visual_cli_reports_missing_manifest() -> None:

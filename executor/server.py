@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import shutil
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -153,6 +154,7 @@ _EXECUTOR_ERROR_CODES = frozenset(
         "agent_provider_rate_limited",
         "agent_provider_server_error",
         "agent_connection_interrupted",
+        "agent_candidate_isolation_unavailable",
         "session_binding_mismatch",
         "session_not_resumable",
         "opencode_workspace_invalid",
@@ -461,8 +463,11 @@ class Executor:
     def _prepare_runtime(self) -> None:
         """创建共享 runtime 目录并确保 executor 以非 root 可写方式启动。"""
         try:
-            for path in (RUNTIME_ROOT, WORKSPACE, RESULT_ROOT, LOG_ROOT, RUNTIME_ROOT / "candidates"):
+            for path in (RUNTIME_ROOT, WORKSPACE, RESULT_ROOT, LOG_ROOT, RUNTIME_ROOT / "candidates", RUNTIME_ROOT / "home"):
                 path.mkdir(parents=True, exist_ok=True)
+            database_path = RUNTIME_ROOT / "opencode.db"
+            database_path.touch(exist_ok=True)
+            os.chmod(database_path, stat.S_IRUSR | stat.S_IWUSR)
             if any(not os.access(path, os.R_OK | os.W_OK) for path in (RUNTIME_ROOT, WORKSPACE, RESULT_ROOT, LOG_ROOT)):
                 self.ready_error = "runtime_not_writable"
                 return
@@ -1064,6 +1069,7 @@ class Executor:
         config_dir = task.config_dir or scratch / ".opencode"
         self._checked_directory(scratch.parent, create=True)
         self._checked_directory(scratch, create=True)
+        self._checked_directory(scratch / "home", create=True)
         self._checked_directory(config_dir, create=True)
         try:
             validate_file_path(config_file, allow_missing=True, code="opencode_workspace_invalid")
@@ -1187,12 +1193,14 @@ class Executor:
 
     def _task_environment(self, task: TaskState) -> dict[str, str]:
         """构造 OpenCode 最小环境白名单，不继承 executor 容器中的无关变量。"""
+        scratch = task.task_scratch_root or (WORKSPACE / "tasks" / task.business_task_id)
         values = {
             "PATH": os.getenv("PATH", "/usr/local/bin:/usr/bin:/bin"),
-            "HOME": os.getenv("HOME", "/runtime/home"),
+            # HOME 使用当前 Task 的独立目录，避免多个 Agent 共享可写配置和缓存。
+            "HOME": str(scratch / "home"),
             "OPENCODE_DB": str(RUNTIME_ROOT / "opencode.db"),
-            "OPENCODE_CONFIG": str(task.config_file or (task.task_scratch_root or (WORKSPACE / "tasks" / task.business_task_id)) / "opencode.json"),
-            "OPENCODE_CONFIG_DIR": str(task.config_dir or (task.task_scratch_root or (WORKSPACE / "tasks" / task.business_task_id)) / ".opencode"),
+            "OPENCODE_CONFIG": str(task.config_file or scratch / "opencode.json"),
+            "OPENCODE_CONFIG_DIR": str(task.config_dir or scratch / ".opencode"),
             "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
             MODEL_BROKER_URL_ENV: self.model_broker_url or self.legacy_base_url,
             # 生产值来自本次 task 的短期 capability；local 旧夹具才使用旧 key。
@@ -1209,6 +1217,59 @@ class Executor:
             "NODE_PATH": "/opt/mememeow/node_modules",
         }
         return values
+
+    def _sandbox_command(self, task: TaskState, command: list[str]) -> list[str]:
+        """为带本地候选清单的 Agent 建立只看当前任务目录的进程边界。
+
+        输入是已经通过任务校验的命令和状态；输出是交给 subprocess 的命令列表。
+        候选清单涉及任务间隔离，必须在操作系统挂载视图中隐藏其它任务目录，不能只
+        依赖 Agent 可覆盖的环境变量或 OpenCode 提示词。
+        """
+        if not task.visual_snapshot_sha256:
+            return command
+        candidate_root = task.candidate_root or (RUNTIME_ROOT / "candidates" / task.business_task_id)
+        if not candidate_root.is_dir():
+            raise RuntimeError("visual_candidate_materialization_failed")
+        bubblewrap = shutil.which("bwrap")
+        if not bubblewrap:
+            raise RuntimeError("agent_candidate_isolation_unavailable")
+        # 先隐藏整个 runtime，再只挂回当前任务需要的目录和文件。这样 Agent 即使
+        # 改写 manifest 环境变量，也看不到其他任务或 scope 的候选目录。
+        mounts: list[str] = [bubblewrap, "--die-with-parent", "--ro-bind", "/", "/", "--tmpfs", str(RUNTIME_ROOT)]
+        scratch = task.task_scratch_root or (WORKSPACE / "tasks" / task.business_task_id)
+        writable_directories = (
+            task.workspace_directory or WORKSPACE,
+            scratch,
+            scratch / "home",
+            RESULT_ROOT / task.business_task_id,
+        )
+        # tmpfs 会遮住 runtime 原有目录；先逐级创建目标，再单独挂回可写视图，
+        # 确保 OpenCode 的配置、缓存、结果文件仍能写入，同时候选目录保持只读。
+        created: set[Path] = set()
+        runtime_root = Path(os.path.abspath(RUNTIME_ROOT))
+
+        def add_mountpoint(path: Path) -> None:
+            """为隐藏 runtime 中的目录目标补齐 tmpfs 挂载点。"""
+            absolute = Path(os.path.abspath(path))
+            try:
+                relative = absolute.relative_to(runtime_root)
+            except ValueError:
+                return
+            current = runtime_root
+            for part in relative.parts:
+                current /= part
+                if current not in created:
+                    mounts.extend(("--dir", str(current)))
+                    created.add(current)
+
+        for directory in writable_directories:
+            add_mountpoint(directory)
+            mounts.extend(("--bind", str(directory), str(directory)))
+        database_path = RUNTIME_ROOT / "opencode.db"
+        mounts.extend(("--bind", str(database_path), str(database_path)))
+        add_mountpoint(candidate_root)
+        mounts.extend(("--ro-bind", str(candidate_root), str(candidate_root), "--", *command))
+        return mounts
 
     def _prompt(self, task: TaskState) -> str:
         """生成唯一业务 prompt；调用方不能覆盖路径、命令或提示词。"""
@@ -1296,6 +1357,7 @@ class Executor:
             if task.session_id:
                 command.extend(("--session", task.session_id))
             command.append(self._prompt(task))
+            command = self._sandbox_command(task, command)
             with tempfile.TemporaryFile(dir=LOG_ROOT, prefix=f"{task.task_id}-", mode="w+b") as out, tempfile.TemporaryFile(dir=LOG_ROOT, prefix=f"{task.task_id}-", mode="w+b") as err:
                 process = subprocess.Popen(command, cwd=task.workspace_directory or WORKSPACE, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
                 with self.lock:
@@ -1656,6 +1718,7 @@ class Handler(BaseHTTPRequestHandler):
                 "model_name_invalid",
                 "visual_match_snapshot_invalid",
                 "visual_candidate_materialization_failed",
+                "agent_candidate_isolation_unavailable",
             }:
                 code = "agent_runtime_unavailable"
             status = {

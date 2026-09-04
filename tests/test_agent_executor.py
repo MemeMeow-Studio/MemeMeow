@@ -202,6 +202,47 @@ def test_executor_runs_fixed_task_and_returns_result(executor_fixture) -> None:
     assert error.value.code == "agent_image_path_forbidden"
 
 
+def test_candidate_sandbox_creates_hidden_runtime_mountpoints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """隐藏 runtime 后，当前任务的 workspace、结果和候选目录仍有明确挂载目标。"""
+    runtime = tmp_path / "runtime"
+    workspace = runtime / "workspace"
+    scratch = workspace / "tasks" / "task-sandbox"
+    result = runtime / "task-results" / "task-sandbox"
+    candidate = runtime / "candidates" / "task-sandbox"
+    for path in (workspace, scratch / "home", result, candidate):
+        path.mkdir(parents=True)
+    task = executor_server.TaskState(
+        task_id="attempt-sandbox",
+        business_task_id="task-sandbox",
+        executor_attempt_id="attempt-sandbox",
+        image_relative_path="sample.png",
+        reverse_image_policy="forbid",
+        timeout_seconds=5,
+        workspace_directory=workspace,
+        candidate_root=candidate,
+        visual_snapshot_sha256="a" * 64,
+        task_scratch_root=scratch,
+    )
+    monkeypatch.setattr(executor_server, "RUNTIME_ROOT", runtime)
+    monkeypatch.setattr(executor_server, "WORKSPACE", workspace)
+    monkeypatch.setattr(executor_server, "RESULT_ROOT", runtime / "task-results")
+    monkeypatch.setattr(executor_server.shutil, "which", lambda name: "/usr/bin/bwrap" if name == "bwrap" else None)
+
+    sandboxed = executor_server.Executor._sandbox_command(object(), task, ["/bin/true"])
+
+    assert sandboxed[0] == "/usr/bin/bwrap"
+    assert "--tmpfs" in sandboxed
+    for path in (runtime / "workspace", runtime / "workspace" / "tasks", scratch, scratch / "home", runtime / "task-results", result, runtime / "candidates", candidate):
+        assert "--dir" in sandboxed
+        assert str(path) in sandboxed
+    candidate_bind = next(
+        index
+        for index in range(len(sandboxed) - 2)
+        if sandboxed[index : index + 3] == ["--ro-bind", str(candidate), str(candidate)]
+    )
+    assert candidate_bind < sandboxed.index("--", candidate_bind)
+
+
 def test_executor_preserves_result_validation_reason_code(executor_fixture, monkeypatch: pytest.MonkeyPatch) -> None:
     """结果公开边界失败时，外部错误码不变但 executor 保留内部原因码。"""
     executor, client, runtime = executor_fixture
