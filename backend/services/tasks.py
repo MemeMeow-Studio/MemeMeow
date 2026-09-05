@@ -1604,7 +1604,7 @@ class PostgresTaskService:
             policy = str((task.payload or {}).get("reverse_image_policy") or "forbid") if task else "forbid"
             audit = environment.reverse_image_usage.aggregate_task(task_id)
             payload = dict(result) if isinstance(result, dict) else {}
-            payload["reverse_image"] = {"policy": policy, **audit}
+            payload["network_reverse_image_search"] = {"policy": policy, **audit}
             if write_provenance:
                 meme_id = (task.payload or {}).get("meme_id") if task else None
                 if meme_id:
@@ -1628,7 +1628,7 @@ class PostgresTaskService:
                 if meme is None:
                     return
                 provenance = dict(meme.provenance or {})
-                provenance["reverse_image"] = {"policy": str((task.payload or {}).get("reverse_image_policy") or "forbid"), **audit}
+                provenance["network_reverse_image_search"] = {"policy": str((task.payload or {}).get("reverse_image_policy") or "forbid"), **audit}
                 meme.provenance = provenance
                 environment.uow.session.flush()
         except Exception:

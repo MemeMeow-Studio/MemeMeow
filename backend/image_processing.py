@@ -981,7 +981,10 @@ class ImageProcessingWorker:
         del explicit_retry  # 终态任务天然脱离活动 dedupe 集合，显式参数仅保留 API 兼容性。
         canonical = self._canonical_stage(stage)
         task_type = STAGE_TASK_TYPES[canonical]
-        policy = normalize_reverse_image_policy(reverse_image_policy)
+        if canonical == "visual" and reverse_image_policy is not None:
+            raise ImageProcessingError("invalid_visual_stage_parameter")
+        # 视觉阶段不携带联网策略；只有 Agent 阶段才会把策略传给联网能力边界。
+        policy = "forbid" if canonical == "visual" else normalize_reverse_image_policy(reverse_image_policy)
         auto_name_value = normalize_auto_name(auto_name)
         config_value = dict(config or {})
         config_hash = processing_config_hash(config_value)

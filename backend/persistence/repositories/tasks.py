@@ -1519,7 +1519,7 @@ class TaskRepository:
                             from backend.persistence.repositories.reverse_image import ReverseImageUsageRepository
                             audit = ReverseImageUsageRepository(self.session, self.scope).aggregate_task(task_id)
                             provenance = dict(meme.provenance or {})
-                            provenance["reverse_image"] = {
+                            provenance["network_reverse_image_search"] = {
                                 "policy": str((task.payload or {}).get("reverse_image_policy") or "forbid"),
                                 **audit,
                             }

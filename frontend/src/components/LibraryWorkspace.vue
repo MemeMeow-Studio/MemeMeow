@@ -214,8 +214,10 @@ async function retryStage(item: MemeImage, stage: 'visual' | 'agent' | 'auto_ren
   stageBusy.value = `${item.meme_id}:${stage}`
   emit('clearError')
   try {
-    await api.submitImageStage({ meme_id: item.meme_id, stage, reverse_image_policy: 'forbid' })
-    retryNotice.value = `${item.filename}：已提交${stage === 'visual' ? '视觉向量' : stage === 'agent' ? 'Agent 语境' : stage === 'auto_rename' ? '自动重命名' : '文本 embedding'}独立任务`
+    const request: Record<string, unknown> = { meme_id: item.meme_id, stage }
+    if (stage !== 'visual') request.reverse_image_policy = 'forbid'
+    await api.submitImageStage(request)
+    retryNotice.value = `${item.filename}：已提交${stage === 'visual' ? '视觉向量生成' : stage === 'agent' ? '图片语境分析' : stage === 'auto_rename' ? '自动重命名' : '文本语义检索'}独立任务`
     await loadLibrary()
   } catch (reason) {
     emit('error', errorMessage(reason))
@@ -289,7 +291,7 @@ async function submitSelectedRetry(submission: SelectedRetrySubmission, options?
     } else {
       const payload: Record<string, unknown> = { items: submission.items, stages: submission.stages }
       if (options) {
-        payload.reverse_image_policy = options.reverse_image_policy
+        if (!(submission.stages.length === 1 && submission.stages[0] === 'visual')) payload.reverse_image_policy = options.reverse_image_policy
         payload.auto_name = options.auto_name
       }
       const response = await api.retryImageStagesBatch(payload)

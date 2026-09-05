@@ -198,6 +198,7 @@ def test_local_visual_match_script_reads_manifest_without_callback(tmp_path: Pat
     environment.update(
         {
             "MEMEMEOW_AGENT_TASK_ID": "task",
+            "MEMEMEOW_DATA_ROOT": str(tmp_path),
             "MEMEMEOW_AGENT_CANDIDATE_MANIFEST": str(candidates / "manifest.json"),
         }
     )

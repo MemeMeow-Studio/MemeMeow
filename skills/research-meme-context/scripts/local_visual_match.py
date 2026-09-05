@@ -35,11 +35,16 @@ def _error(code: str, message: str) -> int:
 
 
 def _manifest_path(task_id: str) -> Path:
-    """只解析 Runner 注入的固定 manifest 路径，拒绝命令行路径覆盖。"""
+    """解析可信运行目录下当前任务的 manifest，拒绝替换根目录或任务。"""
+    runtime_root = Path(os.path.abspath(os.path.expanduser(os.getenv("MEMEMEOW_DATA_ROOT") or "/runtime")))
+    expected = runtime_root / "candidates" / task_id / MANIFEST_NAME
     configured = os.getenv("MEMEMEOW_AGENT_CANDIDATE_MANIFEST")
-    path = Path(configured).expanduser() if configured else Path("/runtime/candidates") / task_id / MANIFEST_NAME
+    if configured:
+        path = Path(configured).expanduser()
+    else:
+        path = expected
     absolute = Path(os.path.abspath(path))
-    if absolute.name != MANIFEST_NAME or absolute.parent.name != task_id or absolute.parent.parent.name != "candidates":
+    if absolute != expected:
         raise ValueError("candidate_manifest_path_invalid")
     return absolute
 

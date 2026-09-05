@@ -47,6 +47,7 @@ def test_visual_stage_rejects_network_policy_before_worker_submission() -> None:
     def service(_request: object, name: str) -> object:
         """提供最小当前 scope 元数据服务。"""
         assert name == "metadata"
+        calls.append("metadata")
         return SimpleNamespace(image_for_meme=lambda _meme_id: (SimpleNamespace(id="meme-1"), Path("/tmp/image.png")))
 
     def worker_factory(_request: object) -> object:

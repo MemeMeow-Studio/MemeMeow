@@ -318,7 +318,7 @@ class PostgresMetadataService:
             if record is None:
                 raise MetadataError("metadata_missing")
             provenance = dict(record.provenance or {})
-            provenance["reverse_image"] = dict(audit)
+            provenance["network_reverse_image_search"] = dict(audit)
             record.provenance = provenance
             record.updated_at = utcnow()
             environment.uow.session.flush()

@@ -37,7 +37,9 @@ class ImageStageSubmissionRequest(_StrictRequestModel):
 
     meme_id: str = Field(min_length=1, max_length=255)
     stage: str = Field(min_length=1, max_length=64)
-    reverse_image_policy: str = Field(default="forbid", pattern="^(forbid|auto)$")
+    # 视觉阶段不能携带联网反向图片检索策略；先保留原始值，便于视觉阶段对任何
+    # 携带该字段的请求统一返回 invalid_visual_stage_parameter，而不是混成校验错误。
+    reverse_image_policy: str | None = None
 
 
 class ImageStageBatchItem(_StrictRequestModel):
@@ -51,7 +53,7 @@ class ImageStageBatchRequest(_StrictRequestModel):
 
     items: list[ImageStageBatchItem] = Field(default_factory=list, max_length=500)
     stages: list[str] = Field(min_length=1, max_length=3)
-    reverse_image_policy: str = Field(default="forbid", pattern="^(forbid|auto)$")
+    reverse_image_policy: str | None = None
     auto_name: StrictBool = False
 
 
@@ -219,6 +221,8 @@ async def submit_image_stage(
         canonical = ImageProcessingWorker._canonical_stage(payload.stage)
     except ImageProcessingError as exc:
         raise error(422, exc.code, "图片阶段无效") from exc
+    if canonical == "visual" and payload.reverse_image_policy is not None:
+        raise error(400, "invalid_visual_stage_parameter", "视觉向量生成不接受 reverse_image_policy")
     try:
         record, _image = service(request, "metadata").image_for_meme(payload.meme_id)
     except MetadataError as exc:
@@ -226,10 +230,13 @@ async def submit_image_stage(
         code = "meme_not_found" if status == 404 else exc.code
         raise error(status, code, "图片不存在或内容已变化") from exc
     try:
+        # 视觉阶段不参与联网策略；仍调用统一规范化入口保持宿主错误投影一致，
+        # 但不能把它返回的默认 forbid 再传入视觉 Worker。
         options = normalize_processing_options(request, reverse_image_policy=payload.reverse_image_policy)
     except ImageProcessingError as exc:
         status = 503 if exc.code == "reverse_image_unavailable" else 400
         raise error(status, exc.code, "图片处理选项无效或服务不可用") from exc
+    reverse_image_policy = None if canonical == "visual" else options.reverse_image_policy
     worker = processing_worker(request)
     if worker is None:
         raise error(503, "image_processing_unavailable", "图片处理服务当前不可用")
@@ -238,7 +245,7 @@ async def submit_image_stage(
             record.id,
             canonical,
             config=processing_config(request),
-            reverse_image_policy=options.reverse_image_policy,
+            reverse_image_policy=reverse_image_policy,
             schedule=True,
         )
     except ImageProcessingError as exc:
@@ -277,12 +284,14 @@ async def submit_image_stage_batch(
     allowed_stages = {"visual", "agent", "text_embedding"}
     if len(set(payload.stages)) != len(payload.stages) or any(stage not in allowed_stages for stage in payload.stages):
         raise error(422, "invalid_image_stage", "批量阶段只能选择视觉向量、图片语境或文本索引，且不能重复")
+    if "visual" in payload.stages and len(payload.stages) == 1 and payload.reverse_image_policy is not None:
+        raise error(400, "invalid_visual_stage_parameter", "视觉向量生成不接受 reverse_image_policy")
     if not payload.items:
         return {"target_count": 0, "submitted_count": 0, "failed_count": 0, "results": []}
     try:
         options = normalize_processing_options(
             request,
-            reverse_image_policy=payload.reverse_image_policy,
+            reverse_image_policy=payload.reverse_image_policy or "forbid",
             auto_name=payload.auto_name,
         )
     except ImageProcessingError as exc:
@@ -297,11 +306,12 @@ async def submit_image_stage_batch(
             try:
                 # 复用单阶段入口的目标和 scope 校验；批量选项在循环前统一规范化。
                 record, _image = service(request, "metadata").image_for_meme(item.meme_id)
+                reverse_image_policy = None if stage == "visual" else options.reverse_image_policy
                 task = worker.submit_stage(
                     record.id,
                     stage,
                     config=processing_config(request),
-                    reverse_image_policy=options.reverse_image_policy,
+                    reverse_image_policy=reverse_image_policy,
                     auto_name=getattr(options, "auto_name", payload.auto_name),
                     schedule=True,
                 )

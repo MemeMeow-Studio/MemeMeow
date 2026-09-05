@@ -303,7 +303,7 @@ def _create_records(resources: DatabaseResources, inspected: list[InspectedImage
 def _request_json(url: str, payload: dict[str, Any], *, timeout: float = 15.0) -> dict[str, Any]:
     """调用现有后端批量视觉任务接口并解析 JSON 响应。"""
     request = urllib.request.Request(
-        url.rstrip("/") + "/images/visual-embedding/batch",
+        url.rstrip("/") + "/images/stages/batch",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
@@ -409,7 +409,7 @@ def submit_visual_tasks(resources: DatabaseResources, settings: Settings, meme_i
         compatible = bool(config and config.get("visual_model") == identity.model and api_dimensions == identity.dimensions and config.get("visual_preprocess_version") == identity.preprocess_version)
         if compatible:
             try:
-                response = _request_json(api_url, {"items": [{"meme_id": meme_id} for meme_id in meme_ids], "include_unready": True})
+                response = _request_json(api_url, {"items": [{"meme_id": meme_id} for meme_id in meme_ids], "stages": ["visual"]})
                 items = response.get("results")
                 if isinstance(items, list):
                     result["mode"] = "api"

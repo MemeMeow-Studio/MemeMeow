@@ -211,6 +211,7 @@ def test_local_visual_cli_reports_missing_runtime_environment() -> None:
     script = Path("skills/research-meme-context/scripts/local_visual_match.py")
     environment = dict(os.environ)
     environment["MEMEMEOW_AGENT_TASK_ID"] = "task-123"
+    environment.pop("MEMEMEOW_DATA_ROOT", None)
     environment.pop("MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL", None)
     environment.pop("MEMEMEOW_VISUAL_MATCH_INTERNAL_URL", None)
     result = subprocess.run([sys.executable, str(script), "--top-k", "2"], capture_output=True, text=True, env=environment, check=False)
@@ -223,6 +224,7 @@ def test_local_visual_cli_rejects_removed_include_self_argument() -> None:
     script = Path("skills/research-meme-context/scripts/local_visual_match.py")
     environment = dict(os.environ)
     environment["MEMEMEOW_AGENT_TASK_ID"] = "task-123"
+    environment.pop("MEMEMEOW_DATA_ROOT", None)
     environment.pop("MEMEMEOW_AGENT_CANDIDATE_MANIFEST", None)
     result = subprocess.run([sys.executable, str(script), "--include-self"], capture_output=True, text=True, env=environment, check=False)
     assert result.returncode != 0
@@ -233,6 +235,7 @@ def test_local_visual_cli_reports_missing_manifest() -> None:
     """CLI 缺少固定 manifest 时返回稳定错误，不再尝试 callback。"""
     environment = dict(os.environ)
     environment["MEMEMEOW_AGENT_TASK_ID"] = "task-123"
+    environment.pop("MEMEMEOW_DATA_ROOT", None)
     environment.pop("MEMEMEOW_AGENT_CANDIDATE_MANIFEST", None)
     environment.pop("MEMEMEOW_VISUAL_SEARCH_INTERNAL_URL", None)
     environment.pop("MEMEMEOW_AGENT_CALLBACK_TOKEN", None)
@@ -272,6 +275,7 @@ def test_local_visual_cli_rejects_manifest_hash_mismatch(tmp_path: Path) -> None
     )
     environment = dict(os.environ)
     environment["MEMEMEOW_AGENT_TASK_ID"] = "task-123"
+    environment["MEMEMEOW_DATA_ROOT"] = str(tmp_path)
     environment["MEMEMEOW_AGENT_CANDIDATE_MANIFEST"] = str(candidate_root / "manifest.json")
     result = subprocess.run(
         [sys.executable, "skills/research-meme-context/scripts/local_visual_match.py"],
@@ -282,3 +286,23 @@ def test_local_visual_cli_rejects_manifest_hash_mismatch(tmp_path: Path) -> None
     )
     assert result.returncode != 0
     assert json.loads(result.stderr)["error"] == "candidate_manifest_invalid"
+
+
+def test_local_visual_cli_rejects_manifest_outside_runtime_root(tmp_path: Path) -> None:
+    """CLI 不接受可信运行目录之外的候选清单路径。"""
+    outside = tmp_path / "candidates" / "task-123" / "manifest.json"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("{}", encoding="utf-8")
+    environment = dict(os.environ)
+    environment["MEMEMEOW_AGENT_TASK_ID"] = "task-123"
+    environment["MEMEMEOW_DATA_ROOT"] = str(tmp_path / "runtime")
+    environment["MEMEMEOW_AGENT_CANDIDATE_MANIFEST"] = str(outside)
+    result = subprocess.run(
+        [sys.executable, "skills/research-meme-context/scripts/local_visual_match.py"],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"] == "candidate_manifest_path_invalid"
