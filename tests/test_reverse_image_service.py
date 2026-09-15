@@ -334,6 +334,32 @@ def test_callback_replaces_request_id_without_second_usage_grant_or_provider(pos
     assert len(service.grants._values) == 1
 
 
+def test_callback_different_image_is_rejected_before_new_callback_or_provider(postgres_resources):
+    """同一 Task 的第二张图片明确耗尽调用机会，且不留下第二条 callback 事实。"""
+    resources, settings = postgres_resources
+    first_image = _image_bytes("red")
+    second_image = _image_bytes("blue")
+    meme = StorageCoordinator(resources).upload(first_image, target_key=f"callback-one-shot-{uuid4().hex}.png", extension=".png", context={}, provenance={})
+    task_id, owner, generation = _running_task(resources, "auto", extra={"meme_id": str(meme.id), "image_sha256": meme.sha256})
+    binding = _callback_binding(task_id, owner, generation, meme.sha256)
+    calls: list[str] = []
+
+    def provider(request: ReverseImageRequest) -> dict[str, Any]:
+        calls.append(request.request_id or "")
+        return {"visual_matches": [{"title": "one-shot"}]}
+
+    service = _service(settings, resources, provider)
+    service.search(ReverseImageRequest(image=first_image, filename="first.png", task_id=task_id, request_id="first", callback_binding=binding))
+    with pytest.raises(ReverseImageError) as error:
+        service.search(ReverseImageRequest(image=second_image, filename="second.png", task_id=task_id, request_id="second", callback_binding=binding))
+    assert error.value.code == "reverse_image_call_limit_reached"
+    assert calls == ["first"]
+    with resources.environment("local") as environment:
+        rows = environment.uow.session.execute(
+            text("SELECT request_id FROM agent_callback_requests WHERE scope_id = 'local' AND task_id = :task_id"),
+            {"task_id": task_id},
+        ).all()
+        assert [row[0] for row in rows] == ["first"]
 def test_callback_cache_hit_does_not_acquire_provider_grant(postgres_resources):
     """callback 复用有效缓存时只记录 hit usage，不创建 provider grant。"""
     resources, settings = postgres_resources

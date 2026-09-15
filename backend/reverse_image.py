@@ -208,8 +208,8 @@ class ReverseImageProviderBinding:
 def derive_controlled_crop(content: bytes, *, filename: str = "image.png") -> tuple[bytes, str]:
     """从已验证的任务源图生成固定中心方形派生图及其 SHA。
 
-    裁剪不接受 Agent 提供的物理路径或任意坐标；调用方必须先证明 ``content``
-    是当前任务目标整图，随后服务端只使用确定性的中心裁剪并限制输出大小。
+    裁剪不接受 Agent 提供的物理路径或任意坐标；调用方提交的内容必须先通过图片格式和大小校验，
+    服务端只使用确定性的中心裁剪并限制输出大小。
     """
     try:
         from PIL import Image
@@ -725,7 +725,6 @@ class ReverseImageService:
                     or task.lease_owner != binding.owner
                     or task.attempt_count != binding.attempt
                     or not binding.allows("analysis.reverse_image_search")
-                    or str((task.payload or {}).get("image_sha256") or "") != binding.target_sha256
                 ):
                     raise ValueError("callback_execution_mismatch")
             except Exception as exc:  # noqa: BLE001 - callback 失败不得暴露任务状态
@@ -788,7 +787,7 @@ class ReverseImageService:
         request_id = request.request_id
         callback_row = None
         with self.resources.environment(self.scope.scope_id) as environment:
-            task = environment.tasks.get(request.task_id, for_update=False)
+            task = environment.tasks.get(request.task_id, for_update=True)
             if task is None or task.task_type != "meme_context_generation":
                 if binding is not None:
                     raise ReverseImageError("agent_callback_invalid_execution", "内部执行绑定无效", status_code=401)
@@ -805,14 +804,12 @@ class ReverseImageService:
                     raise ReverseImageError("agent_callback_invalid_execution", "内部执行绑定无效", status_code=401) from exc
             task_meme_id = (task.payload or {}).get("meme_id")
             target_record = environment.memes.get(task_meme_id) if isinstance(task_meme_id, str) else None
-            source_sha = request.source_image_sha256 or hashlib.sha256(request.image).hexdigest()
-            if isinstance(task_meme_id, str) and (target_record is None or source_sha != target_record.sha256):
+            if isinstance(task_meme_id, str) and target_record is None:
                 if binding is not None:
                     raise ReverseImageError("agent_callback_invalid_execution", "内部执行绑定无效", status_code=401)
                 raise ReverseImageError("task_not_running", "任务当前不可执行反向图片检索", status_code=409)
             if binding is not None:
-                if source_sha != binding.target_sha256:
-                    raise ReverseImageError("agent_callback_invalid_execution", "内部执行绑定无效", status_code=401)
+                # target_sha256 仍是旧 token 的兼容声明，但不再限制 Agent 只能提交任务原图。
                 try:
                     server_digest = callback_input_digest(
                         scope_id=self.scope.scope_id,
@@ -838,6 +835,17 @@ class ReverseImageService:
                 except CallbackError as exc:
                     raise ReverseImageError("agent_callback_invalid_execution", "内部执行绑定无效", status_code=401) from exc
                 request = replace(request, input_digest=server_digest)
+                task_authority = environment.callback_requests.get_by_task_operation(
+                    task_id=task.id,
+                    operation="analysis.reverse_image_search",
+                    for_update=True,
+                )
+                if task_authority is not None and task_authority.input_digest != server_digest:
+                    raise ReverseImageError(
+                        "reverse_image_call_limit_reached",
+                        "当前语境已使用反向图片调用额度",
+                        status_code=409,
+                    )
                 try:
                     callback_row = environment.callback_requests.resolve(
                         request_id=request_id,
@@ -853,6 +861,11 @@ class ReverseImageService:
                         raise ReverseImageError("usage_request_conflict", "请求标识已用于另一项检索", status_code=409) from exc
                     raise ReverseImageError("agent_callback_unavailable", "内部执行绑定暂不可用", status_code=503) from exc
                 request_id = callback_row.request_id
+                if task_authority is None:
+                    # 当前 Task 行已锁定；首条 callback authority 提交后再释放事务，
+                    # 后续图片处理和 provider 网络请求不持有数据库连接。
+                    environment.uow.session.flush()
+                    environment.uow.session.commit()
                 try:
                     bound_usage = environment.reverse_image_usage.get_by_binding(
                         task_id=task.id,
@@ -928,7 +941,12 @@ class ReverseImageService:
                 with self.resources.environment(self.scope.scope_id) as environment:
                     task = self._locked_auto_task(environment.tasks.get(request.task_id), request, scope_id=self.scope.scope_id)
                     event = environment.reverse_image_usage.create(request_id=request_id, task_id=request.task_id, meme_id=(task.payload or {}).get("meme_id"), cache_key=key, cache_status="hit", **self._usage_binding(request))
-                    event = environment.reverse_image_usage.finish(event.request_id, cache_status="hit", outcome="success", result={"used": bool(snapshot and snapshot.get("outcome") == "success"), "snapshot": snapshot})
+                    event = environment.reverse_image_usage.finish(
+                        event.request_id,
+                        cache_status="hit",
+                        outcome=str(snapshot.get("outcome") or "empty"),
+                        result={"used": bool(snapshot and snapshot.get("outcome") == "success"), "snapshot": snapshot},
+                    )
                     if binding is not None:
                         environment.callback_requests.finish(request_id, state="completed", result={"cache_status": "hit"})
                     return self._event_output(event)

@@ -14,7 +14,7 @@
 
 | 工具 | 用途 | Ubuntu 包 |
 |---|---|---|
-| `identify`、`magick` 或 `convert` | 查看尺寸，生成裁剪图或将本地图片压缩到 SerpApi 的 500 KB 限制内 | `imagemagick` |
+| `identify`、`magick` 或 `convert` | 查看尺寸，必要时生成一次受控裁剪图或处理本地图片 | `imagemagick` |
 | `ffmpeg` | 从 GIF、WebP 动图或视频中抽取代表帧 | `ffmpeg` |
 
 ## 按需

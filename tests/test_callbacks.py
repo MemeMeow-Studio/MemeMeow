@@ -281,11 +281,10 @@ def test_callback_body_guard_stops_chunked_body_without_content_length() -> None
         ("claim_generation", 3),
         ("lease_owner", "worker-b"),
         ("attempt_count", 1),
-        ("payload", {"image_sha256": "b" * 64}),
     ),
 )
-def test_validate_binding_task_rejects_claim_and_target_rebinding(field: str, value: object) -> None:
-    """Task claim、attempt 或图片目标任一改绑都必须统一拒绝。"""
+def test_validate_binding_task_rejects_claim_rebinding(field: str, value: object) -> None:
+    """Task claim、attempt 等任一授权事实改绑都必须拒绝。"""
     binding = _binding()
     task = SimpleNamespace(
         id=binding.task_id,

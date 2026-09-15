@@ -134,6 +134,33 @@ class AgentCallbackRequestRepository:
             statement = statement.with_for_update()
         return self.session.scalar(statement)
 
+    def get_by_task_operation(
+        self,
+        *,
+        task_id: str,
+        operation: str,
+        for_update: bool = False,
+    ) -> AgentCallbackRequest | None:
+        """读取当前 Task 的首条 callback authority，跨 claim 保持一次调用语义。"""
+        statement = (
+            select(AgentCallbackRequest)
+            .where(
+                AgentCallbackRequest.scope_id == self.scope.scope_id,
+                AgentCallbackRequest.task_id == task_id,
+                AgentCallbackRequest.operation == operation,
+            )
+            .order_by(AgentCallbackRequest.created_at.asc(), AgentCallbackRequest.request_id.asc())
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        try:
+            rows = list(self.session.scalars(statement))
+        except SQLAlchemyError as exc:
+            raise DatabaseError("callback_binding_schema_unavailable") from exc
+        if len(rows) > 1:
+            raise DatabaseError("callback_request_conflict")
+        return rows[0] if rows else None
+
     def get_by_logical(
         self,
         *,
@@ -370,6 +397,22 @@ class InMemoryAgentCallbackRequestRepository:
         """读取当前 scope 的 request ID 事实。"""
         with self._lock:
             return self._by_id.get(request_id)
+
+    def get_by_task_operation(self, *, task_id: str, operation: str, for_update: bool = False) -> InMemoryCallbackRequest | None:
+        """读取当前 Task 的首条 callback authority，跨 claim 保持一次调用语义。"""
+        del for_update
+        with self._lock:
+            rows = sorted(
+                (
+                    row
+                    for row in self._by_id.values()
+                    if row.task_id == task_id and row.operation == operation
+                ),
+                key=lambda row: (row.created_at, row.request_id),
+            )
+            if len(rows) > 1:
+                raise DatabaseError("callback_request_conflict")
+            return rows[0] if rows else None
 
     def get_by_logical(self, *, task_id: str, claim_generation: int, attempt: int, operation: str, target_sha256: str, input_digest: str) -> InMemoryCallbackRequest | None:
         """按完整逻辑键读取权威事实。"""

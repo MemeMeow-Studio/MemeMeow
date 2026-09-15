@@ -625,10 +625,6 @@ def validate_binding_task(binding: CallbackBinding, task: object, registration: 
             raise CallbackError("agent_callback_invalid_execution")
         if int(getattr(task, "attempt_count", 0)) != binding.attempt:
             raise CallbackError("agent_callback_invalid_execution")
-        payload = getattr(task, "payload", None) or {}
-        target = payload.get("image_sha256")
-        if not isinstance(target, str) or not hmac.compare_digest(target, binding.target_sha256):
-            raise CallbackError("agent_callback_invalid_execution")
     except CallbackError:
         raise
     except Exception as exc:  # noqa: BLE001 - 统一隐藏任务存在性和字段原因

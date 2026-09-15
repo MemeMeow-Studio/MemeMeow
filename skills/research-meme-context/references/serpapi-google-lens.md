@@ -7,8 +7,9 @@ SerpApi 返回的是 Google Lens 的候选网页和图片，不是对表情包�
 ## 选择输入
 
 - **公开图片 URL**：直接传 `url`。URL 必须能被 SerpApi 从公网访问。
-- **本地图片**：通过项目薄客户端提交图片，由后端负责供应商上传和临时标识生命周期。客户端只需提供 JPG/JPEG、PNG、WebP 图片，最大 500 KB；图片过大时生成临时缩小副本，绝不修改原图。
-- 先检索整图。只有整图结果不足以识别主体、模板或引用时，才检索有区分度的裁剪图，例如去掉后加文字的主体区域。每个额外查询都应对应一个尚未解决的证据问题；命中缓存时不要重复调用供应商。
+- **本地图片**：通过项目薄客户端提交任务工作区中的任意有效 JPG/JPEG、PNG、WebP 或 GIF 图片。`.task/.agent-image-*` 等 OpenCode 生成的预览也可以使用；后端只把实际提交图片的 SHA 用于缓存、逻辑摘要和审计，不要求它等于任务原图。文件大小上限由服务端返回的稳定错误说明。
+- 当前 Agent 语境对反向图片 provider 只有一次调用机会。首次有效请求可以使用整图、预览图或受控裁剪图，但不能通过换图片、换参数、`--refresh` 或新的 `--request-id` 发起第二次不同检索。
+- 先选择最能回答当前证据问题的输入；不要把“结果为空”当作可以再次调用的理由。
 
 ## 调用
 
@@ -22,12 +23,7 @@ python skills/research-meme-context/scripts/serpapi_google_lens.py \
   /images/example_meme_1.jpg --task-id "$MEMEMEOW_AGENT_TASK_ID"
 ```
 
-脚本输出包含 `cache.status`：首次为 `miss`，复用已有快照为 `hit`，使用
-`--refresh` 强制请求。成功结果默认长期复用；空结果只复用 3 天；网络或供应商错误
-不会写入可复用快照。脚本默认省略 `request_id`，服务端返回权威 ID；仍可用
-`--request-id` 兼容旧脚本。相同当前 claim、规范化参数和 `refresh` 的重试会复用同一
-callback/usage 事实，provider 已开始但结果未知时返回 `reverse_image_unknown_execution`
-且不会自动重放。
+脚本输出包含 `cache.status`：首次为 `miss`，复用已有快照为 `hit`。`--refresh` 只保留为兼容参数；同一 Agent 语境已经使用过一次反向图片调用后，任何不同图片、参数或 refresh 请求都会返回 `reverse_image_call_limit_reached`。成功、空结果、明确失败和 `reverse_image_unknown_execution` 都会消耗这次语境机会；同一逻辑请求的重放只恢复既有事实，不会再次联系 provider。
 
 脚本只调用携带当前任务 callback 凭据的内部 multipart 接口并输出统一 JSON；缓存、供应商访问、脱敏和 usage event 由后端负责。输出结果不包含供应商临时标识、SerpApi 归档地址和其他内部标识，但会保留候选网页及图片的公开链接供 Agent 核验。
 
@@ -61,13 +57,13 @@ callback/usage 事实，provider 已开始但结果未知时返回 `reverse_imag
 4. 对排名靠前且相关的候选，下载或打开页面比对主体、构图、文字和发布时间。搜索结果标题、缩略图、网页文件名都不能单独证明出处。
 5. 将确认的名称、原文别名、作品名和出处线索写入 `keywords`、`search_queries`、`references`；无法确认的竞争性解释写入 `uncertainties`。
 
-结果为空不代表图片没有网络出处。依次检查：图片是否被裁剪或压缩、是否混入了后加文字、`hl`/`country` 是否合适、以及是否应以一个主体裁剪图进行一次受限重试。
+结果为空不代表图片没有网络出处，但当前 Agent 语境不能因此再次调用 provider。应继续使用已有候选、OCR、文本搜索和页面核验；必要时把未解决的问题写入 `uncertainties`，不要把空结果当作可静默重试或成功。
 
 ## 安全与调用策略
 
 - 不传包含用户隐私、内部内容或无权发送给第三方的图片。
 - 不记录或输出 `api_key`、供应商临时标识、完整上传响应或 SerpApi 搜索归档 URL。
-- 不设置固定的每图请求上限。只要仍有明确、可验证且尚未解决的证据问题，就可以继续搜索；当连续结果不再增加信息时停止。优先检查缓存，并避免提交重复参数的请求。
+- 不设置固定的每图请求上限；但每个 `meme_context_generation` Task 的 Agent 语境最多一次反向图片 provider 调用。只要仍有未解决的证据问题，应在这一次调用前选择合适的图片和参数；调用后的失败或未知执行不是空结果，也不能静默重试或降级成成功。
 - SerpApi 的 Google Lens 是第三方对 Google Lens 结果的封装。字段、召回结果和可用性可能变化；将空结果和候选结果都视为有限证据。
 
 ## 官方文档

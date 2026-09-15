@@ -25,16 +25,11 @@
 ## 对抗性复核
 
 - `/internal/reverse-image/search` 保持单个 `POST`、`internal` tag、route 名称和旧 handler import；
-  新模块 AST 依赖不包含 `api` 或 `server_api`。
-- multipart body 上限、binding/registration、task scope/claim/attempt、目标 Meme SHA 和
-  request id/header/digest 均在 reverse-image service 前 fail-closed；客户端没有 scope/path/target
-  选择字段。
-- `auto_crop` 只在上传整图 SHA 与持久目标匹配后调用确定性服务端裁剪；service 收到的请求
-  保留 callback binding、目标 SHA 和规范化请求绑定。
+- multipart body 上限、binding/registration、task scope/claim/attempt、request id/header/digest 在 reverse-image service 前 fail-closed；上传图片可以是任意有效图片，不再要求与任务原图 SHA 相同；
+- 每个 `meme_context_generation` Task 的 Agent 语境最多一次反向图片 provider 调用。相同逻辑请求可恢复已有事实，不同图片、参数、refresh 或 request ID 返回 `reverse_image_call_limit_reached`；provider 失败或未知执行也不得重放。
 - `ReverseImageError` 与 `DatabaseError` 只投影稳定 status/code/message，不泄露 provider 或
   数据库内部正文。未发现 P1/P2。
 
 ## 同步门禁
 
-用户已批准从本地开源仓库精确 fetch 并普通 merge；开源实现和验证记录提交后，Server 再按
-精确 SHA 同步并补记 merge SHA、祖先关系、变更范围和 Server 回归结果。开源仓库未 push。
+本次公共核心改动尚未创建 commit，未 push，也未同步 Server。必须先在开源仓库完成审核并获得用户明确授权，之后才能按精确 SHA 同步。

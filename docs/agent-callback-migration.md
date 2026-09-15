@@ -11,17 +11,8 @@ operation grant；它只证明一次受控 Agent 执行可以调用指定的内�
 2. 确认 Agent executor 使用独立的 `MEMEMEOW_AGENT_EXECUTOR_TOKEN` 或 named volume
    token。executor Bearer token、callback 根 secret、Google 凭证、`SERPAPI_API_KEY`、
    数据库凭据和 operation grant 不得相互复用。
-3. 先运行数据库迁移和 callback 拒绝回归，再启动 Agent 调度。`0015_bind_agent_callback_request_ids`
-   会先检测 `agent_callback_requests` 的历史重复逻辑键和不完整绑定；发现异常时停止迁移，
-   不删除、合并或猜测覆盖既有事实。Runner 只能拿到当前
-   `task_id`、claim generation/attempt、目标 SHA、允许 operation 和最长两小时有效的
-   callback token；每次调用仍以数据库中的当前 claim 和未过期 lease 为准。
-4. 反向图片 Agent 只通过 `/internal/reverse-image/search` 薄客户端调用；`request_id` 可以
-   省略，服务端按当前 scope、Task claim、attempt、目标/实际图片 SHA 和规范化检索输入
-   返回唯一权威 ID。`input_digest` 如果由旧客户端提交只作为一致性声明，不能覆盖服务端重算值。
-   `forbid` 不
-   读取缓存、不 acquire、不联系 provider；`auto` 仍须经过当前 callback 校验和
-   `analysis.reverse_image_search` acquire。Google 凭证和 SerpApi 密钥只留在 API。
+3. 先运行数据库迁移和 callback 拒绝回归，再启动 Agent 调度。`0015_bind_agent_callback_request_ids` 会先检测 `agent_callback_requests` 的历史重复逻辑键和不完整绑定；发现异常时停止迁移，不删除、合并或猜测覆盖既有事实。Runner 只能拿到当前 `task_id`、claim generation/attempt、允许 operation 和最长两小时有效的 callback token；`target_sha256` 仅作为兼容声明，不限制 Agent 上传哪张有效图片，每次调用仍以数据库中的当前 claim 和未过期 lease 为准。
+4. 反向图片 Agent 只通过 `/internal/reverse-image/search` 薄客户端调用；`request_id` 可以省略，服务端按当前 scope、Task claim、attempt、实际图片 SHA 和规范化检索输入返回唯一权威 ID。`input_digest` 如果由旧客户端提交只作为一致性声明，不能覆盖服务端重算值。每个 `meme_context_generation` Task 的 Agent 语境最多一次 provider 调用；相同逻辑请求可恢复既有事实，不同图片、参数、refresh 或 request ID 返回明确次数限制。`forbid` 不读取缓存、不 acquire、不联系 provider；`auto` 仍须经过当前 callback 校验和 `analysis.reverse_image_search` acquire。Google 凭证和 SerpApi 密钥只留在 API。
 
 旧的在途任务不补发宽权限 token。没有当前完整 claim 的任务应以
 `agent_callback_invalid_execution` 或稳定任务失败收束，随后由显式重试创建新的 claim；
@@ -71,8 +62,7 @@ callback 版本出现故障时，回滚步骤是“禁用 callback 和新 Agent 
    artifact；不要清空表或把未知执行改成可重试成功。
 2. 让 `/internal/reverse-image/search` 在没有完整服务凭据和当前 claim 时继续返回稳定
    拒绝；网络隔离和端口隐藏不能替代认证。视觉候选没有 callback 回滚路径。
-3. 只在恢复到同时支持服务认证、当前 claim fencing、scope/目标 SHA 校验的版本后重新
-   开放 callback。旧任务由新 claim 或显式重试收束，不为旧执行恢复兼容旁路。
+3. 只在恢复到同时支持服务认证、当前 claim fencing 和 scope 校验的版本后重新开放 callback。旧任务由新 claim 或显式重试收束，不为旧执行恢复兼容旁路。
 
 普通上传、已有缓存命中、本地视觉搜索和单图文本 embedding 不应因 callback 回滚而被
    伪装为 Agent 成功。联网反向图片调用在 provider 已开始但结果未知时保持

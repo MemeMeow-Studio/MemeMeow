@@ -75,21 +75,27 @@ async def internal_reverse_image_search(
             task = environment.tasks.get(task_id)
             validate_binding_task(callback_binding, task, callback_registration)
             target_meme = (task.payload or {}).get("meme_id") if task is not None else None
+            # callback token 仍然授权当前 Task 的执行 claim，但上传图片不再绑定到
+            # Task 的原图；Agent 可以在本次语境中选择工作区内任意有效图片。
             target_record = environment.memes.get(target_meme) if isinstance(target_meme, str) else None
-            if target_record is None:
+            if target_meme is not None and target_record is None:
                 raise CallbackError("agent_callback_invalid_execution")
 
-            # 只有先证明上传的是任务目标整图，才允许服务端执行确定性中心裁剪；
-            # Agent 不能借 auto_crop 或自报 SHA 替换逻辑目标。
-            source_sha256 = hashlib.sha256(content).hexdigest()
-            if source_sha256 != target_record.sha256:
-                raise CallbackError("agent_callback_invalid_execution")
             if auto_crop:
                 content, _derived_sha256 = derive_controlled_crop(content, filename=filename or "image.png")
 
         services = scope_services(request, callback_scope)
         service = services.reverse_image
-    except (CallbackError, ScopeResolutionError, DatabaseError, ValueError, RuntimeError) as exc:
+    except ReverseImageError as exc:
+        raise error(exc.status_code, exc.code, str(exc)) from exc
+    except CallbackError as exc:
+        raise error(401, "agent_callback_invalid_execution", "内部执行绑定无效") from exc
+    except ScopeResolutionError as exc:
+        raise error(503, "scope_unavailable", "当前执行范围暂不可用") from exc
+    except DatabaseError as exc:
+        status = 409 if exc.code in {"callback_request_conflict", "callback_binding_conflict", "usage_request_conflict", "usage_event_conflict"} else 503
+        raise error(status, exc.code, "反向图片请求无法完成") from exc
+    except (ValueError, RuntimeError) as exc:
         raise error(401, "agent_callback_invalid_execution", "内部执行绑定无效") from exc
 
     header_request_id = getattr(request.state, "callback_header_request_id", None)
@@ -115,7 +121,7 @@ async def internal_reverse_image_search(
                 query=query,
                 auto_crop=auto_crop,
                 refresh=refresh,
-                source_image_sha256=target_record.sha256,
+                source_image_sha256=hashlib.sha256(content).hexdigest(),
                 callback_binding=callback_binding,
                 input_digest=input_digest,
             )

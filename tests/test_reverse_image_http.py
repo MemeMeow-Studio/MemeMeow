@@ -198,9 +198,9 @@ def test_reverse_image_module_keeps_one_way_dependency() -> None:
     assert "server_api" not in imported
 
 
-@pytest.mark.parametrize("case", ["missing", "mismatch", "registration", "stale", "target"])
+@pytest.mark.parametrize("case", ["missing", "mismatch", "registration", "stale"])
 def test_reverse_image_rejects_invalid_binding_before_service(case: str) -> None:
-    """绑定、任务 claim 或目标 SHA 失败时 reverse-image service 不得执行。"""
+    """绑定、任务 claim 或请求目标不合法时 reverse-image service 不得执行。"""
     request, binding, content, database, service = _harness()
     if case == "missing":
         request.state.callback_binding = None
@@ -243,18 +243,35 @@ def test_reverse_image_rejects_malformed_input_digest_without_service() -> None:
 
 
 def test_reverse_image_forwards_valid_target_and_controlled_crop() -> None:
-    """目标整图验证后才执行受控裁剪，并将绑定事实转发到 service。"""
+    """受控裁剪直接作用于 Agent 提交的图片，并将实际输入摘要转发到 service。"""
     request, binding, content, database, service = _harness()
     result = _call(request, binding, content, database, service, auto_crop=True)
     assert result == {"ok": True}
     payload = service.calls[0]  # type: ignore[attr-defined]
     assert payload.task_id == binding.task_id
-    assert payload.source_image_sha256 == binding.target_sha256
+    assert payload.source_image_sha256 == hashlib.sha256(payload.image).hexdigest()
+    assert payload.source_image_sha256 != binding.target_sha256
     assert payload.callback_binding == binding
     assert payload.image != content
 
 
-def test_reverse_image_database_error_keeps_stable_projection() -> None:
+def test_reverse_image_maps_local_image_error_without_hiding_cause() -> None:
+    """合法 callback 的图片错误投影为具体错误，而不是绑定错误。"""
+    request, binding, content, database, _service = _harness()
+
+    class _InvalidImageService:
+        """模拟领域层完成图片校验后的稳定错误。"""
+
+        def search(self, _payload: ReverseImageRequest) -> dict[str, object]:
+            """返回领域层的 invalid_image 错误供 HTTP 投影验证。"""
+            from backend.reverse_image import ReverseImageError
+
+            raise ReverseImageError("invalid_image", "上传内容不是有效图片", status_code=400)
+
+    with pytest.raises(HTTPException) as caught:
+        _call(request, binding, content, database, _InvalidImageService())
+    assert caught.value.status_code == 400
+    assert caught.value.detail["error"] == "invalid_image"
     """service 数据库冲突只投影稳定 code 与 status，不暴露内部正文。"""
     request, binding, content, database, _service = _harness()
 
