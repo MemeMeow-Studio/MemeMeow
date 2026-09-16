@@ -7,21 +7,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import fcntl
 import hashlib
+import inspect
 import json
 import mimetypes
 import os
 import secrets
 import tempfile
 from io import BytesIO
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterator, Mapping
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -85,6 +87,49 @@ class ReverseImageError(RuntimeError):
         self.code = code
         self.retryable = retryable
         self.status_code = status_code
+
+
+class NetworkReverseImageSearchProvider(Protocol):
+    """联网搜图 Provider 的同步兼容协议。"""
+
+    def search(self, request: "ReverseImageRequest") -> Mapping[str, Any]:
+        """执行一次逻辑联网搜图并返回待校验结果。"""
+
+
+class AsyncNetworkReverseImageSearchProvider(Protocol):
+    """联网搜图 Provider 的原生异步协议。"""
+
+    async def search_async(self, request: "ReverseImageRequest") -> Mapping[str, Any]:
+        """异步执行一次逻辑联网搜图并返回待校验结果。"""
+
+
+class NetworkReverseImageSearchAdapter:
+    """统一调用原生异步 Provider，并在线程中兼容同步实现。"""
+
+    def __init__(self, provider: object) -> None:
+        """保存受信 Provider；凭据和传输细节不得进入公共结果。"""
+        self.provider = provider
+
+    async def search_async(self, request: "ReverseImageRequest") -> dict[str, Any]:
+        """异步执行 Provider，并把返回值收敛为普通字典。"""
+        async_method = getattr(self.provider, "search_async", None)
+        if callable(async_method):
+            value = async_method(request)
+            value = await value if inspect.isawaitable(value) else value
+        else:
+            method = getattr(self.provider, "search", None)
+            target = method if callable(method) else self.provider
+            if not callable(target):
+                raise ReverseImageError("reverse_image_provider_invalid", "反向图片服务返回了无效结果", retryable=True, status_code=503)
+            if inspect.iscoroutinefunction(target):
+                value = await target(request)
+            else:
+                value = await asyncio.to_thread(target, request)
+                if inspect.isawaitable(value):
+                    value = await value
+        if not isinstance(value, Mapping):
+            raise ReverseImageError("reverse_image_provider_invalid", "反向图片服务返回了无效结果", retryable=True, status_code=503)
+        return dict(value)
 
 
 @dataclass(frozen=True)
@@ -201,7 +246,7 @@ class ReverseImageProviderBinding:
         """拒绝空身份或不可调用实现，避免运行后才产生错误缓存身份。"""
         if any(not isinstance(value, str) or not value.strip() for value in (self.name, self.engine, self.cache_variant)):
             raise ValueError("reverse_image_provider_binding_invalid")
-        if not callable(self.search) and not callable(getattr(self.search, "search", None)):
+        if not callable(self.search) and not callable(getattr(self.search, "search", None)) and not callable(getattr(self.search, "search_async", None)):
             raise TypeError("reverse_image_provider_binding_invalid")
 
 
@@ -279,13 +324,31 @@ class ReverseImageCache:
 
     @contextmanager
     def lock(self, key: str) -> Iterator[None]:
-        """在同一缓存键范围内串行执行二次检查和供应商调用。"""
+        """在同步调用中串行执行同一缓存键的二次检查和供应商调用。"""
         with (self.root / f"{key}.lock").open("a+", encoding="utf-8") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX)
             try:
                 yield
             finally:
                 fcntl.flock(handle, fcntl.LOCK_UN)
+
+    @asynccontextmanager
+    async def lock_async(self, key: str, *, retry_seconds: float = 0.05) -> AsyncIterator[None]:
+        """可取消地等待同键跨进程文件锁，并在退出时可靠释放。"""
+        handle = (self.root / f"{key}.lock").open("a+", encoding="utf-8")
+        locked = False
+        try:
+            while not locked:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                except BlockingIOError:
+                    await asyncio.sleep(retry_seconds)
+            yield
+        finally:
+            if locked:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            handle.close()
 
 
 def sanitize_value(value: object, *, secrets_to_remove: tuple[str, ...] = ()) -> object:
@@ -698,6 +761,31 @@ class ReverseImageService:
             )
         raise ReverseImageError("reverse_image_provider_invalid", "反向图片 provider 配置无效", status_code=503)
 
+    async def _network_search_async(self, request: ReverseImageRequest) -> dict[str, Any]:
+        """异步调用当前 Provider；同步实现只在线程中执行网络阶段。"""
+        return await NetworkReverseImageSearchAdapter(self._provider()).search_async(request)
+
+    async def _settle_started_provider(
+        self,
+        request: ReverseImageRequest,
+    ) -> tuple[dict[str, Any] | None, BaseException | None, asyncio.CancelledError | None]:
+        """Provider 开始后延迟请求取消，直到外部调用得到明确终态。"""
+        task = asyncio.create_task(self._network_search_async(request))
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                # shield 保证请求取消不取消 Provider；重复取消只更新当前 Task 的
+                # 取消计数，仍继续等待外部副作用和同键缓存锁得到明确收束。
+                cancellation = cancellation or exc
+            except BaseException:  # noqa: BLE001 - 统一在 task.result() 中读取真实终态。
+                break
+        try:
+            return task.result(), None, cancellation
+        except BaseException as exc:  # noqa: BLE001 - 调用方按既有错误规则完成 usage。
+            return None, exc, cancellation
+
     @staticmethod
     def _locked_auto_task(task: Task | None, request: ReverseImageRequest | None = None, *, scope_id: str | None = None) -> Task:
         """在缓存键锁内重新确认任务仍可执行且策略为 auto。
@@ -774,7 +862,15 @@ class ReverseImageService:
             )
 
     def search(self, request: ReverseImageRequest) -> dict[str, object]:
-        """按 task_id 校验运行任务并执行一次供应商无关逻辑检索。"""
+        """在同步调用方中执行检索；异步上下文必须使用 ``search_async``。"""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.search_async(request))
+        raise RuntimeError("reverse_image_search_async_required")
+
+    async def search_async(self, request: ReverseImageRequest) -> dict[str, object]:
+        """异步执行检索，数据库短事务之外等待缓存锁和 Provider。"""
         request = request.normalized()
         image_sha = hashlib.sha256(request.image).hexdigest()
         provider_identity = {
@@ -934,7 +1030,7 @@ class ReverseImageService:
                 raise ReverseImageError("reverse_image_forbidden", "当前任务禁止反向图片检索", status_code=403)
 
         timestamp = datetime.now(UTC)
-        with self.cache.lock(key):
+        async with self.cache.lock_async(key):
             record = self.cache.load(key)
             snapshot = _latest(record)
             if not request.refresh and _reusable(snapshot, timestamp):
@@ -1042,9 +1138,47 @@ class ReverseImageService:
                     raise ReverseImageError("reverse_image_unknown_execution", "反向图片调用状态未知", status_code=503) from exc
                 if binding is not None:
                     environment.callback_requests.finish(request_id, state="unknown_execution", error={"error": "reverse_image_unknown_execution"})
+            response, provider_exception, cancellation = await self._settle_started_provider(request)
+            if provider_exception is not None:
+                if isinstance(provider_exception, ReverseImageError):
+                    error = provider_exception
+                elif isinstance(provider_exception, Exception):
+                    error = ReverseImageError(
+                        "reverse_image_provider_unavailable",
+                        "反向图片服务暂时不可用",
+                        retryable=True,
+                        status_code=503,
+                    )
+                else:
+                    # Provider Task 自身被取消或进程级异常时无法证明外部终态，
+                    # 必须保留 unknown，不能把同一 request 重新放回供应商。
+                    with self.resources.environment(self.scope.scope_id) as environment:
+                        environment.reverse_image_usage.finish(
+                            request_id,
+                            outcome="failed",
+                            error={"error": "reverse_image_unknown_execution"},
+                        )
+                        if binding is not None:
+                            environment.callback_requests.finish(
+                                request_id,
+                                state="unknown_execution",
+                                error={"error": "reverse_image_unknown_execution"},
+                            )
+                        environment.uow.session.commit()
+                    if cancellation is not None:
+                        raise cancellation
+                    raise ReverseImageError("reverse_image_unknown_execution", "反向图片调用状态未知", status_code=503) from provider_exception
+                with self.resources.environment(self.scope.scope_id) as environment:
+                    environment.reverse_image_usage.finish(request_id, outcome="failed", retryable=error.retryable, error={"error": error.code})
+                    if binding is not None:
+                        environment.callback_requests.finish(request_id, state="failed", error={"error": error.code})
+                    environment.uow.session.commit()
+                if cancellation is not None:
+                    raise cancellation
+                raise error from provider_exception
+
             try:
-                provider = self._provider()
-                response = provider(request) if callable(provider) else provider.search(request)
+                assert response is not None
                 outcome = "empty" if _is_empty(response) else "success"
                 snapshot = {"fetched_at": timestamp.isoformat(), "outcome": outcome, "expires_at": (timestamp + EMPTY_TTL).isoformat() if outcome == "empty" else None, "response": sanitize_value(response)}
                 next_record = {
@@ -1056,23 +1190,33 @@ class ReverseImageService:
                 self.cache.write(key, next_record)
             except ReverseImageError as exc:
                 with self.resources.environment(self.scope.scope_id) as environment:
-                    event = environment.reverse_image_usage.finish(request_id, outcome="failed", retryable=exc.retryable, error={"error": exc.code})
+                    environment.reverse_image_usage.finish(request_id, outcome="failed", retryable=exc.retryable, error={"error": exc.code})
                     if binding is not None:
                         environment.callback_requests.finish(request_id, state="failed", error={"error": exc.code})
+                    environment.uow.session.commit()
+                if cancellation is not None:
+                    raise cancellation
                 raise
-            except Exception as exc:  # noqa: BLE001
-                # 供应商适配器异常也必须收束 started 事件，避免永久悬挂且不回显原始正文。
+            except Exception as exc:  # noqa: BLE001 - 结果处理异常不暴露缓存或 Provider 细节。
                 error = ReverseImageError("reverse_image_provider_unavailable", "反向图片服务暂时不可用", retryable=True, status_code=503)
                 with self.resources.environment(self.scope.scope_id) as environment:
                     environment.reverse_image_usage.finish(request_id, outcome="failed", retryable=True, error={"error": error.code})
                     if binding is not None:
                         environment.callback_requests.finish(request_id, state="failed", error={"error": error.code})
+                    environment.uow.session.commit()
+                if cancellation is not None:
+                    raise cancellation
                 raise error from exc
+
             with self.resources.environment(self.scope.scope_id) as environment:
                 event = environment.reverse_image_usage.finish(request_id, cache_status="refresh" if record else "miss", outcome=outcome, result={"used": outcome == "success", "snapshot": snapshot})
                 if binding is not None:
                     environment.callback_requests.finish(request_id, state="completed", result={"outcome": outcome})
-                return self._event_output(event, snapshot=snapshot)
+                environment.uow.session.commit()
+                result = self._event_output(event, snapshot=snapshot)
+            if cancellation is not None:
+                raise cancellation
+            return result
 
     @staticmethod
     def _event_output(event: ReverseImageUsageEvent, *, snapshot: Mapping[str, object] | None = None) -> dict[str, object]:

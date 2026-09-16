@@ -6,6 +6,7 @@ import ast
 import asyncio
 import hashlib
 import io
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -114,29 +115,32 @@ def _request(binding: CallbackBinding | None, *, header_request_id: str | None =
     return SimpleNamespace(app=SimpleNamespace(state=app_state), state=state, url=SimpleNamespace(path=CALLBACK_PATH))
 
 
-def _call(request: SimpleNamespace, binding: CallbackBinding | None, content: bytes, database: _Database, service: object, **kwargs: object) -> dict[str, object]:
-    """调用新模块并注入全部宿主依赖。"""
-    return asyncio.run(
-        reverse_image_http.internal_reverse_image_search(
-            request,
-            task_id=kwargs.pop("task_id", binding.task_id if binding is not None else "task-reverse"),
-            content=content,
-            filename="meme.png",
-            request_id=kwargs.pop("request_id", None),
-            input_digest=kwargs.pop("input_digest", None),
-            search_type="all",
-            language="zh-cn",
-            country=None,
-            query=None,
-            auto_crop=kwargs.pop("auto_crop", False),
-            refresh=False,
-            binding=lambda received: received.state.callback_binding,
-            registration=lambda received: received.app.state.callback_registry.get(received.url.path),
-            database=lambda _received: database,
-            scope_services=lambda _received, _scope: SimpleNamespace(reverse_image=service),
-            error=_error,
-        )
+async def _call_async(request: SimpleNamespace, binding: CallbackBinding | None, content: bytes, database: _Database, service: object, **kwargs: object) -> dict[str, object]:
+    """异步调用 callback 模块并注入全部宿主依赖。"""
+    return await reverse_image_http.internal_reverse_image_search(
+        request,
+        task_id=kwargs.pop("task_id", binding.task_id if binding is not None else "task-reverse"),
+        content=content,
+        filename="meme.png",
+        request_id=kwargs.pop("request_id", None),
+        input_digest=kwargs.pop("input_digest", None),
+        search_type="all",
+        language="zh-cn",
+        country=None,
+        query=None,
+        auto_crop=kwargs.pop("auto_crop", False),
+        refresh=False,
+        binding=lambda received: received.state.callback_binding,
+        registration=lambda received: received.app.state.callback_registry.get(received.url.path),
+        database=lambda _received: database,
+        scope_services=lambda _received, _scope: SimpleNamespace(reverse_image=service),
+        error=_error,
     )
+
+
+def _call(request: SimpleNamespace, binding: CallbackBinding | None, content: bytes, database: _Database, service: object, **kwargs: object) -> dict[str, object]:
+    """从同步测试中调用异步 callback 边界。"""
+    return asyncio.run(_call_async(request, binding, content, database, service, **kwargs))
 
 
 def _harness(content: bytes | None = None, *, binding: CallbackBinding | None = None, target: object | None = None, task: object | None = None, header_request_id: str | None = None, registration: object | None = DEFAULT_CALLBACK_REGISTRY.get(CALLBACK_PATH)) -> tuple[SimpleNamespace, CallbackBinding, bytes, _Database, object]:
@@ -152,7 +156,7 @@ def _harness(content: bytes | None = None, *, binding: CallbackBinding | None = 
     class _Service:
         """保存 service 请求并返回稳定结果的夹具。"""
 
-        def search(self, payload: ReverseImageRequest) -> dict[str, object]:
+        async def search_async(self, payload: ReverseImageRequest) -> dict[str, object]:
             """记录规范请求并返回其 callback 绑定信息。"""
             calls.append(payload)
             return {"ok": True}
@@ -160,6 +164,73 @@ def _harness(content: bytes | None = None, *, binding: CallbackBinding | None = 
     service = _Service()
     service.calls = calls  # type: ignore[attr-defined]
     return request, binding, content, database, service
+
+
+def test_reverse_image_callback_offloads_legacy_sync_service() -> None:
+    """旧宿主只提供同步 search 时，callback 在线程中兼容且不阻塞事件循环。"""
+    request, binding, content, database, _service = _harness()
+    loop_thread = threading.get_ident()
+    service_threads: list[int] = []
+
+    class _LegacyService:
+        def search(self, _payload: ReverseImageRequest) -> dict[str, object]:
+            service_threads.append(threading.get_ident())
+            return {"ok": True}
+
+    assert _call(request, binding, content, database, _LegacyService()) == {"ok": True}
+    assert service_threads and service_threads[0] != loop_thread
+
+
+def test_reverse_image_callback_cancellation_waits_for_legacy_service() -> None:
+    """取消旧同步 service 时，HTTP 边界等待线程收束后才传播取消。"""
+    request, binding, content, database, _service = _harness()
+    started = threading.Event()
+    release = threading.Event()
+
+    class _LegacyService:
+        def search(self, _payload: ReverseImageRequest) -> dict[str, object]:
+            started.set()
+            assert release.wait(timeout=2)
+            return {"ok": True}
+
+    async def exercise() -> None:
+        task = asyncio.create_task(_call_async(request, binding, content, database, _LegacyService()))
+        while not started.is_set():
+            await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0.02)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+
+
+def test_reverse_image_callback_keeps_event_loop_responsive() -> None:
+    """callback 等待异步 service 时，事件循环仍可继续调度其它请求。"""
+    request, binding, content, database, _service = _harness()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _BlockingService:
+        async def search_async(self, _payload: ReverseImageRequest) -> dict[str, object]:
+            started.set()
+            await release.wait()
+            return {"ok": True}
+
+    async def exercise() -> None:
+        call = asyncio.create_task(_call_async(request, binding, content, database, _BlockingService()))
+        await started.wait()
+        ticks = 0
+        for _ in range(5):
+            ticks += 1
+            await asyncio.sleep(0)
+        release.set()
+        assert await call == {"ok": True}
+        assert ticks == 5
+
+    asyncio.run(exercise())
 
 
 def test_reverse_image_callback_allows_image_above_500_kib() -> None:
@@ -262,7 +333,7 @@ def test_reverse_image_maps_local_image_error_without_hiding_cause() -> None:
     class _InvalidImageService:
         """模拟领域层完成图片校验后的稳定错误。"""
 
-        def search(self, _payload: ReverseImageRequest) -> dict[str, object]:
+        async def search_async(self, _payload: ReverseImageRequest) -> dict[str, object]:
             """返回领域层的 invalid_image 错误供 HTTP 投影验证。"""
             from backend.reverse_image import ReverseImageError
 
@@ -278,7 +349,7 @@ def test_reverse_image_maps_local_image_error_without_hiding_cause() -> None:
     class _FailingService:
         """抛出稳定数据库错误的 service 夹具。"""
 
-        def search(self, _payload: ReverseImageRequest) -> dict[str, object]:
+        async def search_async(self, _payload: ReverseImageRequest) -> dict[str, object]:
             """模拟 callback request 冲突。"""
             raise __import__("backend.database", fromlist=["DatabaseError"]).DatabaseError("callback_request_conflict", "private")
 

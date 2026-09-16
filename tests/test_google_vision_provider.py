@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import threading
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +13,7 @@ import pytest
 
 from backend.reverse_image import (
     GoogleVisionWebDetectionProvider,
+    ReverseImageCache,
     ReverseImageError,
     ReverseImageProviderBinding,
     ReverseImageRequest,
@@ -65,6 +68,148 @@ def test_provider_binding_freezes_identity_and_call_target(tmp_path: Path) -> No
     assert service._provider() is search
     with pytest.raises(FrozenInstanceError):
         binding.name = "changed"  # type: ignore[misc]
+
+
+def test_sync_provider_adapter_runs_off_event_loop(tmp_path: Path) -> None:
+    """同步 Provider 只在线程中运行，等待期间事件循环仍能调度。"""
+    loop_thread = threading.get_ident()
+    provider_thread: list[int] = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def search(_request: ReverseImageRequest) -> dict[str, object]:
+        provider_thread.append(threading.get_ident())
+        started.set()
+        assert release.wait(timeout=2)
+        return {"visual_matches": []}
+
+    settings = SimpleNamespace(
+        reverse_image_provider="google_vision",
+        google_cloud_project=None,
+        google_application_credentials=None,
+        serpapi_api_key=None,
+        data_root=tmp_path / "data",
+        reverse_image_cache_root=tmp_path / "cache",
+    )
+    service = ReverseImageService(settings, SimpleNamespace(), provider_binding=ReverseImageProviderBinding("host", "engine", "variant", search))
+
+    async def exercise() -> None:
+        task = asyncio.create_task(service._network_search_async(_request()))
+        ticks = 0
+        while not started.is_set():
+            ticks += 1
+            await asyncio.sleep(0)
+        release.set()
+        assert await task == {"visual_matches": []}
+        assert ticks > 0
+
+    asyncio.run(exercise())
+    assert provider_thread and provider_thread[0] != loop_thread
+
+
+def test_started_sync_provider_cancellation_waits_for_worker_completion(tmp_path: Path) -> None:
+    """Service 延迟同步 Provider 的请求取消，直到线程得到明确结果。"""
+    started = threading.Event()
+    release = threading.Event()
+
+    def search(_request: ReverseImageRequest) -> dict[str, object]:
+        started.set()
+        assert release.wait(timeout=2)
+        return {"visual_matches": []}
+
+    settings = SimpleNamespace(
+        reverse_image_provider="google_vision",
+        google_cloud_project=None,
+        google_application_credentials=None,
+        serpapi_api_key=None,
+        data_root=tmp_path / "data",
+        reverse_image_cache_root=tmp_path / "cache",
+    )
+    service = ReverseImageService(settings, SimpleNamespace(), provider_binding=ReverseImageProviderBinding("host", "engine", "settled", search))
+
+    async def exercise() -> None:
+        task = asyncio.create_task(service._settle_started_provider(_request()))
+        while not started.is_set():
+            await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0.02)
+        assert not task.done()
+        release.set()
+        response, error, cancellation = await task
+        assert response == {"visual_matches": []}
+        assert error is None
+        assert isinstance(cancellation, asyncio.CancelledError)
+
+    asyncio.run(exercise())
+
+
+def test_async_cache_lock_wait_is_cancellable(tmp_path: Path) -> None:
+    """异步等待同键文件锁时可以取消，既有持锁者不受影响。"""
+    cache = ReverseImageCache(tmp_path / "cache")
+
+    async def exercise() -> None:
+        with cache.lock("same-key"):
+            entered = False
+
+            async def waiter() -> None:
+                nonlocal entered
+                async with cache.lock_async("same-key", retry_seconds=0.001):
+                    entered = True
+
+            task = asyncio.create_task(waiter())
+            await asyncio.sleep(0.01)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert entered is False
+        async with cache.lock_async("same-key", retry_seconds=0.001):
+            pass
+
+    asyncio.run(exercise())
+
+
+def test_native_async_provider_is_awaited_without_worker_thread(tmp_path: Path) -> None:
+    """原生异步 Provider 在当前事件循环中执行，不经过线程兼容层。"""
+    called_threads: list[int] = []
+
+    class AsyncProvider:
+        async def search_async(self, _request: ReverseImageRequest) -> dict[str, object]:
+            called_threads.append(threading.get_ident())
+            await asyncio.sleep(0)
+            return {"visual_matches": []}
+
+    settings = SimpleNamespace(
+        reverse_image_provider="google_vision",
+        google_cloud_project=None,
+        google_application_credentials=None,
+        serpapi_api_key=None,
+        data_root=tmp_path / "data",
+        reverse_image_cache_root=tmp_path / "cache",
+    )
+    service = ReverseImageService(settings, SimpleNamespace(), provider_binding=ReverseImageProviderBinding("host", "engine", "variant", AsyncProvider()))
+    current_thread = threading.get_ident()
+
+    assert asyncio.run(service._network_search_async(_request())) == {"visual_matches": []}
+    assert called_threads == [current_thread]
+
+
+def test_sync_search_rejects_running_event_loop(tmp_path: Path) -> None:
+    """异步调用方误用同步入口时明确报错，不能静默阻塞事件循环。"""
+    settings = SimpleNamespace(
+        reverse_image_provider="google_vision",
+        google_cloud_project=None,
+        google_application_credentials=None,
+        serpapi_api_key=None,
+        data_root=tmp_path / "data",
+        reverse_image_cache_root=tmp_path / "cache",
+    )
+    service = ReverseImageService(settings, SimpleNamespace(), provider=lambda _request: {"visual_matches": []})
+
+    async def exercise() -> None:
+        with pytest.raises(RuntimeError, match="reverse_image_search_async_required"):
+            service.search(_request())
+
+    asyncio.run(exercise())
 
 
 def test_service_selects_only_the_configured_provider(tmp_path: Path) -> None:

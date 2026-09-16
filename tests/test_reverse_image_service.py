@@ -6,11 +6,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import hashlib
 import os
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -101,9 +102,9 @@ def _image_bytes(color: str = "red") -> bytes:
     return output.getvalue()
 
 
-def _request(task_id: str, request_id: str | None = None, *, color: str = "red") -> ReverseImageRequest:
+def _request(task_id: str, request_id: str | None = None, *, color: str = "red", refresh: bool = False) -> ReverseImageRequest:
     """构造一次固定检索参数的请求，便于比较缓存身份。"""
-    return ReverseImageRequest(image=_image_bytes(color), filename="meme.png", task_id=task_id, request_id=request_id)
+    return ReverseImageRequest(image=_image_bytes(color), filename="meme.png", task_id=task_id, request_id=request_id, refresh=refresh)
 
 
 def _running_task(resources: DatabaseResources, policy: str = "auto", *, extra: dict[str, Any] | None = None) -> tuple[str, str, int]:
@@ -175,6 +176,117 @@ def test_auto_cache_miss_then_hit_counts_one_provider_call(postgres_resources):
         assert audit["used"] is True
         assert audit["cache_hits"] == 1
         assert audit["provider_calls"] == 1
+
+
+def test_concurrent_async_miss_calls_provider_once(postgres_resources):
+    """同键普通 miss 异步并发时，等待者重读缓存且只发生一次 Provider 调用。"""
+    resources, settings = postgres_resources
+    task_id, _owner, _generation = _running_task(resources, "auto")
+    calls: list[str] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class AsyncProvider:
+        async def search_async(self, request: ReverseImageRequest) -> dict[str, Any]:
+            calls.append(request.request_id or "")
+            started.set()
+            await release.wait()
+            return {"visual_matches": [{"title": "并发候选"}]}
+
+    service = ReverseImageService(
+        settings,
+        resources,
+        provider_binding=ReverseImageProviderBinding("host_provider", "visual_search", "async", AsyncProvider()),
+    )
+
+    async def exercise() -> tuple[dict[str, object], dict[str, object]]:
+        first = asyncio.create_task(service.search_async(_request(task_id, "async-miss-a")))
+        await started.wait()
+        second = asyncio.create_task(service.search_async(_request(task_id, "async-miss-b")))
+        await asyncio.sleep(0.02)
+        release.set()
+        return await first, await second
+
+    first, second = asyncio.run(exercise())
+    assert calls == ["async-miss-a"]
+    assert {first["cache"]["status"], second["cache"]["status"]} == {"miss", "hit"}
+
+
+def test_concurrent_async_refresh_calls_provider_twice(postgres_resources):
+    """refresh 仍按旧语义逐次执行，不把后一条请求错误改成缓存命中。"""
+    resources, settings = postgres_resources
+    task_id, _owner, _generation = _running_task(resources, "auto")
+    calls: list[str] = []
+
+    class AsyncProvider:
+        async def search_async(self, request: ReverseImageRequest) -> dict[str, Any]:
+            calls.append(request.request_id or "")
+            await asyncio.sleep(0.01)
+            return {"visual_matches": [{"title": request.request_id}]}
+
+    service = ReverseImageService(
+        settings,
+        resources,
+        provider_binding=ReverseImageProviderBinding("host_provider", "visual_search", "async-refresh", AsyncProvider()),
+    )
+
+    async def exercise() -> tuple[dict[str, object], dict[str, object]]:
+        return tuple(
+            await asyncio.gather(
+                service.search_async(_request(task_id, "async-refresh-a", refresh=True)),
+                service.search_async(_request(task_id, "async-refresh-b", refresh=True)),
+            )
+        )  # type: ignore[return-value]
+
+    first, second = asyncio.run(exercise())
+    assert calls == ["async-refresh-a", "async-refresh-b"]
+    assert first["cache"]["status"] == "miss"
+    assert second["cache"]["status"] == "refresh"
+
+
+def test_cancelled_async_provider_settles_before_waiter_reuses_cache(postgres_resources):
+    """请求取消不释放在途调用；同键不同 ID 等待者在明确缓存后复用结果。"""
+    resources, settings = postgres_resources
+    task_id, _owner, _generation = _running_task(resources, "auto")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    class AsyncProvider:
+        async def search_async(self, request: ReverseImageRequest) -> dict[str, Any]:
+            calls.append(request.request_id or "")
+            started.set()
+            await release.wait()
+            return {"visual_matches": [{"title": "cancel-settled"}]}
+
+    service = ReverseImageService(
+        settings,
+        resources,
+        provider_binding=ReverseImageProviderBinding("host_provider", "visual_search", "async-cancel", AsyncProvider()),
+    )
+
+    async def exercise() -> dict[str, object]:
+        first = asyncio.create_task(service.search_async(_request(task_id, "async-cancel-a")))
+        await started.wait()
+        second = asyncio.create_task(service.search_async(_request(task_id, "async-cancel-b")))
+        first.cancel()
+        await asyncio.sleep(0.02)
+        assert not first.done()
+        assert not second.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        return await second
+
+    second = asyncio.run(exercise())
+    assert second["cache"]["status"] == "hit"
+    assert second["provider"]["called"] is False
+    assert calls == ["async-cancel-a"]
+    with resources.environment("local") as environment:
+        first_event = environment.reverse_image_usage.get("async-cancel-a")
+        assert first_event is not None
+        assert first_event.provider_called is True
+        assert first_event.outcome == "success"
 
 
 def test_provider_binding_variant_isolates_cache_and_snapshot(postgres_resources):
@@ -671,11 +783,11 @@ def test_cache_lock_rechecks_task_policy_and_status(postgres_resources, mutation
     resources, settings = postgres_resources
     task_id, _owner, _generation = _running_task(resources, "auto")
     service = _service(settings, resources, lambda _request: {"visual_matches": []})
-    original_lock = service.cache.lock
+    original_lock = service.cache.lock_async
 
-    @contextmanager
-    def mutating_lock(key: str):
-        with original_lock(key):
+    @asynccontextmanager
+    async def mutating_lock(key: str):
+        async with original_lock(key):
             with resources.environment("local") as environment:
                 task = environment.tasks.get(task_id, for_update=True)
                 assert task is not None
@@ -686,7 +798,7 @@ def test_cache_lock_rechecks_task_policy_and_status(postgres_resources, mutation
                 environment.uow.session.flush()
             yield
 
-    service.cache.lock = mutating_lock  # type: ignore[method-assign]
+    service.cache.lock_async = mutating_lock  # type: ignore[method-assign]
     with pytest.raises(ReverseImageError) as error:
         service.search(_request(task_id, f"lock-{mutation}"))
     assert error.value.code == expected

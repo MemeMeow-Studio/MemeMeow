@@ -7,7 +7,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import inspect
 from collections.abc import Callable
 from typing import Any
 
@@ -31,6 +33,27 @@ RegistrationProvider = Callable[[Request], Any]
 DatabaseProvider = Callable[[Request], Any]
 ScopeServicesProvider = Callable[[Request, ScopeContext], Any]
 ErrorFactory = Callable[[int, str, str], HTTPException]
+
+
+async def _run_sync_search(search: Callable[[ReverseImageRequest], object], payload: ReverseImageRequest) -> object:
+    """在线程中兼容同步 service，并在取消时等待其完整退出。"""
+    worker = asyncio.create_task(asyncio.to_thread(search, payload))
+    try:
+        result = await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # 线程内 service 可能已经持久化 provider_started 或正在执行外部调用；
+        # 必须等它自行收束后再传播取消，不能让 HTTP 边界先行结束并诱发重放。
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+        try:
+            worker.result()
+        except BaseException:  # noqa: BLE001 - 原始取消优先，结果只用于回收线程异常。
+            pass
+        raise
+    return await result if inspect.isawaitable(result) else result
 
 
 async def internal_reverse_image_search(
@@ -109,23 +132,32 @@ async def internal_reverse_image_search(
         raise error(401, "agent_callback_invalid_execution", "内部执行绑定无效") from exc
 
     try:
-        return service.search(
-            ReverseImageRequest(
-                image=content,
-                filename=filename or "image",
-                task_id=task_id,
-                request_id=request_id,
-                search_type=search_type,
-                language=language,
-                country=country,
-                query=query,
-                auto_crop=auto_crop,
-                refresh=refresh,
-                source_image_sha256=hashlib.sha256(content).hexdigest(),
-                callback_binding=callback_binding,
-                input_digest=input_digest,
-            )
+        payload = ReverseImageRequest(
+            image=content,
+            filename=filename or "image",
+            task_id=task_id,
+            request_id=request_id,
+            search_type=search_type,
+            language=language,
+            country=country,
+            query=query,
+            auto_crop=auto_crop,
+            refresh=refresh,
+            source_image_sha256=hashlib.sha256(content).hexdigest(),
+            callback_binding=callback_binding,
+            input_digest=input_digest,
         )
+        search_async = getattr(service, "search_async", None)
+        if callable(search_async):
+            result = search_async(payload)
+            return await result if inspect.isawaitable(result) else result
+        search = getattr(service, "search", None)
+        if not callable(search):
+            raise RuntimeError("reverse_image_service_invalid")
+        result = await _run_sync_search(search, payload)
+        if not isinstance(result, dict):
+            raise RuntimeError("reverse_image_service_invalid")
+        return result
     except ReverseImageError as exc:
         raise error(exc.status_code, exc.code, str(exc)) from exc
     except DatabaseError as exc:
