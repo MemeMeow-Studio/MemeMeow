@@ -102,6 +102,53 @@ def _call_list(request, records, environment, services, processing=None):
     )
 
 
+def test_agent_analysis_summary_preserves_timestamp_and_limits_fields() -> None:
+    """分析摘要只取保存的模型和完成时间，不使用当前配置或一般更新时间。"""
+    timestamp = "2026-09-16T08:30:00.128901+00:00"
+    provenance = {
+        "model": "another-model",
+        "updated_at": "2026-09-17T00:00:00Z",
+        "agent_context": {"model": "provider/analysis-model", "completed_at": timestamp, "task_id": "private"},
+    }
+    assert image_library_http.agent_analysis_summary(provenance) == {
+        "model": "provider/analysis-model", "completed_at": timestamp,
+    }
+    assert provenance["agent_context"]["task_id"] == "private"
+
+
+@pytest.mark.parametrize("context", [None, [], {},
+    {"model": "", "completed_at": "2026-09-16T08:30:00Z"},
+    {"model": "bad\nmodel", "completed_at": "2026-09-16T08:30:00Z"},
+    {"model": "valid", "completed_at": "2026-09-16"},
+    {"model": "valid", "completed_at": "invalid"},
+])
+def test_agent_analysis_summary_omits_incomplete_record(context) -> None:
+    """缺少合法模型或完整时间时不伪造分析摘要。"""
+    assert image_library_http.agent_analysis_summary({"agent_context": context}) is None
+
+
+def test_metadata_derives_analysis_without_persisting_it() -> None:
+    """HTTP 摘要覆盖同名扩展，但不修改数据库来源对象。"""
+    from copy import deepcopy
+
+    source = {"image": {"relative_path": "meme.png"}, "provenance": {
+        "agent_analysis": {"model": "forged"},
+        "agent_context": {"model": "model_plus", "completed_at": "2026-09-16T08:30:00Z", "task_id": "private"},
+    }}
+    services = _services(Path("meme.png"))
+    services.metadata.load = lambda _image: SimpleNamespace(model_dump=lambda **_kwargs: deepcopy(source))
+    payload = asyncio.run(image_library_http.image_metadata(
+        _request(), meme_id="meme-1", services=lambda _request: services, error=_error,
+    ))
+    assert payload["provenance"]["agent_analysis"] == {"model": "model_plus", "completed_at": "2026-09-16T08:30:00Z"}
+    assert source["provenance"]["agent_analysis"] == {"model": "forged"}
+    source["provenance"].pop("agent_context")
+    payload = asyncio.run(image_library_http.image_metadata(
+        _request(), meme_id="meme-1", services=lambda _request: services, error=_error,
+    ))
+    assert "agent_analysis" not in payload["provenance"]
+
+
 def test_image_library_routes_and_legacy_names_remain_available() -> None:
     """图片列表、详情和媒体 route metadata 保持兼容且不重复注册。"""
     expected = {"/images", "/images/metadata", "/media/{meme_id}"}

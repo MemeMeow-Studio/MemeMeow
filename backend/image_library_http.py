@@ -8,7 +8,8 @@ services、数据库环境、处理 repository、视觉 identity 和路由注册
 from __future__ import annotations
 
 import mimetypes
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from fastapi import HTTPException, Request
@@ -17,6 +18,7 @@ from fastapi.responses import FileResponse
 from backend.database import DatabaseError
 from backend.image_naming import public_filename_fields, saved_filename
 from backend.metadata import MetadataError
+from backend.public_dto import sanitize_public_timestamp
 from backend.services.thumbnails import ThumbnailError
 
 
@@ -26,6 +28,22 @@ ProcessingRepositoryProvider = Callable[[Request], Any]
 VisualIdentityProvider = Callable[[Request], Any]
 ErrorFactory = Callable[[int, str, str], HTTPException]
 MISSING_MEDIA_ERRORS = frozenset({"metadata_missing", "file_not_found"})
+
+
+def agent_analysis_summary(provenance: object) -> dict[str, str] | None:
+    """从已保存的 Agent 语境提取模型和完整完成时间，供图片详情只读展示。"""
+    context = provenance.get("agent_context") if isinstance(provenance, Mapping) else None
+    if not isinstance(context, Mapping):
+        return None
+    model = context.get("model")
+    completed_at = sanitize_public_timestamp(context.get("completed_at"))
+    if (
+        not isinstance(model, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}", model)
+        or completed_at is None
+    ):
+        return None
+    return {"model": model, "completed_at": completed_at}
 
 
 async def list_images(
@@ -135,6 +153,13 @@ async def image_metadata(
         message = "图片不存在" if exc.code in MISSING_MEDIA_ERRORS else "图片元数据无法读取"
         raise error(status, code, message) from exc
     payload = metadata.model_dump(mode="json", exclude_none=False)
+    provenance = payload.get("provenance")
+    if isinstance(provenance, dict):
+        # 摘要只由服务端事实派生，不能沿用导入数据中同名的扩展字段。
+        provenance.pop("agent_analysis", None)
+        analysis = agent_analysis_summary(provenance)
+        if analysis is not None:
+            provenance["agent_analysis"] = analysis
     try:
         public_fields = public_filename_fields(record)
     except ValueError as exc:

@@ -5,7 +5,7 @@ import { api } from '../api'
 import { useModalDialog } from '../composables/useModalDialog'
 import { showTaskDiagnostics } from '../config/debug'
 import type { ImageProcessingStage, MemeImage } from '../types'
-import { formatTaskTime, imageStageLabel, imageStageStatusLabel, taskStatusLabel } from '../utils/presentation'
+import { formatAnalysisDate, formatTaskTime, imageStageLabel, imageStageStatusLabel, taskStatusLabel } from '../utils/presentation'
 
 const props = defineProps<{
   image: MemeImage
@@ -206,6 +206,12 @@ function metadataErrorText(value: unknown): string {
 const metadataPayload = computed<MetadataRecord | null>(() => (isRecord(previewJson.value) ? previewJson.value : null))
 const metadataContext = computed<MetadataRecord>(() => (isRecord(metadataPayload.value?.meme_context) ? metadataPayload.value.meme_context : {}))
 const metadataProvenance = computed<MetadataRecord>(() => (isRecord(metadataPayload.value?.provenance) ? metadataPayload.value.provenance : {}))
+const agentAnalysis = computed<MetadataRecord>(() => (isRecord(metadataProvenance.value.agent_analysis) ? metadataProvenance.value.agent_analysis : {}))
+const analysisModel = computed(() => firstString(agentAnalysis.value.model))
+const analysisDate = computed(() => {
+  const formatted = formatAnalysisDate(firstString(agentAnalysis.value.completed_at))
+  return formatted === '—' ? '' : formatted
+})
 const metadataStatusCode = computed(() => {
   const status = firstString(metadataPayload.value?.context_status, metadataPayload.value?.metadata_status, metadataPayload.value?.status, props.image.metadata?.status)
   return Object.prototype.hasOwnProperty.call(METADATA_STATUS_VIEWS, status) ? status : 'unknown'
@@ -359,6 +365,13 @@ void loadMetadata()
               <details class="metadata-details">
                 <summary>更多信息</summary>
                 <div class="metadata-details-body">
+                  <section v-if="analysisModel || analysisDate" class="metadata-detail-group" aria-labelledby="metadata-analysis-title">
+                    <h4 id="metadata-analysis-title">语境分析</h4>
+                    <dl class="metadata-detail-list">
+                      <div v-if="analysisModel"><dt>分析模型</dt><dd>{{ analysisModel }}</dd></div>
+                      <div v-if="analysisDate"><dt>分析日期</dt><dd>{{ analysisDate }}</dd></div>
+                    </dl>
+                  </section>
                   <section class="metadata-detail-group" aria-labelledby="metadata-file-details-title">
                     <h4 id="metadata-file-details-title">文件信息</h4>
                     <dl class="metadata-detail-list">

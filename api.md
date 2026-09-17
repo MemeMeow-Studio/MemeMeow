@@ -63,13 +63,23 @@ app = create_app(scope_resolver=LocalScopeResolver("local"))
 ## 图片库和媒体
 
 - `GET /images?search=&page=1&page_size=50`：分页列出当前请求 scope 的扁平图片；每个图片项包含 `meme_id`、文件名、原图 `media_url`、`thumbnail`、`metadata.status`、文本索引 `embedding_status` 和图片视觉向量 `visual_embedding_status`。`thumbnail` 形状为 `{ "status": "available|pending|failed|stale", "media_url": "..."|null, "width": 320, "height": 180, "media_type": "image/jpeg" }`；只有 `available` 返回宽高、媒体类型和受控缩略图 URL。
-- `GET /images/metadata?meme_id=`：读取当前 scope 指定 Meme 的完整数据库语境；不接受路径式资源标识。
+- `GET /images/metadata?meme_id=`：读取当前 scope 指定 Meme 的图片信息和语境；文件身份按公开展示字段投影，不接受路径式资源标识。
 - `POST /images/rename`：请求 `{ "meme_id": "...", "new_name": "new" }`，保留原扩展名且拒绝覆盖。
 - `POST /images/delete`：请求 `{ "meme_id": "..." }`，隔离并删除图片及数据库 Meme。
 - `POST /images/upload`：multipart 字段 `reverse_image_policy=forbid|auto`、`auto_name=true|false` 和多个 `files`，单请求最多 20 个文件，逐文件返回成功或失败，图片直接写入当前请求 scope 的受控图片根；成功入库后自动创建或复用逐图处理 job；不接受目标目录、`scope_id` 或 `user_id`。部署可通过 `MEMEMEOW_MAX_REQUEST_BYTES` 启用总请求字节预算，未配置时不启用总量限制；响应丢失后的同名、同 SHA、同大小提交会返回既有 `meme_id` 和当前处理状态。
 - 上传成功会在 PostgreSQL 创建稳定 `meme_id` 和 `pending` 元数据记录；`meme_context.title` 初始为 `null`。数据库是唯一结构化事实，运行时不读取或写入 sidecar。
 - `GET /media/{meme_id}`：按当前请求 scope 稳定 Meme ID 受控读取 PNG/JPG/JPEG/GIF；跨 scope ID 返回 `404 meme_not_found`。响应使用 `Cache-Control: private, no-store` 和 `Vary: Cookie`。
 - `GET /media/{meme_id}/thumbnail`：按当前请求 scope 和稳定 Meme ID 读取已完成且仍通过源版本、输出 SHA/大小、尺寸及 `image/jpeg` 校验的缩略图；不存在、未就绪、失效、损坏或跨 scope 的派生对象均按 `404 meme_not_found` 处理。响应同样使用 `Cache-Control: private, no-store` 和 `Vary: Cookie`，不接受客户端路径或内部 `output_key`。
+
+### 分析信息
+
+图片详情响应中的 `provenance.agent_analysis` 是只读摘要，仅包含 `model` 和 `completed_at`，从最近一次已保存的 Agent 语境分析记录派生，不使用当前模型配置或元数据更新时间代替。示例：
+
+```json
+{"model":"provider/analysis-model","completed_at":"2026-09-16T08:30:00.128901+00:00"}
+```
+
+缺少有效模型或完成时间时不返回该摘要。它不包含任务 ID、配置哈希等内部诊断字段；现有其他 provenance 字段保持不变。API 保留完整完成时间，图片详情的“分析日期”按浏览器本地时区只显示年月日。该时间表示语境分析结果的保存时间，不代表后续自动命名、文本索引或整个处理 Job 已成功。接口不会写回数据库或修改图片文件。
 
 ### 缩略图派生
 

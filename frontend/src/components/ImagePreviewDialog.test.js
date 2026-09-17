@@ -140,6 +140,35 @@ describe('ImagePreviewDialog', () => {
     wrapper.unmount()
   })
 
+  it('只读展示分析模型和本地日期，保留原有更新时间', async () => {
+    const completedAt = '2026-09-16T23:30:00.128901+00:00'
+    const wrapper = await mountDialog(metadataPayload('ready', {}, {
+      updated_at: '2026-09-17T08:30:00Z',
+      agent_analysis: { model: 'provider/analysis-model', completed_at: completedAt },
+    }))
+    const group = wrapper.get('[aria-labelledby="metadata-analysis-title"]')
+    expect(group.findAll('dt').map((item) => item.text())).toEqual(['分析模型', '分析日期'])
+    expect(group.findAll('dd').map((item) => item.text())).toEqual([
+      'provider/analysis-model',
+      new Date(completedAt).toLocaleDateString('zh-CN', { year: 'numeric', month: 'numeric', day: 'numeric' }),
+    ])
+    expect(group.text()).not.toContain(':')
+    expect(group.find('input').exists()).toBe(false)
+    expect(wrapper.text()).toContain('更新时间')
+    expect(wrapper.get('[aria-labelledby="metadata-provenance-title"]').text()).toContain(
+      new Date('2026-09-17T08:30:00Z').toLocaleString('zh-CN', {
+        year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
+      }),
+    )
+    wrapper.unmount()
+  })
+
+  it.each([undefined, {}, { completed_at: 'invalid' }])('没有有效分析记录时隐藏分析区块', async (analysis) => {
+    const wrapper = await mountDialog(metadataPayload('ready', {}, { agent_analysis: analysis }))
+    expect(wrapper.find('[aria-labelledby="metadata-analysis-title"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
   it('读取元数据失败时仍保留文件信息和可理解错误', async () => {
     imageMetadata.mockRejectedValue(new Error('failed at /srv/private/sample.png'))
     const wrapper = mount(ImagePreviewDialog, {

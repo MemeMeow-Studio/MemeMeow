@@ -155,6 +155,16 @@ export function imageStageStatusLabel(status?: string): string {
   }[status || ''] || taskStatusLabel(status)
 }
 
+/** 将分析完成时间按浏览器本地时区显示到日，不改变 API 中的完整时间。 */
+export function formatAnalysisDate(value?: string): string {
+  if (!value) return '—'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '—'
+  return date.toLocaleDateString('zh-CN', {
+    year: 'numeric', month: 'numeric', day: 'numeric',
+  })
+}
+
 /** 将任务时间压缩为桌面和移动端都能容纳的本地格式。 */
 export function formatTaskTime(value?: string | number | Date): string {
   if (!value) return '—'
