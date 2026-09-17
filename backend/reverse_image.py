@@ -957,11 +957,6 @@ class ReverseImageService:
                         raise ReverseImageError("usage_request_conflict", "请求标识已用于另一项检索", status_code=409) from exc
                     raise ReverseImageError("agent_callback_unavailable", "内部执行绑定暂不可用", status_code=503) from exc
                 request_id = callback_row.request_id
-                if task_authority is None:
-                    # 当前 Task 行已锁定；首条 callback authority 提交后再释放事务，
-                    # 后续图片处理和 provider 网络请求不持有数据库连接。
-                    environment.uow.session.flush()
-                    environment.uow.session.commit()
                 try:
                     bound_usage = environment.reverse_image_usage.get_by_binding(
                         task_id=task.id,
@@ -980,6 +975,11 @@ class ReverseImageService:
                     # callback 行缺失时，完整 usage 事实可能来自旧崩溃窗口；其 ID
                     # 无法安全改绑到新候选，避免通过新 ID 重放 provider。
                     raise ReverseImageError("reverse_image_unknown_execution", "反向图片调用状态未知", status_code=503)
+                if task_authority is None:
+                    # 当前 Task 行已锁定；只有确认不存在其它 usage authority 后，才能
+                    # 提交首条 callback，避免恢复异常留下新的权威别名。
+                    environment.uow.session.flush()
+                    environment.uow.session.commit()
                 if callback_row.state in {"unknown_execution", "failed", "completed"} and callback_row.completed_at is not None:
                     # callback 终态而 usage 缺失表示崩溃窗口无法证明完整结果；只允许
                     # 返回已存在的 usage，不能用新 request ID 再次触发 provider。
