@@ -15,7 +15,7 @@ MemeMeow 是一个基于自然语言的表情包检索工具。它能让你通�
 
 ## 🚀 立即使用
 
-前往[MemeMeow官网](https://mememeow-dev.stellarformation.cc) 立即开始使用，无需本地部署。
+预计将于九月底开放。
 
 ## 📖 核心功能与使用说明
 
