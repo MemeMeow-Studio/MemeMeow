@@ -539,6 +539,11 @@ class OpenCodeRunner:
         if health and code in {"agent_timeout", "agent_executor_unavailable", "agent_executor_http_error"}:
             return "agent_runtime_unavailable"
         known = {
+            "agent_analysis_policy_missing",
+            "agent_analysis_policy_invalid",
+            "agent_analysis_usage_unavailable",
+            "agent_analysis_reminder_plugin_unavailable",
+            "agent_maximum_analysis_depth_exceeded",
             "agent_timeout",
             "task_interrupted",
             "agent_process_failed",
@@ -1558,9 +1563,12 @@ class OpenCodeRunner:
         processing_config_hash: str | None = None,
         workspace_context: TrustedWorkspaceContext | None = None,
         model_capability: str | None = None,
+        analysis_policy: dict[str, object] | None = None,
     ) -> tuple[dict[str, Any], str]:
         """执行单张图片研究；失败也尽力返回可验证 session 诊断。"""
         task_id = task_id or uuid.uuid4().hex
+        if analysis_policy is not None and not self.executor_mode:
+            raise OpenCodeError("agent_analysis_policy_invalid", "启用分析用量控制需要 Executor 模式")
         # host 回滚模式也需要 attempt 级诊断标识；executor 模式提交后会以
         # 服务端生成的独立 attempt 覆盖该临时值。
         local_executor_attempt_id = f"host-attempt-{uuid.uuid4().hex}"
@@ -1680,6 +1688,7 @@ class OpenCodeRunner:
                         workspace_selector=None if resolved_workspace.local else resolved_workspace.selector,
                         workspace_capability=capability,
                         model_capability=model_capability,
+                        analysis_policy=analysis_policy,
                     )
                     if response.executor_attempt_id:
                         self._remember_executor_attempt(task_id, response.executor_attempt_id)

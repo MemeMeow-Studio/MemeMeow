@@ -3,6 +3,7 @@ fastapi
 uvicorn[standard]
 python-dotenv
 pydantic-settings
+loguru>=0.7.3
 python-multipart
 numpy
 pillow

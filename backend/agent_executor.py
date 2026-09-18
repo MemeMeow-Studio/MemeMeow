@@ -19,6 +19,7 @@ from typing import Any, Callable
 from urllib.parse import quote, urlsplit
 
 from executor.model_capability import MODEL_CAPABILITY_FIELD, ModelCapabilityError, validate_model_capability
+from executor.analysis_policy import parse_analysis_policy
 
 
 class AgentExecutorError(RuntimeError):
@@ -37,6 +38,11 @@ _PENDING_STATUSES = frozenset({"queued", "running"})
 _ATTEMPT_HISTORY_LIMIT = 5000
 _KNOWN_TASK_ERRORS = frozenset(
     {
+        "agent_analysis_policy_missing",
+        "agent_analysis_policy_invalid",
+        "agent_analysis_usage_unavailable",
+        "agent_analysis_reminder_plugin_unavailable",
+        "agent_maximum_analysis_depth_exceeded",
         "agent_timeout",
         "task_interrupted",
         "agent_process_failed",
@@ -98,6 +104,9 @@ class ExecutorTaskResponse:
     result_path: str | None
     executor_attempt_id: str | None = None
     business_task_id: str | None = None
+    observed_cost: str | None = None
+    usage_checked_at: str | None = None
+    reminder_sent: bool = False
 
 
 class AgentExecutorClient:
@@ -187,6 +196,9 @@ class AgentExecutorClient:
             result_path=value.get("result_path") if isinstance(value.get("result_path"), str) else None,
             executor_attempt_id=value.get("executor_attempt_id") if isinstance(value.get("executor_attempt_id"), str) else None,
             business_task_id=value.get("business_task_id") if isinstance(value.get("business_task_id"), str) else None,
+            observed_cost=value.get("observed_cost") if isinstance(value.get("observed_cost"), str) else None,
+            usage_checked_at=value.get("usage_checked_at") if isinstance(value.get("usage_checked_at"), str) else None,
+            reminder_sent=value.get("reminder_sent") is True,
         )
 
     @staticmethod
@@ -281,9 +293,12 @@ class AgentExecutorClient:
         workspace_capability: str | None = None,
         model_capability: str | None = None,
         visual_snapshot_sha256: str | None = None,
+        analysis_policy: dict[str, object] | None = None,
     ) -> ExecutorTaskResponse:
         """提交绑定模型 capability 的独立 executor attempt，并可按明确 session 续跑。"""
         timeout_value = int(timeout_seconds)
+        if analysis_policy is not None:
+            analysis_policy = parse_analysis_policy(analysis_policy).model_dump(mode="json")
         attempt_id = executor_attempt_id or f"attempt-{uuid4().hex}"
         if model_capability is not None:
             try:
@@ -314,6 +329,7 @@ class AgentExecutorClient:
                     **({MODEL_CAPABILITY_FIELD: model_capability} if model_capability else {}),
                     **({"visual_snapshot_sha256": visual_snapshot_sha256} if visual_snapshot_sha256 else {}),
                     **({"callback_token": callback_token} if callback_token else {}),
+                    **({"analysis_policy": analysis_policy} if analysis_policy is not None else {}),
                 },
                 timeout=max(self.timeout, timeout_value + 10),
             )

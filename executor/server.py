@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from typing import Any
+from decimal import Decimal
+from loguru import logger
 from urllib.parse import unquote, urlsplit
 
 try:
@@ -61,6 +63,8 @@ except ModuleNotFoundError as exc:  # pragma: no cover - Agent 镜像只复制 e
         validate_file_path,
     )
 from executor.agent_limits import validate_agent_concurrency
+from executor.analysis_policy import AnalysisPolicyError, parse_analysis_policy
+from executor.analysis_monitor import AnalysisMonitor, AnalysisControlError
 from executor.process_supervisor import ProcessSupervisor
 from executor.result_store import ExecutorResultStore, ExecutorResultStoreError
 from executor.task_queue import ExecutionQueue
@@ -123,6 +127,7 @@ ALLOWED_REQUEST_FIELDS = frozenset(
         "workspace_selector",
         "workspace_capability",
         "visual_snapshot_sha256",
+        "analysis_policy",
         MODEL_CAPABILITY_FIELD,
     }
 )
@@ -132,6 +137,11 @@ REQUIRED_RESULT_FIELDS = frozenset(
 TASK_HISTORY_LIMIT = 5000
 _EXECUTOR_ERROR_CODES = frozenset(
     {
+        "agent_analysis_policy_missing",
+        "agent_analysis_policy_invalid",
+        "agent_analysis_usage_unavailable",
+        "agent_analysis_reminder_plugin_unavailable",
+        "agent_maximum_analysis_depth_exceeded",
         "agent_timeout",
         "task_interrupted",
         "agent_process_failed",
@@ -350,6 +360,10 @@ class TaskState:
     process: subprocess.Popen[bytes] | None = field(default=None, repr=False)
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     done: threading.Event = field(default_factory=threading.Event, repr=False)
+    analysis_policy: dict[str, object] | None = field(default=None, repr=False)
+    observed_cost: str | None = None
+    usage_checked_at: str | None = None
+    reminder_sent: bool = False
 
     def public(self) -> dict[str, object]:
         """返回 API 可见状态，不暴露进程对象和 executor 本地实现细节。"""
@@ -371,6 +385,9 @@ class TaskState:
             "completed_at": self.completed_at,
             "process_reaped": self.process_reaped,
             "workspace_selector": self.workspace_selector,
+            "observed_cost": self.observed_cost,
+            "usage_checked_at": self.usage_checked_at,
+            "reminder_sent": self.reminder_sent,
         }
 
 
@@ -723,6 +740,10 @@ class Executor:
             "created_at": task.created_at,
             "completed_at": task.completed_at,
             "process_reaped": task.process_reaped,
+            "analysis_policy": task.analysis_policy,
+            "observed_cost": task.observed_cost,
+            "usage_checked_at": task.usage_checked_at,
+            "reminder_sent": task.reminder_sent,
         }
         values = [item for item in existing if item.get("executor_attempt_id") != task.executor_attempt_id]
         values.append(entry)
@@ -786,6 +807,9 @@ class Executor:
                 created_at=float(entry.get("created_at")) if isinstance(entry.get("created_at"), (int, float)) else time.time(),
                 completed_at=float(entry.get("completed_at")) if isinstance(entry.get("completed_at"), (int, float)) else time.time(),
                 process_reaped=True,
+                analysis_policy=entry.get("analysis_policy"),
+                observed_cost=entry.get("observed_cost"),
+                usage_checked_at=entry.get("usage_checked_at"),
             )
         return None
 
@@ -901,6 +925,15 @@ class Executor:
             MODEL_CAPABILITY_FIELD: model_capability,
         }
         self._verify_workspace_capability(values)
+        policy = payload.get("analysis_policy")
+        if policy is not None:
+            try:
+                parsed = parse_analysis_policy(policy)
+            except AnalysisPolicyError as exc:
+                raise ValueError(exc.code) from exc
+            if parsed.model != self.model or parsed.variant != "max":
+                raise ValueError("agent_analysis_policy_invalid")
+            values["analysis_policy"] = parsed.model_dump(mode="json")
         layout = self._workspace_layout(selector=workspace_selector if isinstance(workspace_selector, str) else None, business_task_id=business_task_id)
         image = layout.images_root / relative
         try:
@@ -989,6 +1022,8 @@ class Executor:
                     raise RuntimeError("unknown_execution")
                 raise RuntimeError("task_exists")
             source = self._resume_source(values) if values.get("session_id") else None
+            if source is not None and source.analysis_policy != values.get("analysis_policy"):
+                raise RuntimeError("agent_analysis_policy_invalid")
             task = TaskState(
                 task_id=str(values["business_task_id"]),
                 business_task_id=str(values["business_task_id"]),
@@ -1014,6 +1049,8 @@ class Executor:
                 is_resume=source is not None,
                 callback_token=values.get("callback_token") if isinstance(values.get("callback_token"), str) else None,
                 result_path=f"task-results/{values['business_task_id']}/{RESULT_FILE_NAME}",
+                analysis_policy=values.get("analysis_policy"),
+                observed_cost=source.observed_cost if source else None,
             )
             self.tasks[task.executor_attempt_id] = task
             self.futures[task.executor_attempt_id] = self.pool.submit(self._run, task)
@@ -1076,6 +1113,13 @@ class Executor:
         except Exception as exc:  # noqa: BLE001 - 配置路径是 executor 安全边界
             raise RuntimeError("opencode_workspace_invalid") from exc
         config = json.loads(json.dumps(RUNTIME_OPENCODE_CONFIG, ensure_ascii=False))
+        if task.analysis_policy is not None:
+            config["plugin"] = [["file:///opt/mememeow/plugins/analysis-reminder.mjs", {
+                "attempt_id": task.executor_attempt_id,
+                "policy": task.analysis_policy,
+                "session_id": task.session_id,
+                "status_path": str(scratch / f"analysis-{task.executor_attempt_id}.json"),
+            }]]
         config["permission"] = {
             "external_directory": self._workspace_permission_rules(task),
             "edit": self._workspace_edit_permission_rules(task),
@@ -1365,6 +1409,16 @@ class Executor:
                     # 进程启动后，只有父进程确认 waitpid 收束才允许该 attempt 作为续跑源。
                     task.process_reaped = False
                 deadline = time.monotonic() + task.timeout_seconds
+                monitor = None
+                if task.analysis_policy is not None:
+                    scratch = task.task_scratch_root or (WORKSPACE / "tasks" / task.business_task_id)
+                    monitor = AnalysisMonitor(
+                        attempt_id=task.executor_attempt_id, policy=task.analysis_policy,
+                        database=Path(env["OPENCODE_DB"]), directory=task.workspace_directory or WORKSPACE,
+                        status_path=scratch / f"analysis-{task.executor_attempt_id}.json",
+                        startup_deadline=min(deadline, time.monotonic() + 30),
+                        observed_cost=Decimal(task.observed_cost or "0"),
+                    )
                 while process.poll() is None:
                     if task.cancel_event.is_set():
                         reaped = self.process_supervisor.terminate(process).reaped
@@ -1381,6 +1435,8 @@ class Executor:
                             raise _ProcessFailure("unknown_execution", "无法确认 OpenCode 进程已终止")
                         timed_out = True
                         break
+                    if monitor is not None:
+                        self._check_analysis(task, monitor, process, out)
                     time.sleep(0.05)
                 if process.poll() is not None:
                     with self.lock:
@@ -1389,6 +1445,8 @@ class Executor:
                 err.flush()
                 # session 必须从完整 stdout 流解析；采样只保留给有限错误诊断。
                 self._capture_session(task, out)
+                if monitor is not None and not timed_out and not task.cancel_event.is_set():
+                    self._check_analysis(task, monitor, process, out, exited=True)
                 stdout = _stream_sample(out, 256 * 1024)
                 stderr = _stream_sample(err, 16 * 1024)
             if task.cancel_event.is_set():
@@ -1476,6 +1534,39 @@ class Executor:
                     # 但此时新 executor 必须因缺少签名事实而拒绝自动续跑。
                     pass
                 task.done.set()
+
+    def _check_analysis(self, task: TaskState, monitor: AnalysisMonitor, process: subprocess.Popen[bytes], stdout: Any, *, exited: bool = False) -> None:
+        """检查冻结 attempt 的金额和插件，触发时确认进程回收后发布稳定错误。"""
+        if not exited and time.monotonic() < monitor.next_check:
+            return
+        try:
+            if task.session_id is None:
+                # 独立打开文件描述符，读取位置不能改变子进程的 stdout 写入位置。
+                with open(f"/proc/self/fd/{stdout.fileno()}", "rb") as snapshot:
+                    self._capture_session(task, snapshot)
+            monitor.check(task.session_id, exited=exited)
+        except (AnalysisControlError, RuntimeError) as exc:
+            code = exc.code if isinstance(exc, AnalysisControlError) else "agent_analysis_usage_unavailable"
+            reason = exc.reason if isinstance(exc, AnalysisControlError) else str(exc)
+            reaped = self.process_supervisor.terminate(process).reaped
+            with self.lock:
+                task.process_reaped = reaped
+            logger.bind(
+                attempt_id=task.executor_attempt_id, policy=task.analysis_policy,
+                observed_cost=str(monitor.observed_cost), phase=reason,
+                process_reaped=reaped, trigger=code,
+            ).error(
+                "Agent 分析用量控制终止：attempt={}；策略={}；观测金额={}；原因={}；阶段={}；进程回收={}",
+                task.executor_attempt_id, task.analysis_policy, str(monitor.observed_cost), code, reason, reaped,
+            )
+            public_code = code if reaped else "unknown_execution"
+            message = "超过最大分析程度" if public_code == "agent_maximum_analysis_depth_exceeded" else f"{code}:{reason}" if reaped else f"进程回收未确认；触发原因={code}；阶段={reason}"
+            raise _ProcessFailure(public_code, message) from exc
+        finally:
+            with self.lock:
+                task.observed_cost = str(monitor.observed_cost)
+                task.usage_checked_at = monitor.usage_checked_at
+                task.reminder_sent = monitor.reminder_sent
 
     def _capture_session(self, task: TaskState, stdout: Any) -> None:
         """从完整临时 stdout 流逐行绑定 session，避免采样截断 JSONL。"""

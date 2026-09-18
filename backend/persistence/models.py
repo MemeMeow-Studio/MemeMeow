@@ -11,6 +11,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -25,6 +26,7 @@ from sqlalchemy import (
     Index,
     Integer,
     JSON,
+    Numeric,
     String,
     UniqueConstraint,
     Uuid,
@@ -403,6 +405,13 @@ class Task(Base):
     error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     # Agent session 恢复摘要只保存稳定标识和脱敏错误，不保存 prompt/transcript。
     resume_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    # 分析金额策略只由受信控制面冻结；公开任务 DTO 不暴露该 JSONB 内容。
+    analysis_policy: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    observed_cost: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    usage_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reminder_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    termination_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    termination_signal: Mapped[str | None] = mapped_column(String(16), nullable=True)
     resume_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     resume_session_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     executor_attempt_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -438,6 +447,9 @@ class Task(Base):
         CheckConstraint("visual_snapshot_sha256 IS NULL OR length(visual_snapshot_sha256) = 64", name="ck_task_visual_snapshot_sha256"),
         CheckConstraint("visual_snapshot_protocol_version IS NULL OR visual_snapshot_protocol_version > 0", name="ck_task_visual_snapshot_protocol_version"),
         CheckConstraint("visual_snapshot_candidate_count IS NULL OR visual_snapshot_candidate_count >= 0", name="ck_task_visual_snapshot_candidate_count"),
+        CheckConstraint("observed_cost IS NULL OR observed_cost >= 0", name="ck_task_observed_cost"),
+        CheckConstraint("termination_reason IS NULL OR termination_reason IN ('analysis_cost_limit','unknown_execution','timeout','cancelled','process_failed')", name="ck_task_termination_reason"),
+        CheckConstraint("termination_signal IS NULL OR termination_signal IN ('SIGTERM','SIGKILL')", name="ck_task_termination_signal"),
         UniqueConstraint("scope_id", "id", name="uq_task_scope_id"),
         Index("ix_tasks_image_submission", "scope_id", "submission_mode", "image_stage", "processing_job_id", "created_at"),
         Index("ix_tasks_image_target_active", "scope_id", "target_meme_id", "target_image_sha256", "status", "created_at"),
@@ -661,6 +673,13 @@ class ImageProcessingAttempt(Base):
     resume_of_attempt_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     workspace_selector: Mapped[str | None] = mapped_column(String(128), nullable=True)
     processing_config_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # attempt 保存任务创建时冻结的金额策略及 Executor 最后可信观测。
+    analysis_policy: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    observed_cost: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    usage_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reminder_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    termination_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    termination_signal: Mapped[str | None] = mapped_column(String(16), nullable=True)
     resume_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     resume_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
@@ -681,6 +700,9 @@ class ImageProcessingAttempt(Base):
         CheckConstraint("visual_snapshot_sha256 IS NULL OR length(visual_snapshot_sha256) = 64", name="ck_attempt_visual_snapshot_sha256"),
         CheckConstraint("visual_snapshot_protocol_version IS NULL OR visual_snapshot_protocol_version > 0", name="ck_attempt_visual_snapshot_protocol_version"),
         CheckConstraint("visual_snapshot_candidate_count IS NULL OR visual_snapshot_candidate_count >= 0", name="ck_attempt_visual_snapshot_candidate_count"),
+        CheckConstraint("observed_cost IS NULL OR observed_cost >= 0", name="ck_attempt_observed_cost"),
+        CheckConstraint("termination_reason IS NULL OR termination_reason IN ('analysis_cost_limit','unknown_execution','timeout','cancelled','process_failed')", name="ck_attempt_termination_reason"),
+        CheckConstraint("termination_signal IS NULL OR termination_signal IN ('SIGTERM','SIGKILL')", name="ck_attempt_termination_signal"),
         Index("ix_image_processing_attempts_task", "scope_id", "task_id", "attempt"),
         Index(
             "uq_image_processing_attempt_executor_id",

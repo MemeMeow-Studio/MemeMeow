@@ -15,6 +15,11 @@ COPY .opencode/package*.json /opt/mememeow/
 RUN npm ci --omit=dev
 RUN npm install --global --no-fund --no-audit opencode-ai@1.18.18
 
+# Executor 使用与项目一致的校验库和日志库，依赖随镜像安装。
+RUN python3 -m venv /opt/mememeow/python \
+    && /opt/mememeow/python/bin/pip install --no-cache-dir pydantic==2.13.4 loguru==0.7.3
+COPY .opencode/plugins /opt/mememeow/plugins
+
 COPY skills/research-meme-context /skills/research-meme-context
 COPY executor /opt/mememeow/executor
 # executor 与 Skill 共享无状态协议快照，不把项目后端或数据库带入 Agent 镜像。
@@ -31,7 +36,7 @@ RUN groupadd --system mememeow-agent \
     && chmod -R a=rX /skills/research-meme-context
 
 ENV HOME=/runtime/home \
-    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PATH=/opt/mememeow/python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     PYTHONPATH=/opt/mememeow \
     PYTHONUNBUFFERED=1
 

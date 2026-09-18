@@ -32,6 +32,12 @@ RUNTIME_OPENCODE_CONFIG: dict[str, Any] = {
                     "attachment": True,
                     "modalities": {"input": ["text", "image", "pdf"], "output": ["text"]},
                     "limit": {"context": 1050000, "input": 922000, "output": 128000},
+                    "cost": {
+                        "input": 0.2, "output": 1.2, "cache_read": 0.02, "cache_write": 0.25,
+                        "context_over_200k": {
+                            "input": 0.4, "output": 1.8, "cache_read": 0.04, "cache_write": 0.5,
+                        },
+                    },
                     "variants": {"max": {"reasoningEffort": "max"}},
                 }
             },
