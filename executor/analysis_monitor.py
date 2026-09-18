@@ -10,6 +10,8 @@ import time
 
 from executor.analysis_usage import AnalysisUsageError, read_analysis_usage
 
+PLUGIN_VERSION = "1.18.18"
+
 
 class AnalysisControlError(RuntimeError):
     """携带可公开错误码和受保护原因，交给现有 supervisor 回收进程。"""
@@ -48,7 +50,12 @@ class AnalysisMonitor:
                 status = json.loads(self.status_path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, ValueError) as exc:
                 raise AnalysisControlError("agent_analysis_reminder_plugin_unavailable", "plugin_status_unreadable") from exc
-            if not isinstance(status, dict) or status.get("attempt_id") != self.attempt_id or status.get("policy_version") != self.policy["version"]:
+            if (
+                not isinstance(status, dict)
+                or status.get("attempt_id") != self.attempt_id
+                or status.get("plugin_version") != PLUGIN_VERSION
+                or status.get("policy_version") != self.policy["version"]
+            ):
                 raise AnalysisControlError("agent_analysis_reminder_plugin_unavailable", "plugin_attempt_binding_mismatch")
             self.ready = status.get("ready") is True
             self.reminder_sent = self.reminder_sent or status.get("reminder_sent") is True

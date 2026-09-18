@@ -19,7 +19,7 @@ export default async function analysisReminder({ client }, options) {
     throw new Error("analysis_plugin_configuration_invalid");
   }
   const state = {
-    attempt_id, policy_version: policy.version, ready: false,
+    attempt_id, plugin_version: runtimeVersion, policy_version: policy.version, ready: false,
     session_id: session_id ?? null, reminder_sent: false, error: null,
   };
   // 固定版本的 v1 transport 保留 OpenCode 进程内 fetch，v2 SDK 提供累计金额投影。
