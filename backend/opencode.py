@@ -99,8 +99,8 @@ RUNTIME_OPENCODE_CONFIG: dict[str, Any] = {
                         "output": 128000,
                     },
                     "cost": {
-                        "input": 0.2,
-                        "output": 1.2,
+                        "input": 0.25,
+                        "output": 2,
                         "cache_read": 0.02,
                         "cache_write": 0.25,
                         "context_over_200k": {

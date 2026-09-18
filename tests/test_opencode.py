@@ -153,6 +153,8 @@ def test_prepare_runtime_writes_common_config_without_secrets(tmp_path: Path):
     assert provider["models"]["gpt-5.6-luna"]["variants"] == {
         "max": {"reasoningEffort": "max"}
     }
+    assert provider["models"]["gpt-5.6-luna"]["cost"]["input"] == 0.25
+    assert provider["models"]["gpt-5.6-luna"]["cost"]["output"] == 2
     assert "not-written-to-config" not in (runner.workspace / "opencode.json").read_text(encoding="utf-8")
 
 
