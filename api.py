@@ -519,7 +519,7 @@ def _context_enqueue_error(exc: Exception) -> str:
     if isinstance(code, str) and code:
         return code
     text = str(exc).split(":", 1)[0]
-    return text if text in {"agent_backpressure", "agent_fairness_unavailable", "agent_executor_not_configured", "agent_executor_unavailable", "agent_executor_unauthorized", "agent_runtime_unavailable", "generation_policy_conflict", "processing_options_conflict", "reverse_image_unavailable", "invalid_reverse_image_policy", "invalid_auto_name", "opencode_workspace_provider_missing", "opencode_workspace_invalid", "opencode_workspace_mismatch"} else "context_enqueue_failed"
+    return text if text in {"agent_backpressure", "agent_fairness_unavailable", "agent_executor_not_configured", "agent_executor_unavailable", "agent_executor_unauthorized", "agent_runtime_unavailable", "model_capability_invalid", "model_capability_unavailable", "model_broker_endpoint_invalid", "generation_policy_conflict", "processing_options_conflict", "reverse_image_unavailable", "invalid_reverse_image_policy", "invalid_auto_name", "opencode_workspace_provider_missing", "opencode_workspace_invalid", "opencode_workspace_mismatch"} else "context_enqueue_failed"
 
 
 def _collection_payload(request: Request, environment, row) -> dict[str, object]:
@@ -853,6 +853,7 @@ async def lifespan(app: FastAPI):
                     resume_of_attempt_id=payload.get("_resume_of_attempt_id") if isinstance(payload.get("_resume_of_attempt_id"), str) else None,
                     processing_config_hash=config_hash,
                     workspace_context=workspace_context,
+                    analysis_observed_cost=payload.get("_observed_cost"),
                     analysis_policy=payload.get("analysis_policy") if isinstance(payload.get("analysis_policy"), dict) else None,
                 )
             finally:
@@ -900,7 +901,7 @@ async def lifespan(app: FastAPI):
                 payload["_resume_session_id"] = failure_session_id
             if getattr(exc, "executor_attempt_id", None):
                 payload["_executor_attempt_id"] = exc.executor_attempt_id
-            for field in ("observed_cost", "usage_checked_at", "termination_reason", "termination_signal"):
+            for field in ("observed_cost", "usage_checked_at", "termination_reason", "termination_signal", "check_stage", "trigger_reason"):
                 value = getattr(exc, field, None)
                 if isinstance(value, str):
                     payload[f"_{field}"] = value
@@ -2214,7 +2215,7 @@ async def repair_metadata(request: Request) -> dict[str, object]:
     return await _repair_metadata_http(request, task_service=lambda received: _service(received, "tasks"))
 
 
-def create_app(*, scope_resolver, service_factory: ScopeServiceFactory | None = None, operation_policy=None, callback_issuer=None, callback_verifier=None, agent_input_provider: Callable[[ScopeContext, Path], str | Path] | None = None, workspace_provider=None, reverse_image_provider_binding: ReverseImageProviderBinding | None = None, extensions: Sequence[ApplicationExtension] | None = None) -> FastAPI:
+def create_app(*, scope_resolver, service_factory: ScopeServiceFactory | None = None, operation_policy=None, callback_issuer=None, callback_verifier=None, agent_input_provider: Callable[[ScopeContext, Path], str | Path] | None = None, workspace_provider=None, model_capability_provider=None, reverse_image_provider_binding: ReverseImageProviderBinding | None = None, extensions: Sequence[ApplicationExtension] | None = None) -> FastAPI:
     """创建显式绑定 scope resolver 的 FastAPI 应用。
 
     ``scope_resolver`` 是必填参数；适配宿主可注入自己的可信 resolver、兼容的
@@ -2231,6 +2232,7 @@ def create_app(*, scope_resolver, service_factory: ScopeServiceFactory | None = 
         callback_verifier=callback_verifier,
         agent_input_provider=agent_input_provider,
         workspace_provider=workspace_provider,
+        model_capability_provider=model_capability_provider,
         reverse_image_provider_binding=reverse_image_provider_binding,
         extensions=extensions,
     )

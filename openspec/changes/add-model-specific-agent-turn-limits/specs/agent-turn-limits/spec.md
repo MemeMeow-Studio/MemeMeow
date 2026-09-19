@@ -68,7 +68,7 @@
 
 ### Requirement: Executor 必须在达到终止限额后停止 Agent
 
-Executor MUST 使用任务已经设置的 `OPENCODE_DB` 定位当前 workspace 数据库，并按冻结的主 session ID 读取 `session.cost` 作为终止判断的唯一金额事实。首次执行 MUST 在进程运行期间取得并绑定主 session，允许启动阶段有限等待，不能等到进程结束或选择数据库中最新的 session；期限届满仍无法绑定时 MUST 以 `agent_analysis_usage_unavailable` 触发停止。恢复 MUST 校验原 session，不得重新选择或重置用量。插件 MUST 通过同一 OpenCode 进程的 session SDK 投影读取同一累计金额，不得自行重新计算 token 价格。当观测金额达到或超过冻结策略的终止金额限额时，Executor MUST 阻止任务继续正常运行，直接复用进程组 `SIGTERM`、有限等待、必要时 `SIGKILL` 和 `wait` 回收流程，不新增 OpenCode 协作式中断通道。系统不要求在单次模型请求进行中预测最终金额，也不保证最终金额严格小于或等于终止金额限额；Executor 下一次检查前已经完成的一个或多个调用所产生的超过属于允许行为。
+生产 Executor MUST 使用绑定当前 executor attempt 的短期模型 capability，从部署固定的模型 broker `/analysis-usage` 接口读取累计金额，作为终止判断的唯一金额事实。broker MUST 校验 capability 与请求头中的 executor attempt 标识一致，并返回该 attempt 已完成模型调用的累计金额、检查时间和同一 attempt 标识；恢复 attempt 的累计金额 MUST 以持久化的最近可信金额为起点。Executor MUST 拒绝跳转、attempt 不匹配、金额倒退、无时区检查时间、超大响应、无效金额和读取故障。任务专属 `OPENCODE_DB` 只供 OpenCode 和提醒插件使用，不能决定生产终止。插件 MUST 通过同一 OpenCode 进程的 session SDK 投影读取主 session 累计金额，不得自行重新计算 token 价格。当 broker 观测金额达到或超过冻结策略的终止金额限额时，Executor MUST 阻止任务继续正常运行，直接复用进程组 `SIGTERM`、有限等待、必要时 `SIGKILL` 和 `wait` 回收流程，不新增 OpenCode 协作式中断通道。系统不要求在单次模型请求进行中预测最终金额，也不保证最终金额严格小于或等于终止金额限额；Executor 下一次检查前已经完成的一个或多个调用所产生的超过属于允许行为。
 
 #### Scenario: 完成一次调用后超过终止限额
 - **WHEN** 终止金额限额为 0.20 美元，调用前累计金额为 0.19 美元，本次调用完成后累计金额为 0.23 美元
@@ -77,6 +77,14 @@ Executor MUST 使用任务已经设置的 `OPENCODE_DB` 定位当前 workspace �
 #### Scenario: 插件提醒失败不影响终止
 - **WHEN** 插件未能发送收尾提醒，但 Executor 观测到累计金额已经达到终止金额限额
 - **THEN** Executor 仍独立终止任务，插件失败不会使任务获得无限分析程度
+
+#### Scenario: Agent 修改任务专属 OpenCode 数据库
+- **WHEN** Agent 修改本任务 SQLite 中的 session 金额或提醒状态
+- **THEN** 模型 broker 保存的 attempt 累计金额保持不变，Executor 继续根据 broker 金额执行终止
+
+#### Scenario: broker 用量协议无法确认
+- **WHEN** broker 请求跳转、attempt 不匹配、金额倒退、响应无效或查询失败
+- **THEN** Executor 使用 `agent_analysis_usage_unavailable` 触发进程回收，不继续无限分析
 
 #### Scenario: SIGTERM 后进程没有及时退出
 - **WHEN** Executor 向进程组发送 SIGTERM 后，进程没有在现有有限等待时间内退出
@@ -100,7 +108,7 @@ Executor MUST 使用任务已经设置的 `OPENCODE_DB` 定位当前 workspace �
 
 ### Requirement: 恢复任务必须沿用原分析用量策略和累计用量
 
-系统 MUST 以 attempt 记录作为冻结策略、当前 session 标识、最近可信累计金额和该 attempt 提醒状态的权威来源；Task 只保存公开终态和最近可展示摘要。恢复同一 OpenCode session 或重新启动执行进程时 MUST 继续使用原策略和该 session 的累计金额，不得因为进程、Worker 或服务重启而重新获得完整分析程度。恢复产生的新 attempt 可以拥有自己的最多一次提醒状态。旧 attempt 的迟到状态 MUST NOT 覆盖新 attempt 的策略、用量或终态。
+系统 MUST 以 attempt 记录作为冻结策略、当前 session 标识、最近可信累计金额和该 attempt 提醒状态的权威来源；Task 只保存公开终态和最近可展示摘要。恢复同一 OpenCode session 或重新启动执行进程时 MUST 继续使用原策略，并把最近可信累计金额作为新 broker attempt 的起点，不得因为进程、Worker 或服务重启而重新获得完整分析程度。恢复产生的新 attempt 可以拥有自己的最多一次提醒状态。旧 attempt 的迟到状态 MUST NOT 覆盖新 attempt 的策略、用量或终态。
 
 #### Scenario: 恢复同一 session
 - **WHEN** 一个提醒金额限额为 0.10 美元、终止金额限额为 0.20 美元的任务在累计 0.12 美元后恢复同一 session 并创建新 attempt

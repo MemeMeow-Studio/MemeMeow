@@ -8,6 +8,12 @@ from pathlib import Path
 import pytest
 
 from backend.model_capability import ModelCapabilityError, validate_model_broker_url, validate_model_capability
+from backend.model_capability_provider import (
+    ModelCapabilityProviderError,
+    ModelCapabilityRequest,
+    capability_for_model_provider,
+    normalize_observed_cost,
+)
 from executor import server as executor_server
 
 
@@ -77,3 +83,60 @@ def test_runtime_config_uses_broker_capability_names() -> None:
     assert "MEMEMEOW_MODEL_CAPABILITY" in document
     assert "MEMEMEOW_OPENCODE_API_KEY" not in document
     json.dumps(document)
+
+
+class _RecordingCapabilityProvider:
+    """记录签发请求字段，验证 capability 绑定的 attempt 和模型事实。"""
+
+    def __init__(self) -> None:
+        self.requests: list[ModelCapabilityRequest] = []
+
+    def capability(self, request: ModelCapabilityRequest) -> str:
+        """返回满足公共传输约束的测试 capability。"""
+        self.requests.append(request)
+        return "capability-" + "x" * 20
+
+
+def test_model_capability_provider_receives_frozen_attempt_facts() -> None:
+    """provider 必须收到当前任务、attempt、模型、策略和恢复金额。"""
+    provider = _RecordingCapabilityProvider()
+    request = ModelCapabilityRequest(
+        task_id="task-1",
+        attempt_id="attempt-1",
+        scope_id="scope-1",
+        model="mememeow/gpt-5.6-sol",
+        variant="max",
+        session_id="session-1",
+        resume_of_attempt_id="attempt-0",
+        analysis_policy={"version": 1, "model_key": "model_plus", "termination_cost": "0.30"},
+        observed_cost=normalize_observed_cost("0.28"),
+    )
+
+    capability = capability_for_model_provider(provider, request)
+
+    assert capability.startswith("capability-")
+    assert provider.requests == [request]
+
+
+@pytest.mark.parametrize("value", [True, "NaN", "-0.1"])
+def test_model_capability_provider_rejects_invalid_recovery_cost(value: object) -> None:
+    """恢复金额不能通过 capability 请求进入 broker。"""
+    with pytest.raises(ModelCapabilityProviderError, match="恢复金额无效"):
+        normalize_observed_cost(value)
+
+
+def test_model_capability_provider_rejects_invalid_provider_result() -> None:
+    """provider 返回越界 capability 时必须保留稳定错误。"""
+    class InvalidProvider:
+        """返回无效值的 provider 测试实现。"""
+
+        def capability(self, _request: ModelCapabilityRequest) -> str:
+            """返回过短值。"""
+            return "short"
+
+    with pytest.raises(ModelCapabilityProviderError, match="模型 capability 无效"):
+        capability_for_model_provider(InvalidProvider(), ModelCapabilityRequest(
+            task_id="task-1", attempt_id="attempt-1", scope_id="scope-1",
+            model="mememeow/gpt-5.6-sol", variant="max", session_id=None,
+            resume_of_attempt_id=None, analysis_policy=None, observed_cost=None,
+        ))

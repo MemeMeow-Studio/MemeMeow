@@ -25,7 +25,7 @@ from backend.persistence.models import (
 
 SCOPE_LOCAL = "local"
 # 当前代码要求的 Alembic head；数据库初始化脚本会显式传入同一 revision。
-CURRENT_SCHEMA_REVISION = "0025_agent_analysis_diagnostics"
+CURRENT_SCHEMA_REVISION = "0027_already_exited_termination_signal"
 
 
 class DatabaseError(RuntimeError):

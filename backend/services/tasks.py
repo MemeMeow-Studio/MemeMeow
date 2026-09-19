@@ -45,6 +45,7 @@ from backend.agent_resume import (
     sanitize_error_history,
     within_total_timeout,
 )
+from backend.agent_executor import ANALYSIS_CHECK_STAGES, ANALYSIS_TRIGGER_REASONS
 from backend.config import validate_agent_concurrency
 from executor.analysis_policy import AnalysisPolicyError, parse_analysis_policy
 from executor.agent_limits import validate_agent_concurrency_at_most
@@ -85,7 +86,7 @@ def _iso(value: datetime | str | None) -> str:
 
 
 _TERMINATION_REASONS = frozenset({"analysis_cost_limit", "unknown_execution", "timeout", "cancelled", "process_failed"})
-_TERMINATION_SIGNALS = frozenset({"SIGTERM", "SIGKILL"})
+_TERMINATION_SIGNALS = frozenset({"SIGTERM", "SIGKILL", "already_exited"})
 _TERMINATION_REASON_BY_ERROR = {
     "agent_maximum_analysis_depth_exceeded": "analysis_cost_limit",
     "unknown_execution": "unknown_execution",
@@ -124,17 +125,40 @@ def _payload_cost(value: object) -> Decimal | None:
     return amount
 
 
+def _max_observed_cost(current: object, incoming: Decimal | None) -> Decimal | None:
+    """保留当前 attempt 已观测到的最大金额，拒绝迟到快照覆盖较新事实。"""
+    if incoming is None:
+        return _payload_cost(current)
+    if current is None:
+        return incoming
+    current_cost = _payload_cost(current)
+    if current_cost is None or incoming > current_cost:
+        return incoming
+    return current_cost
+
+
 def _termination_summary(payload: Mapping[str, object], error: Mapping[str, object] | None) -> tuple[str | None, str | None]:
     """生成受保护终止摘要；显式字段必须属于固定枚举。"""
     raw_reason = payload.get("_termination_reason")
-    if raw_reason is not None and raw_reason not in _TERMINATION_REASONS:
+    if raw_reason is not None and (not isinstance(raw_reason, str) or raw_reason not in _TERMINATION_REASONS):
         raise ValueError("agent_analysis_termination_reason_invalid")
     raw_signal = payload.get("_termination_signal")
-    if raw_signal is not None and raw_signal not in _TERMINATION_SIGNALS:
+    if raw_signal is not None and (not isinstance(raw_signal, str) or raw_signal not in _TERMINATION_SIGNALS):
         raise ValueError("agent_analysis_termination_signal_invalid")
     error_code = error.get("error") if error is not None else None
     reason = raw_reason or (_TERMINATION_REASON_BY_ERROR.get(error_code, "process_failed") if isinstance(error_code, str) else None)
     return reason if isinstance(reason, str) else None, raw_signal if isinstance(raw_signal, str) else None
+
+
+def _analysis_diagnostic(payload: Mapping[str, object]) -> dict[str, str] | None:
+    """校验 Executor 的受控分析阶段和触发原因，拒绝任意文本进入诊断。"""
+    stage = payload.get("_check_stage")
+    reason = payload.get("_trigger_reason")
+    if stage is None and reason is None:
+        return None
+    if (not isinstance(stage, str) or stage not in ANALYSIS_CHECK_STAGES or not isinstance(reason, str) or reason not in ANALYSIS_TRIGGER_REASONS):
+        raise ValueError("agent_analysis_diagnostic_invalid")
+    return {"check_stage": str(stage), "trigger_reason": str(reason)}
 
 class PostgresTaskService:
     """使用指定 scope 记录、去重、租约和 claim fencing 的任务执行器。
@@ -507,6 +531,7 @@ class PostgresTaskService:
             observed_cost = _payload_cost(payload.get("_observed_cost"))
             usage_checked_at = _payload_datetime(payload.get("_usage_checked_at"))
             termination_reason, termination_signal = _termination_summary(payload, None)
+            analysis_diagnostic = _analysis_diagnostic(payload)
         except ValueError:
             return
         now = utcnow()
@@ -579,6 +604,7 @@ class PostgresTaskService:
                     reminder_sent=payload.get("_reminder_sent") is True,
                     termination_reason=termination_reason,
                     termination_signal=termination_signal,
+                    analysis_diagnostic=analysis_diagnostic,
                     visual_snapshot_sha256=(str(snapshot_summary["snapshot_sha256"]) if snapshot_summary is not None else payload.get("_visual_snapshot_sha256") if isinstance(payload.get("_visual_snapshot_sha256"), str) else None),
                     visual_snapshot_protocol_version=(int(snapshot_summary["protocol_version"]) if snapshot_summary is not None else payload.get("_visual_snapshot_protocol_version") if isinstance(payload.get("_visual_snapshot_protocol_version"), int) and not isinstance(payload.get("_visual_snapshot_protocol_version"), bool) else None),
                     visual_snapshot_matched_at=(datetime.fromisoformat(str(snapshot_summary["matched_at"]).replace("Z", "+00:00")) if snapshot_summary is not None else payload.get("_visual_snapshot_matched_at") if isinstance(payload.get("_visual_snapshot_matched_at"), datetime) else None),
@@ -599,7 +625,7 @@ class PostgresTaskService:
                     if row.analysis_policy is None:
                         row.analysis_policy = incoming_policy
                 if observed_cost is not None:
-                    row.observed_cost = observed_cost
+                    row.observed_cost = _max_observed_cost(row.observed_cost, observed_cost)
                 if usage_checked_at is not None:
                     row.usage_checked_at = usage_checked_at
                 if payload.get("_reminder_sent") is True:
@@ -608,6 +634,8 @@ class PostgresTaskService:
                     row.termination_reason = termination_reason
                 if termination_signal is not None:
                     row.termination_signal = termination_signal
+                if analysis_diagnostic is not None:
+                    row.analysis_diagnostic = analysis_diagnostic
                 # 迁移前任务首次写 attempt 时可能尚无配置 hash；snapshot
                 # 前置器随后会在同一 claim 补齐该字段，恢复事实必须同步更新。
                 if getattr(row, "processing_config_hash", None) is None and payload.get("processing_config_hash") is not None:
@@ -636,7 +664,7 @@ class PostgresTaskService:
                 if current_task.analysis_policy is None:
                     current_task.analysis_policy = incoming_policy
             if observed_cost is not None:
-                current_task.observed_cost = observed_cost
+                current_task.observed_cost = _max_observed_cost(current_task.observed_cost, observed_cost)
             if usage_checked_at is not None:
                 current_task.usage_checked_at = usage_checked_at
             if payload.get("_reminder_sent") is True:
@@ -699,6 +727,7 @@ class PostgresTaskService:
             observed_cost = _payload_cost(payload.get("_observed_cost"))
             usage_checked_at = _payload_datetime(payload.get("_usage_checked_at"))
             termination_reason, termination_signal = _termination_summary(payload, safe_error)
+            analysis_diagnostic = _analysis_diagnostic(payload)
         except ValueError:
             return False
         now = utcnow()
@@ -776,8 +805,8 @@ class PostgresTaskService:
                     if record.analysis_policy is None:
                         record.analysis_policy = incoming_policy
             if observed_cost is not None:
-                row.observed_cost = observed_cost
-                task.observed_cost = observed_cost
+                row.observed_cost = _max_observed_cost(row.observed_cost, observed_cost)
+                task.observed_cost = _max_observed_cost(task.observed_cost, observed_cost)
             if usage_checked_at is not None:
                 row.usage_checked_at = usage_checked_at
                 task.usage_checked_at = usage_checked_at
@@ -790,6 +819,8 @@ class PostgresTaskService:
             if termination_signal is not None:
                 row.termination_signal = termination_signal
                 task.termination_signal = termination_signal
+            if analysis_diagnostic is not None:
+                row.analysis_diagnostic = analysis_diagnostic
             row.resume_available = bool(resume_available and safe_session and safe_executor_attempt)
             row.state = "failed" if safe_error else "completed"
             row.updated_at = now
@@ -813,7 +844,7 @@ class PostgresTaskService:
             session.commit()
             return True
 
-    def _resume_candidate(self, claim: Task, payload: dict[str, Any]) -> dict[str, str] | None:
+    def _resume_candidate(self, claim: Task, payload: dict[str, Any]) -> dict[str, Any] | None:
         """读取并校验同一任务最近的可续跑 attempt，拒绝猜测 session。"""
         if not self.resume_enabled or claim.task_type != "meme_context_generation":
             return None
@@ -897,17 +928,50 @@ class PostgresTaskService:
                 or getattr(previous, "visual_snapshot_candidate_count", None) != current_summary["candidate_count"]
             ):
                 raise RuntimeError("visual_match_snapshot_invalid")
+        current_policy_value = payload.get("analysis_policy")
+        if current_policy_value is None:
+            current_policy_value = getattr(claim, "analysis_policy", None)
+        current_policy: dict[str, object] | None = None
+        if current_policy_value is not None:
+            if not isinstance(current_policy_value, dict):
+                raise RuntimeError("agent_analysis_policy_invalid")
+            try:
+                current_policy = parse_analysis_policy(current_policy_value).model_dump(mode="json")
+            except AnalysisPolicyError as exc:
+                raise RuntimeError(exc.code) from exc
+        previous_policy_value = getattr(previous, "analysis_policy", None)
+        previous_policy: dict[str, object] | None = None
+        if previous_policy_value is not None:
+            if not isinstance(previous_policy_value, dict):
+                raise RuntimeError("agent_analysis_policy_invalid")
+            try:
+                previous_policy = parse_analysis_policy(previous_policy_value).model_dump(mode="json")
+            except AnalysisPolicyError as exc:
+                raise RuntimeError(exc.code) from exc
+        if current_policy is not None and previous_policy is not None and current_policy != previous_policy:
+            raise RuntimeError("agent_analysis_policy_invalid")
+        analysis_policy = current_policy or previous_policy
+
+
         previous_reason = getattr(previous, "resume_reason", None) if previous is not None else None
         resume_reason = previous_reason if isinstance(previous_reason, str) and previous_reason else "session_resumable"
-        return {
+        candidate = {
             "session_id": session_id,
             "executor_attempt_id": executor_attempt_id,
             "resume_of_attempt_id": executor_attempt_id,
             "resume_reason": resume_reason,
             "workspace_selector": selector,
         }
+        if analysis_policy is not None:
+            candidate["analysis_policy"] = analysis_policy
 
-    def _begin_resume(self, claim: Task, candidate: dict[str, str]) -> bool:
+
+        previous_cost = getattr(previous, "observed_cost", None)
+        if previous_cost is not None:
+            candidate["observed_cost"] = format(previous_cost, "f")
+        return candidate
+
+    def _begin_resume(self, claim: Task, candidate: dict[str, Any]) -> bool:
         """在 claim fencing 下原子递增续跑次数，防止并发恢复器重复使用 session。"""
         now = utcnow()
         with self.resources.environment(self.scope.scope_id) as environment:
@@ -1539,14 +1603,16 @@ class PostgresTaskService:
                     "visual_match_snapshot_invalid",
                     "visual_match_snapshot_conflict",
                     "visual_match_snapshot_unavailable",
+                    "agent_analysis_policy_missing",
+                    "agent_analysis_policy_invalid",
                 }:
                     raise
                 self._image_attempt_state(claim, task_payload, "failed")
                 self._fenced_failure(
                     task_id,
                     generation,
-                    message="视觉候选 snapshot 无法恢复" if code.startswith("visual_match_snapshot") else "workspace 绑定无法恢复",
-                    error={"error": code, "message": "视觉候选 snapshot 与持久恢复事实不一致" if code.startswith("visual_match_snapshot") else "workspace selector 与持久恢复事实不一致"},
+                    message="视觉候选 snapshot 无法恢复" if code.startswith("visual_match_snapshot") else "分析用量策略无法恢复" if code.startswith("agent_analysis_policy") else "workspace 绑定无法恢复",
+                    error={"error": code, "message": "视觉候选 snapshot 与持久恢复事实不一致" if code.startswith("visual_match_snapshot") else "分析用量策略与持久恢复事实不一致" if code.startswith("agent_analysis_policy") else "workspace selector 与持久恢复事实不一致"},
                     retry=False,
                     resume_available=False,
                     resume_reason=code,
@@ -1567,6 +1633,14 @@ class PostgresTaskService:
                 task_payload["_resume_available"] = True
                 task_payload["_resume_reason"] = resume_candidate["resume_reason"]
                 task_payload["_workspace_selector"] = resume_candidate["workspace_selector"]
+                resumed_policy = resume_candidate.get("analysis_policy")
+                if isinstance(resumed_policy, dict):
+                    if task_payload.get("analysis_policy") != resumed_policy:
+                        task_payload["analysis_policy"] = dict(resumed_policy)
+                        self._persist_claim_payload_updates(claim, {"analysis_policy": task_payload["analysis_policy"]})
+
+                if isinstance(resume_candidate.get("observed_cost"), str):
+                    task_payload["_observed_cost"] = resume_candidate["observed_cost"]
 
             self._image_attempt_state(claim, task_payload, "prepared")
 
@@ -1651,6 +1725,14 @@ class PostgresTaskService:
                     "task_handler_missing",
                     "opencode_not_configured",
                     "agent_runtime_unavailable",
+                    "agent_analysis_policy_missing",
+                    "agent_analysis_policy_invalid",
+                    "agent_analysis_usage_unavailable",
+                    "agent_analysis_reminder_plugin_unavailable",
+                    "agent_maximum_analysis_depth_exceeded",
+                    "model_capability_invalid",
+                    "model_capability_unavailable",
+                    "model_broker_endpoint_invalid",
                     "agent_image_root_mismatch",
                     "reverse_image_forbidden",
                     "invalid_reverse_image_policy",

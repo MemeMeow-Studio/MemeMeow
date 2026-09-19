@@ -32,6 +32,13 @@ from backend.agent_executor import AgentExecutorClient, AgentExecutorError, Exec
 from backend.agent_resume import classify_resume_error, normalize_identifier
 from backend.config import Settings, validate_agent_concurrency
 from backend.metadata import MemeContext
+from backend.model_capability_provider import (
+    ModelCapabilityProvider,
+    ModelCapabilityProviderError,
+    ModelCapabilityRequest,
+    capability_for_model_provider,
+    normalize_observed_cost,
+)
 from backend.opencode_result_store import OpenCodeResultStore
 from backend.runtime_execution import AttemptFence, ExecutionBinding, ExecutionBindingError, stable_input_digest
 from backend.opencode_workspace import (
@@ -189,6 +196,8 @@ class OpenCodeError(RuntimeError):
         reminder_sent: bool = False,
         termination_reason: str | None = None,
         termination_signal: str | None = None,
+        check_stage: str | None = None,
+        trigger_reason: str | None = None,
     ):
         """保存稳定错误及受信 Executor 返回的有限 attempt 诊断。"""
         super().__init__(message or code)
@@ -204,6 +213,8 @@ class OpenCodeError(RuntimeError):
         self.reminder_sent = bool(reminder_sent)
         self.termination_reason = termination_reason
         self.termination_signal = termination_signal
+        self.check_stage = check_stage
+        self.trigger_reason = trigger_reason
 
 
 def _workspace_opencode_config(workspace: ResolvedWorkspace) -> dict[str, Any]:
@@ -229,7 +240,14 @@ def _workspace_opencode_config(workspace: ResolvedWorkspace) -> dict[str, Any]:
 class OpenCodeRunner:
     """在固定 runtime 中按 slot 受控并行执行 OpenCode，并返回已校验研究结果。"""
 
-    def __init__(self, settings: Settings, project_root: Path | None = None, *, workspace_provider: WorkspaceProvider | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        project_root: Path | None = None,
+        *,
+        workspace_provider: WorkspaceProvider | None = None,
+        model_capability_provider: ModelCapabilityProvider | None = None,
+    ):
         """初始化 runner；应用装配应显式传入 provider，旧直接夹具兼容 local。"""
         self.settings = settings
         self.project_root = (project_root or Path(__file__).resolve().parent.parent).resolve()
@@ -265,6 +283,7 @@ class OpenCodeRunner:
             image_root=self._configured_image_root(),
             skill_root=self.project_root / "skills" / "research-meme-context",
         )
+        self.model_capability_provider = model_capability_provider
         self._workspace_by_task: dict[str, ResolvedWorkspace] = {}
         self._workspace_selectors: dict[str, str] = {}
         self._workspace_capabilities: dict[str, str] = {}
@@ -601,6 +620,9 @@ class OpenCodeRunner:
             "agent_analysis_usage_unavailable",
             "agent_analysis_reminder_plugin_unavailable",
             "agent_maximum_analysis_depth_exceeded",
+            "model_capability_invalid",
+            "model_capability_unavailable",
+            "model_broker_endpoint_invalid",
             "agent_timeout",
             "task_interrupted",
             "agent_process_failed",
@@ -1620,12 +1642,19 @@ class OpenCodeRunner:
         processing_config_hash: str | None = None,
         workspace_context: TrustedWorkspaceContext | None = None,
         model_capability: str | None = None,
+        analysis_observed_cost: object = None,
         analysis_policy: dict[str, object] | None = None,
     ) -> tuple[dict[str, Any], str]:
         """执行单张图片研究；失败也尽力返回可验证 session 诊断。"""
         task_id = task_id or uuid.uuid4().hex
         if analysis_policy is not None and not self.executor_mode:
             raise OpenCodeError("agent_analysis_policy_invalid", "启用分析用量控制需要 Executor 模式")
+        normalized_observed_cost = None
+        if analysis_policy is not None:
+            try:
+                normalized_observed_cost = normalize_observed_cost(analysis_observed_cost)
+            except ModelCapabilityProviderError as exc:
+                raise OpenCodeError(exc.code, str(exc)) from exc
         # host 回滚模式也需要 attempt 级诊断标识；executor 模式提交后会以
         # 服务端生成的独立 attempt 覆盖该临时值。
         local_executor_attempt_id = f"host-attempt-{uuid.uuid4().hex}"
@@ -1649,6 +1678,32 @@ class OpenCodeRunner:
         if context.task_id != task_id:
             raise OpenCodeError("opencode_workspace_mismatch", "workspace 上下文与任务不一致", executor_attempt_id=local_executor_attempt_id)
         resolved_workspace = self.resolve_workspace(context)
+        if analysis_policy is not None and model_capability is None and self.model_capability_provider is not None:
+            policy_model = analysis_policy.get("model")
+            policy_variant = analysis_policy.get("variant")
+            if not isinstance(policy_model, str) or not isinstance(policy_variant, str):
+                raise OpenCodeError("agent_analysis_policy_invalid", "分析用量策略缺少模型事实", executor_attempt_id=local_executor_attempt_id)
+            request = ModelCapabilityRequest(
+                task_id=task_id,
+                attempt_id=local_executor_attempt_id,
+                scope_id=context.scope_id,
+                model=policy_model,
+                variant=policy_variant,
+                session_id=resume_session_id,
+                resume_of_attempt_id=resume_of_attempt_id,
+                analysis_policy=dict(analysis_policy),
+                observed_cost=normalized_observed_cost,
+            )
+            try:
+                model_capability = capability_for_model_provider(self.model_capability_provider, request)
+            except ModelCapabilityProviderError as exc:
+                raise OpenCodeError(exc.code, str(exc), executor_attempt_id=local_executor_attempt_id) from exc
+        if analysis_policy is not None and not model_capability:
+            raise OpenCodeError(
+                "model_capability_unavailable",
+                "启用分析用量控制需要当前 attempt 的模型 capability",
+                executor_attempt_id=local_executor_attempt_id,
+            )
         try:
             binding = ExecutionBinding(
                 task_id=task_id,
@@ -1754,41 +1809,53 @@ class OpenCodeRunner:
                     code = self._executor_error_code(exc.code)
                     if exc.executor_attempt_id:
                         self._remember_executor_attempt(task_id, exc.executor_attempt_id)
+
+                    cancelled_response: ExecutorTaskResponse | None = None
+
                     if code in {"agent_timeout", "agent_executor_unavailable", "agent_runtime_unavailable", "agent_executor_invalid_response"}:
+
                         try:
-                            self.executor.cancel(exc.executor_attempt_id or task_id)
+
+                            cancelled_response = self.executor.cancel(exc.executor_attempt_id or task_id)
+
                         except AgentExecutorError:
+
                             pass
+
                     decision = classify_resume_error(code, session_id=exc.session_id, target_unchanged=True, grant_state="committed")
                     if code == "agent_timeout":
                         raise OpenCodeError(
                             "agent_timeout",
                             "OpenCode 执行超时",
-                            session_id=exc.session_id,
-                            executor_attempt_id=exc.executor_attempt_id,
+                            session_id=exc.session_id or getattr(cancelled_response, "session_id", None),
+                            executor_attempt_id=exc.executor_attempt_id or getattr(cancelled_response, "executor_attempt_id", None),
                             http_status=exc.http_status,
                             reason_code=exc.reason_code,
-                            process_reaped=exc.process_reaped,
-                            observed_cost=exc.observed_cost,
-                            usage_checked_at=exc.usage_checked_at,
-                            reminder_sent=exc.reminder_sent,
+                            process_reaped=exc.process_reaped if exc.process_reaped is not None else getattr(cancelled_response, "process_reaped", None),
+                            observed_cost=exc.observed_cost or getattr(cancelled_response, "observed_cost", None),
+                            usage_checked_at=exc.usage_checked_at or getattr(cancelled_response, "usage_checked_at", None),
+                            reminder_sent=exc.reminder_sent or getattr(cancelled_response, "reminder_sent", False),
                             termination_reason=exc.termination_reason,
-                            termination_signal=exc.termination_signal,
+                            termination_signal=exc.termination_signal or getattr(cancelled_response, "termination_signal", None),
+                            check_stage=exc.check_stage or getattr(cancelled_response, "check_stage", None),
+                            trigger_reason=exc.trigger_reason or getattr(cancelled_response, "trigger_reason", None),
                         ) from exc
                     raise OpenCodeError(
                         code,
                         str(exc)[:500],
-                        session_id=exc.session_id,
-                        executor_attempt_id=exc.executor_attempt_id,
+                        session_id=exc.session_id or getattr(cancelled_response, "session_id", None),
+                        executor_attempt_id=exc.executor_attempt_id or getattr(cancelled_response, "executor_attempt_id", None),
                         retryable=decision.retryable,
                         http_status=exc.http_status,
                         reason_code=exc.reason_code,
-                        process_reaped=exc.process_reaped,
-                        observed_cost=exc.observed_cost,
-                        usage_checked_at=exc.usage_checked_at,
-                        reminder_sent=exc.reminder_sent,
+                        process_reaped=exc.process_reaped if exc.process_reaped is not None else getattr(cancelled_response, "process_reaped", None),
+                        observed_cost=exc.observed_cost or getattr(cancelled_response, "observed_cost", None),
+                        usage_checked_at=exc.usage_checked_at or getattr(cancelled_response, "usage_checked_at", None),
+                        reminder_sent=exc.reminder_sent or getattr(cancelled_response, "reminder_sent", False),
                         termination_reason=exc.termination_reason,
-                        termination_signal=exc.termination_signal,
+                        termination_signal=exc.termination_signal or getattr(cancelled_response, "termination_signal", None),
+                        check_stage=exc.check_stage or getattr(cancelled_response, "check_stage", None),
+                        trigger_reason=exc.trigger_reason or getattr(cancelled_response, "trigger_reason", None),
                     ) from exc
                 if self._take_pre_cancelled(task_id):
                     try:

@@ -449,7 +449,7 @@ class Task(Base):
         CheckConstraint("visual_snapshot_candidate_count IS NULL OR visual_snapshot_candidate_count >= 0", name="ck_task_visual_snapshot_candidate_count"),
         CheckConstraint("observed_cost IS NULL OR observed_cost >= 0", name="ck_task_observed_cost"),
         CheckConstraint("termination_reason IS NULL OR termination_reason IN ('analysis_cost_limit','unknown_execution','timeout','cancelled','process_failed')", name="ck_task_termination_reason"),
-        CheckConstraint("termination_signal IS NULL OR termination_signal IN ('SIGTERM','SIGKILL')", name="ck_task_termination_signal"),
+        CheckConstraint("termination_signal IS NULL OR termination_signal IN ('SIGTERM','SIGKILL','already_exited')", name="ck_task_termination_signal"),
         UniqueConstraint("scope_id", "id", name="uq_task_scope_id"),
         Index("ix_tasks_image_submission", "scope_id", "submission_mode", "image_stage", "processing_job_id", "created_at"),
         Index("ix_tasks_image_target_active", "scope_id", "target_meme_id", "target_image_sha256", "status", "created_at"),
@@ -681,6 +681,8 @@ class ImageProcessingAttempt(Base):
     termination_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     termination_signal: Mapped[str | None] = mapped_column(String(16), nullable=True)
     process_reaped: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # 仅保存固定检查阶段和稳定触发类别，详细原因保留在受保护日志中。
+    analysis_diagnostic: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     resume_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     resume_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
@@ -703,7 +705,14 @@ class ImageProcessingAttempt(Base):
         CheckConstraint("visual_snapshot_candidate_count IS NULL OR visual_snapshot_candidate_count >= 0", name="ck_attempt_visual_snapshot_candidate_count"),
         CheckConstraint("observed_cost IS NULL OR observed_cost >= 0", name="ck_attempt_observed_cost"),
         CheckConstraint("termination_reason IS NULL OR termination_reason IN ('analysis_cost_limit','unknown_execution','timeout','cancelled','process_failed')", name="ck_attempt_termination_reason"),
-        CheckConstraint("termination_signal IS NULL OR termination_signal IN ('SIGTERM','SIGKILL')", name="ck_attempt_termination_signal"),
+        CheckConstraint("termination_signal IS NULL OR termination_signal IN ('SIGTERM','SIGKILL','already_exited')", name="ck_attempt_termination_signal"),
+        CheckConstraint(
+            "analysis_diagnostic IS NULL OR analysis_diagnostic IN ("
+            "'{\"check_stage\":\"analysis_monitor\",\"trigger_reason\":\"agent_analysis_usage_unavailable\"}'::jsonb,"
+            "'{\"check_stage\":\"analysis_monitor\",\"trigger_reason\":\"agent_analysis_reminder_plugin_unavailable\"}'::jsonb,"
+            "'{\"check_stage\":\"analysis_monitor\",\"trigger_reason\":\"agent_maximum_analysis_depth_exceeded\"}'::jsonb)",
+            name="ck_attempt_analysis_diagnostic",
+        ),
         Index("ix_image_processing_attempts_task", "scope_id", "task_id", "attempt"),
         Index(
             "uq_image_processing_attempt_executor_id",

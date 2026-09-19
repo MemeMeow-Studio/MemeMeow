@@ -47,6 +47,7 @@ def create_application(
     callback_verifier: object | None = None,
     agent_input_provider: Callable[[ScopeContext, Any], str | Any] | None = None,
     workspace_provider: object | None = None,
+    model_capability_provider: object | None = None,
     reverse_image_provider_binding: ReverseImageProviderBinding | None = None,
     extensions: Sequence[ApplicationExtension] | None = None,
 ) -> FastAPI:
@@ -102,6 +103,8 @@ def create_application(
         created.state.agent_input_provider = agent_input_provider
     if workspace_provider is not None:
         created.state.workspace_provider = workspace_provider
+    if model_capability_provider is not None:
+        created.state.model_capability_provider = model_capability_provider
     if reverse_image_provider_binding is not None:
         created.state.reverse_image_provider_binding = reverse_image_provider_binding
     return created

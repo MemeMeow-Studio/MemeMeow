@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import json
+import socket
 import stat
+import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
+from collections.abc import Iterator
 
 import pytest
 
@@ -20,6 +25,15 @@ from backend.opencode import OpenCodeError, OpenCodeRunner
 from backend.opencode_workspace import WorkspaceCapabilitySigner
 from executor import server as executor_server
 from executor.token import ExecutorTokenError, ensure_token_file, read_token_file
+
+
+@pytest.fixture
+def analysis_executor_root() -> Iterator[Path]:
+    """在仓库测试缓存目录创建一次性分析隔离根目录。"""
+    root = Path(".pytest_cache/analysis_agent_executor")
+    root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=root) as directory:
+        yield Path(directory)
 
 
 def _candidate() -> dict[str, object]:
@@ -228,7 +242,7 @@ def test_candidate_sandbox_creates_hidden_runtime_mountpoints(tmp_path: Path, mo
     monkeypatch.setattr(executor_server, "RESULT_ROOT", runtime / "task-results")
     monkeypatch.setattr(executor_server.shutil, "which", lambda name: "/usr/bin/bwrap" if name == "bwrap" else None)
 
-    sandboxed = executor_server.Executor._sandbox_command(object(), task, ["/bin/true"])
+    sandboxed = executor_server.Executor._sandbox_command(SimpleNamespace(token_file=""), task, ["/bin/true"])
 
     assert sandboxed[0] == "/usr/bin/bwrap"
     assert "--tmpfs" in sandboxed
@@ -241,6 +255,146 @@ def test_candidate_sandbox_creates_hidden_runtime_mountpoints(tmp_path: Path, mo
         if sandboxed[index : index + 3] == ["--ro-bind", str(candidate), str(candidate)]
     )
     assert candidate_bind < sandboxed.index("--", candidate_bind)
+
+
+def test_analysis_policy_uses_private_database_and_sandbox_view(analysis_executor_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """分析策略任务只挂载当前任务资源，并隐藏 Executor token 与宿主进程信息。"""
+    runtime = analysis_executor_root / "runtime"
+    workspace = runtime / "workspace"
+    scratch = workspace / "tasks" / "task-analysis"
+    result = runtime / "task-results" / "task-analysis"
+    images = analysis_executor_root / "images"
+    skills = analysis_executor_root / "skills"
+    secret = analysis_executor_root / "executor-secret"
+    for path in (scratch / "home", result, images, skills, secret):
+        path.mkdir(parents=True)
+    image = images / "sample.png"
+    image.write_bytes(b"image")
+    token = secret / "token"
+    token.write_text("executor-secret", encoding="ascii")
+    policy = {
+        "version": 1,
+        "model_key": "model_plus",
+        "model": "mememeow/gpt-5.6-luna",
+        "variant": "max",
+        "currency": "USD",
+        "reminder_cost": "0.15",
+        "termination_cost": "0.30",
+    }
+    task = executor_server.TaskState(
+        task_id="task-analysis",
+        business_task_id="task-analysis",
+        executor_attempt_id="a",
+        image_relative_path="sample.png",
+        reverse_image_policy="forbid",
+        timeout_seconds=5,
+        workspace_directory=workspace,
+        images_root=images,
+        skill_root=skills,
+        task_scratch_root=scratch,
+        analysis_policy=policy,
+    )
+    monkeypatch.setattr(executor_server, "RUNTIME_ROOT", runtime)
+    monkeypatch.setattr(executor_server, "WORKSPACE", workspace)
+    monkeypatch.setattr(executor_server, "RESULT_ROOT", runtime / "task-results")
+    socket_root = runtime / "s"
+    monkeypatch.setattr(executor_server, "ANALYSIS_SOCKET_ROOT", socket_root)
+    socket_root.mkdir(parents=True)
+    socket_path = socket_root / "a.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    listener.close()
+    monkeypatch.setattr(executor_server.shutil, "which", lambda name: "/usr/bin/bwrap" if name == "bwrap" else None)
+    executor = SimpleNamespace(token_file=str(token))
+
+    sandboxed = executor_server.Executor._sandbox_command(executor, task, ["/bin/true"])
+    environment = executor_server.Executor._task_environment(
+        SimpleNamespace(model_broker_url="https://broker.example/v1", legacy_base_url="", legacy_api_key=""),
+        task,
+    )
+
+    assert sandboxed[:5] == ["/usr/bin/bwrap", "--die-with-parent", "--unshare-pid", "--ro-bind", "/"]
+    assert ["--proc", "/proc"] == sandboxed[sandboxed.index("--proc") : sandboxed.index("--proc") + 2]
+    assert ["--tmpfs", str(runtime)] in [sandboxed[index:index + 2] for index in range(len(sandboxed) - 1)]
+    assert ["--tmpfs", str(images)] in [sandboxed[index:index + 2] for index in range(len(sandboxed) - 1)]
+    assert ["--bind", str(workspace), str(workspace)] not in [sandboxed[index:index + 3] for index in range(len(sandboxed) - 2)]
+    assert ["--bind", str(runtime / "opencode.db"), str(runtime / "opencode.db")] not in [sandboxed[index:index + 3] for index in range(len(sandboxed) - 2)]
+    assert ["--bind", str(scratch), str(scratch)] in [sandboxed[index:index + 3] for index in range(len(sandboxed) - 2)]
+    assert ["--ro-bind", str(image), str(image)] in [sandboxed[index:index + 3] for index in range(len(sandboxed) - 2)]
+    assert ["--ro-bind", "/dev/null", str(token)] in [sandboxed[index:index + 3] for index in range(len(sandboxed) - 2)]
+    assert environment["OPENCODE_DB"] == str(scratch / "opencode.db")
+    assert executor_server.Executor._process_directory(task) == scratch
+
+
+def test_analysis_policy_bubblewrap_hides_other_task_files(analysis_executor_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """真实 bubblewrap 进程只能访问当前任务挂载和空的 Executor token 文件。"""
+    if executor_server.shutil.which("bwrap") is None:
+        pytest.skip("bubblewrap unavailable")
+    runtime = analysis_executor_root / "runtime"
+    workspace = runtime / "workspace"
+    scratch = workspace / "tasks" / "task-analysis"
+    other_task = workspace / "tasks" / "other-task"
+    result = runtime / "task-results" / "task-analysis"
+    images = analysis_executor_root / "images"
+    skills = analysis_executor_root / "skills"
+    secret = analysis_executor_root / "executor-secret"
+    for path in (scratch / "home", other_task, result, images, skills, secret):
+        path.mkdir(parents=True)
+    image = images / "sample.png"
+    other_image = images / "other.png"
+    image.write_bytes(b"image")
+    other_image.write_bytes(b"other")
+    (other_task / "secret.txt").write_text("other task", encoding="utf-8")
+    (skills / "SKILL.md").write_text("skill", encoding="utf-8")
+    token = secret / "token"
+    token.write_text("executor-secret", encoding="ascii")
+    task = executor_server.TaskState(
+        task_id="task-analysis",
+        business_task_id="task-analysis",
+        executor_attempt_id="a",
+        image_relative_path="sample.png",
+        reverse_image_policy="forbid",
+        timeout_seconds=5,
+        workspace_directory=workspace,
+        images_root=images,
+        skill_root=skills,
+        task_scratch_root=scratch,
+        analysis_policy={"version": 1, "termination_cost": "0.30"},
+    )
+    monkeypatch.setattr(executor_server, "RUNTIME_ROOT", runtime)
+    monkeypatch.setattr(executor_server, "WORKSPACE", workspace)
+    monkeypatch.setattr(executor_server, "RESULT_ROOT", runtime / "task-results")
+    socket_root = runtime / "s"
+    monkeypatch.setattr(executor_server, "ANALYSIS_SOCKET_ROOT", socket_root)
+    socket_root.mkdir(parents=True)
+    socket_path = socket_root / "a.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    listener.close()
+    checks = " && ".join((
+        'test ! -s "$1"',
+        'test -r "$2"',
+        'test ! -e "$3"',
+        'test ! -e "$4"',
+        'test -r "$5"',
+        'cat /proc/1/cmdline > "$6/proc-one"',
+        'touch "$6/scratch-write"',
+        'touch "$7/result-write"',
+    ))
+    command = [
+        "/bin/sh", "-c", checks, "sandbox-check", str(token), str(image), str(other_image),
+        str(other_task / "secret.txt"), str(skills / "SKILL.md"), str(scratch), str(result),
+    ]
+    sandboxed = executor_server.Executor._sandbox_command(SimpleNamespace(token_file=str(token)), task, command)
+
+    completed = subprocess.run(sandboxed, cwd=scratch, check=False, capture_output=True, text=True)
+
+    assert completed.returncode == 0, completed.stderr
+    assert (scratch / "scratch-write").is_file()
+    assert (result / "result-write").is_file()
+    assert (scratch / "proc-one").read_bytes().startswith(b"/usr/bin/bwrap\x00")
 
 
 def test_executor_preserves_result_validation_reason_code(executor_fixture, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -340,6 +494,8 @@ def test_executor_client_timeout_keeps_cancel_diagnostics() -> None:
         usage_checked_at="2026-09-19T08:00:00+00:00",
         reminder_sent=True,
         termination_signal="SIGTERM",
+        check_stage="analysis_monitor",
+        trigger_reason="agent_maximum_analysis_depth_exceeded",
     )
     failure = client._timeout_error(pending, cancelled, None)
 
@@ -351,6 +507,8 @@ def test_executor_client_timeout_keeps_cancel_diagnostics() -> None:
     assert failure.usage_checked_at == "2026-09-19T08:00:00+00:00"
     assert failure.reminder_sent is True
     assert failure.termination_signal == "SIGTERM"
+    assert failure.check_stage == "analysis_monitor"
+    assert failure.trigger_reason == "agent_maximum_analysis_depth_exceeded"
 
 
 def test_executor_client_preserves_analysis_termination_diagnostic(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -375,6 +533,8 @@ def test_executor_client_preserves_analysis_termination_diagnostic(monkeypatch: 
                 "message": "超过最大分析程度",
                 "analysis_diagnostic": {
                     "termination_signal": "SIGTERM",
+                    "check_stage": "analysis_monitor",
+                    "trigger_reason": "agent_maximum_analysis_depth_exceeded",
                     "private_extra": "discarded",
                 },
             },
@@ -396,6 +556,8 @@ def test_executor_client_preserves_analysis_termination_diagnostic(monkeypatch: 
     assert failure.value.reminder_sent is True
     assert failure.value.termination_reason == "analysis_cost_limit"
     assert failure.value.termination_signal == "SIGTERM"
+    assert failure.value.check_stage == "analysis_monitor"
+    assert failure.value.trigger_reason == "agent_maximum_analysis_depth_exceeded"
 
 
 def test_executor_client_forwards_resume_source_attempt(monkeypatch: pytest.MonkeyPatch) -> None:

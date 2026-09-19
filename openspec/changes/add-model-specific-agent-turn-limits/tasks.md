@@ -16,22 +16,22 @@
 - [x] 2.4 对 session 缺失、用量读取失败和提示注入失败记录明确错误；运行期提醒失败允许任务继续，插件不调用终止流程
 - [x] 2.5 让任务配置显式引用镜像内只读插件并传入冻结策略、目标模型、模型等级、attempt 标识和策略版本
 - [x] 2.6 将插件源码和依赖预装到 Agent 镜像受保护路径，验证任务中的 Bash、Python 和 Node 不能修改或替换插件
-- [x] 2.7 增加启动后就绪轮询测试，覆盖插件找不到、加载失败、初始化失败、版本不兼容、就绪超时、旧 attempt 就绪状态拒绝及未就绪即退出不得成功；覆盖主 session 单独计量、每 attempt 最多提醒一次、运行期提醒失败仍由 Executor 独立限制和隔离边界
+- [x] 2.7 增加启动后就绪轮询测试，覆盖插件找不到、加载失败、初始化失败、版本不兼容、就绪超时、旧 attempt 就绪状态拒绝及未就绪即退出不得成功；覆盖主 session 单独计量、每 attempt 最多提醒一次、运行期提醒失败仍由 Executor 独立限制，以及任务级 bubblewrap 隔离边界
 
 ## 3. Executor 用量读取和终止
 
 - [x] 3.1 以 Executor attempt 状态作为冻结策略、当前 session 标识、最近可信累计金额、提醒状态和最后检查时间的运行权威；Task 保存公开终态和最近展示摘要
-- [x] 3.2 在进程运行期间取得并冻结主 session ID，首次启动允许有限等待，恢复时校验原绑定；在现有进程检查循环中使用任务 `OPENCODE_DB` 定位 workspace 数据库并读取该 session 的 `session.cost`
+- [x] 3.2 在现有进程检查循环中使用当前模型 capability 查询 broker 保存的 attempt 累计金额；生产终止不读取任务 SQLite，恢复 attempt 以最近可信金额为累计起点
 - [x] 3.3 当观测金额达到或超过终止金额限额时，复用现有进程组 SIGTERM、有限等待、必要时 SIGKILL 和 wait 回收流程；无法确认回收时使用 `unknown_execution` 并保留原始触发原因
 - [x] 3.4 接受 Executor 下一次检查前已经完成的一个或多个调用造成的金额超出，不增加流式 token 预测或请求期间金额截断协议
 - [x] 3.5 将分析程度终止映射为 `agent_maximum_analysis_depth_exceeded` 和“超过最大分析程度”，同时在受保护诊断中保存阈值、最终观测金额、检查阶段和回收结果
 - [x] 3.6 恢复同一 session 时校验并沿用原策略和累计金额，禁止进程、Worker 或服务重启后重置分析程度
-- [x] 3.7 为数据库不存在、session 不匹配、schema 不兼容、金额字段无效和读取异常建立明确执行控制错误，不静默变成无限分析程度
-- [x] 3.8 增加 Executor 进程夹具测试，覆盖低于限额、达到限额、调用后超过、插件失败、SIGTERM 正常退出、SIGKILL 回收、回收未确认的 `unknown_execution` 和旧 attempt 迟到状态
+- [x] 3.7 为 broker 跳转、attempt 不匹配、金额倒退、无时区时间、超大响应、HTTP 故障和金额字段无效建立明确执行控制错误，不静默变成无限分析程度
+- [x] 3.8 增加 Executor 进程及真实本地 broker HTTP 测试，覆盖低于限额、达到限额、调用后超过、插件失败、SIGTERM 正常退出、SIGKILL 回收、回收未确认的 `unknown_execution` 和旧 attempt 迟到状态
 
 ## 4. 后端持久化、任务状态和页面
 
-- [x] 4.1 增加 PostgreSQL migration：Task 与 Agent attempt 保存冻结策略、累计金额、提醒状态、检查时间及终止诊断，attempt 保存进程回收结果
+- [x] 4.1 增加 PostgreSQL migration：Task 与 Agent attempt 保存冻结策略、累计金额、提醒状态、检查时间及终止诊断，attempt 保存进程回收结果和固定值 `analysis_diagnostic`
 - [x] 4.2 扩展 Task 与 attempt repository 和 claim fencing 更新，只允许当前 claim 在同一事务中写入 attempt 权威事实及 Task 公开终态和摘要
 - [x] 4.3 扩展 `ExecutorTaskResponse` 和 `AgentExecutorClient`，返回 `observed_cost`、`usage_checked_at`、`reminder_sent`、回收状态和受控终止摘要，不暴露金额限额、提示词、推理正文或凭据
 - [x] 4.4 更新任务摘要和公开 DTO，对普通用户只返回 `agent_maximum_analysis_depth_exceeded` 和“超过最大分析程度”，内部诊断保留可行动的金额与终止阶段
@@ -47,5 +47,5 @@
 - [x] 5.3 在 Docker Agent 环境执行真实任务，验证插件在每个 attempt 达到提醒金额后最多提醒一次、Executor 达到终止金额后停止，并接受下一次检查前已完成调用造成的金额超出
 - [x] 5.4 验证插件缺失、损坏、初始化失败、版本不兼容或就绪超时会在启动后检测并触发停止；插件成功就绪后的提醒失败不会绕过 Executor；SIGTERM 未及时退出时 SIGKILL 和 wait 能够完成回收，回收未确认时不得报告普通金额或插件失败
 - [x] 5.5 验证普通用户只看到“超过最大分析程度”，受保护日志保留观测金额、冻结策略、失败阶段和回收结果，且不包含凭据或推理正文
-- [x] 5.6 完成公共核心与 Server 的精确 SHA 同步、祖先关系核验、Docker 健康检查、Luna 价格检查及免费模型内部价格检查；Server 提交仅保存在本地
-- [ ] 5.7 完成诊断写回修复后的严格复审、风险测试、静态检查和待用户审核的公共 commit
+- [ ] 5.6 完成公共核心与 Server 的精确 SHA 同步、祖先关系核验、Docker 健康检查、Luna 价格检查及免费模型内部价格检查；Server 提交仅保存在本地
+- [x] 5.7 完成诊断写回修复后的严格复审、风险测试、静态检查和待用户审核的公共 commit

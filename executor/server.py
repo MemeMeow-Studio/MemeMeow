@@ -14,6 +14,7 @@ import json
 import os
 import re
 import signal
+import socket
 import stat
 import subprocess
 import tempfile
@@ -104,6 +105,7 @@ IMAGE_ROOT = Path(os.getenv("MEMEMEOW_EXECUTOR_IMAGE_ROOT", "/images"))
 WORKSPACE = RUNTIME_ROOT / "workspace"
 RESULT_ROOT = RUNTIME_ROOT / "task-results"
 LOG_ROOT = RUNTIME_ROOT / "logs"
+ANALYSIS_SOCKET_ROOT = RUNTIME_ROOT / "analysis-sockets"
 SKILL_ROOT = Path(os.getenv("MEMEMEOW_EXECUTOR_SKILL_ROOT", "/skills/research-meme-context"))
 WORKSPACE_ROOT = Path(os.getenv("MEMEMEOW_EXECUTOR_WORKSPACE_ROOT", str(RUNTIME_ROOT / "workspaces")))
 DEFAULT_MAX_RESULT_BYTES = 1024 * 1024
@@ -488,7 +490,7 @@ class Executor:
     def _prepare_runtime(self) -> None:
         """创建共享 runtime 目录并确保 executor 以非 root 可写方式启动。"""
         try:
-            for path in (RUNTIME_ROOT, WORKSPACE, RESULT_ROOT, LOG_ROOT, RUNTIME_ROOT / "candidates", RUNTIME_ROOT / "home"):
+            for path in (RUNTIME_ROOT, WORKSPACE, RESULT_ROOT, LOG_ROOT, ANALYSIS_SOCKET_ROOT, RUNTIME_ROOT / "candidates", RUNTIME_ROOT / "home"):
                 path.mkdir(parents=True, exist_ok=True)
             database_path = RUNTIME_ROOT / "opencode.db"
             database_path.touch(exist_ok=True)
@@ -941,6 +943,10 @@ class Executor:
                 raise ValueError(exc.code) from exc
             if parsed.model != self.model or parsed.variant != "max":
                 raise ValueError("agent_analysis_policy_invalid")
+            if self.release_profile in {"production", "public", "1", "true", "yes", "on"} and not self.model_broker_configured:
+                raise ValueError("model_broker_endpoint_invalid")
+            if model_capability is not None and not self.model_broker_configured:
+                raise ValueError("model_broker_endpoint_invalid")
             values["analysis_policy"] = parsed.model_dump(mode="json")
         layout = self._workspace_layout(selector=workspace_selector if isinstance(workspace_selector, str) else None, business_task_id=business_task_id)
         image = layout.images_root / relative
@@ -1126,7 +1132,7 @@ class Executor:
                 "attempt_id": task.executor_attempt_id,
                 "policy": task.analysis_policy,
                 "session_id": task.session_id,
-                "status_path": str(scratch / f"analysis-{task.executor_attempt_id}.json"),
+                "socket_path": str(ANALYSIS_SOCKET_ROOT / f"{task.executor_attempt_id}.sock"),
             }]]
         config["permission"] = {
             "external_directory": self._workspace_permission_rules(task),
@@ -1250,7 +1256,8 @@ class Executor:
             "PATH": os.getenv("PATH", "/usr/local/bin:/usr/bin:/bin"),
             # HOME 使用当前 Task 的独立目录，避免多个 Agent 共享可写配置和缓存。
             "HOME": str(scratch / "home"),
-            "OPENCODE_DB": str(RUNTIME_ROOT / "opencode.db"),
+            # 启用分析策略后使用任务专属数据库；broker 金额仍是终止判断依据。
+            "OPENCODE_DB": str(scratch / "opencode.db" if task.analysis_policy is not None else RUNTIME_ROOT / "opencode.db"),
             "OPENCODE_CONFIG": str(task.config_file or scratch / "opencode.json"),
             "OPENCODE_CONFIG_DIR": str(task.config_dir or scratch / ".opencode"),
             "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
@@ -1270,44 +1277,71 @@ class Executor:
         }
         return values
 
+    @staticmethod
+    def _process_directory(task: TaskState) -> Path:
+        """返回 OpenCode 当前任务的工作目录；分析策略任务固定使用专属 scratch。"""
+        if task.analysis_policy is not None:
+            return task.task_scratch_root or (WORKSPACE / "tasks" / task.business_task_id)
+        return task.workspace_directory or WORKSPACE
+
     def _sandbox_command(self, task: TaskState, command: list[str]) -> list[str]:
-        """为带本地候选清单的 Agent 建立只看当前任务目录的进程边界。
+        """为候选清单或分析策略任务建立只看当前任务目录的进程边界。
 
         输入是已经通过任务校验的命令和状态；输出是交给 subprocess 的命令列表。
-        候选清单涉及任务间隔离，必须在操作系统挂载视图中隐藏其它任务目录，不能只
-        依赖 Agent 可覆盖的环境变量或 OpenCode 提示词。
+        候选清单和分析控制都涉及任务间隔离，必须在操作系统挂载视图中隐藏其他任务
+        目录、Executor token 和宿主进程信息，不能只依赖环境变量或 OpenCode 提示词。
         """
-        if not task.visual_snapshot_sha256:
+        if not task.visual_snapshot_sha256 and task.analysis_policy is None:
             return command
         candidate_root = task.candidate_root or (RUNTIME_ROOT / "candidates" / task.business_task_id)
-        if not candidate_root.is_dir():
+        if task.visual_snapshot_sha256 and not candidate_root.is_dir():
             raise RuntimeError("visual_candidate_materialization_failed")
         bubblewrap = shutil.which("bwrap")
         if not bubblewrap:
-            raise RuntimeError("agent_candidate_isolation_unavailable")
+            code = "agent_runtime_unavailable" if task.analysis_policy is not None else "agent_candidate_isolation_unavailable"
+            raise RuntimeError(code)
         # 先隐藏整个 runtime，再只挂回当前任务需要的目录和文件。这样 Agent 即使
         # 改写 manifest 环境变量，也看不到其他任务或 scope 的候选目录。
-        mounts: list[str] = [bubblewrap, "--die-with-parent", "--ro-bind", "/", "/", "--tmpfs", str(RUNTIME_ROOT)]
+        mounts: list[str] = [
+            bubblewrap,
+            "--die-with-parent",
+            "--unshare-pid",
+            "--ro-bind", "/", "/",
+            "--proc", "/proc",
+            "--tmpfs", str(RUNTIME_ROOT),
+        ]
         scratch = task.task_scratch_root or (WORKSPACE / "tasks" / task.business_task_id)
-        writable_directories = (
-            task.workspace_directory or WORKSPACE,
-            scratch,
-            scratch / "home",
-            RESULT_ROOT / task.business_task_id,
-        )
+        workspace = task.workspace_directory or WORKSPACE
+        image_root = task.images_root or IMAGE_ROOT
+        skill_root = task.skill_root or SKILL_ROOT
+        hidden_roots = [Path(os.path.abspath(RUNTIME_ROOT))]
+
+        def hidden_by_existing(path: Path) -> bool:
+            """判断路径是否已经位于先前隐藏的目录中。"""
+            absolute = Path(os.path.abspath(path))
+            return any(absolute == root or absolute.is_relative_to(root) for root in hidden_roots)
+
+        for root in (image_root, workspace if task.analysis_policy is not None else None):
+            if root is not None and not hidden_by_existing(root):
+                absolute = Path(os.path.abspath(root))
+                mounts.extend(("--tmpfs", str(absolute)))
+                hidden_roots.append(absolute)
+
+        writable_directories = [scratch, scratch / "home", RESULT_ROOT / task.business_task_id]
+        if task.analysis_policy is None:
+            writable_directories.insert(0, workspace)
         # tmpfs 会遮住 runtime 原有目录；先逐级创建目标，再单独挂回可写视图，
         # 确保 OpenCode 的配置、缓存、结果文件仍能写入，同时候选目录保持只读。
         created: set[Path] = set()
-        runtime_root = Path(os.path.abspath(RUNTIME_ROOT))
 
         def add_mountpoint(path: Path) -> None:
-            """为隐藏 runtime 中的目录目标补齐 tmpfs 挂载点。"""
+            """为隐藏目录中的目标补齐 tmpfs 挂载点。"""
             absolute = Path(os.path.abspath(path))
-            try:
-                relative = absolute.relative_to(runtime_root)
-            except ValueError:
+            hidden_root = next((root for root in hidden_roots if absolute == root or absolute.is_relative_to(root)), None)
+            if hidden_root is None:
                 return
-            current = runtime_root
+            relative = absolute.relative_to(hidden_root)
+            current = hidden_root
             for part in relative.parts:
                 current /= part
                 if current not in created:
@@ -1317,10 +1351,25 @@ class Executor:
         for directory in writable_directories:
             add_mountpoint(directory)
             mounts.extend(("--bind", str(directory), str(directory)))
-        database_path = RUNTIME_ROOT / "opencode.db"
-        mounts.extend(("--bind", str(database_path), str(database_path)))
-        add_mountpoint(candidate_root)
-        mounts.extend(("--ro-bind", str(candidate_root), str(candidate_root), "--", *command))
+        if task.analysis_policy is None:
+            database_path = RUNTIME_ROOT / "opencode.db"
+            mounts.extend(("--bind", str(database_path), str(database_path)))
+        add_mountpoint(skill_root)
+        mounts.extend(("--ro-bind", str(skill_root), str(skill_root)))
+        if task.visual_snapshot_sha256:
+            add_mountpoint(candidate_root)
+            mounts.extend(("--ro-bind", str(candidate_root), str(candidate_root)))
+        if task.analysis_policy is not None:
+            socket_path = ANALYSIS_SOCKET_ROOT / f"{task.executor_attempt_id}.sock"
+            add_mountpoint(socket_path.parent)
+            mounts.extend(("--ro-bind", str(socket_path), str(socket_path)))
+        image = image_root / _relative_image_path(task.image_relative_path)
+        add_mountpoint(image.parent)
+        mounts.extend(("--ro-bind", str(image), str(image)))
+        token_path = Path(self.token_file) if self.token_file else None
+        if token_path is not None and not hidden_by_existing(token_path):
+            mounts.extend(("--ro-bind", "/dev/null", str(token_path)))
+        mounts.extend(("--", *command))
         return mounts
 
     def _prompt(self, task: TaskState) -> str:
@@ -1347,6 +1396,7 @@ class Executor:
         stdout = b""
         stderr = b""
         timed_out = False
+        analysis_socket: socket.socket | None = None
         try:
             with self.lock:
                 if task.cancel_event.is_set():
@@ -1389,12 +1439,22 @@ class Executor:
                 if isinstance(exc, ValueError) and str(exc) == "agent_image_path_forbidden":
                     raise
                 raise ValueError("agent_image_path_forbidden") from exc
+            process_directory = self._process_directory(task)
+            if task.analysis_policy is not None:
+                ANALYSIS_SOCKET_ROOT.mkdir(parents=True, exist_ok=True)
+                socket_path = ANALYSIS_SOCKET_ROOT / f"{task.executor_attempt_id}.sock"
+                if socket_path.exists() or socket_path.is_symlink():
+                    socket_path.unlink()
+                analysis_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                analysis_socket.bind(str(socket_path))
+                os.chmod(socket_path, stat.S_IRUSR | stat.S_IWUSR)
+                analysis_socket.listen(8)
             command = [
                 self.opencode_executable,
                 "run",
                 "--auto",
                 "--dir",
-                str(task.workspace_directory or WORKSPACE),
+                str(process_directory),
                 "--format",
                 "json",
                 "--file",
@@ -1411,7 +1471,7 @@ class Executor:
             command.append(self._prompt(task))
             command = self._sandbox_command(task, command)
             with tempfile.TemporaryFile(dir=LOG_ROOT, prefix=f"{task.task_id}-", mode="w+b") as out, tempfile.TemporaryFile(dir=LOG_ROOT, prefix=f"{task.task_id}-", mode="w+b") as err:
-                process = subprocess.Popen(command, cwd=task.workspace_directory or WORKSPACE, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+                process = subprocess.Popen(command, cwd=process_directory, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
                 with self.lock:
                     task.process = process
                     # 进程启动后，只有父进程确认 waitpid 收束才允许该 attempt 作为续跑源。
@@ -1422,11 +1482,15 @@ class Executor:
                     scratch = task.task_scratch_root or (WORKSPACE / "tasks" / task.business_task_id)
                     monitor = AnalysisMonitor(
                         attempt_id=task.executor_attempt_id, policy=task.analysis_policy,
-                        database=Path(env["OPENCODE_DB"]), directory=task.workspace_directory or WORKSPACE,
+                        database=Path(env["OPENCODE_DB"]), directory=process_directory,
                         status_path=scratch / f"analysis-{task.executor_attempt_id}.json",
                         startup_deadline=min(deadline, time.monotonic() + 30),
+                        status_socket=analysis_socket,
                         observed_cost=Decimal(task.observed_cost or "0"),
+                        broker_url=self.model_broker_url if self.model_broker_configured and task.model_capability else None,
+                        model_capability=task.model_capability if self.model_broker_configured else None,
                     )
+                    monitor.expected_pid = process.pid
                 while process.poll() is None:
                     if task.cancel_event.is_set():
                         reaped = self.process_supervisor.terminate(process).reaped
@@ -1535,6 +1599,13 @@ class Executor:
                 task.error = _json_error(code, "任务已取消" if code == "task_interrupted" else "无法确认 OpenCode 进程已终止" if code == "unknown_execution" else _redact_diagnostic(str(exc), (self.legacy_api_key, self.token, task.callback_token or "")))
                 task.completed_at = time.time()
         finally:
+            if analysis_socket is not None:
+                analysis_socket.close()
+                socket_path = ANALYSIS_SOCKET_ROOT / f"{task.executor_attempt_id}.sock"
+                try:
+                    socket_path.unlink()
+                except FileNotFoundError:
+                    pass
             with self.lock:
                 task.process = None
                 try:
@@ -1560,18 +1631,20 @@ class Executor:
             reason = exc.reason if isinstance(exc, AnalysisControlError) else str(exc)
             termination = self.process_supervisor.terminate(process)
             reaped = termination.reaped
-            signal_name = "already_exited"
+            signal_name: str | None = None
             if termination.returncode in {-15, 143}:
                 signal_name = "SIGTERM"
             elif termination.returncode in {-9, 137}:
                 signal_name = "SIGKILL"
+            elif termination.reaped and termination.returncode is not None:
+                signal_name = "already_exited"
             diagnostic = {
                 "threshold_cost": str(monitor.policy.get("termination_cost")),
                 "final_observed_cost": str(monitor.observed_cost),
                 "check_stage": "analysis_monitor",
                 "termination_signal": signal_name,
                 "process_reaped": reaped,
-                "trigger_reason": reason,
+                "trigger_reason": code,
             }
             with self.lock:
                 task.process_reaped = reaped
@@ -1795,6 +1868,8 @@ class Handler(BaseHTTPRequestHandler):
                 "agent_image_path_forbidden": "图片路径不在受控图片目录内",
                 "agent_result_path_invalid": "任务标识非法",
                 "invalid_reverse_image_policy": "反向图片策略无效",
+                "agent_analysis_policy_missing": "启用分析用量控制但缺少冻结策略",
+                "agent_analysis_policy_invalid": "分析用量策略无效",
                 "agent_timeout_limit_exceeded": "任务超时超过 executor 上限",
                 "session_binding_mismatch": "续跑 session 与任务事实不匹配",
                 "opencode_workspace_invalid": "workspace selector 或目录无效",
@@ -1831,6 +1906,8 @@ class Handler(BaseHTTPRequestHandler):
                 "model_capability_unavailable",
                 "model_broker_endpoint_invalid",
                 "model_name_invalid",
+                "agent_analysis_policy_missing",
+                "agent_analysis_policy_invalid",
                 "visual_match_snapshot_invalid",
                 "visual_candidate_materialization_failed",
                 "agent_candidate_isolation_unavailable",

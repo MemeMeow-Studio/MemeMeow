@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import hashlib
 import json
+import tempfile
 import threading
 import time
 from decimal import Decimal
@@ -1356,6 +1357,15 @@ def postgres_resources(postgres_engine: Engine, tmp_path: Path):
         _clean_business_rows(postgres_engine)
 
 
+@pytest.fixture
+def postgres_analysis_root() -> Iterator[Path]:
+    """在仓库测试缓存目录创建一次性分析集成测试根目录。"""
+    root = Path(".pytest_cache/postgres_analysis")
+    root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=root) as directory:
+        yield Path(directory)
+
+
 def test_concurrent_same_content_uploads_converge_after_file_commit(postgres_resources, monkeypatch: pytest.MonkeyPatch) -> None:
     """同一 scope 的并发同内容上传必须等待文件落位并复用同一 Meme。"""
     resources = postgres_resources
@@ -2227,7 +2237,7 @@ def test_process_worker_manager_handles_many_scopes_and_restart_claims(postgres_
             connection.execute(text("DELETE FROM scopes WHERE id IN (:scope_a, :scope_b)"), {"scope_a": scope_ids[0], "scope_b": scope_ids[1]})
 
 
-def test_agent_attempt_persists_analysis_summary_under_claim_fencing(postgres_engine: Engine, tmp_path: Path) -> None:
+def test_agent_attempt_persists_analysis_summary_under_claim_fencing(postgres_engine: Engine, postgres_analysis_root: Path) -> None:
     """当前 claim 在同一事务中更新 attempt 权威事实和 Task 展示摘要。"""
     scope_id = f"analysis-summary-scope-{uuid4().hex}"
     task_id = f"analysis-summary-{uuid4().hex}"
@@ -2242,8 +2252,8 @@ def test_agent_attempt_persists_analysis_summary_under_claim_fencing(postgres_en
     settings = Settings(
         _env_file=None,
         database_url=_test_database_url(),
-        data_root=tmp_path / "data",
-        image_root=tmp_path / "images",
+        data_root=postgres_analysis_root / "data",
+        image_root=postgres_analysis_root / "images",
     )
     resources = DatabaseResources(
         postgres_engine,
@@ -2311,7 +2321,18 @@ def test_agent_attempt_persists_analysis_summary_under_claim_fencing(postgres_en
             "_reminder_sent": True,
             "_termination_reason": "analysis_cost_limit",
             "_termination_signal": "SIGTERM",
+            "_check_stage": "analysis_monitor",
+            "_trigger_reason": "agent_maximum_analysis_depth_exceeded",
         }
+        invalid_diagnostic = {**payload, "_trigger_reason": "provider message"}
+        assert service.record_agent_attempt(
+            invalid_diagnostic,
+            error={"error": "agent_maximum_analysis_depth_exceeded", "message": "超过最大分析程度"},
+            session_id="analysis-session",
+            executor_attempt_id="analysis-attempt",
+            workspace_selector=workspace_selector,
+            process_reaped=True,
+        ) is False
         assert service.record_agent_attempt(
             payload,
             error={"error": "agent_maximum_analysis_depth_exceeded", "message": "超过最大分析程度"},
@@ -2338,11 +2359,65 @@ def test_agent_attempt_persists_analysis_summary_under_claim_fencing(postgres_en
             assert record.reminder_sent is True
             assert record.termination_reason == "analysis_cost_limit"
             assert record.termination_signal == "SIGTERM"
+        assert attempt.analysis_diagnostic == {
+            "check_stage": "analysis_monitor",
+            "trigger_reason": "agent_maximum_analysis_depth_exceeded",
+        }
         assert attempt.process_reaped is True
     finally:
         service.shutdown()
         with postgres_engine.begin() as connection:
             connection.execute(text("DELETE FROM scopes WHERE id = :id"), {"id": scope_id})
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "agent_analysis_policy_missing",
+        "agent_analysis_policy_invalid",
+        "agent_analysis_usage_unavailable",
+        "agent_analysis_reminder_plugin_unavailable",
+        "agent_maximum_analysis_depth_exceeded",
+    ],
+)
+def test_compatibility_agent_analysis_control_errors_do_not_retry(postgres_resources, code: str) -> None:
+    """兼容图片任务遇到分析控制终态后必须保持一次 attempt。"""
+    task_service = PostgresTaskService(postgres_resources, agent_concurrency=1, max_attempts=3)
+
+    def analysis_failure(_payload, _progress):
+        """返回当前参数指定的稳定分析控制错误。"""
+        raise RuntimeError(f"{code}: analysis control stopped")
+
+    task_service.register("meme_context_generation", analysis_failure)
+    submitted = task_service.submit(
+        "meme_context_generation",
+        {
+            "meme_id": f"analysis-control-{code}",
+            "image_sha256": "a" * 64,
+            "processing_config_hash": "b" * 64,
+            "reverse_image_policy": "forbid",
+        },
+        schedule=False,
+    )
+    try:
+        with postgres_resources.environment("local") as environment:
+            claim = environment.tasks.claim(
+                owner=task_service.owner,
+                task_id=submitted.task_id,
+                lane="agent",
+                lane_capacity=task_service.agent_concurrency,
+                lease_seconds=120,
+            )
+        assert claim is not None
+        task_service._run(submitted.task_id, preclaimed=claim)
+
+        completed = task_service.get(submitted.task_id)
+        assert completed is not None
+        assert completed.status == "failed"
+        assert completed.attempts == 1
+        assert completed.error is not None and completed.error["error"] == code
+    finally:
+        task_service.shutdown()
 
 
 def test_agent_resume_keeps_queued_state_across_two_provider_failures(postgres_resources) -> None:
@@ -2365,11 +2440,14 @@ def test_agent_resume_keeps_queued_state_across_two_provider_failures(postgres_r
         """模拟保留 session 的 provider 错误并持久化当前 attempt。"""
         attempt = int(payload["_claim_attempt"])
         inherited_session = payload.get("_resume_session_id")
+        if attempt == 1:
+            payload["_observed_cost"] = "0.28"
         observed.append(
             {
                 "attempt": attempt,
                 "session_id": inherited_session,
                 "resume_available": payload.get("_resume_available"),
+                "observed_cost": payload.get("_observed_cost"),
             }
         )
         if attempt == 1:
@@ -2439,6 +2517,7 @@ def test_agent_resume_keeps_queued_state_across_two_provider_failures(postgres_r
         assert len(observed) == 3
         assert [item["session_id"] for item in observed] == [None, "resume-session", "resume-session"]
         assert [item["resume_available"] for item in observed] == [None, True, True]
+        assert [item["observed_cost"] for item in observed] == ["0.28", "0.28000000", "0.28000000"]
 
         exhausted = run_claimed_attempt()
         assert exhausted.status == "failed"

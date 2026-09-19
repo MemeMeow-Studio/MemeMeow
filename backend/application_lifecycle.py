@@ -283,6 +283,9 @@ def _prepare_lifecycle(
     configured_workspace_provider = getattr(app.state, "workspace_provider", None)
     if configured_workspace_provider is None and configured_factory is not None:
         configured_workspace_provider = getattr(configured_factory, "workspace_provider", None)
+    configured_model_capability_provider = getattr(app.state, "model_capability_provider", None)
+    if configured_model_capability_provider is None and configured_factory is not None:
+        configured_model_capability_provider = getattr(configured_factory, "model_capability_provider", None)
 
     def local_candidate_materializer(context: Any, resolved: Any) -> None:
         """调用当前生命周期的 scope-bound 数据资源物化 local 候选。"""
@@ -332,6 +335,7 @@ def _prepare_lifecycle(
     app.state.opencode = (opencode_factory or OpenCodeRunner)(settings)
     ownership.opencode = app.state.opencode
     app.state.opencode.workspace_provider = configured_workspace_provider
+    app.state.opencode.model_capability_provider = configured_model_capability_provider
     try:
         app.state.agent_activity = (activity_factory or OpenCodeActivityReader)(settings.opencode_runtime_root)
     except Exception:  # noqa: BLE001 - 可选观测配置异常不能阻止任务服务启动

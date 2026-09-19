@@ -40,6 +40,8 @@ class AgentExecutorError(RuntimeError):
         reminder_sent: bool = False,
         termination_reason: str | None = None,
         termination_signal: str | None = None,
+        check_stage: str | None = None,
+        trigger_reason: str | None = None,
     ):
         """保存经过协议校验的 attempt 终态，供受信持久化调用链使用。"""
         super().__init__(message or code)
@@ -52,14 +54,22 @@ class AgentExecutorError(RuntimeError):
         self.observed_cost = observed_cost if isinstance(observed_cost, str) else None
         self.usage_checked_at = usage_checked_at if isinstance(usage_checked_at, str) else None
         self.reminder_sent = bool(reminder_sent)
-        self.termination_reason = termination_reason if termination_reason in _TERMINATION_REASONS else None
-        self.termination_signal = termination_signal if termination_signal in _TERMINATION_SIGNALS else None
+        self.termination_reason = termination_reason if isinstance(termination_reason, str) and termination_reason in _TERMINATION_REASONS else None
+        self.termination_signal = termination_signal if isinstance(termination_signal, str) and termination_signal in _TERMINATION_SIGNALS else None
+        self.check_stage = check_stage if isinstance(check_stage, str) and check_stage in ANALYSIS_CHECK_STAGES else None
+        self.trigger_reason = trigger_reason if isinstance(trigger_reason, str) and trigger_reason in ANALYSIS_TRIGGER_REASONS else None
 
 
 _PENDING_STATUSES = frozenset({"queued", "running"})
 _ATTEMPT_HISTORY_LIMIT = 5000
 _TERMINATION_REASONS = frozenset({"analysis_cost_limit", "unknown_execution", "timeout", "cancelled", "process_failed"})
-_TERMINATION_SIGNALS = frozenset({"SIGTERM", "SIGKILL"})
+_TERMINATION_SIGNALS = frozenset({"SIGTERM", "SIGKILL", "already_exited"})
+ANALYSIS_CHECK_STAGES = frozenset({"analysis_monitor"})
+ANALYSIS_TRIGGER_REASONS = frozenset({
+    "agent_analysis_usage_unavailable",
+    "agent_analysis_reminder_plugin_unavailable",
+    "agent_maximum_analysis_depth_exceeded",
+})
 _TERMINATION_REASON_BY_ERROR = {
     "agent_maximum_analysis_depth_exceeded": "analysis_cost_limit",
     "unknown_execution": "unknown_execution",
@@ -140,6 +150,8 @@ class ExecutorTaskResponse:
     reminder_sent: bool = False
     termination_reason: str | None = None
     termination_signal: str | None = None
+    check_stage: str | None = None
+    trigger_reason: str | None = None
 
 
 class AgentExecutorClient:
@@ -224,6 +236,8 @@ class AgentExecutorClient:
         error_code = error.get("error") if error is not None else None
         diagnostic = error.get("analysis_diagnostic") if error is not None else None
         termination_signal = diagnostic.get("termination_signal") if isinstance(diagnostic, dict) else None
+        check_stage = diagnostic.get("check_stage") if isinstance(diagnostic, dict) else None
+        trigger_reason = diagnostic.get("trigger_reason") if isinstance(diagnostic, dict) else None
         safe_error = {
             str(key): str(item)
             for key, item in error.items()
@@ -242,7 +256,9 @@ class AgentExecutorClient:
             usage_checked_at=value.get("usage_checked_at") if isinstance(value.get("usage_checked_at"), str) else None,
             reminder_sent=value.get("reminder_sent") is True,
             termination_reason=_TERMINATION_REASON_BY_ERROR.get(error_code, "process_failed") if isinstance(error_code, str) else None,
-            termination_signal=termination_signal if termination_signal in _TERMINATION_SIGNALS else None,
+            termination_signal=termination_signal if isinstance(termination_signal, str) and termination_signal in _TERMINATION_SIGNALS else None,
+            check_stage=check_stage if isinstance(check_stage, str) and check_stage in ANALYSIS_CHECK_STAGES else None,
+            trigger_reason=trigger_reason if isinstance(trigger_reason, str) and trigger_reason in ANALYSIS_TRIGGER_REASONS else None,
         )
 
     @staticmethod
@@ -279,19 +295,23 @@ class AgentExecutorClient:
     ) -> AgentExecutorError:
         """合并轮询与取消诊断，生成等待超时的最终错误。"""
         diagnostic_response = cancelled_response or response
-        process_reaped = diagnostic_response.process_reaped
-        observed_cost = diagnostic_response.observed_cost
-        usage_checked_at = diagnostic_response.usage_checked_at
-        reminder_sent = diagnostic_response.reminder_sent
-        termination_signal = diagnostic_response.termination_signal
-        session_id = diagnostic_response.session_id
-        attempt_id = diagnostic_response.executor_attempt_id
+        process_reaped = diagnostic_response.process_reaped if diagnostic_response.process_reaped is not None else response.process_reaped
+        observed_cost = diagnostic_response.observed_cost or response.observed_cost
+        usage_checked_at = diagnostic_response.usage_checked_at or response.usage_checked_at
+        reminder_sent = diagnostic_response.reminder_sent or response.reminder_sent
+        termination_signal = diagnostic_response.termination_signal or response.termination_signal
+        check_stage = diagnostic_response.check_stage or response.check_stage
+        trigger_reason = diagnostic_response.trigger_reason or response.trigger_reason
+        session_id = diagnostic_response.session_id or response.session_id
+        attempt_id = diagnostic_response.executor_attempt_id or response.executor_attempt_id
         if cancellation_error is not None:
             process_reaped = process_reaped if process_reaped is not None else cancellation_error.process_reaped
             observed_cost = observed_cost or cancellation_error.observed_cost
             usage_checked_at = usage_checked_at or cancellation_error.usage_checked_at
             reminder_sent = reminder_sent or cancellation_error.reminder_sent
             termination_signal = termination_signal or cancellation_error.termination_signal
+            check_stage = check_stage or cancellation_error.check_stage
+            trigger_reason = trigger_reason or cancellation_error.trigger_reason
             session_id = session_id or cancellation_error.session_id
             attempt_id = attempt_id or cancellation_error.executor_attempt_id
         return AgentExecutorError(
@@ -305,6 +325,8 @@ class AgentExecutorClient:
             reminder_sent=reminder_sent,
             termination_reason="timeout",
             termination_signal=termination_signal,
+            check_stage=check_stage,
+            trigger_reason=trigger_reason,
         )
 
     def _wait_for_terminal(self, response: ExecutorTaskResponse, *, task_id: str, executor_task_id: str, timeout_seconds: int) -> ExecutorTaskResponse:
@@ -325,13 +347,43 @@ class AgentExecutorClient:
             poll_delay = min(2.0, poll_delay * 1.5)
             try:
                 response = self._for_task(self.status(executor_task_id), task_id)
-            except AgentExecutorError:
+            except AgentExecutorError as status_error:
                 # 轮询链路断开时尽力取消已提交任务，防止 HTTP 响应丢失后孤儿执行。
                 try:
-                    self.cancel(executor_task_id)
-                except AgentExecutorError:
-                    pass
-                raise
+                    cancelled_response = self.cancel(executor_task_id)
+                except AgentExecutorError as cancellation_error:
+                    raise AgentExecutorError(
+                        status_error.code,
+                        str(status_error)[:500],
+                        session_id=status_error.session_id or cancellation_error.session_id,
+                        executor_attempt_id=status_error.executor_attempt_id or cancellation_error.executor_attempt_id,
+                        http_status=status_error.http_status,
+                        reason_code=status_error.reason_code,
+                        process_reaped=status_error.process_reaped if status_error.process_reaped is not None else cancellation_error.process_reaped,
+                        observed_cost=status_error.observed_cost or cancellation_error.observed_cost,
+                        usage_checked_at=status_error.usage_checked_at or cancellation_error.usage_checked_at,
+                        reminder_sent=status_error.reminder_sent or cancellation_error.reminder_sent,
+                        termination_reason=status_error.termination_reason,
+                        termination_signal=status_error.termination_signal or cancellation_error.termination_signal,
+                        check_stage=status_error.check_stage or cancellation_error.check_stage,
+                        trigger_reason=status_error.trigger_reason or cancellation_error.trigger_reason,
+                    ) from status_error
+                raise AgentExecutorError(
+                    status_error.code,
+                    str(status_error)[:500],
+                    session_id=status_error.session_id or cancelled_response.session_id,
+                    executor_attempt_id=status_error.executor_attempt_id or cancelled_response.executor_attempt_id,
+                    http_status=status_error.http_status,
+                    reason_code=status_error.reason_code,
+                    process_reaped=status_error.process_reaped if status_error.process_reaped is not None else cancelled_response.process_reaped,
+                    observed_cost=status_error.observed_cost or cancelled_response.observed_cost,
+                    usage_checked_at=status_error.usage_checked_at or cancelled_response.usage_checked_at,
+                    reminder_sent=status_error.reminder_sent or cancelled_response.reminder_sent,
+                    termination_reason=status_error.termination_reason,
+                    termination_signal=status_error.termination_signal or cancelled_response.termination_signal,
+                    check_stage=status_error.check_stage or cancelled_response.check_stage,
+                    trigger_reason=status_error.trigger_reason or cancelled_response.trigger_reason,
+                ) from status_error
         return response
 
     def health(self) -> dict[str, object]:
@@ -359,9 +411,7 @@ class AgentExecutorClient:
         """返回当前业务任务最近一次提交的 executor attempt 标识。"""
         return self._attempt_ids.get(task_id)
 
-    def run(
-        self,
-        *,
+    def run(self, *,
         task_id: str,
         image_relative_path: str,
         reverse_image_policy: str,
@@ -416,20 +466,34 @@ class AgentExecutorClient:
                 timeout=max(self.timeout, timeout_value + 10),
             )
         except AgentExecutorError as exc:
+            cancelled_response: ExecutorTaskResponse | None = None
+            cancellation_error: AgentExecutorError | None = None
+            if exc.code == "agent_timeout":
+                try:
+                    cancelled_response = self.cancel(attempt_id)
+                except AgentExecutorError as error:
+                    cancellation_error = error
+                else:
+                    if cancelled_response.status == "succeeded":
+                        return cancelled_response
+            diagnostic_source = cancelled_response or cancellation_error
             raise AgentExecutorError(
                 exc.code,
                 str(exc)[:500],
-                session_id=exc.session_id,
-                executor_attempt_id=exc.executor_attempt_id or attempt_id,
+                session_id=exc.session_id or getattr(diagnostic_source, "session_id", None),
+                executor_attempt_id=exc.executor_attempt_id or getattr(diagnostic_source, "executor_attempt_id", None) or attempt_id,
                 http_status=exc.http_status,
                 reason_code=exc.reason_code,
-                process_reaped=exc.process_reaped,
-                observed_cost=exc.observed_cost,
-                usage_checked_at=exc.usage_checked_at,
-                reminder_sent=exc.reminder_sent,
+                process_reaped=exc.process_reaped if exc.process_reaped is not None else getattr(diagnostic_source, "process_reaped", None),
+                observed_cost=exc.observed_cost or getattr(diagnostic_source, "observed_cost", None),
+                usage_checked_at=exc.usage_checked_at or getattr(diagnostic_source, "usage_checked_at", None),
+                reminder_sent=exc.reminder_sent or getattr(diagnostic_source, "reminder_sent", False),
                 termination_reason=exc.termination_reason,
-                termination_signal=exc.termination_signal,
+                termination_signal=exc.termination_signal or getattr(diagnostic_source, "termination_signal", None),
+                check_stage=exc.check_stage or getattr(diagnostic_source, "check_stage", None),
+                trigger_reason=exc.trigger_reason or getattr(diagnostic_source, "trigger_reason", None),
             ) from exc
+
         response = self._for_task(self._response(value), task_id)
         if response.executor_attempt_id and response.executor_attempt_id != attempt_id:
             raise AgentExecutorError("agent_executor_invalid_response", "Agent executor attempt 标识不匹配", executor_attempt_id=attempt_id)
@@ -452,6 +516,8 @@ class AgentExecutorClient:
                 reminder_sent=exc.reminder_sent or response.reminder_sent,
                 termination_reason=exc.termination_reason,
                 termination_signal=exc.termination_signal,
+                check_stage=exc.check_stage,
+                trigger_reason=exc.trigger_reason,
             ) from exc
         if response.status == "failed":
             code = self._failure_code(response)
@@ -471,6 +537,8 @@ class AgentExecutorClient:
                 reminder_sent=response.reminder_sent,
                 termination_reason=response.termination_reason,
                 termination_signal=response.termination_signal,
+                check_stage=response.check_stage,
+                trigger_reason=response.trigger_reason,
             )
         if response.status == "cancelled":
             raise AgentExecutorError(
@@ -483,6 +551,9 @@ class AgentExecutorClient:
                 usage_checked_at=response.usage_checked_at,
                 reminder_sent=response.reminder_sent,
                 termination_reason="cancelled",
+                termination_signal=response.termination_signal,
+                check_stage=response.check_stage,
+                trigger_reason=response.trigger_reason,
             )
         if response.status != "succeeded":
             raise AgentExecutorError("agent_executor_invalid_response", "Agent executor 任务状态无效")
