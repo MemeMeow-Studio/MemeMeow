@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 import json
+import os
+
 from pathlib import Path
 import socket
 import struct
@@ -122,9 +124,22 @@ class AnalysisMonitor:
             return None
         try:
             connection.settimeout(0.5)
-            peer_pid, _peer_uid, _peer_gid = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+            peer_pid, _peer_uid, _peer_gid = struct.unpack(
+                "3i",
+                connection.getsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_PEERCRED,
+                    struct.calcsize("3i"),
+                ),
+            )
             if self.expected_pid is not None and peer_pid != self.expected_pid:
-                return None
+                try:
+                    expected_session = os.getsid(self.expected_pid)
+                    peer_session = os.getsid(peer_pid)
+                except OSError:
+                    return None
+                if peer_session != expected_session:
+                    return None
             if self.expected_pid is None:
                 self.expected_pid = peer_pid
             chunks: list[bytes] = []
@@ -135,15 +150,27 @@ class AnalysisMonitor:
                         break
                     chunks.append(chunk)
                     if sum(map(len, chunks)) > 65536:
-                        raise AnalysisControlError("agent_analysis_reminder_plugin_unavailable", "plugin_status_too_large")
+                        raise AnalysisControlError(
+                            "agent_analysis_reminder_plugin_unavailable",
+                            "plugin_status_too_large",
+                        )
             except socket.timeout as exc:
-                raise AnalysisControlError("agent_analysis_reminder_plugin_unavailable", "plugin_status_read_timeout") from exc
+                raise AnalysisControlError(
+                    "agent_analysis_reminder_plugin_unavailable",
+                    "plugin_status_read_timeout",
+                ) from exc
             try:
                 value = json.loads(b"".join(chunks).decode("utf-8"))
             except (UnicodeError, ValueError) as exc:
-                raise AnalysisControlError("agent_analysis_reminder_plugin_unavailable", "plugin_status_unreadable") from exc
+                raise AnalysisControlError(
+                    "agent_analysis_reminder_plugin_unavailable",
+                    "plugin_status_unreadable",
+                ) from exc
             if not isinstance(value, dict):
-                raise AnalysisControlError("agent_analysis_reminder_plugin_unavailable", "plugin_status_unreadable")
+                raise AnalysisControlError(
+                    "agent_analysis_reminder_plugin_unavailable",
+                    "plugin_status_unreadable",
+                )
             return value
         finally:
             connection.close()

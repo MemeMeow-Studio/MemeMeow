@@ -4,6 +4,8 @@ from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import select
+
 from pathlib import Path
 import sqlite3
 import socket
@@ -226,22 +228,30 @@ def test_analysis_monitor_accepts_only_opencode_peer(analysis_monitor_root: Path
         "client.close()"
     )
     subprocess.run([sys.executable, "-c", child_code, str(socket_path)], check=True, start_new_session=True)
+    readable, _, _ = select.select([listener], [], [], 1)
+    assert readable
+
     assert monitor._read_socket_status() is None
 
     same_session = subprocess.Popen([
         sys.executable,
         "-c",
-        child_code + "; import time; print('ready', flush=True); time.sleep(1)",
+        child_code + "; import time; print('ready', flush=True); time.sleep(30)",
         str(socket_path),
     ], stdout=subprocess.PIPE)
     same_session.stdout.read(5)
-
     try:
-        assert monitor._read_socket_status() is None
+        readable, _, _ = select.select([listener], [], [], 1)
+        assert readable
+        assert monitor._read_socket_status() == {
+            "attempt_id": "attempt-analysis",
+            "plugin_version": "1.18.18",
+            "policy_version": 1,
+            "ready": True,
+        }
     finally:
+        same_session.terminate()
         same_session.wait(timeout=2)
-
-
 
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.connect(str(socket_path))
