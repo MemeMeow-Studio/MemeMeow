@@ -6,13 +6,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import os
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
+from loguru import logger
+from starlette.concurrency import run_in_threadpool
 
 from backend.visual import (
     VISUAL_CHECKPOINT_FILENAME,
@@ -56,6 +60,32 @@ def _service_settings() -> SimpleNamespace:
 settings = _service_settings()
 runner = VisualModelRunner(settings)
 app = FastAPI(title="MemeMeow Visual Inference", version="1.0.0")
+_VISUAL_CONCURRENCY = asyncio.Semaphore(1)
+
+
+async def _run_visual(operation: Callable[..., dict[str, object]], *args: object) -> dict[str, object]:
+    """串行执行同步模型操作；健康检查和推理共用名额，取消后等待线程结束。"""
+    async with _VISUAL_CONCURRENCY:
+        worker = asyncio.create_task(run_in_threadpool(operation, *args))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            try:
+                worker.result()
+            except Exception as exc:
+                logger.error(
+                    "视觉操作在请求取消后报错 error_code={} exception_type={}",
+                    exc.code if isinstance(exc, VisualEmbeddingError) else "visual_operation_failed",
+                    type(exc).__name__,
+                )
+            raise
 
 
 def _check_token(value: str | None) -> None:
@@ -68,7 +98,7 @@ def _check_token(value: str | None) -> None:
 @app.get("/health")
 async def health() -> dict[str, object]:
     """返回脱敏模型健康状态，权重路径和凭据永不出现在响应中。"""
-    return runner.health()
+    return await _run_visual(runner.health)
 
 
 @app.post("/internal/visual-embedding")
@@ -80,7 +110,7 @@ async def visual_embedding(
     _check_token(x_mememeow_internal_token)
     content = await image.read()
     try:
-        return runner.embed(content)
+        return await _run_visual(runner.embed, content)
     except VisualEmbeddingError as exc:
         return JSONResponse(status_code=exc.status_code, content={"error": exc.code, "message": str(exc)})
 

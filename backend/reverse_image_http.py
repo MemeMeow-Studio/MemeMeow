@@ -14,6 +14,7 @@ from collections.abc import Callable
 from typing import Any
 
 from fastapi import HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 
 from backend.callbacks import (
     CallbackError,
@@ -37,7 +38,7 @@ ErrorFactory = Callable[[int, str, str], HTTPException]
 
 async def _run_sync_search(search: Callable[[ReverseImageRequest], object], payload: ReverseImageRequest) -> object:
     """在线程中兼容同步 service，并在取消时等待其完整退出。"""
-    worker = asyncio.create_task(asyncio.to_thread(search, payload))
+    worker = asyncio.create_task(run_in_threadpool(search, payload))
     try:
         result = await asyncio.shield(worker)
     except asyncio.CancelledError:

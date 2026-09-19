@@ -29,6 +29,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from sqlalchemy import select
+from starlette.concurrency import run_in_threadpool
 
 from backend.config import Settings
 from backend.callbacks import (
@@ -124,7 +125,7 @@ class NetworkReverseImageSearchAdapter:
             if inspect.iscoroutinefunction(target):
                 value = await target(request)
             else:
-                value = await asyncio.to_thread(target, request)
+                value = await run_in_threadpool(target, request)
                 if inspect.isawaitable(value):
                     value = await value
         if not isinstance(value, Mapping):

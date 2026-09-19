@@ -14,6 +14,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from backend.app_extensions import ApplicationExtension, extension_paths, path_is_exempt
 from backend.callbacks import (
@@ -293,7 +294,7 @@ async def health(request: Request) -> dict[str, object]:
     """
     settings = getattr(request.app.state, "settings", None)
     visual_client = getattr(request.app.state, "visual_inference", None)
-    visual_status = visual_client.health() if visual_client is not None else {"available": False}
+    visual_status = await run_in_threadpool(visual_client.health) if visual_client is not None else {"available": False}
     return {
         "status": "ok" if getattr(request.app.state, "service_factory", None) is not None else "degraded",
         "visual_available": bool(visual_status.get("available")),
