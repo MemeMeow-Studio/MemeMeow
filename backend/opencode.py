@@ -23,12 +23,12 @@ from dataclasses import replace
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from queue import Empty, Queue
-from threading import Event, Lock, RLock, Semaphore
+from threading import Event, Lock, RLock, Semaphore, local
 from typing import Any, BinaryIO, Callable, Iterator, Mapping
 from urllib.error import URLError
 from urllib.request import urlopen
 
-from backend.agent_executor import AgentExecutorClient, AgentExecutorError
+from backend.agent_executor import AgentExecutorClient, AgentExecutorError, ExecutorTaskResponse
 from backend.agent_resume import classify_resume_error, normalize_identifier
 from backend.config import Settings, validate_agent_concurrency
 from backend.metadata import MemeContext
@@ -173,7 +173,24 @@ def _stream_sample(stream: BinaryIO, limit: int) -> bytes:
 class OpenCodeError(RuntimeError):
     """携带稳定错误码的 OpenCode 运行失败。"""
 
-    def __init__(self, code: str, message: str | None = None, *, session_id: str | None = None, executor_attempt_id: str | None = None, retryable: bool | None = None, http_status: int | None = None, reason_code: str | None = None):
+    def __init__(
+        self,
+        code: str,
+        message: str | None = None,
+        *,
+        session_id: str | None = None,
+        executor_attempt_id: str | None = None,
+        retryable: bool | None = None,
+        http_status: int | None = None,
+        reason_code: str | None = None,
+        process_reaped: bool | None = None,
+        observed_cost: str | None = None,
+        usage_checked_at: str | None = None,
+        reminder_sent: bool = False,
+        termination_reason: str | None = None,
+        termination_signal: str | None = None,
+    ):
+        """保存稳定错误及受信 Executor 返回的有限 attempt 诊断。"""
         super().__init__(message or code)
         self.code = code
         self.session_id = normalize_identifier(session_id, kind="session")
@@ -181,6 +198,12 @@ class OpenCodeError(RuntimeError):
         self.retryable = retryable
         self.http_status = http_status
         self.reason_code = reason_code if isinstance(reason_code, str) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,127}", reason_code) else None
+        self.process_reaped = process_reaped if isinstance(process_reaped, bool) else None
+        self.observed_cost = observed_cost if isinstance(observed_cost, str) else None
+        self.usage_checked_at = usage_checked_at if isinstance(usage_checked_at, str) else None
+        self.reminder_sent = bool(reminder_sent)
+        self.termination_reason = termination_reason
+        self.termination_signal = termination_signal
 
 
 def _workspace_opencode_config(workspace: ResolvedWorkspace) -> dict[str, Any]:
@@ -232,6 +255,8 @@ class OpenCodeRunner:
         self._active_task_ids: set[str] = set()
         self._active_executor_task_ids: set[str] = set()
         self._last_executor_attempt_ids: dict[str, str] = {}
+        self._executor_attempt_context = local()
+        self._analysis_observations: dict[tuple[str, str], dict[str, object]] = {}
         self._cancelled_task_ids: set[str] = set()
         # 未显式传入 provider 只为既有开源直接构造调用保留 local 兼容；应用工厂
         # 对 non-local scope 必须显式装配 provider，不能在这里猜测路径。
@@ -523,15 +548,47 @@ class OpenCodeRunner:
 
     def executor_attempt_id_for(self, task_id: str) -> str | None:
         """按业务 task 读取最近 attempt，避免并发任务互相串接诊断。"""
+        thread_binding = getattr(self._executor_attempt_context, "binding", None)
+        if isinstance(thread_binding, tuple) and thread_binding[0] == task_id:
+            return thread_binding[1]
         with self._process_lock:
             return self._last_executor_attempt_ids.get(task_id)
 
+    def analysis_observation_for(self, task_id: str, executor_attempt_id: str | None = None) -> dict[str, object] | None:
+        """按当前 executor attempt 取出一次分析摘要，读取后立即清理。"""
+        with self._process_lock:
+            expected_attempt_id = executor_attempt_id or self._last_executor_attempt_ids.get(task_id)
+            if not isinstance(expected_attempt_id, str) or not expected_attempt_id:
+                return None
+            value = self._analysis_observations.pop((task_id, expected_attempt_id), None)
+            return dict(value) if value is not None else None
+
     def _remember_executor_attempt(self, task_id: str, executor_attempt_id: str) -> None:
         """保存任务 attempt 摘要并限制长期运行进程的内存历史。"""
+        self._executor_attempt_context.binding = (task_id, executor_attempt_id)
         with self._process_lock:
             self._last_executor_attempt_ids[task_id] = executor_attempt_id
             while len(self._last_executor_attempt_ids) > 5000:
                 self._last_executor_attempt_ids.pop(next(iter(self._last_executor_attempt_ids)))
+
+    def _remember_analysis_observation(self, task_id: str, response: ExecutorTaskResponse) -> None:
+        """暂存成功响应的分析摘要，等待 API 在同一次调用中取出并持久化。"""
+        if response.observed_cost is None:
+            return
+        with self._process_lock:
+            thread_binding = getattr(self._executor_attempt_context, "binding", None)
+            expected_attempt_id = thread_binding[1] if isinstance(thread_binding, tuple) and thread_binding[0] == task_id else None
+            response_attempt_id = response.executor_attempt_id or expected_attempt_id
+            if not isinstance(expected_attempt_id, str) or response_attempt_id != expected_attempt_id:
+                return
+            self._analysis_observations[(task_id, expected_attempt_id)] = {
+                "observed_cost": response.observed_cost,
+                "usage_checked_at": response.usage_checked_at,
+                "reminder_sent": response.reminder_sent,
+                "process_reaped": response.process_reaped,
+            }
+            while len(self._analysis_observations) > 5000:
+                self._analysis_observations.pop(next(iter(self._analysis_observations)))
 
     @staticmethod
     def _executor_error_code(code: str, *, health: bool = False) -> str:
@@ -1692,6 +1749,7 @@ class OpenCodeRunner:
                     )
                     if response.executor_attempt_id:
                         self._remember_executor_attempt(task_id, response.executor_attempt_id)
+                    self._remember_analysis_observation(task_id, response)
                 except AgentExecutorError as exc:
                     code = self._executor_error_code(exc.code)
                     if exc.executor_attempt_id:
@@ -1710,8 +1768,28 @@ class OpenCodeRunner:
                             executor_attempt_id=exc.executor_attempt_id,
                             http_status=exc.http_status,
                             reason_code=exc.reason_code,
+                            process_reaped=exc.process_reaped,
+                            observed_cost=exc.observed_cost,
+                            usage_checked_at=exc.usage_checked_at,
+                            reminder_sent=exc.reminder_sent,
+                            termination_reason=exc.termination_reason,
+                            termination_signal=exc.termination_signal,
                         ) from exc
-                    raise OpenCodeError(code, str(exc)[:500], session_id=exc.session_id, executor_attempt_id=exc.executor_attempt_id, retryable=decision.retryable, http_status=exc.http_status, reason_code=exc.reason_code) from exc
+                    raise OpenCodeError(
+                        code,
+                        str(exc)[:500],
+                        session_id=exc.session_id,
+                        executor_attempt_id=exc.executor_attempt_id,
+                        retryable=decision.retryable,
+                        http_status=exc.http_status,
+                        reason_code=exc.reason_code,
+                        process_reaped=exc.process_reaped,
+                        observed_cost=exc.observed_cost,
+                        usage_checked_at=exc.usage_checked_at,
+                        reminder_sent=exc.reminder_sent,
+                        termination_reason=exc.termination_reason,
+                        termination_signal=exc.termination_signal,
+                    ) from exc
                 if self._take_pre_cancelled(task_id):
                     try:
                         self.executor.cancel(response.executor_attempt_id or task_id)

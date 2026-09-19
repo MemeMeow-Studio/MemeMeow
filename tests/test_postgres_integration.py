@@ -12,6 +12,7 @@ import hashlib
 import json
 import threading
 import time
+from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -63,6 +64,8 @@ from backend.visual import VisualSearchError, VisualSearchService
 from backend.scope import ScopeServiceFactory
 from backend.pg_services import PostgresTaskService, PostgresTaskWorkerManager
 from backend.services.metadata import PostgresMetadataService
+from backend.persistence.models import ImageProcessingAttempt
+from executor.analysis_policy import freeze_analysis_policy
 
 
 class _CountingAllowAllPolicy(AllowAllOperationPolicy):
@@ -2222,6 +2225,124 @@ def test_process_worker_manager_handles_many_scopes_and_restart_claims(postgres_
         factory.shutdown()
         with postgres_engine.begin() as connection:
             connection.execute(text("DELETE FROM scopes WHERE id IN (:scope_a, :scope_b)"), {"scope_a": scope_ids[0], "scope_b": scope_ids[1]})
+
+
+def test_agent_attempt_persists_analysis_summary_under_claim_fencing(postgres_engine: Engine, tmp_path: Path) -> None:
+    """当前 claim 在同一事务中更新 attempt 权威事实和 Task 展示摘要。"""
+    scope_id = f"analysis-summary-scope-{uuid4().hex}"
+    task_id = f"analysis-summary-{uuid4().hex}"
+    workspace_selector = f"analysis-summary-{uuid4().hex}"
+    target_sha = "a" * 64
+    config_hash = "b" * 64
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO scopes(id, storage_namespace, created_at) VALUES (:id, :namespace, now())"),
+            {"id": scope_id, "namespace": uuid4()},
+        )
+    settings = Settings(
+        _env_file=None,
+        database_url=_test_database_url(),
+        data_root=tmp_path / "data",
+        image_root=tmp_path / "images",
+    )
+    resources = DatabaseResources(
+        postgres_engine,
+        image_root=settings.image_root,
+        data_root=settings.data_root,
+        settings=settings,
+        require_local_scope=False,
+    )
+    service = PostgresTaskService(resources, scope_id=scope_id, max_attempts=3)
+    policy = freeze_analysis_policy(
+        enabled=True,
+        model_key="model_plus",
+        model="mememeow/gpt-5.6-luna",
+        variant="max",
+        reminder_cost="0.15",
+        termination_cost="0.30",
+    )
+    assert policy is not None
+    now = utcnow()
+    try:
+        with resources.factory() as session:
+            session.add(
+                Task(
+                    scope_id=scope_id,
+                    id=task_id,
+                    task_type="meme_context_generation",
+                    submission_mode="standalone",
+                    image_stage="agent",
+                    payload={"image_sha256": target_sha},
+                    status="running",
+                    lease_owner=service.owner,
+                    lease_expires_at=now + timedelta(minutes=5),
+                    claim_generation=1,
+                    attempt_count=1,
+                    max_attempts=3,
+                )
+            )
+            session.flush()
+            session.add(
+                ImageProcessingAttempt(
+                    scope_id=scope_id,
+                    task_id=task_id,
+                    attempt=1,
+                    attempt_id=f"attempt-{uuid4().hex}",
+                    stage="agent",
+                    state="external_started",
+                    processing_config_hash=config_hash,
+                    input_digest="c" * 64,
+                    target_sha256=target_sha,
+                    claim_generation=1,
+                )
+            )
+            session.commit()
+
+        payload = {
+            "_claim_task_id": task_id,
+            "_claim_generation": 1,
+            "_claim_owner": service.owner,
+            "_claim_attempt": 1,
+            "processing_config_hash": config_hash,
+            "_workspace_selector": workspace_selector,
+            "analysis_policy": policy,
+            "_observed_cost": "0.31",
+            "_usage_checked_at": "2026-09-19T08:00:00+00:00",
+            "_reminder_sent": True,
+            "_termination_reason": "analysis_cost_limit",
+            "_termination_signal": "SIGTERM",
+        }
+        assert service.record_agent_attempt(
+            payload,
+            error={"error": "agent_maximum_analysis_depth_exceeded", "message": "超过最大分析程度"},
+            session_id="analysis-session",
+            executor_attempt_id="analysis-attempt",
+            workspace_selector=workspace_selector,
+            process_reaped=True,
+        ) is True
+
+        with resources.factory() as session:
+            task = session.get(Task, task_id)
+            attempt = session.scalar(
+                select(ImageProcessingAttempt).where(
+                    ImageProcessingAttempt.scope_id == scope_id,
+                    ImageProcessingAttempt.task_id == task_id,
+                    ImageProcessingAttempt.attempt == 1,
+                )
+            )
+        assert task is not None and attempt is not None
+        for record in (task, attempt):
+            assert record.analysis_policy == policy
+            assert record.observed_cost == Decimal("0.31000000")
+            assert record.usage_checked_at == datetime(2026, 9, 19, 8, 0, tzinfo=timezone.utc)
+            assert record.reminder_sent is True
+            assert record.termination_reason == "analysis_cost_limit"
+            assert record.termination_signal == "SIGTERM"
+        assert attempt.process_reaped is True
+    finally:
+        service.shutdown()
+        with postgres_engine.begin() as connection:
+            connection.execute(text("DELETE FROM scopes WHERE id = :id"), {"id": scope_id})
 
 
 def test_agent_resume_keeps_queued_state_across_two_provider_failures(postgres_resources) -> None:

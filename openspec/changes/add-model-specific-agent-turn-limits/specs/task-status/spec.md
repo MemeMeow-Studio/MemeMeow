@@ -1,57 +1,49 @@
 ## MODIFIED Requirements
 
+金额终止及金额读取失败规则仅适用于冻结为启用分析用量策略的任务。公共默认配置关闭提醒和金额终止；未启用及历史无策略任务保留现有执行行为和活动观察字段。
+
+金额终止、插件启动失败及用量读取失败的普通失败原因均以进程已经确认回收为前提。无法确认回收时 MUST 使用 `unknown_execution`；受保护诊断 MUST 同时保留原始触发原因、失败阶段和回收结果。
+
 ### Requirement: 语境研究任务必须提供可选的 Agent 活跃度摘要
 
-任务状态接口 MUST 为 `meme_context_generation` 任务优先返回执行器持久化的实时轮次快照，包括 `agent_completed_turns`、`agent_turn_running` 和 `agent_last_activity_at`。`agent_completed_turns` MUST 表示当前任务主 session 已结束的 Agent 步骤数量，`agent_turn_running` MUST 表示是否存在已开始但尚未结束的步骤，`agent_last_activity_at` MUST 表示该任务最后一次已确认 Agent 活动的 UTC 时间；这些字段 MUST NOT 被解释为任务完成百分比或剩余轮次数。任务进入终态前 MUST 保存最后可确认的快照。对于没有新快照的历史任务，系统可以使用只读 OpenCode 会话元数据补齐字段，但不得用该兼容读取作为轮次限制依据。
-
-#### Scenario: 新任务从执行器快照展示轮次
-- **WHEN** 执行器已经确认 19 次步骤开始、18 次步骤结束且最近活动时间已持久化
-- **THEN** 响应返回 `agent_completed_turns: 18`、`agent_turn_running: true` 和对应的 `agent_last_activity_at`
+任务状态接口 MUST 在可获得 OpenCode 会话数据时，为 `meme_context_generation` 任务返回 `agent_completed_turns`、`agent_turn_running` 和 `agent_last_activity_at`。`agent_completed_turns` MUST 表示已经结束的 Agent 步骤数量，`agent_turn_running` MUST 表示是否存在已经开始且尚未结束的步骤，`agent_last_activity_at` MUST 表示该 session 最近一次活动的 UTC 时间；这些字段 MUST NOT 被解释为任务完成百分比、剩余分析程度或金额。任务因达到分析程度终止边界进入终态时，公开错误码 MUST 为 `agent_maximum_analysis_depth_exceeded`，显示消息 MUST 为“超过最大分析程度”，不得直接返回提醒金额限额、终止金额限额或最终观测金额。
 
 #### Scenario: Agent 已完成若干轮且新一轮正在执行
-- **WHEN** 客户端查询一个具有 19 次步骤开始、18 次步骤结束及最近活动时间的语境研究任务
+- **WHEN** 客户端查询一个具有 19 次步骤开始、18 次步骤结束及最近 part 更新时间的语境研究任务
 - **THEN** 响应返回 `agent_completed_turns: 18`、`agent_turn_running: true` 和对应的 `agent_last_activity_at`
 
 #### Scenario: Agent 当前没有未完成轮次
-- **WHEN** 客户端查询一个步骤开始数与步骤结束数相同的语境研究任务，且执行器快照已持久化
+- **WHEN** 客户端查询一个步骤开始数与步骤结束数相同的语境研究任务
 - **THEN** 响应返回相应的已完成轮次，并返回 `agent_turn_running: false`
 
-#### Scenario: 任务终态保留最后快照
-- **WHEN** Agent 任务因成功、普通失败或轮次超限进入终态
-- **THEN** 任务详情仍返回终态前最后可确认的轮次数和最近活动时间，不因 OpenCode 进程退出或 SQLite 不可读而丢失已保存快照
-
-#### Scenario: 历史任务没有实时快照
-- **WHEN** 查询迁移前创建且没有执行器轮次快照的语境研究任务
-- **THEN** 系统可以从可用的 OpenCode 会话元数据提供兼容活跃度字段；无法可靠读取时省略字段，不虚构零轮
+#### Scenario: 分析程度终止后的公开状态
+- **WHEN** Agent 任务因为达到终止金额限额而停止
+- **THEN** 任务状态为 `failed`，详情返回 `agent_maximum_analysis_depth_exceeded` 和“超过最大分析程度”，且不向普通用户返回内部金额策略或最终观测金额
 
 #### Scenario: 非语境研究任务
 - **WHEN** 客户端查询缓存生成或其他不由 OpenCode Agent 执行的任务
 - **THEN** 响应不提供 Agent 活跃度摘要
 
-### Requirement: Agent 活跃度观测必须只读且可降级
+### Requirement: Agent 活跃度观测必须只读且可省略
 
-系统 MUST 以任务执行器产生并持久化的轮次快照作为新任务的主要活跃度来源。读取任务状态时 MUST NOT 为了新任务的实时轮次继续轮询或写入 OpenCode SQLite；OpenCode SQLite 仅可用于 session 持久化、恢复和没有实时快照的历史任务兼容诊断。无论执行器快照或兼容数据库是否不存在、繁忙、不可读、schema 不兼容或找不到任务 session，系统 MUST 继续返回正常任务状态，并省略无法确认的活跃度字段。活跃度观测失败 MUST NOT 改变任务执行、轮次限制或任务终态。
-
-#### Scenario: 新任务使用持久快照
-- **WHEN** 客户端查询正在运行的新任务，且 PostgreSQL 中存在最近的执行器轮次快照
-- **THEN** 任务状态直接返回该快照，不访问 OpenCode SQLite 计算当前轮次
-
-#### Scenario: 历史兼容数据库不可用
-- **WHEN** 客户端查询没有执行器快照的历史任务，且其 OpenCode 会话数据库不存在、被锁定或 schema 不兼容
-- **THEN** 任务状态仍成功返回现有任务字段，并省略 Agent 活跃度字段
+系统 MUST 仅从 Agent 运行时已有的会话元数据计算活跃度，不得返回推理文本、工具参数、原始日志、消息正文、分析金额或内部金额限额。会话数据库不存在、繁忙、不可读、schema 不兼容或找不到任务 session 时，系统 MUST 省略 Agent 活跃度字段，并继续返回正常任务状态；活跃度观测失败不得改变或中断任务执行。Executor 为执行分析程度终止而读取累计金额属于独立的执行控制，该读取失败不得转换成普通活跃度字段缺失。
 
 #### Scenario: OpenCode 会话数据库不可用
-- **WHEN** 客户端查询没有执行器快照的历史任务，且 OpenCode 会话数据库不存在、被锁定或无法按预期 schema 查询
-- **THEN** 任务状态仍成功返回现有任务字段，并省略 Agent 活跃度字段
+- **WHEN** 客户端查询任务时 OpenCode 会话数据库不存在、被锁定或无法按预期 schema 查询
+- **THEN** 任务状态接口仍成功返回现有任务字段，且省略 Agent 活跃度字段
 
 #### Scenario: 历史任务没有对应 session
-- **WHEN** 客户端查询一个没有执行器快照且没有对应 OpenCode session 的语境研究任务
-- **THEN** 任务状态正常返回任务信息，且不虚构零轮或最近活动时间
+- **WHEN** 客户端查询一个没有对应 OpenCode session 的语境研究任务
+- **THEN** 任务状态接口正常返回任务信息，且不提供无法确认的轮次或最近活跃时间
 
 #### Scenario: 查询任务列表
 - **WHEN** 客户端查询包含多个语境研究任务的任务列表
-- **THEN** 系统使用持久快照批量装配活动字段，并仅对缺少快照的历史任务执行有界兼容读取
+- **THEN** 系统以有界的批量读取装配每个可匹配任务的活跃度，不因任务数量逐任务建立独立观测流程
 
-#### Scenario: 活跃度观测失败不改变硬限制
-- **WHEN** 页面查询活跃度时发生读取错误
-- **THEN** 该错误不改变已经冻结的轮次策略，也不阻止或延后执行器对轮次上限的处理
+#### Scenario: 活跃度观测失败不改变分析程度终止
+- **WHEN** 页面读取轮次或最近活动时间失败，但 Executor 已确认累计金额达到终止金额限额
+- **THEN** Executor 仍终止任务，公开状态仍为“超过最大分析程度”
+
+#### Scenario: 执行控制用量读取失败
+- **WHEN** Executor 无法读取执行终止判断所需的当前 session 累计金额
+- **THEN** 任务进入 `failed`，记录稳定错误 `agent_analysis_usage_unavailable` 和明确失败阶段，不把该故障转换成活跃度字段缺失或无限分析程度

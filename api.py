@@ -537,6 +537,21 @@ def _collection_package_error(exc: CollectionPackageError) -> HTTPException:
     return _collection_package_error_http(exc, error=_error)
 
 
+def _consume_analysis_observation(runner: object, task_id: str, payload: dict[str, Any], *, executor_attempt_id: str | None = None) -> None:
+    """按当前 executor attempt 读取一次分析摘要，只复制允许持久化的固定字段。"""
+    observation_reader = getattr(runner, "analysis_observation_for", None)
+    if not callable(observation_reader):
+        return
+    observation = observation_reader(task_id, executor_attempt_id)
+    if not isinstance(observation, Mapping):
+        return
+    payload["_observed_cost"] = observation.get("observed_cost")
+    payload["_usage_checked_at"] = observation.get("usage_checked_at")
+    payload["_reminder_sent"] = observation.get("reminder_sent") is True
+    if isinstance(observation.get("process_reaped"), bool):
+        payload["_process_reaped"] = observation["process_reaped"]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """初始化一次服务依赖，并在关闭时终止未完成任务。"""
@@ -827,17 +842,28 @@ async def lifespan(app: FastAPI):
                 )
             except WorkspaceResolutionError as exc:
                 raise OpenCodeError(exc.code, str(exc)) from exc
-            candidate, session_id = app.state.opencode.run(
-                agent_image,
-                progress,
-                task_id=claim_task_id,
-                reverse_image_policy=str(payload.get("reverse_image_policy") or "forbid"),
-                callback_token=callback_token,
-                resume_session_id=payload.get("_resume_session_id") if isinstance(payload.get("_resume_session_id"), str) else None,
-                resume_of_attempt_id=payload.get("_resume_of_attempt_id") if isinstance(payload.get("_resume_of_attempt_id"), str) else None,
-                processing_config_hash=config_hash,
-                workspace_context=workspace_context,
-            )
+            try:
+                candidate, session_id = app.state.opencode.run(
+                    agent_image,
+                    progress,
+                    task_id=claim_task_id,
+                    reverse_image_policy=str(payload.get("reverse_image_policy") or "forbid"),
+                    callback_token=callback_token,
+                    resume_session_id=payload.get("_resume_session_id") if isinstance(payload.get("_resume_session_id"), str) else None,
+                    resume_of_attempt_id=payload.get("_resume_of_attempt_id") if isinstance(payload.get("_resume_of_attempt_id"), str) else None,
+                    processing_config_hash=config_hash,
+                    workspace_context=workspace_context,
+                    analysis_policy=payload.get("analysis_policy") if isinstance(payload.get("analysis_policy"), dict) else None,
+                )
+            finally:
+                attempt_reader = getattr(app.state.opencode, "executor_attempt_id_for", None)
+                current_attempt_id = attempt_reader(claim_task_id) if callable(attempt_reader) else None
+                _consume_analysis_observation(
+                    app.state.opencode,
+                    claim_task_id,
+                    payload,
+                    executor_attempt_id=current_attempt_id if isinstance(current_attempt_id, str) else None,
+                )
         except OpenCodeError as exc:
             # 续跑候选已由 Worker 按持久 session、scope、输入摘要和配置 hash
             # 校验；executor 的 HTTP/连接错误可能没有重复回传 session，此时沿用
@@ -874,6 +900,15 @@ async def lifespan(app: FastAPI):
                 payload["_resume_session_id"] = failure_session_id
             if getattr(exc, "executor_attempt_id", None):
                 payload["_executor_attempt_id"] = exc.executor_attempt_id
+            for field in ("observed_cost", "usage_checked_at", "termination_reason", "termination_signal"):
+                value = getattr(exc, field, None)
+                if isinstance(value, str):
+                    payload[f"_{field}"] = value
+            if getattr(exc, "reminder_sent", False) is True:
+                payload["_reminder_sent"] = True
+            process_reaped = getattr(exc, "process_reaped", None)
+            if isinstance(process_reaped, bool):
+                payload["_process_reaped"] = process_reaped
             selector_reader = getattr(app.state.opencode, "workspace_for_task", None)
             if callable(selector_reader):
                 selector = selector_reader(claim_task_id)
@@ -896,6 +931,7 @@ async def lifespan(app: FastAPI):
                         workspace_selector=payload.get("_workspace_selector") if isinstance(payload.get("_workspace_selector"), str) else None,
                         resume_available=decision.available,
                         resume_reason=decision.reason,
+                        process_reaped=process_reaped,
                     )
                     if recorded is False:
                         raise RuntimeError("unknown_execution: Agent attempt 事实未能通过 claim fencing 保存")
@@ -934,6 +970,7 @@ async def lifespan(app: FastAPI):
                     executor_attempt_id=executor_attempt_id,
                     workspace_selector=payload.get("_workspace_selector") if isinstance(payload.get("_workspace_selector"), str) else None,
                     resume_available=False,
+                    process_reaped=payload.get("_process_reaped") if isinstance(payload.get("_process_reaped"), bool) else True,
                 )
                 if recorded is False:
                     raise RuntimeError("unknown_execution: Agent attempt 事实未能通过 claim fencing 保存")

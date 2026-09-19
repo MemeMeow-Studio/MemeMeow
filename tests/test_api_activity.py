@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-from api import _task_summary, get_task, list_tasks
+from api import _consume_analysis_observation, _task_summary, get_task, list_tasks
 from backend.opencode_activity import AgentActivity, OpenCodeActivityReader
 from backend.tasks import TaskRecord
 
@@ -42,6 +42,40 @@ class FakeTasks:
     def get(self, task_id: str):
         """按任务 ID 返回固定详情。"""
         return next((record for record in self.records if record.task_id == task_id), None)
+
+
+def test_consume_analysis_observation_copies_fixed_fields_once() -> None:
+    """Worker 在调用结束后取走有限摘要，不把未知诊断放入持久化 payload。"""
+
+    class Runner:
+        """返回一次摘要并记录读取次数。"""
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def analysis_observation_for(self, task_id: str, executor_attempt_id: str | None = None):
+            """模拟读取后清理的 Runner 接口。"""
+            self.calls.append(task_id)
+            assert executor_attempt_id == "attempt-analysis"
+            return {
+                "observed_cost": "0.12",
+                "usage_checked_at": "2026-09-19T08:00:00+00:00",
+                "reminder_sent": True,
+                "process_reaped": True,
+                "private_extra": "discarded",
+            }
+
+    runner = Runner()
+    payload: dict[str, object] = {}
+    _consume_analysis_observation(runner, "analysis-task", payload, executor_attempt_id="attempt-analysis")
+
+    assert runner.calls == ["analysis-task"]
+    assert payload == {
+        "_observed_cost": "0.12",
+        "_usage_checked_at": "2026-09-19T08:00:00+00:00",
+        "_reminder_sent": True,
+        "_process_reaped": True,
+    }
 
 
 def _request(records: list[TaskRecord], reader: FakeActivityReader):

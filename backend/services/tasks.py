@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import shutil
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -45,6 +46,7 @@ from backend.agent_resume import (
     within_total_timeout,
 )
 from backend.config import validate_agent_concurrency
+from executor.analysis_policy import AnalysisPolicyError, parse_analysis_policy
 from executor.agent_limits import validate_agent_concurrency_at_most
 from backend.image_stage_plan import IMAGE_PROCESSING_MAX_ATTEMPTS, image_task_requires_single_attempt
 from backend.operation_policy import GrantAssociation, GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations, require_allowed
@@ -80,6 +82,59 @@ def _iso(value: datetime | str | None) -> str:
     if value is None:
         return datetime.now(timezone.utc).isoformat()
     return value.isoformat() if isinstance(value, datetime) else str(value)
+
+
+_TERMINATION_REASONS = frozenset({"analysis_cost_limit", "unknown_execution", "timeout", "cancelled", "process_failed"})
+_TERMINATION_SIGNALS = frozenset({"SIGTERM", "SIGKILL"})
+_TERMINATION_REASON_BY_ERROR = {
+    "agent_maximum_analysis_depth_exceeded": "analysis_cost_limit",
+    "unknown_execution": "unknown_execution",
+    "agent_timeout": "timeout",
+    "task_interrupted": "cancelled",
+}
+
+
+def _payload_datetime(value: object) -> datetime | None:
+    """解析 Executor 返回的 UTC 检查时间；无效输入由调用方拒绝写回。"""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("agent_analysis_usage_checked_at_invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("agent_analysis_usage_checked_at_invalid") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("agent_analysis_usage_checked_at_invalid")
+    return parsed
+
+
+def _payload_cost(value: object) -> Decimal | None:
+    """解析 Executor 金额摘要，拒绝布尔值、负数和非有限值。"""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+        raise ValueError("agent_analysis_observed_cost_invalid")
+    try:
+        amount = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise ValueError("agent_analysis_observed_cost_invalid") from exc
+    if not amount.is_finite() or amount < 0:
+        raise ValueError("agent_analysis_observed_cost_invalid")
+    return amount
+
+
+def _termination_summary(payload: Mapping[str, object], error: Mapping[str, object] | None) -> tuple[str | None, str | None]:
+    """生成受保护终止摘要；显式字段必须属于固定枚举。"""
+    raw_reason = payload.get("_termination_reason")
+    if raw_reason is not None and raw_reason not in _TERMINATION_REASONS:
+        raise ValueError("agent_analysis_termination_reason_invalid")
+    raw_signal = payload.get("_termination_signal")
+    if raw_signal is not None and raw_signal not in _TERMINATION_SIGNALS:
+        raise ValueError("agent_analysis_termination_signal_invalid")
+    error_code = error.get("error") if error is not None else None
+    reason = raw_reason or (_TERMINATION_REASON_BY_ERROR.get(error_code, "process_failed") if isinstance(error_code, str) else None)
+    return reason if isinstance(reason, str) else None, raw_signal if isinstance(raw_signal, str) else None
 
 class PostgresTaskService:
     """使用指定 scope 记录、去重、租约和 claim fencing 的任务执行器。
@@ -439,6 +494,21 @@ class PostgresTaskService:
             payload,
             raw_snapshot if isinstance(raw_snapshot, Mapping) else None,
         )
+        incoming_policy: dict[str, object] | None = None
+        raw_policy = payload.get("analysis_policy")
+        if raw_policy is not None:
+            if not isinstance(raw_policy, dict):
+                return
+            try:
+                incoming_policy = parse_analysis_policy(raw_policy).model_dump(mode="json")
+            except AnalysisPolicyError:
+                return
+        try:
+            observed_cost = _payload_cost(payload.get("_observed_cost"))
+            usage_checked_at = _payload_datetime(payload.get("_usage_checked_at"))
+            termination_reason, termination_signal = _termination_summary(payload, None)
+        except ValueError:
+            return
         now = utcnow()
         raw_selector = payload.get("_workspace_selector")
         if raw_selector is not None and (
@@ -458,7 +528,7 @@ class PostgresTaskService:
                     Task.claim_generation == claim.claim_generation,
                     Task.lease_owner == self.owner,
                     Task.lease_expires_at > now,
-                )
+                ).with_for_update()
             )
             if current_task is None:
                 return
@@ -469,6 +539,23 @@ class PostgresTaskService:
                     ImageProcessingAttempt.attempt == claim.attempt_count,
                 ).with_for_update()
             )
+            if row is not None:
+                # 绑定事实必须在状态写入前完成检查，策略冲突不能提交新的运行状态。
+                if row.claim_generation != claim.claim_generation:
+                    return
+                if isinstance(raw_selector, str) and row.workspace_selector is not None and row.workspace_selector != raw_selector:
+                    return
+            if incoming_policy is not None:
+                for record in (row, current_task):
+                    stored_policy_value = getattr(record, "analysis_policy", None) if record is not None else None
+                    if stored_policy_value is None:
+                        continue
+                    try:
+                        stored_policy = parse_analysis_policy(stored_policy_value).model_dump(mode="json")
+                    except AnalysisPolicyError:
+                        return
+                    if stored_policy != incoming_policy:
+                        return
             if row is None:
                 row = ImageProcessingAttempt(
                     scope_id=self.scope.scope_id,
@@ -486,6 +573,12 @@ class PostgresTaskService:
                     input_digest=input_digest,
                     target_sha256=target_sha.lower(),
                     claim_generation=claim.claim_generation,
+                    analysis_policy=incoming_policy,
+                    observed_cost=observed_cost,
+                    usage_checked_at=usage_checked_at,
+                    reminder_sent=payload.get("_reminder_sent") is True,
+                    termination_reason=termination_reason,
+                    termination_signal=termination_signal,
                     visual_snapshot_sha256=(str(snapshot_summary["snapshot_sha256"]) if snapshot_summary is not None else payload.get("_visual_snapshot_sha256") if isinstance(payload.get("_visual_snapshot_sha256"), str) else None),
                     visual_snapshot_protocol_version=(int(snapshot_summary["protocol_version"]) if snapshot_summary is not None else payload.get("_visual_snapshot_protocol_version") if isinstance(payload.get("_visual_snapshot_protocol_version"), int) and not isinstance(payload.get("_visual_snapshot_protocol_version"), bool) else None),
                     visual_snapshot_matched_at=(datetime.fromisoformat(str(snapshot_summary["matched_at"]).replace("Z", "+00:00")) if snapshot_summary is not None else payload.get("_visual_snapshot_matched_at") if isinstance(payload.get("_visual_snapshot_matched_at"), datetime) else None),
@@ -494,10 +587,6 @@ class PostgresTaskService:
                 session.add(row)
             else:
                 # 旧 Worker 不能把新 claim 的 attempt 状态覆盖回去。
-                if row.claim_generation != claim.claim_generation:
-                    return
-                if isinstance(raw_selector, str) and row.workspace_selector is not None and row.workspace_selector != raw_selector:
-                    return
                 row.state = state
                 row.updated_at = now
                 if normalize_identifier(payload.get("_resume_session_id"), kind="session"):
@@ -506,6 +595,19 @@ class PostgresTaskService:
                     row.executor_attempt_id = str(payload["_executor_attempt_id"])
                 if isinstance(payload.get("_workspace_selector"), str) and SELECTOR_RE.fullmatch(str(payload["_workspace_selector"])):
                     row.workspace_selector = str(payload["_workspace_selector"])
+                if incoming_policy is not None:
+                    if row.analysis_policy is None:
+                        row.analysis_policy = incoming_policy
+                if observed_cost is not None:
+                    row.observed_cost = observed_cost
+                if usage_checked_at is not None:
+                    row.usage_checked_at = usage_checked_at
+                if payload.get("_reminder_sent") is True:
+                    row.reminder_sent = True
+                if termination_reason is not None:
+                    row.termination_reason = termination_reason
+                if termination_signal is not None:
+                    row.termination_signal = termination_signal
                 # 迁移前任务首次写 attempt 时可能尚无配置 hash；snapshot
                 # 前置器随后会在同一 claim 补齐该字段，恢复事实必须同步更新。
                 if getattr(row, "processing_config_hash", None) is None and payload.get("processing_config_hash") is not None:
@@ -530,6 +632,19 @@ class PostgresTaskService:
                         row.visual_snapshot_matched_at = payload["_visual_snapshot_matched_at"]
                     if isinstance(payload.get("_visual_snapshot_candidate_count"), int) and not isinstance(payload.get("_visual_snapshot_candidate_count"), bool):
                         row.visual_snapshot_candidate_count = payload["_visual_snapshot_candidate_count"]
+            if incoming_policy is not None:
+                if current_task.analysis_policy is None:
+                    current_task.analysis_policy = incoming_policy
+            if observed_cost is not None:
+                current_task.observed_cost = observed_cost
+            if usage_checked_at is not None:
+                current_task.usage_checked_at = usage_checked_at
+            if payload.get("_reminder_sent") is True:
+                current_task.reminder_sent = True
+            if termination_reason is not None:
+                current_task.termination_reason = termination_reason
+            if termination_signal is not None:
+                current_task.termination_signal = termination_signal
             session.commit()
 
     def record_agent_attempt(
@@ -542,13 +657,16 @@ class PostgresTaskService:
         workspace_selector: str | None = None,
         resume_available: bool = False,
         resume_reason: str | None = None,
+        process_reaped: bool | None = None,
     ) -> bool:
-        """在当前 claim fencing 下持久化 Agent session、executor attempt 和失败历史。"""
+        """在当前 claim fencing 下持久化 Agent attempt、用量摘要和失败历史。"""
         task_id = payload.get("_claim_task_id")
         generation = payload.get("_claim_generation")
         owner = payload.get("_claim_owner")
         attempt = payload.get("_claim_attempt")
         if not isinstance(task_id, str) or not isinstance(generation, int) or not isinstance(owner, str) or not isinstance(attempt, int):
+            return False
+        if process_reaped is not None and not isinstance(process_reaped, bool):
             return False
         safe_session = normalize_identifier(session_id, kind="session")
         safe_executor_attempt = normalize_identifier(executor_attempt_id, kind="attempt")
@@ -566,9 +684,24 @@ class PostgresTaskService:
         payload_config_hash = normalize_config_hash(payload.get("processing_config_hash"))
         if payload.get("processing_config_hash") is not None and payload_config_hash is None:
             return False
-        now = utcnow()
         # 原因码只保存在内部 attempt 记录；公开任务 DTO 默认会丢弃该附加字段。
         safe_error = sanitize_error(error, include_reason_code=True) if error else None
+        incoming_policy: dict[str, object] | None = None
+        raw_policy = payload.get("analysis_policy")
+        if raw_policy is not None:
+            if not isinstance(raw_policy, dict):
+                return False
+            try:
+                incoming_policy = parse_analysis_policy(raw_policy).model_dump(mode="json")
+            except AnalysisPolicyError:
+                return False
+        try:
+            observed_cost = _payload_cost(payload.get("_observed_cost"))
+            usage_checked_at = _payload_datetime(payload.get("_usage_checked_at"))
+            termination_reason, termination_signal = _termination_summary(payload, safe_error)
+        except ValueError:
+            return False
+        now = utcnow()
         with self.resources.environment(self.scope.scope_id) as environment:
             session = environment.uow.session
             task = session.scalar(
@@ -612,6 +745,18 @@ class PostgresTaskService:
             if safe_workspace_selector is not None and task.workspace_selector is not None and task.workspace_selector != safe_workspace_selector:
                 session.commit()
                 return False
+            if incoming_policy is not None:
+                for record in (row, task):
+                    if record.analysis_policy is None:
+                        continue
+                    try:
+                        stored_policy = parse_analysis_policy(record.analysis_policy).model_dump(mode="json")
+                    except AnalysisPolicyError:
+                        session.commit()
+                        return False
+                    if stored_policy != incoming_policy:
+                        session.commit()
+                        return False
             if safe_session:
                 row.session_id = safe_session
                 task.resume_session_id = safe_session
@@ -624,6 +769,27 @@ class PostgresTaskService:
             if safe_error:
                 row.error = safe_error
                 row.resume_reason = resume_reason or safe_error.get("error")
+            if process_reaped is not None:
+                row.process_reaped = process_reaped
+            if incoming_policy is not None:
+                for record in (row, task):
+                    if record.analysis_policy is None:
+                        record.analysis_policy = incoming_policy
+            if observed_cost is not None:
+                row.observed_cost = observed_cost
+                task.observed_cost = observed_cost
+            if usage_checked_at is not None:
+                row.usage_checked_at = usage_checked_at
+                task.usage_checked_at = usage_checked_at
+            if payload.get("_reminder_sent") is True:
+                row.reminder_sent = True
+                task.reminder_sent = True
+            if termination_reason is not None:
+                row.termination_reason = termination_reason
+                task.termination_reason = termination_reason
+            if termination_signal is not None:
+                row.termination_signal = termination_signal
+                task.termination_signal = termination_signal
             row.resume_available = bool(resume_available and safe_session and safe_executor_attempt)
             row.state = "failed" if safe_error else "completed"
             row.updated_at = now

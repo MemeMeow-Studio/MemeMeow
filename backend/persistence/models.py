@@ -680,6 +680,7 @@ class ImageProcessingAttempt(Base):
     reminder_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     termination_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     termination_signal: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    process_reaped: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     resume_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     resume_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)

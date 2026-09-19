@@ -191,13 +191,21 @@ _GENERIC_PATH_PATTERN = re.compile(r"(?<![A-Za-z0-9:/])/(?:[^\s,;:'\"()\[\]{}]+/
 
 
 class _ProcessFailure(RuntimeError):
-    """保存 OpenCode 进程失败的稳定错误码和可选 HTTP 状态。"""
+    """保存 OpenCode 进程失败的稳定错误码和受保护诊断。"""
 
-    def __init__(self, code: str, message: str, *, http_status: int | None = None):
-        """初始化进程失败；message 只允许作为有限诊断返回。"""
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        http_status: int | None = None,
+        analysis_diagnostic: dict[str, object] | None = None,
+    ):
+        """初始化进程失败；诊断只在受信 Executor 调用链中传递。"""
         super().__init__(message)
         self.code = code
         self.http_status = http_status
+        self.analysis_diagnostic = analysis_diagnostic
 
 
 class _ResultFileValidationFailure(RuntimeError):
@@ -1479,6 +1487,8 @@ class Executor:
                     "error": code,
                     "message": _redact_diagnostic(exc.args[0], (self.legacy_api_key, self.token, task.callback_token or "")),
                 }
+                if exc.analysis_diagnostic is not None:
+                    error["analysis_diagnostic"] = exc.analysis_diagnostic
                 if exc.http_status is not None:
                     error["http_status"] = exc.http_status
                 task.error = error
@@ -1548,7 +1558,21 @@ class Executor:
         except (AnalysisControlError, RuntimeError) as exc:
             code = exc.code if isinstance(exc, AnalysisControlError) else "agent_analysis_usage_unavailable"
             reason = exc.reason if isinstance(exc, AnalysisControlError) else str(exc)
-            reaped = self.process_supervisor.terminate(process).reaped
+            termination = self.process_supervisor.terminate(process)
+            reaped = termination.reaped
+            signal_name = "already_exited"
+            if termination.returncode in {-15, 143}:
+                signal_name = "SIGTERM"
+            elif termination.returncode in {-9, 137}:
+                signal_name = "SIGKILL"
+            diagnostic = {
+                "threshold_cost": str(monitor.policy.get("termination_cost")),
+                "final_observed_cost": str(monitor.observed_cost),
+                "check_stage": "analysis_monitor",
+                "termination_signal": signal_name,
+                "process_reaped": reaped,
+                "trigger_reason": reason,
+            }
             with self.lock:
                 task.process_reaped = reaped
             logger.bind(
@@ -1561,7 +1585,7 @@ class Executor:
             )
             public_code = code if reaped else "unknown_execution"
             message = "超过最大分析程度" if public_code == "agent_maximum_analysis_depth_exceeded" else f"{code}:{reason}" if reaped else f"进程回收未确认；触发原因={code}；阶段={reason}"
-            raise _ProcessFailure(public_code, message) from exc
+            raise _ProcessFailure(public_code, message, analysis_diagnostic=diagnostic) from exc
         finally:
             with self.lock:
                 task.observed_cost = str(monitor.observed_cost)

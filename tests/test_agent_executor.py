@@ -315,6 +315,89 @@ def test_executor_client_waits_for_nonterminal_sync_response(monkeypatch: pytest
     assert calls == [("POST", "/v1/tasks"), ("GET", "/v1/tasks/queued-task"), ("GET", "/v1/tasks/queued-task")]
 
 
+def test_executor_client_timeout_keeps_cancel_diagnostics() -> None:
+    """等待超时后的取消响应必须保留最终金额、检查时间、提醒和终止信号。"""
+    client = AgentExecutorClient("http://agent:8277", "executor-token", timeout=2)
+    pending = ExecutorTaskResponse(
+        "timeout-task",
+        "running",
+        "session-before-cancel",
+        None,
+        None,
+        executor_attempt_id="attempt-timeout",
+        observed_cost="0.11",
+        usage_checked_at="2026-09-19T07:59:00+00:00",
+    )
+    cancelled = ExecutorTaskResponse(
+        "attempt-timeout",
+        "cancelled",
+        "session-after-cancel",
+        {"error": "task_interrupted"},
+        None,
+        executor_attempt_id="attempt-timeout",
+        process_reaped=True,
+        observed_cost="0.37",
+        usage_checked_at="2026-09-19T08:00:00+00:00",
+        reminder_sent=True,
+        termination_signal="SIGTERM",
+    )
+    failure = client._timeout_error(pending, cancelled, None)
+
+    assert failure.code == "agent_timeout"
+    assert failure.executor_attempt_id == "attempt-timeout"
+    assert failure.session_id == "session-after-cancel"
+    assert failure.process_reaped is True
+    assert failure.observed_cost == "0.37"
+    assert failure.usage_checked_at == "2026-09-19T08:00:00+00:00"
+    assert failure.reminder_sent is True
+    assert failure.termination_signal == "SIGTERM"
+
+
+def test_executor_client_preserves_analysis_termination_diagnostic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """受信客户端提取固定终止诊断，同时丢弃嵌套对象中的其它字段。"""
+    client = AgentExecutorClient("http://agent:8277", "executor-token", timeout=2)
+
+    def request(method: str, path: str, payload=None, *, timeout=None):
+        """返回达到分析金额边界后的真实协议形状。"""
+        del method, path, timeout
+        attempt_id = str((payload or {})["executor_attempt_id"])
+        return 200, {
+            "task_id": "analysis-limit-task",
+            "business_task_id": "analysis-limit-task",
+            "executor_attempt_id": attempt_id,
+            "status": "failed",
+            "process_reaped": True,
+            "observed_cost": "0.31",
+            "usage_checked_at": "2026-09-19T08:00:00+00:00",
+            "reminder_sent": True,
+            "error": {
+                "error": "agent_maximum_analysis_depth_exceeded",
+                "message": "超过最大分析程度",
+                "analysis_diagnostic": {
+                    "termination_signal": "SIGTERM",
+                    "private_extra": "discarded",
+                },
+            },
+        }
+
+    monkeypatch.setattr(client, "_request", request)
+    with pytest.raises(AgentExecutorError) as failure:
+        client.run(
+            task_id="analysis-limit-task",
+            image_relative_path="sample.png",
+            reverse_image_policy="forbid",
+            timeout_seconds=5,
+        )
+
+    assert failure.value.code == "agent_maximum_analysis_depth_exceeded"
+    assert failure.value.process_reaped is True
+    assert failure.value.observed_cost == "0.31"
+    assert failure.value.usage_checked_at == "2026-09-19T08:00:00+00:00"
+    assert failure.value.reminder_sent is True
+    assert failure.value.termination_reason == "analysis_cost_limit"
+    assert failure.value.termination_signal == "SIGTERM"
+
+
 def test_executor_client_forwards_resume_source_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
     """续跑请求必须把上一条 executor attempt 作为明确绑定传给 executor。"""
     client = AgentExecutorClient("http://agent:8277", "executor-token", timeout=2)
@@ -748,13 +831,31 @@ def test_runner_executor_mode_uses_http_without_docker_cli(tmp_path: Path, monke
         result_dir = runner.runtime_root / "task-results" / kwargs["task_id"]
         result_dir.mkdir(parents=True, exist_ok=True)
         (result_dir / "result.json.tmp").write_text(json.dumps(_candidate(), ensure_ascii=False), encoding="utf-8")
-        return ExecutorTaskResponse(kwargs["task_id"], "succeeded", "session-http", None, "task-results/result.json.tmp")
+        return ExecutorTaskResponse(
+            kwargs["task_id"],
+            "succeeded",
+            "session-http",
+            None,
+            "task-results/result.json.tmp",
+            process_reaped=True,
+            observed_cost="0.12",
+            usage_checked_at="2026-09-19T08:00:00+00:00",
+            reminder_sent=True,
+        )
 
     monkeypatch.setattr(runner.executor, "run", run_http)
     monkeypatch.setattr(executor_server.subprocess, "Popen", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Compose runner must not start local subprocess")))
     result, session = runner.run(image, lambda *_args: None, task_id="http-task")
     assert result["title"] == "executor 测试"
     assert session == "session-http"
+    attempt_id = runner.executor_attempt_id_for("http-task")
+    assert runner.analysis_observation_for("http-task", attempt_id) == {
+        "observed_cost": "0.12",
+        "usage_checked_at": "2026-09-19T08:00:00+00:00",
+        "reminder_sent": True,
+        "process_reaped": True,
+    }
+    assert runner.analysis_observation_for("http-task", attempt_id) is None
 
 
 def test_runner_executor_mode_rejects_success_without_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

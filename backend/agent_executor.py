@@ -25,17 +25,47 @@ from executor.analysis_policy import parse_analysis_policy
 class AgentExecutorError(RuntimeError):
     """executor 请求失败，携带稳定错误码和安全诊断。"""
 
-    def __init__(self, code: str, message: str | None = None, *, session_id: str | None = None, executor_attempt_id: str | None = None, http_status: int | None = None, reason_code: str | None = None):
+    def __init__(
+        self,
+        code: str,
+        message: str | None = None,
+        *,
+        session_id: str | None = None,
+        executor_attempt_id: str | None = None,
+        http_status: int | None = None,
+        reason_code: str | None = None,
+        process_reaped: bool | None = None,
+        observed_cost: str | None = None,
+        usage_checked_at: str | None = None,
+        reminder_sent: bool = False,
+        termination_reason: str | None = None,
+        termination_signal: str | None = None,
+    ):
+        """保存经过协议校验的 attempt 终态，供受信持久化调用链使用。"""
         super().__init__(message or code)
         self.code = code
         self.session_id = session_id
         self.executor_attempt_id = executor_attempt_id
         self.http_status = http_status
         self.reason_code = reason_code if isinstance(reason_code, str) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,127}", reason_code) else None
+        self.process_reaped = process_reaped if isinstance(process_reaped, bool) else None
+        self.observed_cost = observed_cost if isinstance(observed_cost, str) else None
+        self.usage_checked_at = usage_checked_at if isinstance(usage_checked_at, str) else None
+        self.reminder_sent = bool(reminder_sent)
+        self.termination_reason = termination_reason if termination_reason in _TERMINATION_REASONS else None
+        self.termination_signal = termination_signal if termination_signal in _TERMINATION_SIGNALS else None
 
 
 _PENDING_STATUSES = frozenset({"queued", "running"})
 _ATTEMPT_HISTORY_LIMIT = 5000
+_TERMINATION_REASONS = frozenset({"analysis_cost_limit", "unknown_execution", "timeout", "cancelled", "process_failed"})
+_TERMINATION_SIGNALS = frozenset({"SIGTERM", "SIGKILL"})
+_TERMINATION_REASON_BY_ERROR = {
+    "agent_maximum_analysis_depth_exceeded": "analysis_cost_limit",
+    "unknown_execution": "unknown_execution",
+    "agent_timeout": "timeout",
+    "task_interrupted": "cancelled",
+}
 _KNOWN_TASK_ERRORS = frozenset(
     {
         "agent_analysis_policy_missing",
@@ -104,9 +134,12 @@ class ExecutorTaskResponse:
     result_path: str | None
     executor_attempt_id: str | None = None
     business_task_id: str | None = None
+    process_reaped: bool | None = None
     observed_cost: str | None = None
     usage_checked_at: str | None = None
     reminder_sent: bool = False
+    termination_reason: str | None = None
+    termination_signal: str | None = None
 
 
 class AgentExecutorClient:
@@ -188,17 +221,28 @@ class AgentExecutorClient:
         error = value.get("error")
         if not isinstance(error, dict):
             error = None
+        error_code = error.get("error") if error is not None else None
+        diagnostic = error.get("analysis_diagnostic") if error is not None else None
+        termination_signal = diagnostic.get("termination_signal") if isinstance(diagnostic, dict) else None
+        safe_error = {
+            str(key): str(item)
+            for key, item in error.items()
+            if isinstance(item, (str, int, float, bool))
+        } if error else None
         return ExecutorTaskResponse(
             task_id=task_id,
             status=status,
             session_id=value.get("session_id") if isinstance(value.get("session_id"), str) else None,
-            error={str(key): str(item) for key, item in error.items()} if error else None,
+            error=safe_error,
             result_path=value.get("result_path") if isinstance(value.get("result_path"), str) else None,
             executor_attempt_id=value.get("executor_attempt_id") if isinstance(value.get("executor_attempt_id"), str) else None,
             business_task_id=value.get("business_task_id") if isinstance(value.get("business_task_id"), str) else None,
+            process_reaped=value.get("process_reaped") if isinstance(value.get("process_reaped"), bool) else None,
             observed_cost=value.get("observed_cost") if isinstance(value.get("observed_cost"), str) else None,
             usage_checked_at=value.get("usage_checked_at") if isinstance(value.get("usage_checked_at"), str) else None,
             reminder_sent=value.get("reminder_sent") is True,
+            termination_reason=_TERMINATION_REASON_BY_ERROR.get(error_code, "process_failed") if isinstance(error_code, str) else None,
+            termination_signal=termination_signal if termination_signal in _TERMINATION_SIGNALS else None,
         )
 
     @staticmethod
@@ -227,6 +271,42 @@ class AgentExecutorClient:
         code = (response.error or {}).get("error")
         return code if code in _KNOWN_TASK_ERRORS else "agent_process_failed"
 
+    @staticmethod
+    def _timeout_error(
+        response: ExecutorTaskResponse,
+        cancelled_response: ExecutorTaskResponse | None,
+        cancellation_error: AgentExecutorError | None,
+    ) -> AgentExecutorError:
+        """合并轮询与取消诊断，生成等待超时的最终错误。"""
+        diagnostic_response = cancelled_response or response
+        process_reaped = diagnostic_response.process_reaped
+        observed_cost = diagnostic_response.observed_cost
+        usage_checked_at = diagnostic_response.usage_checked_at
+        reminder_sent = diagnostic_response.reminder_sent
+        termination_signal = diagnostic_response.termination_signal
+        session_id = diagnostic_response.session_id
+        attempt_id = diagnostic_response.executor_attempt_id
+        if cancellation_error is not None:
+            process_reaped = process_reaped if process_reaped is not None else cancellation_error.process_reaped
+            observed_cost = observed_cost or cancellation_error.observed_cost
+            usage_checked_at = usage_checked_at or cancellation_error.usage_checked_at
+            reminder_sent = reminder_sent or cancellation_error.reminder_sent
+            termination_signal = termination_signal or cancellation_error.termination_signal
+            session_id = session_id or cancellation_error.session_id
+            attempt_id = attempt_id or cancellation_error.executor_attempt_id
+        return AgentExecutorError(
+            "agent_timeout",
+            "Agent executor 等待任务终态超时",
+            session_id=session_id,
+            executor_attempt_id=attempt_id,
+            process_reaped=process_reaped,
+            observed_cost=observed_cost,
+            usage_checked_at=usage_checked_at,
+            reminder_sent=reminder_sent,
+            termination_reason="timeout",
+            termination_signal=termination_signal,
+        )
+
     def _wait_for_terminal(self, response: ExecutorTaskResponse, *, task_id: str, executor_task_id: str, timeout_seconds: int) -> ExecutorTaskResponse:
         """轮询同步提交的非终态响应，超时后只取消当前任务。"""
         deadline = time.monotonic() + max(5, int(timeout_seconds) + 10)
@@ -234,11 +314,13 @@ class AgentExecutorClient:
         while response.status in _PENDING_STATUSES:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                cancelled_response: ExecutorTaskResponse | None = None
+                cancellation_error: AgentExecutorError | None = None
                 try:
-                    self.cancel(executor_task_id)
-                except AgentExecutorError:
-                    pass
-                raise AgentExecutorError("agent_timeout", "Agent executor 等待任务终态超时")
+                    cancelled_response = self.cancel(executor_task_id)
+                except AgentExecutorError as exc:
+                    cancellation_error = exc
+                raise self._timeout_error(response, cancelled_response, cancellation_error)
             time.sleep(min(poll_delay, remaining))
             poll_delay = min(2.0, poll_delay * 1.5)
             try:
@@ -341,6 +423,12 @@ class AgentExecutorClient:
                 executor_attempt_id=exc.executor_attempt_id or attempt_id,
                 http_status=exc.http_status,
                 reason_code=exc.reason_code,
+                process_reaped=exc.process_reaped,
+                observed_cost=exc.observed_cost,
+                usage_checked_at=exc.usage_checked_at,
+                reminder_sent=exc.reminder_sent,
+                termination_reason=exc.termination_reason,
+                termination_signal=exc.termination_signal,
             ) from exc
         response = self._for_task(self._response(value), task_id)
         if response.executor_attempt_id and response.executor_attempt_id != attempt_id:
@@ -358,6 +446,12 @@ class AgentExecutorClient:
                 executor_attempt_id=exc.executor_attempt_id or response.executor_attempt_id or attempt_id,
                 http_status=exc.http_status,
                 reason_code=exc.reason_code,
+                process_reaped=exc.process_reaped,
+                observed_cost=exc.observed_cost or response.observed_cost,
+                usage_checked_at=exc.usage_checked_at or response.usage_checked_at,
+                reminder_sent=exc.reminder_sent or response.reminder_sent,
+                termination_reason=exc.termination_reason,
+                termination_signal=exc.termination_signal,
             ) from exc
         if response.status == "failed":
             code = self._failure_code(response)
@@ -371,9 +465,25 @@ class AgentExecutorClient:
                 executor_attempt_id=response.executor_attempt_id or attempt_id,
                 http_status=http_status,
                 reason_code=error.get("reason_code"),
+                process_reaped=response.process_reaped,
+                observed_cost=response.observed_cost,
+                usage_checked_at=response.usage_checked_at,
+                reminder_sent=response.reminder_sent,
+                termination_reason=response.termination_reason,
+                termination_signal=response.termination_signal,
             )
         if response.status == "cancelled":
-            raise AgentExecutorError("task_interrupted", "Agent 任务已取消", session_id=response.session_id, executor_attempt_id=response.executor_attempt_id or attempt_id)
+            raise AgentExecutorError(
+                "task_interrupted",
+                "Agent 任务已取消",
+                session_id=response.session_id,
+                executor_attempt_id=response.executor_attempt_id or attempt_id,
+                process_reaped=response.process_reaped,
+                observed_cost=response.observed_cost,
+                usage_checked_at=response.usage_checked_at,
+                reminder_sent=response.reminder_sent,
+                termination_reason="cancelled",
+            )
         if response.status != "succeeded":
             raise AgentExecutorError("agent_executor_invalid_response", "Agent executor 任务状态无效")
         return response
