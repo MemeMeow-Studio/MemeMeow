@@ -114,7 +114,10 @@ class AnalysisMonitor:
             raise AnalysisControlError("agent_analysis_reminder_plugin_unavailable", reason)
 
     def _read_socket_status(self) -> dict[str, object] | None:
-        """读取当前 OpenCode 主进程通过 Unix socket 发来的状态。"""
+        """读取 Executor 创建的状态 socket。
+
+        由 AnalysisMonitor.check 轮询调用；无可读连接时返回 None，收到合法状态时返回 JSON 对象。
+        """
 
         assert self.status_socket is not None
         self.status_socket.setblocking(False)
