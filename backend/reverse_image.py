@@ -43,6 +43,7 @@ from backend.callbacks import (
 )
 from backend.database import DatabaseError, DatabaseResources, ReverseImageUsageEvent, ScopeContext, Task, utcnow
 from backend.operation_policy import AllowAllOperationPolicy, GrantAssociation, GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations, require_allowed
+from backend.operation_diagnostics import OperationDiagnostics
 
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
@@ -769,6 +770,7 @@ class ReverseImageService:
     async def _settle_started_provider(
         self,
         request: ReverseImageRequest,
+        diagnostics: OperationDiagnostics | None = None,
     ) -> tuple[dict[str, Any] | None, BaseException | None, asyncio.CancelledError | None]:
         """Provider 开始后延迟请求取消，直到外部调用得到明确终态。"""
         task = asyncio.create_task(self._network_search_async(request))
@@ -780,6 +782,8 @@ class ReverseImageService:
                 # shield 保证请求取消不取消 Provider；重复取消只更新当前 Task 的
                 # 取消计数，仍继续等待外部副作用和同键缓存锁得到明确收束。
                 cancellation = cancellation or exc
+                if diagnostics is not None:
+                    diagnostics.cancelled()
             except BaseException:  # noqa: BLE001 - 统一在 task.result() 中读取真实终态。
                 break
         try:
@@ -872,6 +876,25 @@ class ReverseImageService:
 
     async def search_async(self, request: ReverseImageRequest) -> dict[str, object]:
         """异步执行检索，数据库短事务之外等待缓存锁和 Provider。"""
+        with OperationDiagnostics(
+            "reverse_image_completed", phase="validation", provider=self.provider_name,
+            provider_called=False, replay=False,
+        ) as diagnostics:
+            result = await self._search_async(request, diagnostics)
+            cache = result.get("cache", {})
+            provider = result.get("provider", {})
+            diagnostics.fields.update(
+                cache_status=cache.get("status"),
+                outcome=provider.get("outcome"),
+            )
+            if result.get("reason"):
+                diagnostics.fields.setdefault("error_code", result["reason"])
+            if diagnostics.fields.get("error_code") == "reverse_image_unknown_execution":
+                diagnostics.fields["outcome"] = "unknown_execution"
+            return result
+
+    async def _search_async(self, request: ReverseImageRequest, diagnostics: OperationDiagnostics) -> dict[str, object]:
+        """执行检索并在本地记录阶段；计时器不参与授权、缓存或计量判断。"""
         request = request.normalized()
         image_sha = hashlib.sha256(request.image).hexdigest()
         provider_identity = {
@@ -1005,21 +1028,26 @@ class ReverseImageService:
                 ):
                     raise ReverseImageError("usage_request_conflict", "请求标识已用于另一项检索", status_code=409)
                 if existing.completed_at is not None:
+                    diagnostics.phase("persist")
                     self._reconcile_callback_from_usage(environment, callback_row, existing)
-                    return self._event_output(existing)
+                    diagnostics.fields["replay"] = True
+                    return self._event_output(existing, diagnostics=diagnostics)
                 if binding is not None and (
                     existing.provider_called
                     or (callback_row is not None and callback_row.state in {"failed", "completed", "unknown_execution"})
                 ):
                     # provider 已开始，或 callback 已有不可与未完成 usage 证明一致的
                     # 终态时，只能返回稳定未知状态，不能重新 acquire 或联系 provider。
+                    diagnostics.phase("persist")
                     if callback_row is not None and callback_row.completed_at is None:
                         environment.callback_requests.finish(request_id, state="unknown_execution", error={"error": "reverse_image_unknown_execution"})
                     environment.uow.session.commit()
                     raise ReverseImageError("reverse_image_unknown_execution", "反向图片调用状态未知", status_code=503)
                 if callback_row is not None and existing.provider_called and callback_row.completed_at is None:
+                    diagnostics.phase("persist")
                     environment.callback_requests.finish(request_id, state="unknown_execution", error={"error": "reverse_image_unknown_execution"})
-                return self._event_output(existing)
+                diagnostics.fields["replay"] = True
+                return self._event_output(existing, diagnostics=diagnostics)
             policy = str((task.payload or {}).get("reverse_image_policy") or "forbid")
             if policy != "auto":
                 event = environment.reverse_image_usage.create(request_id=request_id, task_id=task.id, meme_id=(task.payload or {}).get("meme_id"), cache_key=key, cache_status="miss", **self._usage_binding(request))
@@ -1031,10 +1059,15 @@ class ReverseImageService:
                 raise ReverseImageError("reverse_image_forbidden", "当前任务禁止反向图片检索", status_code=403)
 
         timestamp = datetime.now(UTC)
+        diagnostics.phase("lock_wait")
         async with self.cache.lock_async(key):
+            diagnostics.phase("cache_read")
             record = self.cache.load(key)
             snapshot = _latest(record)
+            diagnostics.fields["cache_status"] = "refresh" if record else "miss"
             if not request.refresh and _reusable(snapshot, timestamp):
+                diagnostics.fields["cache_status"] = "hit"
+                diagnostics.phase("persist")
                 with self.resources.environment(self.scope.scope_id) as environment:
                     task = self._locked_auto_task(environment.tasks.get(request.task_id), request, scope_id=self.scope.scope_id)
                     event = environment.reverse_image_usage.create(request_id=request_id, task_id=request.task_id, meme_id=(task.payload or {}).get("meme_id"), cache_key=key, cache_status="hit", **self._usage_binding(request))
@@ -1046,25 +1079,29 @@ class ReverseImageService:
                     )
                     if binding is not None:
                         environment.callback_requests.finish(request_id, state="completed", result={"cache_status": "hit"})
-                    return self._event_output(event)
+                    return self._event_output(event, diagnostics=diagnostics)
+            diagnostics.phase("validation")
             with self.resources.environment(self.scope.scope_id) as environment:
                 task = self._locked_auto_task(environment.tasks.get(request.task_id), request, scope_id=self.scope.scope_id)
                 event = environment.reverse_image_usage.create(request_id=request_id, task_id=request.task_id, meme_id=(task.payload or {}).get("meme_id"), cache_key=key, cache_status="refresh" if record else "miss", provider=self.provider_name, **self._usage_binding(request))
                 if event.task_id != request.task_id or event.cache_key != key:
                     raise ReverseImageError("usage_request_conflict", "请求标识已用于另一项检索", status_code=409)
                 if event.completed_at is not None:
-                    return self._event_output(event)
+                    diagnostics.fields["replay"] = True
+                    return self._event_output(event, diagnostics=diagnostics)
                 if event.provider_called:
+                    diagnostics.fields["replay"] = True
                     # 进程可能在供应商调用后中断；未知结果只保留已计数状态，不自动重放付费请求。
                     if binding is not None:
                         environment.callback_requests.finish(request_id, state="unknown_execution", error={"error": "reverse_image_unknown_execution"})
-                    return self._event_output(event)
+                    return self._event_output(event, diagnostics=diagnostics)
                 if not self.available:
                     environment.reverse_image_usage.finish(request_id, outcome="failed", retryable=True, error={"error": "reverse_image_unavailable"})
                     if binding is not None:
                         environment.callback_requests.finish(request_id, state="failed", error={"error": "reverse_image_unavailable"})
                     environment.uow.session.commit()
                     raise ReverseImageError("reverse_image_unavailable", "反向图片服务尚未配置", retryable=True, status_code=503)
+                diagnostics.phase("quota")
                 operation_request = self.operation_policy.request(
                     self.scope,
                     Operations.ANALYSIS_REVERSE_IMAGE_SEARCH,
@@ -1085,6 +1122,8 @@ class ReverseImageService:
                             grant = require_allowed(self.operation_policy.acquire(operation_request))
                             association = self.grants.put(GrantAssociation(operation_request, grant))
                 except OperationPolicyError as exc:
+                    diagnostics.failure(exc)
+                    diagnostics.phase("persist")
                     event = environment.reverse_image_usage.create(
                         request_id=request_id,
                         task_id=request.task_id,
@@ -1102,8 +1141,9 @@ class ReverseImageService:
                     )
                     if callback_row is not None:
                         environment.callback_requests.finish(request_id, state="failed", result={"used": False}, error={"error": exc.code})
-                    return self._event_output(event)
+                    return self._event_output(event, diagnostics=diagnostics)
                 if association.state in {"committed", "released", "unknown"}:
+                    diagnostics.phase("persist")
                     # 已计量或结果未知的逻辑 request 不得再次联系 provider。
                     event = environment.reverse_image_usage.finish(
                         request_id,
@@ -1114,7 +1154,7 @@ class ReverseImageService:
                         environment.callback_requests.finish(request_id, state="unknown_execution", error={"error": "reverse_image_unknown_execution"})
                         environment.uow.session.commit()
                         raise ReverseImageError("reverse_image_unknown_execution", "反向图片调用状态未知", status_code=503)
-                    return self._event_output(event)
+                    return self._event_output(event, diagnostics=diagnostics)
                 try:
                     commit_result = self.operation_policy.commit(association.grant)
                     if not commit_result.ok or commit_result.state not in {"committed", "already_committed"}:
@@ -1124,8 +1164,11 @@ class ReverseImageService:
                         raise OperationPolicyError("operation_grant_invalid")
                     # commit 成功后再持久化 provider_started，避免策略拒绝被误记为
                     # 已经联系供应商；该事实提交后才离开缓存锁调用 provider。
+                    diagnostics.phase("persist")
                     environment.reverse_image_usage.mark_provider_started(event.request_id)
                 except (OperationPolicyError, DatabaseError) as exc:
+                    diagnostics.failure(exc)
+                    diagnostics.phase("persist")
                     # provider 尚未启动但计量或审计状态无法确认，保留 unknown 事实并禁止重放。
                     transition = getattr(self.grants, "transition", None)
                     if callable(transition):
@@ -1139,7 +1182,13 @@ class ReverseImageService:
                     raise ReverseImageError("reverse_image_unknown_execution", "反向图片调用状态未知", status_code=503) from exc
                 if binding is not None:
                     environment.callback_requests.finish(request_id, state="unknown_execution", error={"error": "reverse_image_unknown_execution"})
-            response, provider_exception, cancellation = await self._settle_started_provider(request)
+            diagnostics.phase("provider")
+            diagnostics.fields["provider_called"] = True
+            response, provider_exception, cancellation = await self._settle_started_provider(request, diagnostics)
+            if provider_exception is not None:
+                diagnostics.failure(provider_exception)
+                diagnostics.fields["provider_outcome"] = "failed" if isinstance(provider_exception, Exception) else "unknown_execution"
+            diagnostics.phase("persist")
             if provider_exception is not None:
                 if isinstance(provider_exception, ReverseImageError):
                     error = provider_exception
@@ -1181,6 +1230,7 @@ class ReverseImageService:
             try:
                 assert response is not None
                 outcome = "empty" if _is_empty(response) else "success"
+                diagnostics.fields["provider_outcome"] = outcome
                 snapshot = {"fetched_at": timestamp.isoformat(), "outcome": outcome, "expires_at": (timestamp + EMPTY_TTL).isoformat() if outcome == "empty" else None, "response": sanitize_value(response)}
                 next_record = {
                     "schema_version": CACHE_SCHEMA_VERSION,
@@ -1190,6 +1240,7 @@ class ReverseImageService:
                 }
                 self.cache.write(key, next_record)
             except ReverseImageError as exc:
+                diagnostics.failure(exc)
                 with self.resources.environment(self.scope.scope_id) as environment:
                     environment.reverse_image_usage.finish(request_id, outcome="failed", retryable=exc.retryable, error={"error": exc.code})
                     if binding is not None:
@@ -1199,6 +1250,7 @@ class ReverseImageService:
                     raise cancellation
                 raise
             except Exception as exc:  # noqa: BLE001 - 结果处理异常不暴露缓存或 Provider 细节。
+                diagnostics.failure(exc)
                 error = ReverseImageError("reverse_image_provider_unavailable", "反向图片服务暂时不可用", retryable=True, status_code=503)
                 with self.resources.environment(self.scope.scope_id) as environment:
                     environment.reverse_image_usage.finish(request_id, outcome="failed", retryable=True, error={"error": error.code})
@@ -1214,14 +1266,19 @@ class ReverseImageService:
                 if binding is not None:
                     environment.callback_requests.finish(request_id, state="completed", result={"outcome": outcome})
                 environment.uow.session.commit()
-                result = self._event_output(event, snapshot=snapshot)
+                result = self._event_output(event, snapshot=snapshot, diagnostics=diagnostics)
             if cancellation is not None:
                 raise cancellation
             return result
 
     @staticmethod
-    def _event_output(event: ReverseImageUsageEvent, *, snapshot: Mapping[str, object] | None = None) -> dict[str, object]:
+    def _event_output(event: ReverseImageUsageEvent, *, snapshot: Mapping[str, object] | None = None, diagnostics: OperationDiagnostics | None = None) -> dict[str, object]:
         """将事件映射为稳定供应商无关 JSON。"""
+        if diagnostics is not None:
+            diagnostics.fields["recorded_provider_called"] = event.provider_called
+            diagnostics.fields["recorded_outcome"] = event.outcome
+            if isinstance(event.error, Mapping) and isinstance(event.error.get("error"), str):
+                diagnostics.fields.setdefault("error_code", event.error["error"])
         payload = event.result or {}
         selected = snapshot or payload.get("snapshot")
         result = selected.get("response") if isinstance(selected, Mapping) else None
