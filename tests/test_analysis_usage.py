@@ -1,7 +1,6 @@
 # 使用真实 SQLite 连接验证 Executor 的主 session 金额读取及错误分类。
 
 from decimal import Decimal
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import select
@@ -12,65 +11,12 @@ import socket
 import subprocess
 import sys
 import tempfile
-import threading
 from collections.abc import Iterator
 
 import pytest
 
-from executor.analysis_usage import AnalysisUsageError, read_analysis_usage, read_broker_analysis_usage
+from executor.analysis_usage import AnalysisUsageError, read_analysis_usage
 from executor.analysis_monitor import AnalysisControlError, AnalysisMonitor
-
-
-class _AnalysisUsageHandler(BaseHTTPRequestHandler):
-    """提供可配置的本地 broker HTTP 协议端点。"""
-
-    def do_GET(self) -> None:
-        """记录请求头，并按测试配置返回状态、响应头和字节正文。"""
-        self.server.requests.append({
-            "path": self.path,
-            "authorization": self.headers.get("Authorization"),
-            "attempt_id": self.headers.get("X-MemeMeow-Executor-Attempt-ID"),
-        })
-        status, headers, body = self.server.responses.get(self.path, (404, {}, b""))
-        self.send_response(status)
-        for name, value in headers.items():
-            self.send_header(name, value)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, _format: str, *_args: object) -> None:
-        """测试服务不写入标准错误。"""
-
-
-@pytest.fixture
-def broker_server():
-    """启动真实本地 HTTP 服务并在测试结束后完整关闭。"""
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _AnalysisUsageHandler)
-    server.requests = []
-    server.responses = {}
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield server
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
-
-
-def _broker_response(*, attempt_id: str = "attempt-analysis", cost: object = "0.12", checked_at: object = "2026-09-19T08:00:00+00:00") -> bytes:
-    """生成 broker 用量协议的 JSON 字节正文。"""
-    return json.dumps({
-        "executor_attempt_id": attempt_id,
-        "observed_cost": cost,
-        "checked_at": checked_at,
-    }).encode("utf-8")
-
-
-def _broker_url(server: ThreadingHTTPServer) -> str:
-    """返回当前本地服务的版本化 endpoint。"""
-    return f"http://127.0.0.1:{server.server_port}/v1"
 
 
 @pytest.fixture
@@ -80,128 +26,6 @@ def analysis_monitor_root() -> Iterator[Path]:
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=root) as directory:
         yield Path(directory)
-
-
-def test_broker_usage_uses_bound_capability_and_attempt(broker_server) -> None:
-    """broker 查询必须携带当前 capability 和 attempt，并返回可信金额快照。"""
-    broker_server.responses["/v1/analysis-usage"] = (
-        200,
-        {"Content-Type": "application/json"},
-        _broker_response(),
-    )
-
-    usage = read_broker_analysis_usage(
-        _broker_url(broker_server),
-        capability="capability-" + "x" * 20,
-        attempt_id="attempt-analysis",
-    )
-
-    assert usage.observed_cost == Decimal("0.12")
-    assert usage.checked_at == "2026-09-19T08:00:00+00:00"
-    assert broker_server.requests == [{
-        "path": "/v1/analysis-usage",
-        "authorization": "Bearer capability-xxxxxxxxxxxxxxxxxxxx",
-        "attempt_id": "attempt-analysis",
-    }]
-
-
-@pytest.mark.parametrize(
-    ("body", "minimum_cost", "reason"),
-    [
-        (_broker_response(attempt_id="other-attempt"), Decimal("0"), "attempt_binding_mismatch"),
-        (_broker_response(cost="0.11"), Decimal("0.12"), "session_cost_decreased"),
-        (_broker_response(cost=True), Decimal("0"), "session_cost_invalid"),
-        (_broker_response(cost="NaN"), Decimal("0"), "session_cost_invalid"),
-        (_broker_response(cost="-0.01"), Decimal("0"), "session_cost_invalid"),
-        (_broker_response(checked_at="2026-09-19T08:00:00"), Decimal("0"), "usage_checked_at_invalid"),
-        (json.dumps({"executor_attempt_id": "attempt-analysis", "observed_cost": "0.12", "checked_at": "2026-09-19T08:00:00+00:00", "extra": True}).encode("utf-8"), Decimal("0"), "broker_usage_response_invalid"),
-    ],
-)
-def test_broker_usage_rejects_untrusted_snapshots(broker_server, body: bytes, minimum_cost: Decimal, reason: str) -> None:
-    """attempt 冲突、金额倒退、无时区时间和未知字段都不能成为终止事实。"""
-    broker_server.responses["/v1/analysis-usage"] = (200, {"Content-Type": "application/json"}, body)
-
-    with pytest.raises(AnalysisUsageError, match=reason):
-        read_broker_analysis_usage(
-            _broker_url(broker_server),
-            capability="capability-" + "x" * 20,
-            attempt_id="attempt-analysis",
-            minimum_cost=minimum_cost,
-        )
-
-
-def test_broker_usage_rejects_redirect_without_forwarding_capability(broker_server) -> None:
-    """broker 跳转必须被拒绝，capability 不能转发到 Location。"""
-    broker_server.responses["/v1/analysis-usage"] = (302, {"Location": "/redirected"}, b"")
-    broker_server.responses["/redirected"] = (200, {"Content-Type": "application/json"}, _broker_response())
-
-    with pytest.raises(AnalysisUsageError, match="broker_usage_http_302"):
-        read_broker_analysis_usage(
-            _broker_url(broker_server),
-            capability="capability-" + "x" * 20,
-            attempt_id="attempt-analysis",
-        )
-
-    assert [request["path"] for request in broker_server.requests] == ["/v1/analysis-usage"]
-
-
-def test_broker_usage_rejects_http_errors_and_oversized_responses(broker_server) -> None:
-    """HTTP 故障和超过协议上限的正文必须保留明确原因。"""
-    broker_server.responses["/v1/analysis-usage"] = (503, {"Content-Type": "application/json"}, b"{}")
-    with pytest.raises(AnalysisUsageError, match="broker_usage_http_503"):
-        read_broker_analysis_usage(
-            _broker_url(broker_server),
-            capability="capability-" + "x" * 20,
-            attempt_id="attempt-analysis",
-        )
-    broker_server.responses["/v1/analysis-usage"] = (
-        200,
-        {"Content-Type": "application/json"},
-        b"x" * (64 * 1024 + 1),
-    )
-    with pytest.raises(AnalysisUsageError, match="broker_usage_response_too_large"):
-        read_broker_analysis_usage(
-            _broker_url(broker_server),
-            capability="capability-" + "x" * 20,
-            attempt_id="attempt-analysis",
-        )
-
-
-def test_analysis_monitor_uses_broker_cost_without_local_database(broker_server, analysis_monitor_root: Path) -> None:
-    """配置 broker 后，Executor 依据 attempt 金额终止且不依赖任务 SQLite。"""
-    broker_server.responses["/v1/analysis-usage"] = (
-        200,
-        {"Content-Type": "application/json"},
-        _broker_response(cost="0.31"),
-    )
-    status_path = analysis_monitor_root / "analysis-attempt-analysis.json"
-    status_path.write_text(json.dumps({
-        "attempt_id": "attempt-analysis",
-        "plugin_version": "1.18.18",
-        "policy_version": 1,
-        "ready": True,
-        "session_id": "session-analysis",
-        "reminder_sent": True,
-        "error": None,
-    }), encoding="utf-8")
-    monitor = AnalysisMonitor(
-        attempt_id="attempt-analysis",
-        policy={"version": 1, "termination_cost": "0.30"},
-        database=analysis_monitor_root / "missing.db",
-        directory=analysis_monitor_root,
-        status_path=status_path,
-        startup_deadline=0,
-        broker_url=_broker_url(broker_server),
-        model_capability="capability-" + "x" * 20,
-    )
-
-    with pytest.raises(AnalysisControlError) as failure:
-        monitor.check("session-analysis")
-
-    assert failure.value.code == "agent_maximum_analysis_depth_exceeded"
-    assert failure.value.reason == "termination_cost_reached"
-    assert monitor.observed_cost == Decimal("0.31")
-    assert monitor.reminder_sent is True
 
 
 def test_analysis_monitor_accepts_only_opencode_peer(analysis_monitor_root: Path) -> None:
@@ -338,3 +162,76 @@ def test_schema_incompatible(database):
         connection.execute("ALTER TABLE session DROP COLUMN cost")
     with pytest.raises(AnalysisUsageError, match="session_schema_incompatible"):
         read_analysis_usage(database, session_id="main", directory=Path("/workspace"))
+
+
+@pytest.mark.parametrize("cost", [0.19, 0.20, 0.23])
+def test_monitor_reads_main_session_threshold(database, analysis_monitor_root: Path, cost: float) -> None:
+    """监控器读取实际 SQLite 金额，达到边界时报告终止并保存观测值。"""
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE session SET cost = ? WHERE id = 'main'", (cost,))
+    monitor = AnalysisMonitor(
+        attempt_id="attempt-analysis", policy={"version": 1, "termination_cost": "0.20"},
+        database=database, directory=Path("/workspace"),
+        status_path=analysis_monitor_root / "pending.json", startup_deadline=float("inf"),
+    )
+    if cost >= 0.20:
+        with pytest.raises(AnalysisControlError) as failure:
+            monitor.check("main")
+        assert failure.value.code == "agent_maximum_analysis_depth_exceeded"
+        assert failure.value.reason == "termination_cost_reached"
+    else:
+        monitor.check("main")
+    assert monitor.observed_cost == Decimal(str(cost))
+    assert monitor.usage_checked_at is not None
+
+
+@pytest.mark.parametrize("exited", [False, True])
+def test_monitor_requires_session_before_deadline(analysis_monitor_root: Path, exited: bool) -> None:
+    """session 尚未绑定时允许启动等待，期限届满或进程退出必须报告具体原因。"""
+    monitor = AnalysisMonitor(
+        attempt_id="attempt-analysis", policy={"version": 1, "termination_cost": "0.20"},
+        database=analysis_monitor_root / "missing.db", directory=analysis_monitor_root,
+        status_path=analysis_monitor_root / "pending.json", startup_deadline=float("inf"),
+    )
+    monitor.check(None)
+    assert monitor.usage_checked_at is None
+    monitor.next_check = 0
+    if not exited:
+        monitor.startup_deadline = 0
+    with pytest.raises(AnalysisControlError) as failure:
+        monitor.check(None, exited=exited)
+    assert failure.value.code == "agent_analysis_usage_unavailable"
+    assert failure.value.reason == "session_binding_deadline_exceeded"
+
+
+def test_monitor_reports_missing_task_database(analysis_monitor_root: Path) -> None:
+    """已绑定 session 的任务缺少数据库时立即返回用量错误。"""
+    monitor = AnalysisMonitor(
+        attempt_id="attempt-analysis", policy={"version": 1, "termination_cost": "0.20"},
+        database=analysis_monitor_root / "missing.db", directory=analysis_monitor_root,
+        status_path=analysis_monitor_root / "pending.json", startup_deadline=float("inf"),
+    )
+    with pytest.raises(AnalysisControlError) as failure:
+        monitor.check("main")
+    assert failure.value.code == "agent_analysis_usage_unavailable"
+    assert failure.value.reason == "database_missing"
+
+
+def test_usage_reads_committed_cost_during_wal_write(database) -> None:
+    """WAL 写事务进行期间读取已提交金额，提交完成后能够读取新增金额。"""
+    with sqlite3.connect(database) as writer:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        writer.execute("UPDATE session SET cost = 0.31 WHERE id = 'main'")
+        pending = read_analysis_usage(database, session_id="main", directory=Path("/workspace"))
+        assert pending.observed_cost == Decimal("0.23")
+        writer.commit()
+        committed = read_analysis_usage(database, session_id="main", directory=Path("/workspace"))
+        assert committed.observed_cost == Decimal("0.31")
+
+
+def test_usage_reports_exclusive_database_lock(database) -> None:
+    """数据库排他锁超过读取期限时保留 SQLite 错误类别。"""
+    with sqlite3.connect(database) as writer:
+        writer.execute("BEGIN EXCLUSIVE")
+        with pytest.raises(AnalysisUsageError, match="database_read_error:SQLITE_BUSY"):
+            read_analysis_usage(database, session_id="main", directory=Path("/workspace"))

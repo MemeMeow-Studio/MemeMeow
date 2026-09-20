@@ -1256,7 +1256,7 @@ class Executor:
             "PATH": os.getenv("PATH", "/usr/local/bin:/usr/bin:/bin"),
             # HOME 使用当前 Task 的独立目录，避免多个 Agent 共享可写配置和缓存。
             "HOME": str(scratch / "home"),
-            # 启用分析策略后使用任务专属数据库；broker 金额仍是终止判断依据。
+            # 提醒和终止共同读取任务专属数据库中的主 session 金额。
             "OPENCODE_DB": str(scratch / "opencode.db" if task.analysis_policy is not None else RUNTIME_ROOT / "opencode.db"),
             "OPENCODE_CONFIG": str(task.config_file or scratch / "opencode.json"),
             "OPENCODE_CONFIG_DIR": str(task.config_dir or scratch / ".opencode"),
@@ -1487,8 +1487,6 @@ class Executor:
                         startup_deadline=min(deadline, time.monotonic() + 30),
                         status_socket=analysis_socket,
                         observed_cost=Decimal(task.observed_cost or "0"),
-                        broker_url=self.model_broker_url if self.model_broker_configured and task.model_capability else None,
-                        model_capability=task.model_capability if self.model_broker_configured else None,
                     )
                     monitor.expected_pid = process.pid
                 while process.poll() is None:

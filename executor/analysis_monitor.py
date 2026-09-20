@@ -12,7 +12,7 @@ import socket
 import struct
 import time
 
-from executor.analysis_usage import AnalysisUsageError, read_analysis_usage, read_broker_analysis_usage
+from executor.analysis_usage import AnalysisUsageError, read_analysis_usage
 
 PLUGIN_VERSION = "1.18.18"
 
@@ -44,8 +44,6 @@ class AnalysisMonitor:
     ready: bool = False
     next_check: float = 0
     reminder_error: str | None = None
-    broker_url: str | None = None
-    model_capability: str | None = None
 
     def check(self, session_id: str | None, *, exited: bool = False) -> None:
         """轮询当前 attempt 的就绪及金额；终止原因通过异常交给进程管理者。"""
@@ -81,21 +79,7 @@ class AnalysisMonitor:
                 raise AnalysisControlError("agent_analysis_reminder_plugin_unavailable", self.reminder_error)
             if session_id and status.get("session_id") not in (None, session_id):
                 raise AnalysisControlError("agent_analysis_usage_unavailable", "plugin_session_binding_mismatch")
-        if self.broker_url is not None or self.model_capability is not None:
-            if self.broker_url is None or self.model_capability is None:
-                raise AnalysisControlError("agent_analysis_usage_unavailable", "broker_usage_configuration_invalid")
-            try:
-                usage = read_broker_analysis_usage(
-                    self.broker_url,
-                    capability=self.model_capability,
-                    attempt_id=self.attempt_id,
-                    minimum_cost=self.observed_cost,
-                )
-            except AnalysisUsageError as exc:
-                raise AnalysisControlError(exc.code, exc.reason) from exc
-            self.observed_cost = usage.observed_cost
-            self.usage_checked_at = usage.checked_at
-        elif session_id:
+        if session_id:
             try:
                 usage = read_analysis_usage(
                     self.database, session_id=session_id, directory=self.directory,
