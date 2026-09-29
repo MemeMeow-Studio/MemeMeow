@@ -187,7 +187,6 @@ services:
       - type: bind
         source: ${MEMEMEOW_IMAGE_ROOT_HOST:-./data/images}
         target: /app/data/images
-        read_only: true
     logging:
       driver: json-file
       options:
