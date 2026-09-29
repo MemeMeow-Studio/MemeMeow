@@ -154,6 +154,46 @@ services:
       retries: 12
       start_period: 5s
 
+  mememeow-auto-rename:
+    profiles: ["app"]
+    build:
+      context: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+      runtime-init:
+        condition: service_completed_successfully
+    user: "${MEMEMEOW_RUNTIME_UID:?MEMEMEOW_RUNTIME_UID must be a non-root positive integer}:${MEMEMEOW_RUNTIME_GID:?MEMEMEOW_RUNTIME_GID must be a non-root positive integer}"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 120s
+    command: ["python", "-m", "backend.naming_runtime"]
+    environment:
+      MEMEMEOW_DATABASE_URL: ${MEMEMEOW_DATABASE_URL_CONTAINER:-postgresql+psycopg://mememeow:mememeow@postgres:5432/mememeow}
+      MEMEMEOW_DATA_ROOT: /app/data/opencode
+      MEMEMEOW_IMAGE_ROOT: /app/data/images
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
+      MEMEMEOW_AUTO_RENAME_BASE_URL: ${MEMEMEOW_AUTO_RENAME_BASE_URL:-}
+      MEMEMEOW_AUTO_RENAME_API_KEY: ${MEMEMEOW_AUTO_RENAME_API_KEY:-}
+      MEMEMEOW_AUTO_RENAME_MODEL: ${MEMEMEOW_AUTO_RENAME_MODEL:-mememeow/auto-rename}
+      MEMEMEOW_AUTO_RENAME_POOL: ${MEMEMEOW_AUTO_RENAME_POOL:-default}
+      MEMEMEOW_AUTO_RENAME_CONCURRENCY: ${MEMEMEOW_AUTO_RENAME_CONCURRENCY:-10}
+      MEMEMEOW_AUTO_RENAME_INTERVAL_SECONDS: ${MEMEMEOW_AUTO_RENAME_INTERVAL_SECONDS:-30}
+      MEMEMEOW_AUTO_RENAME_TIMEOUT_SECONDS: ${MEMEMEOW_AUTO_RENAME_TIMEOUT_SECONDS:-90}
+    volumes:
+      - mememeow-agent-runtime-data:/app/data/opencode
+      - type: bind
+        source: ${MEMEMEOW_IMAGE_ROOT_HOST:-./data/images}
+        target: /app/data/images
+        read_only: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
   mememeow:
     profiles: ["app"]
     # API 需要等待 Agent 进程结束和恢复信息保存，依赖服务随后关闭。

@@ -7,6 +7,7 @@ import ImageProcessingOptionsDialog from './ImageProcessingOptionsDialog.vue'
 import UploadPendingItem from './UploadPendingItem.vue'
 import UploadTaskHistory from './UploadTaskHistory.vue'
 import { useUploadBatch } from '../composables/useUploadBatch'
+import { defaultUploadMode } from '../utils/uploadMode'
 
 const props = defineProps<{
   config: ServiceConfig | null
@@ -201,7 +202,7 @@ onUnmounted(() => {
 /** 打开共享选项对话框；请求尚未发生时保留文件选择。 */
 function openOptions(event?: MouseEvent): void {
   if (busy.value || !submitFiles.value.length) return
-  if (!preserveRetryOptions.value) retryOptions.value = { reverse_image_policy: 'forbid', auto_name: false }
+  if (!preserveRetryOptions.value) retryOptions.value = { reverse_image_policy: 'forbid', auto_name: false, upload_mode: defaultUploadMode(submitFiles.value.length) }
   dialogTrigger.value = event?.currentTarget instanceof HTMLElement ? event.currentTarget : null
   dialogOpen.value = true
 }
@@ -294,7 +295,8 @@ async function retryTransfer(requestId: string): Promise<void> {
     :reverse-image-reason="props.config ? '反向图片服务不可用' : '服务状态未知'"
     :busy="busy"
     :return-focus="dialogTrigger"
-    :initial-options="preserveRetryOptions ? retryOptions : undefined"
+    :initial-options="retryOptions"
+    upload
     @cancel="cancelOptions"
     @confirm="confirmOptions"
   />

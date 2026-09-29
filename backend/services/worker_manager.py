@@ -42,7 +42,7 @@ def _generic_task_filter() -> Any:
     """返回通用 Worker 可处理的任务条件，保留迁移前图片任务。"""
     # submission_mode 允许为 NULL 以兼容迁移前任务；直接对组合条件取反会让
     # SQL 的三值逻辑把这些历史行错误地过滤掉。
-    return or_(
+    return (Task.task_type != "image_name_generation") & or_(
         Task.submission_mode.is_(None),
         ~(
             Task.task_type.in_(IMAGE_PROCESSING_TASK_TYPES)
@@ -298,7 +298,7 @@ class PostgresTaskWorkerManager:
         return invalid
 
     def _recover_pending_batches(self) -> list[str]:
-        """按批次所属 scope 恢复未收束的唯一 cache 任务，不扫描并实例化全部历史 scope。"""
+        """按批次所属 scope 恢复未完成的结果汇总。"""
         queued: list[str] = []
         if self._scope_service_resolver is None:
             return queued
@@ -308,16 +308,7 @@ class PostgresTaskWorkerManager:
             try:
                 services = self._scope_service_resolver(scope_id)
                 with self.resources.environment(services.scope) as environment:
-                    task = environment.tasks.finalize_batch_with_task(
-                        batch_id,
-                        task_type="cache_generation",
-                        payload={},
-                        dedupe_key="cache_generation",
-                        settings_version=self.settings_version,
-                        max_attempts=self.max_attempts,
-                    )
-                    if task is not None:
-                        queued.append(task.id)
+                    environment.tasks.finalize_batch(batch_id)
             except (DatabaseError, RuntimeError, TypeError, ValueError):
                 # 任务 scope 无法装配时由后续任务诊断和宿主日志收束，不回退到 local。
                 continue
@@ -384,6 +375,8 @@ class PostgresTaskWorkerManager:
         with self.resources.environment(scope) as environment:
             queued = environment.tasks.get(task_id)
             if queued is None:
+                return None
+            if queued.task_type == "image_name_generation":
                 return None
             if queued.task_type in IMAGE_PROCESSING_TASK_TYPES and queued.submission_mode in {"pipeline", "standalone"}:
                 # 图片任务属于专用 Worker；通用 manager 不得认领或收束它们。

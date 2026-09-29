@@ -29,7 +29,7 @@ from backend.config import Settings, validate_agent_concurrency
 from backend.config_http import STORAGE_PREFLIGHT_BLOCKING_KEYS
 from backend.database import DatabaseError, DatabaseResources, ScopeContext, check_database, create_engine_for_settings
 from backend.image_processing import ACTIVE_JOB_STATUSES, ImageProcessingWorker
-from backend.persistence.models import ImageProcessingJob
+from backend.persistence.models import ImageProcessingJob, Task
 from backend.opencode import OpenCodeRunner
 from backend.opencode_activity import OpenCodeActivityReader
 from backend.opencode_workspace import LocalWorkspaceProvider, MissingWorkspaceProvider
@@ -383,6 +383,8 @@ def scope_processing_worker(application: FastAPI, scope: ScopeContext) -> ImageP
     if not isinstance(workers, dict):
         return None
     with application.state.image_processing_workers_lock:
+        if getattr(application.state, "image_processing_stopping", False):
+            return None
         worker = workers.get(scope.scope_id)
         if worker is not None:
             return worker
@@ -406,19 +408,29 @@ def scope_processing_worker(application: FastAPI, scope: ScopeContext) -> ImageP
 
 
 def restore_image_processing_workers(application: FastAPI) -> int:
-    """启动有未完成图片 Job 的 scope Worker，返回扫描到的 scope 数量。"""
+    """发现未完成 Job 和独立图片任务，为其 scope 启动处理 Worker。"""
+    if getattr(application.state, "image_processing_stopping", False):
+        return 0
     with application.state.database.factory() as session:
-        scope_ids = list(session.scalars(
+        scope_ids = set(session.scalars(
             select(ImageProcessingJob.scope_id)
             .where(ImageProcessingJob.status.in_(ACTIVE_JOB_STATUSES))
             .distinct()
             .order_by(ImageProcessingJob.scope_id)
         ))
+        scope_ids.update(session.scalars(
+            select(Task.scope_id).where(
+                Task.status.in_(("queued", "running")),
+                Task.submission_mode.in_(("pipeline", "standalone")),
+                Task.task_type.in_(("visual_embedding_generation", "meme_context_generation", "image_auto_rename", "text_embedding_generation")),
+            ).distinct()
+        ))
     # 创建服务和开始执行前归还连接，Worker 的扫描及认领使用自己的短事务。
-    for scope_id in scope_ids:
+    for scope_id in sorted(scope_ids):
         if scope_processing_worker(application, ScopeContext(scope_id)) is None:
+            if getattr(application.state, "image_processing_stopping", False):
+                return 0
             raise DatabaseError("image_processing_worker_unavailable")
-    logger.info("image_processing_startup_recovery scopes={}", len(scope_ids))
     return len(scope_ids)
 
 
@@ -644,6 +656,7 @@ def _build_scope_runtime(
     app.state.image_processing_task_handlers = dict(task_handlers)
     app.state.image_processing_workers = {}
     app.state.image_processing_workers_lock = RLock()
+    app.state.image_processing_stopping = False
     tasks = local_services.tasks if local_services is not None else None
     if tasks is not None:
         app.state.tasks = tasks
@@ -652,6 +665,9 @@ def _build_scope_runtime(
     if local_services is not None:
         scope_processing_worker(app, local_services.scope)
     restore_image_processing_workers(app)
+    if worker_manager is not None:
+        # 独立命名进程可以在 API 启动之后为任意 scope 提交文本任务。
+        worker_manager.register_maintenance(lambda: restore_image_processing_workers(app))
     setup.factory = runtime_factory
     setup.worker_manager = worker_manager
     setup.shared_worker_executor = shared_worker_executor
@@ -690,7 +706,13 @@ async def shutdown_lifecycle(
         except BaseException as exc:  # noqa: BLE001 - 扩展失败不能跳过核心资源关闭
             errors.append(("shutdown.extension", exc))
     opencode = getattr(app.state, "opencode", None)
-    image_workers = list(getattr(app.state, "image_processing_workers", {}).values())
+    worker_lock = getattr(app.state, "image_processing_workers_lock", None)
+    if worker_lock is not None:
+        with worker_lock:
+            app.state.image_processing_stopping = True
+            image_workers = list(getattr(app.state, "image_processing_workers", {}).values())
+    else:
+        image_workers = []
     for image_worker in image_workers:
         _close_resource(image_worker, "stop_claiming", errors, "shutdown.image_worker.stop_claiming")
     if runtime is not None:

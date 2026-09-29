@@ -88,6 +88,12 @@ useModalDialog({
         <div><dt>创建时间</dt><dd>{{ formatTaskTime(task.created_at) }}</dd></div>
         <div><dt>完成时间</dt><dd>{{ formatTaskTime(task.completed_at) }}</dd></div>
         <div v-if="task.error"><dt>错误</dt><dd>{{ task.error.error }}</dd></div>
+        <div v-if="task.task_type === 'image_name_generation' && task.status === 'failed'">
+          <dt>后台命名</dt><dd>{{ task.error?.message }} 符合条件的图片会在后续用户轮询中再次处理。</dd>
+        </div>
+        <div v-if="task.result?.text_input_status === 'waiting_for_text'">
+          <dt>文本索引</dt><dd>等待有效名称或语境，图片向量独立处理。</dd>
+        </div>
         <div v-if="task.task_type === 'image_library_processing' && task.result">
           <dt>扫描结果</dt>
           <dd>检查 {{ task.result.scanned_count }}，提交 {{ task.result.submitted_count }}，处理中 {{ task.result.conflict_count }}，无需修复 {{ task.result.not_needed_count }}。图片处理结果请查看对应图片任务。</dd>

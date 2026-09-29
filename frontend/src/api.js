@@ -95,6 +95,7 @@ export const api = {
       : normalizeImageProcessingOptions(options)
     const body = new FormData()
     body.append('request_id', requestOptions.requestId || crypto.randomUUID())
+    body.append('upload_mode', options?.upload_mode === 'direct' ? 'direct' : 'analyze')
     body.append('reverse_image_policy', normalized.reverse_image_policy)
     body.append('auto_name', String(normalized.auto_name))
     files.forEach((file) => body.append('files', file))

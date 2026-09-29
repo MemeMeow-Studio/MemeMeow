@@ -7,22 +7,20 @@ from uuid import UUID
 
 import numpy as np
 from openai import OpenAI
+from sqlalchemy import select
 
 from backend.persistence.models import (
     EMBEDDING_DIMENSIONS,
     Meme,
     ScopeContext,
-    utcnow,
+    Task,
 )
 from backend.persistence.engine import DatabaseError
 from backend.persistence.resources import DatabaseResources
-from backend.metadata import (
-    MetadataError,
-    MemeContext,
-    semantic_document,
-    semantic_document_hash,
-)
+from backend.metadata import MetadataError
 from backend.services.metadata import PostgresMetadataService
+from backend.embedding_input import build_text_input
+from backend.text_updates import enqueue_text_update
 
 # 检索服务沿用旧 logger 名称，避免服务拆分改变日志路由。
 logger = logging.getLogger("backend.pg_services")
@@ -71,105 +69,90 @@ class PostgresSearchService:
             return environment.search.valid_text_embedding_ids(self.model, memes)
 
     def generate_cache(self, progress: Callable[[float | None, str | None], None], claim: tuple[str, int, str] | None = None) -> dict[str, object]:
-        """按当前可索引候选回填增量文本向量，完成后切换 scope 迁移状态。
-
-        候选读取使用 Meme UUID keyset 分页，避免把一个 scope 的全部 ORM 行同时
-        装入内存。不可索引或无法验证原图的记录只计入跳过报告；一旦记录进入候选，
-        后续 embedding 或版本校验失败就直接中止迁移，不把失败伪装成跳过。
-        """
+        """提交去重的单图任务，周期读取其终态并汇总部分成功和错误。"""
+        if claim is None:
+            raise DatabaseError("cache_generation_claim_required")
         with self._generation_lock:
+            with self.resources.environment(self.scope) as environment:
+                environment.search.assert_claim(claim)
+                parent = environment.tasks.get(claim[0])
+                plan = parent.payload.get("cache_plan")
+            if plan is not None:
+                return self._cache_result(plan, claim)
             preflight = self.resources.search_rebuild_preflight(self.scope)
             if preflight["blocking"]:
                 logger.warning("search_rebuild_blocked scope=%s keys=%s", self.scope.scope_id, preflight["blocking_keys"])
                 raise RuntimeError("search_rebuild_preflight_failed")
-            candidates: list[tuple[UUID, int, str, str, str]] = []
-            skipped = 0
-            skipped_by_reason: dict[str, int] = {}
+            counts = {"reused_count": 0, "active_count": 0, "waiting_for_text_count": 0, "needed_count": 0}
+            children: list[str] = []
+            errors: list[dict[str, str]] = []
             after_id: UUID | None = None
             while True:
                 with self.resources.environment(self.scope.scope_id) as environment:
                     environment.search.assert_claim(claim)
                     page = environment.memes.list_rebuild_page(after_id=after_id, limit=200)
-                    if not page:
-                        break
-                    page_last_id = page[-1].id
-                    for meme in page:
-                        reason: str | None = None
-                        if meme.context_status not in {"partial", "ready"}:
-                            reason = "metadata_unavailable"
-                        try:
-                            context = MemeContext.model_validate(meme.meme_context or {})
-                        except (TypeError, ValueError):
-                            reason = "metadata_invalid"
-                            context = None
-                        if reason is None:
-                            try:
-                                image = self.metadata.blob_store.resolve(meme.storage_key)
-                                identity = self.metadata._identity(image)
-                            except (DatabaseError, MetadataError, OSError, ValueError):
-                                reason = "image_unavailable"
-                            else:
-                                if identity["sha256"] != meme.sha256 or identity["size_bytes"] != meme.size_bytes:
-                                    reason = "image_identity_mismatch"
-                        if reason is not None:
-                            skipped += 1
-                            skipped_by_reason[reason] = skipped_by_reason.get(reason, 0) + 1
-                            continue
-                        text_value = semantic_document(context)
-                        if not text_value:
-                            skipped += 1
-                            skipped_by_reason["semantic_text_empty"] = skipped_by_reason.get("semantic_text_empty", 0) + 1
-                            continue
-                        metadata_hash = semantic_document_hash(context)
-                        if metadata_hash is None:
-                            skipped += 1
-                            skipped_by_reason["semantic_text_empty"] = skipped_by_reason.get("semantic_text_empty", 0) + 1
-                            continue
-                        stored_metadata_hash = getattr(meme, "search_metadata_hash", None)
-                        if stored_metadata_hash != metadata_hash:
-                            # 回填前物化当前 canonical hash；旧 hash 对应的向量会在
-                            # begin_incremental_backfill 中清掉，不能继续沿用历史事实。
-                            meme.search_metadata_hash = metadata_hash
-                            meme.updated_at = utcnow()
-                        candidates.append((meme.id, meme.revision, str(meme.sha256).lower(), text_value, metadata_hash))
-                    after_id = page_last_id
-                if len(page) < 200:
-                    # keyset 查询已经到达当前快照末尾；若并发新增更大的 UUID，最终
-                    # 候选覆盖校验会发现它，不会静默发布不完整索引。
+                if not page:
                     break
+                for snapshot in page:
+                    # 单图任务负责文件身份检查和模型执行，扫描仅保存当前输入。
+                    with self.resources.environment(self.scope) as environment:
+                        environment.search.assert_claim(claim)
+                        current = environment.memes.get(snapshot.id, for_update=True)
+                        if current is None:
+                            errors.append({"meme_id": str(snapshot.id), "error": "meme_not_found"})
+                            continue
+                        text_input = build_text_input(current.display_name, current.meme_context, current.context_status)
+                        current.search_metadata_hash = text_input.fingerprint
+                        current.text_input_status = text_input.status
+                        if text_input.status == "waiting_for_text":
+                            counts["waiting_for_text_count"] += 1
+                            continue
+                        if text_input.status != "eligible":
+                            errors.append({"meme_id": str(current.id), "error": text_input.status})
+                            continue
+                        if current.id in environment.search.valid_text_embedding_ids(self.model, [current]):
+                            counts["reused_count"] += 1
+                            continue
+                        active = environment.uow.session.scalar(select(Task.id).where(
+                            Task.scope_id == self.scope.scope_id,
+                            Task.target_meme_id == current.id,
+                            Task.target_image_sha256 == current.sha256,
+                            Task.task_type == "text_embedding_generation",
+                            Task.status.in_(("queued", "running")),
+                            Task.payload["metadata_hash"].astext == text_input.fingerprint,
+                            Task.payload["embedding_model"].astext == self.model,
+                        ).limit(1))
+                        if active is not None:
+                            counts["active_count"] += 1
+                            children.append(active)
+                            continue
+                        child = enqueue_text_update(environment.uow.session, current)
+                        if child is not None:
+                            counts["needed_count"] += 1
+                            children.append(child.id)
+                    if progress:
+                        progress(None, f"已提交 {counts['needed_count']} 张图片的文本修复")
+                after_id = page[-1].id
+            plan = {"counts": counts, "task_ids": children, "errors": errors}
+            with self.resources.environment(self.scope) as environment:
+                if not environment.tasks.update_payload_fenced(*claim, {"cache_plan": plan}):
+                    raise DatabaseError("claim_expired")
+            return self._cache_result(plan, claim)
 
-            candidates.sort(key=lambda item: str(item[0]))
-            # 空候选也必须先把旧来源冻结为 backfill，并清掉当前模型的旧行；否则
-            # 失败迁移会继续暴露旧 generation 或上一次增量结果。
-            with self.resources.environment(self.scope.scope_id) as environment:
-                environment.search.assert_claim(claim)
-                state = environment.search.begin_incremental_backfill(self.model, total_count=len(candidates), claim=claim)
-                epoch = state.epoch
-            if not candidates:
-                raise RuntimeError("no_indexable_images")
-            total = len(candidates)
-            from backend.image_processing import SingleImageEmbeddingService
-
-            embedding_service = SingleImageEmbeddingService(self.resources, scope_id=self.scope, model=self.model, embedder=self._embedding)
-            for index, (meme_id, _revision, image_sha, text_value, metadata_hash) in enumerate(candidates, start=1):
-                embedding_service.upsert(meme_id, image_sha256=image_sha, metadata_hash=metadata_hash, semantic_document=text_value, claim=claim)
-                with self.resources.environment(self.scope.scope_id) as environment:
-                    if not environment.search.record_incremental_backfill(epoch=epoch, completed_count=index, model=self.model, claim=claim):
-                        raise DatabaseError("migration_epoch_changed")
-                if progress:
-                    progress(index / total, f"正在生成 pgvector 索引 {index}/{total}")
-            with self.resources.environment(self.scope.scope_id) as environment:
-                expected_candidates = [(meme_id, image_sha, metadata_hash) for meme_id, _revision, image_sha, _text, metadata_hash in candidates]
-                if not environment.search.switch_incremental_only(epoch=epoch, model=self.model, expected_candidates=expected_candidates, claim=claim):
-                    raise DatabaseError("migration_incomplete")
-            return {
-                "indexed_count": total,
-                "skipped_count": skipped,
-                "skipped_by_reason": skipped_by_reason,
-                "epoch": epoch,
-                "model": self.model,
-                "dimensions": EMBEDDING_DIMENSIONS,
-            }
+    def _cache_result(self, plan: dict[str, Any], claim: tuple[str, int, str]) -> dict[str, object]:
+        """从持久子任务汇总当前结果；活动子任务让父任务归还执行线程。"""
+        with self.resources.environment(self.scope) as environment:
+            environment.search.assert_claim(claim)
+            children = list(environment.uow.session.scalars(select(Task).where(Task.scope_id == self.scope.scope_id, Task.id.in_(plan["task_ids"]))))
+        counts = dict(plan["counts"])
+        errors = list(plan["errors"])
+        errors.extend({"task_id": child.id, "error": child.error} for child in children if child.status == "failed")
+        missing = set(plan["task_ids"]) - {child.id for child in children}
+        errors.extend({"task_id": task_id, "error": "task_not_found"} for task_id in missing)
+        succeeded = sum(child.status == "succeeded" for child in children)
+        return {**counts, "generated_count": succeeded, "failed_count": len(errors), "errors": errors,
+            "indexed_count": counts["reused_count"] + succeeded, "model": self.model,
+            "dimensions": EMBEDDING_DIMENSIONS, "_pending": any(child.status in {"queued", "running"} for child in children)}
 
     def _enhance_query(self, query: str) -> str:
         """使用可选 LLM 改写查询；失败由 API 回退普通查询。"""

@@ -142,6 +142,7 @@ export function taskTypeLabel(type?: string): string {
     derived_thumbnail_generation: '缩略图生成',
     visual_embedding_generation: '图片向量生成',
     image_auto_rename: '自动重命名',
+    image_name_generation: '后台图片命名',
     text_embedding_generation: '文本语义检索',
     image_processing: '完整图片处理',
   }[type || ''] || type || '未知任务'

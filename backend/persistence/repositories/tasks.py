@@ -56,7 +56,7 @@ def _exclude_explicit_image_pipeline() -> Any:
     """返回排除显式图片 pipeline、保留迁移前 NULL 来源任务的条件。"""
     # 对含 NULL 的组合谓词直接取反会得到 UNKNOWN；显式保留 NULL 才能让旧图片
     # 任务继续由兼容 Worker 恢复和认领。
-    return or_(
+    return (Task.task_type != "image_name_generation") & or_(
         Task.submission_mode.is_(None),
         ~(
             Task.task_type.in_(IMAGE_PROCESSING_LANE_TYPES)
@@ -371,6 +371,21 @@ class TaskRepository:
         这里校验阶段、Job 关联和模式互斥关系。
         """
         user_image_submission = payload.pop("_user_image_submission", False) is True
+        if task_type == "derived_thumbnail_generation":
+            try:
+                target_meme_id = UUID(str(payload["meme_id"]))
+                target_image_sha256 = str(payload["image_sha256"]).lower()
+            except (KeyError, ValueError, TypeError) as exc:
+                raise DatabaseError("image_target_required") from exc
+            self._lock_image_submission(target_meme_id, target_image_sha256)
+            target = self.session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == target_meme_id))
+            if target is None or target.sha256 != target_image_sha256:
+                raise DatabaseError("image_target_changed")
+            naming = self.session.scalar(select(Task.id).where(Task.scope_id == self.scope.scope_id,
+                Task.target_meme_id == target_meme_id, Task.task_type == "image_name_generation",
+                Task.status.in_(("queued", "running"))).limit(1))
+            if naming is not None:
+                raise DatabaseError("image_processing_conflict")
         image_task_stages = {
             "visual_embedding_generation": "visual",
             "meme_context_generation": "agent",
@@ -422,18 +437,44 @@ class TaskRepository:
                 # payload 猜测；提交事务内同时确认目标仍属于当前 scope 和当前 SHA。
                 if target_meme_id is None or target_image_sha256 is None:
                     raise DatabaseError("image_target_required")
-                if user_image_submission:
+                if not payload.get("text_followup"):
                     # 用户新请求必须先拿到图片级事务锁，再读取当前 Meme、Job 和
                     # Task；这样检查和插入不会被另一种图片处理模式穿过窗口。
                     self._lock_image_submission(target_meme_id, target_image_sha256)
+                if not payload.get("text_followup"):
+                    naming = self.session.scalar(select(Task.id).where(
+                        Task.scope_id == self.scope.scope_id,
+                        Task.target_meme_id == target_meme_id,
+                        Task.task_type == "image_name_generation",
+                        Task.status.in_(("queued", "running")),
+                    ).limit(1))
+                    if naming is not None:
+                        raise DatabaseError("image_processing_conflict")
                 target_meme = self.session.scalar(
                     select(Meme).where(
                         Meme.scope_id == self.scope.scope_id,
                         Meme.id == target_meme_id,
-                    )
+                    ).with_for_update()
                 )
                 if target_meme is None or str(target_meme.sha256).lower() != target_image_sha256:
                     raise DatabaseError("image_target_changed")
+                if task_type == "text_embedding_generation" and submission_mode == "standalone":
+                    # 名称更新和显式修复共享当前文本输入的活动任务。
+                    model = payload.get("embedding_model") or self.session.info.get("embedding_model")
+                    fingerprint = payload.get("metadata_hash") or target_meme.search_metadata_hash
+                    if model and fingerprint:
+                        payload["embedding_model"] = model
+                        payload["metadata_hash"] = fingerprint
+                        existing_text = self.session.scalar(select(Task).where(
+                            Task.scope_id == self.scope.scope_id, Task.task_type == task_type,
+                            Task.target_meme_id == target_meme_id, Task.target_image_sha256 == target_image_sha256,
+                            Task.submission_mode == "standalone", Task.status.in_(("queued", "running")),
+                            Task.payload["metadata_hash"].astext == fingerprint,
+                            Task.payload["embedding_model"].astext == model,
+                        ).limit(1))
+                        if existing_text is not None:
+                            return existing_text
+                        dedupe_key = f"text-input:{target_meme_id}:{target_image_sha256}:{fingerprint}:{model}"
                 if submission_mode == "pipeline":
                     job = self.session.scalar(
                         select(ImageProcessingJob).where(
@@ -462,7 +503,12 @@ class TaskRepository:
         if lane == "agent" or lane_backpressure is not None:
             self._lock_lane(lane)
         if dedupe_key:
-            existing = self.session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.task_type == task_type, Task.dedupe_key == dedupe_key, Task.status.in_(("queued", "running"))).with_for_update())
+            existing_query = select(Task).where(Task.scope_id == self.scope.scope_id, Task.task_type == task_type, Task.dedupe_key == dedupe_key, Task.status.in_(("queued", "running")))
+            # 文本后续提交持有 Meme 行锁；复用任务不修改其状态，无需取得
+            # Task 行锁，从而允许正在写回文本的事务完成。
+            if not payload.get("text_followup"):
+                existing_query = existing_query.with_for_update()
+            existing = self.session.scalar(existing_query)
             if existing:
                 try:
                     existing_resource = validate_lane_resource_key(getattr(existing, "lane_resource_key", None))
@@ -528,7 +574,7 @@ class TaskRepository:
         return self.session.scalar(
             select(Task.id).where(
                 Task.scope_id == self.scope.scope_id,
-                Task.task_type.in_(tuple(IMAGE_PROCESSING_LANE_TYPES)),
+                Task.task_type.in_((*IMAGE_PROCESSING_LANE_TYPES, "image_name_generation")),
                 Task.status.in_(("queued", "running")),
                 Task.target_meme_id == meme_id,
                 Task.target_image_sha256 == image_sha256,
@@ -631,7 +677,7 @@ class TaskRepository:
     def recover_expired(self, *, owner: str, limit: int = 1000, exclude_task_types: set[str] | frozenset[str] | None = None, include_task_types: set[str] | frozenset[str] | None = None, exclude_image_pipeline: bool = False) -> list[str]:
         """恢复失效租约，并可保留显式图片阶段给专用 Worker。"""
         now = utcnow()
-        filters = [Task.scope_id == self.scope.scope_id, Task.status == "running", Task.lease_expires_at < now]
+        filters = [Task.scope_id == self.scope.scope_id, Task.status == "running", Task.lease_expires_at < now, Task.task_type != "image_name_generation"]
         if exclude_task_types:
             filters.append(~Task.task_type.in_(exclude_task_types))
         if include_task_types:
@@ -1059,7 +1105,7 @@ class TaskRepository:
             self._clear_expired_lane_slots_locked(lane=lane, now=now, capacity=capacity)
             self._clear_expired_lane_resource_slots_locked(lane=lane, resource_key=resource_key, now=now, capacity=resource_capacity)
 
-            candidate_filters = [Task.lane == lane, Task.status == "queued", Task.available_at <= now]
+            candidate_filters = [Task.lane == lane, Task.status == "queued", Task.available_at <= now, Task.task_type != "image_name_generation"]
             resource_filter = Task.lane_resource_key == resource_key
             if resource_key == GLOBAL_LANE_RESOURCE_KEY:
                 resource_filter = or_(resource_filter, Task.lane_resource_key.is_(None))
@@ -1219,11 +1265,11 @@ class TaskRepository:
             child = self.get(task_id)
             if child is None or child.task_type not in {"visual_embedding_generation", "meme_context_generation"}:
                 raise DatabaseError("batch_sealed")
-            # 视觉重试可能在旧 finalizer 完成后补入 Agent；重新打开收束状态，
-            # 让该子任务终态后再次提交文本索引，而不是沿用旧批次快照。
+            # 后续成员加入时更新同一批次汇总，保留批次身份。
             if batch.finalizer_state == "complete":
                 batch.finalizer_state = "pending"
                 batch.finalized_at = None
+                batch.summary = None
         if self.session.scalar(select(TaskBatchItem).where(TaskBatchItem.scope_id == self.scope.scope_id, TaskBatchItem.batch_id == batch_id, TaskBatchItem.task_id == task_id)) is None:
             self.session.add(TaskBatchItem(scope_id=self.scope.scope_id, batch_id=batch_id, task_id=task_id))
             self.session.flush()
@@ -1246,8 +1292,23 @@ class TaskRepository:
         return list(self.session.scalars(select(TaskBatchItem.batch_id).where(TaskBatchItem.scope_id == self.scope.scope_id, TaskBatchItem.task_id == task_id)))
 
     def finalize_batch(self, batch_id: str) -> bool:
-        """在锁定已封口批次后检查成员终态，并原子写入索引刷新任务。"""
-        return self._finalize_batch_task(batch_id) is not None
+        """锁定已封口批次，成员全部终态时原子保存成功和失败汇总。"""
+        batch = self.session.scalar(select(TaskBatch).where(TaskBatch.scope_id == self.scope.scope_id, TaskBatch.batch_id == batch_id).with_for_update())
+        if batch is None or not batch.sealed or batch.finalizer_state == "complete":
+            return False
+        members = list(self.session.scalars(select(Task).join(TaskBatchItem, (Task.scope_id == TaskBatchItem.scope_id) & (Task.id == TaskBatchItem.task_id)).where(TaskBatchItem.scope_id == self.scope.scope_id, TaskBatchItem.batch_id == batch_id)))
+        if any(task.status not in {"succeeded", "failed"} for task in members):
+            return False
+        batch.summary = {
+            "total_count": len(members),
+            "succeeded_count": sum(task.status == "succeeded" for task in members),
+            "failed_count": sum(task.status == "failed" for task in members),
+            "errors": [{"task_id": task.id, "error": task.error} for task in members if task.status == "failed"],
+        }
+        batch.finalizer_state = "complete"
+        batch.finalized_at = utcnow()
+        self.session.flush()
+        return True
 
     def seal_batch(self, batch_id: str) -> None:
         """标记批次不再接收成员，防止 finalizer 观察到不完整成员集合。"""
@@ -1256,10 +1317,6 @@ class TaskRepository:
             raise DatabaseError("batch_not_found")
         batch.sealed = True
         self.session.flush()
-
-    def finalize_batch_with_task(self, batch_id: str, *, task_type: str, payload: dict[str, Any], dedupe_key: str, settings_version: str | None = None, max_attempts: int = 3) -> Task | None:
-        """锁定已封口批次，并在同一事务插入或复用唯一索引任务。"""
-        return self._finalize_batch_task(batch_id, task_type=task_type, payload=payload, dedupe_key=dedupe_key, settings_version=settings_version, max_attempts=max_attempts)
 
     def pending_finalizer_batches(self, *, limit: int = 1000) -> list[str]:
         """列出当前 scope 中需要重试收束的已封口批次，供 Worker 启动恢复。"""
@@ -1275,39 +1332,7 @@ class TaskRepository:
         )
         return list(self.session.scalars(statement))
 
-    def _finalize_batch_task(self, batch_id: str, *, task_type: str | None = None, payload: dict[str, Any] | None = None, dedupe_key: str | None = None, settings_version: str | None = None, max_attempts: int = 3) -> Task | None:
-        """在同一事务锁定批次并可选插入唯一索引任务。"""
-        batch = self.session.scalar(select(TaskBatch).where(TaskBatch.scope_id == self.scope.scope_id, TaskBatch.batch_id == batch_id).with_for_update())
-        if batch is None or not batch.sealed or batch.finalizer_state not in {"pending", "submitted"}:
-            return None
-        item_count = self.session.scalar(select(func.count()).select_from(TaskBatchItem).where(TaskBatchItem.scope_id == self.scope.scope_id, TaskBatchItem.batch_id == batch_id)) or 0
-        if not item_count:
-            return None
-        active = self.session.scalar(select(func.count()).select_from(TaskBatchItem).join(Task, (Task.scope_id == TaskBatchItem.scope_id) & (Task.id == TaskBatchItem.task_id)).where(TaskBatchItem.scope_id == self.scope.scope_id, TaskBatchItem.batch_id == batch_id, ~Task.status.in_(("succeeded", "failed")))) or 0
-        if active:
-            return None
-        task: Task | None = None
-        if task_type is not None:
-            if dedupe_key:
-                task = self.session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.task_type == task_type, Task.dedupe_key == dedupe_key, Task.status.in_(("queued", "running"))).with_for_update())
-            if task is None:
-                task = Task(id=uuid.uuid4().hex, scope_id=self.scope.scope_id, task_type=task_type, lane="default", payload=dict(payload or {}), dedupe_key=dedupe_key, settings_version=settings_version, max_attempts=max_attempts)
-                self.session.add(task)
-                try:
-                    with self.session.begin_nested():
-                        self.session.flush()
-                except IntegrityError:
-                    task = self.session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.task_type == task_type, Task.dedupe_key == dedupe_key, Task.status.in_(("queued", "running"))))
-                    if task is None:
-                        raise DatabaseError("task_submit_conflict")
-            batch.finalizer_state = "complete"
-        else:
-            batch.finalizer_state = "submitted"
-        batch.finalized_at = utcnow()
-        self.session.flush()
-        return task
-
-    def claim(self, *, owner: str, lease_seconds: int = 120, lane: str | None = None, task_id: str | None = None, lane_capacity: int | None = None, resource_key: str | None = None, resource_capacity: int | None = None, scope_capacity: int | None = None, exclude_task_types: set[str] | frozenset[str] | None = None) -> Task | None:
+    def claim(self, *, owner: str, lease_seconds: int = 120, lane: str | None = None, task_id: str | None = None, lane_capacity: int | None = None, resource_key: str | None = None, resource_capacity: int | None = None, scope_capacity: int | None = None, exclude_task_types: set[str] | frozenset[str] | None = None, allow_name_generation: bool = False) -> Task | None:
         """兼容 scope-bound 认领并递增 claim generation。
 
         Agent 正常调度必须使用 ``claim_next``；这个入口只保留给已由专用控制面
@@ -1345,6 +1370,8 @@ class TaskRepository:
         else:
             self.recover_expired(owner=owner, exclude_task_types=exclude_task_types)
         filters = [Task.scope_id == self.scope.scope_id, Task.status == "queued", Task.available_at <= now]
+        if not allow_name_generation:
+            filters.append(Task.task_type != "image_name_generation")
         if lane:
             filters.append(Task.lane == lane)
         if task_id:
@@ -1358,8 +1385,17 @@ class TaskRepository:
             filters.append(~Task.task_type.in_(exclude_task_types))
         statement = select(Task).where(*filters).order_by(Task.available_at, Task.created_at, Task.id).with_for_update(skip_locked=True).limit(1)
         task = self.session.scalar(statement)
+        if task is not None and task.task_type == "text_embedding_generation":
+            naming = self.session.scalar(select(Task.id).where(
+                Task.scope_id == task.scope_id,
+                Task.target_meme_id == task.target_meme_id,
+                Task.task_type == "image_name_generation",
+                Task.status.in_(("queued", "running")),
+            ).limit(1))
+            if naming is not None:
+                return None
         if task is None:
-            filters = [Task.scope_id == self.scope.scope_id, Task.status == "running", Task.lease_expires_at < now, Task.attempt_count < Task.max_attempts]
+            filters = [Task.scope_id == self.scope.scope_id, Task.status == "running", Task.lease_expires_at < now, Task.attempt_count < Task.max_attempts, Task.task_type != "image_name_generation"]
             if lane:
                 filters.append(Task.lane == lane)
             if task_id:
@@ -1548,6 +1584,19 @@ class TaskRepository:
             self._release_lane_slots(self.scope.scope_id, task_id, owner=owner, claim_generation=claim_generation)
             self.session.flush()
         return True
+
+    def defer_cache_fenced(self, task_id: str, claim_generation: int, owner: str, result: dict[str, Any]) -> bool:
+        """缓存汇总等待子任务时归还执行权，周期检查不消耗失败尝试次数。"""
+        now = utcnow()
+        changed = self.session.execute(update(Task).where(
+            Task.scope_id == self.scope.scope_id, Task.id == task_id,
+            Task.task_type == "cache_generation", Task.status == "running",
+            Task.claim_generation == claim_generation, Task.lease_owner == owner,
+            Task.lease_expires_at > now,
+        ).values(status="queued", result=result, message="等待单图文本任务完成",
+            available_at=now + timedelta(seconds=2), updated_at=now,
+            lease_owner=None, lease_expires_at=None, attempt_count=Task.attempt_count - 1))
+        return changed.rowcount == 1
 
     def complete_fenced_with_provenance(self, task_id: str, claim_generation: int, owner: str, *, result: Any) -> bool:
         """原子提交图片 Agent 成功终态及反向图片 provenance。

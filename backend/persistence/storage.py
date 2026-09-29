@@ -503,19 +503,23 @@ class StorageCoordinator:
                 if existing is not None:
                     raise DatabaseError("upload_reconciliation_required")
 
-                from backend.metadata import MemeContext, semantic_document_hash
+                from backend.metadata import MemeContext
+                from backend.embedding_input import build_text_input
 
                 parsed_context = MemeContext.model_validate(context)
+                text_input = build_text_input(normalized_display_name, parsed_context, status)
                 record = Meme(
                     id=meme_id or uuid.uuid4(),
                     scope_id=self.scope.scope_id,
                     storage_key=physical_key,
                     display_name=normalized_display_name,
+                    name_source="uploaded" if provenance.get("upload_receipt_id") else "unknown",
+                    text_input_status=text_input.status,
                     extension=normalized_extension,
                     size_bytes=len(content),
                     sha256=digest,
                     context_status=status,
-                    search_metadata_hash=semantic_document_hash(parsed_context),
+                    search_metadata_hash=text_input.fingerprint,
                     meme_context=parsed_context.model_dump(mode="json", exclude_none=False),
                     provenance=provenance,
                     extensions=dict(extensions or {}),
@@ -649,10 +653,9 @@ class StorageCoordinator:
             )
             if record is None:
                 raise DatabaseError("meme_not_found")
-            record.display_name = normalized_name
-            record.updated_at = utcnow()
-            session.flush()
-            return record
+            from backend.persistence.repositories.memes import MemeRepository
+
+            return MemeRepository(session, self.scope).update_display_name(record.id, normalized_name)
 
     def _rename_if_current_display_name(
         self,
@@ -762,10 +765,14 @@ class StorageCoordinator:
             )
             if unsettled_operation is not None:
                 raise DatabaseError("storage_operation_unknown")
-            record.display_name = normalized_name
-            record.updated_at = utcnow()
-            session.flush()
-            return record
+            from backend.persistence.repositories.memes import MemeRepository
+
+            return MemeRepository(session, self.scope).update_display_name(
+                record.id, normalized_name, name_source="automatic",
+                expected_display_name=expected_display_name,
+                expected_revision=expected_revision, expected_sha256=expected_sha256,
+                claim=(task_id, claim_generation, claim_owner),
+            )
 
     def rename_if_current(
         self,

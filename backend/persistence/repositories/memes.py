@@ -16,6 +16,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from backend.image_naming import normalize_display_name, normalize_extension, saved_filename
+from backend.embedding_input import build_text_input
 from backend.paths import validate_business_storage_key
 from backend.persistence.engine import DatabaseError
 from backend.persistence.models import Meme, ScopeContext, StorageOperation, Task, utcnow
@@ -136,7 +137,7 @@ class MemeRepository:
             raise DatabaseError("migration_count_invalid") from exc
         statement = select(Meme).where(
             Meme.scope_id == self.scope.scope_id,
-            Meme.context_status.in_(("partial", "ready")),
+            Meme.context_status.in_(("pending", "partial", "ready")),
             _durable_meme_clause(),
         )
         if after_id is not None:
@@ -155,7 +156,7 @@ class MemeRepository:
         ).exists()
         return (Meme.scope_id == self.scope.scope_id, ~active_operation, _durable_meme_clause())
 
-    def create(self, *, storage_key: str, extension: str, size_bytes: int, sha256: str, context: dict[str, Any], provenance: dict[str, Any], display_name: str | None = None, status: str = "pending", meme_id: UUID | None = None, extensions: dict[str, Any] | None = None) -> Meme:
+    def create(self, *, storage_key: str, extension: str, size_bytes: int, sha256: str, context: dict[str, Any], provenance: dict[str, Any], display_name: str | None = None, status: str = "pending", meme_id: UUID | None = None, extensions: dict[str, Any] | None = None, name_source: str = "unknown") -> Meme:
         """创建稳定 UUID Meme、独立展示名称和初始语境记录。"""
         try:
             validate_business_storage_key(storage_key)
@@ -175,10 +176,13 @@ class MemeRepository:
         normalized_sha256 = sha256.lower()
         if storage_key != f"{normalized_sha256}{normalized_extension}":
             raise DatabaseError("content_addressed_key_required")
-        from backend.metadata import MemeContext, semantic_document_hash
+        from backend.metadata import MemeContext
 
         parsed_context = MemeContext.model_validate(context)
-        record = Meme(id=meme_id or uuid.uuid4(), scope_id=self.scope.scope_id, storage_key=storage_key, display_name=normalized_name, extension=normalized_extension, size_bytes=size_bytes, sha256=normalized_sha256, context_status=status, search_metadata_hash=semantic_document_hash(parsed_context), meme_context=parsed_context.model_dump(mode="json", exclude_none=False), provenance=provenance, extensions=extensions or {}, revision=1)
+        if name_source not in {"uploaded", "manual", "automatic", "unknown"}:
+            raise DatabaseError("name_source_invalid")
+        text_input = build_text_input(normalized_name, parsed_context, status)
+        record = Meme(id=meme_id or uuid.uuid4(), scope_id=self.scope.scope_id, storage_key=storage_key, display_name=normalized_name, name_source=name_source, text_input_status=text_input.status, extension=normalized_extension, size_bytes=size_bytes, sha256=normalized_sha256, context_status=status, search_metadata_hash=text_input.fingerprint, meme_context=parsed_context.model_dump(mode="json", exclude_none=False), provenance=provenance, extensions=extensions or {}, revision=1)
         self.session.add(record)
         self.session.flush()
         return record
@@ -199,17 +203,22 @@ class MemeRepository:
             raise DatabaseError("target_changed")
         if expected_sha256 is not None and record.sha256 != expected_sha256:
             raise DatabaseError("target_changed")
-        from backend.metadata import MemeContext, semantic_document_hash
+        from backend.metadata import MemeContext
 
         parsed_context = MemeContext.model_validate(context)
         normalized_context = parsed_context.model_dump(mode="json", exclude_none=False)
         context_changed = record.meme_context != normalized_context or record.context_status != status
         record.meme_context = normalized_context
-        record.search_metadata_hash = semantic_document_hash(parsed_context)
+        text_input = build_text_input(record.display_name, parsed_context, status)
+        record.search_metadata_hash = text_input.fingerprint
+        record.text_input_status = text_input.status
         record.provenance = provenance
         record.context_status = status
         if context_changed:
             record.revision += 1
+            from backend.text_updates import enqueue_text_update
+
+            enqueue_text_update(self.session, record, source_task=task if claim is not None else None)
         record.updated_at = utcnow()
         self.session.flush()
         return record
@@ -223,6 +232,8 @@ class MemeRepository:
         expected_revision: int | None = None,
         expected_sha256: str | None = None,
         claim: tuple[str, int, str] | None = None,
+        name_source: str = "manual",
+        expected_name_source: str | None = None,
     ) -> Meme:
         """以可选 CAS/Task claim 只更新展示名称，不触碰物理身份或 revision。"""
         try:
@@ -244,7 +255,22 @@ class MemeRepository:
             raise DatabaseError("target_changed")
         if expected_sha256 is not None and record.sha256.lower() != expected_sha256.lower():
             raise DatabaseError("target_changed")
+        if name_source not in {"manual", "automatic"}:
+            raise DatabaseError("name_source_invalid")
+        if expected_name_source is not None and record.name_source != expected_name_source:
+            raise DatabaseError("target_changed")
+        if name_source == "automatic" and record.name_source in {"manual", "unknown"}:
+            raise DatabaseError("name_protected")
+        previous_hash = record.search_metadata_hash
         record.display_name = normalized_name
+        record.name_source = name_source
+        text_input = build_text_input(normalized_name, record.meme_context, record.context_status)
+        record.search_metadata_hash = text_input.fingerprint
+        record.text_input_status = text_input.status
+        if previous_hash != text_input.fingerprint:
+            from backend.text_updates import enqueue_text_update
+
+            enqueue_text_update(self.session, record, source_task=task if claim is not None else None)
         record.updated_at = utcnow()
         self.session.flush()
         return record

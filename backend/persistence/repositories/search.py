@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.persistence.engine import DatabaseError
+from backend.embedding_input import build_text_input
 from backend.persistence.models import (
     EMBEDDING_DIMENSIONS,
     Meme,
@@ -114,14 +115,7 @@ class SearchRepository:
             if generation is None:
                 raise DatabaseError("migration_generation_invalid")
             state.legacy_generation_id = identifier
-        # 新 epoch 的 ready 行不能被上一次回填误认为当前结果；查询在 backfill
-        # 期间本来就被门禁，但清理旧行还能让最终覆盖校验保持单一事实。
-        self.session.execute(
-            delete(MemeTextEmbedding).where(
-                MemeTextEmbedding.scope_id == self.scope.scope_id,
-                MemeTextEmbedding.embedding_model_version == model,
-            )
-        )
+        # 各向量由当前输入指纹判断资格，刷新保留已经有效的单图结果。
         state.updated_at = utcnow()
         self.session.flush()
         return state
@@ -178,7 +172,7 @@ class SearchRepository:
         rows = self.session.scalars(
             select(Meme).where(
                 Meme.scope_id == self.scope.scope_id,
-                Meme.context_status.in_(("partial", "ready")),
+                Meme.context_status.in_(("pending", "partial", "ready")),
                 Meme.search_metadata_hash.is_not(None),
                 ~active_operation,
                 _durable_meme_clause(),
@@ -190,7 +184,7 @@ class SearchRepository:
             if metadata_hash is None:
                 continue
             try:
-                if not semantic_document(MemeContext.model_validate(meme.meme_context or {})):
+                if not build_text_input(meme.display_name, meme.meme_context, meme.context_status).text:
                     continue
             except (TypeError, ValueError):
                 continue
@@ -208,7 +202,7 @@ class SearchRepository:
                 MemeTextEmbedding.dimensions == EMBEDDING_DIMENSIONS,
                 MemeTextEmbedding.status == "ready",
                 MemeTextEmbedding.embedding.is_not(None),
-                Meme.context_status.in_(("partial", "ready")),
+                Meme.context_status.in_(("pending", "partial", "ready")),
                 Meme.sha256 == MemeTextEmbedding.image_sha256,
                 Meme.search_metadata_hash == MemeTextEmbedding.metadata_hash,
             )
@@ -277,11 +271,9 @@ class SearchRepository:
 
     @staticmethod
     def _metadata_hash(meme: Meme) -> str | None:
-        """验证已存 hash 确实来自七字段语义文本；不信任孤立字符串。"""
+        """验证已存指纹符合当前名称、有效语境和文本构造版本。"""
         try:
-            from backend.metadata import MemeContext, semantic_document_hash
-
-            expected = semantic_document_hash(MemeContext.model_validate(meme.meme_context or {}))
+            expected = build_text_input(meme.display_name, meme.meme_context, meme.context_status).fingerprint
         except (TypeError, ValueError):
             return None
         stored = getattr(meme, "search_metadata_hash", None)
@@ -298,14 +290,7 @@ class SearchRepository:
             # 生产 repository 必须绑定数据库 Session；没有 Session 的历史内存 facade
             # 不能读取向量或伪造可用来源。
             return "not_ready"
-        state = self.migration_state(normalized_model)
-        if state is None or state.mode != "incremental_only":
-            return "not_ready"
-        # ORM 状态始终有 model；缺失属性只为无 Session 的旧测试 facade 保留
-        # 最小兼容，真实数据库不会把未知模型当成当前来源。
-        stored_model = getattr(state, "model", normalized_model)
-        if stored_model != normalized_model:
-            return "not_ready"
+        # 单图成功提交即可参与查询；查询条件独立验证每条向量的当前资格。
         return "incremental"
 
     def has_incremental(self, model: str) -> bool:
@@ -322,7 +307,7 @@ class SearchRepository:
                 MemeTextEmbedding.dimensions == EMBEDDING_DIMENSIONS,
                 MemeTextEmbedding.status == "ready",
                 MemeTextEmbedding.embedding.is_not(None),
-                Meme.context_status.in_(("partial", "ready")),
+                Meme.context_status.in_(("pending", "partial", "ready")),
                 Meme.sha256 == MemeTextEmbedding.image_sha256,
                 Meme.search_metadata_hash == MemeTextEmbedding.metadata_hash,
             )
@@ -361,7 +346,7 @@ class SearchRepository:
                 MemeTextEmbedding.dimensions == EMBEDDING_DIMENSIONS,
                 MemeTextEmbedding.status == "ready",
                 MemeTextEmbedding.embedding.is_not(None),
-                Meme.context_status.in_(("partial", "ready")),
+                Meme.context_status.in_(("pending", "partial", "ready")),
                 Meme.sha256 == MemeTextEmbedding.image_sha256,
                 Meme.search_metadata_hash == MemeTextEmbedding.metadata_hash,
             )
@@ -552,7 +537,7 @@ class SearchRepository:
                 MemeTextEmbedding.dimensions == EMBEDDING_DIMENSIONS,
                 MemeTextEmbedding.status == "ready",
                 MemeTextEmbedding.embedding.is_not(None),
-                Meme.context_status.in_(("partial", "ready")),
+                Meme.context_status.in_(("pending", "partial", "ready")),
                 Meme.sha256 == MemeTextEmbedding.image_sha256,
                 Meme.search_metadata_hash == MemeTextEmbedding.metadata_hash,
             )

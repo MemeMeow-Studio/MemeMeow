@@ -2548,7 +2548,7 @@ def test_host_database_resources_do_not_require_local_scope(postgres_engine: Eng
 
 
 def test_sealed_batch_reopens_after_late_agent_child(postgres_resources) -> None:
-    """视觉重试在旧缓存收束后补入 Agent 时，批次必须再次提交文本索引。"""
+    """后续 Agent 成员加入后更新同一批次汇总，完成检查保持幂等。"""
     batch_id = f"late-agent-{uuid4().hex}"
     with postgres_resources.environment("local") as environment:
         visual = environment.tasks.submit(
@@ -2559,14 +2559,8 @@ def test_sealed_batch_reopens_after_late_agent_child(postgres_resources) -> None
         environment.tasks.add_batch_item(batch_id, visual.id)
         environment.tasks.seal_batch(batch_id)
         visual.status = "succeeded"
-        first_cache = environment.tasks.finalize_batch_with_task(
-            batch_id,
-            task_type="cache_generation",
-            payload={},
-            dedupe_key="cache_generation",
-        )
-        assert first_cache is not None
-        first_cache.status = "succeeded"
+        assert environment.tasks.finalize_batch(batch_id)
+        assert not environment.tasks.finalize_batch(batch_id)
 
         child = environment.tasks.submit(
             task_type="meme_context_generation",
@@ -2578,17 +2572,12 @@ def test_sealed_batch_reopens_after_late_agent_child(postgres_resources) -> None
         batch = environment.uow.session.get(TaskBatch, {"scope_id": "local", "batch_id": batch_id})
         assert batch is not None and batch.finalizer_state == "pending"
         child.status = "succeeded"
-        second_cache = environment.tasks.finalize_batch_with_task(
-            batch_id,
-            task_type="cache_generation",
-            payload={},
-            dedupe_key="cache_generation",
-        )
-        assert second_cache is not None and second_cache.id != first_cache.id
+        assert environment.tasks.finalize_batch(batch_id)
+        assert batch.summary == {"total_count": 2, "succeeded_count": 2, "failed_count": 0, "errors": []}
 
 
 def test_sealed_batch_accepts_visual_stage_retry(postgres_resources) -> None:
-    """视觉阶段显式重试不能因批次已封口而丢失文本索引收束关系。"""
+    """视觉阶段显式重试纳入批次汇总，原失败结果保持可查询。"""
     batch_id = f"visual-retry-{uuid4().hex}"
     with postgres_resources.environment("local") as environment:
         original = environment.tasks.submit(
@@ -2599,14 +2588,7 @@ def test_sealed_batch_accepts_visual_stage_retry(postgres_resources) -> None:
         environment.tasks.add_batch_item(batch_id, original.id)
         environment.tasks.seal_batch(batch_id)
         original.status = "failed"
-        first_cache = environment.tasks.finalize_batch_with_task(
-            batch_id,
-            task_type="cache_generation",
-            payload={},
-            dedupe_key="cache-generation-visual-retry-first",
-        )
-        assert first_cache is not None
-        first_cache.status = "succeeded"
+        assert environment.tasks.finalize_batch(batch_id)
 
         retry = environment.tasks.submit(
             task_type="visual_embedding_generation",
@@ -2617,13 +2599,10 @@ def test_sealed_batch_accepts_visual_stage_retry(postgres_resources) -> None:
         batch = environment.uow.session.get(TaskBatch, {"scope_id": "local", "batch_id": batch_id})
         assert batch is not None and batch.finalizer_state == "pending"
         retry.status = "succeeded"
-        second_cache = environment.tasks.finalize_batch_with_task(
-            batch_id,
-            task_type="cache_generation",
-            payload={},
-            dedupe_key="cache-generation-visual-retry-second",
-        )
-        assert second_cache is not None and second_cache.id != first_cache.id
+        assert environment.tasks.finalize_batch(batch_id)
+        assert batch.summary["succeeded_count"] == 1
+        assert batch.summary["failed_count"] == 1
+        assert batch.summary["errors"] == [{"task_id": original.id, "error": None}]
 
 
 def test_generation_activation_rejects_new_indexable_source(postgres_resources) -> None:

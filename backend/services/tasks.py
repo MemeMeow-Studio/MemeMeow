@@ -74,6 +74,8 @@ UNTRUSTED_SCOPE_FIELDS = frozenset({"scope_id", "scope-id", "user_id", "user-id"
 def _is_explicit_image_task(record: object) -> bool:
     """判断图片任务是否已经绑定新控制面的显式来源。"""
     return (
+        getattr(record, "task_type", None) == "image_name_generation"
+    ) or (
         getattr(record, "task_type", None) in IMAGE_PROCESSING_TASK_TYPES
         and getattr(record, "submission_mode", None) in {"pipeline", "standalone"}
     )
@@ -237,22 +239,10 @@ class PostgresTaskService:
         self._batch_finalizer = callback
 
     def seal_batch(self, batch_id: str) -> None:
-        """封口批次并在同一数据库事务中持久化唯一缓存任务。"""
-        created_task_id: str | None = None
+        """封口批次并在成员全部完成时保存一次结果汇总。"""
         with self.resources.environment(self.scope.scope_id) as environment:
             environment.tasks.seal_batch(batch_id)
-            task = environment.tasks.finalize_batch_with_task(
-                batch_id,
-                task_type="cache_generation",
-                payload={},
-                dedupe_key="cache_generation",
-                settings_version=self.settings_version,
-                max_attempts=self.max_attempts,
-            )
-            if task is not None:
-                created_task_id = task.id
-        if created_task_id:
-            self._schedule(created_task_id)
+            environment.tasks.finalize_batch(batch_id)
 
     @staticmethod
     def _dedupe(task_type: str, payload: dict[str, Any]) -> str:
@@ -361,8 +351,7 @@ class PostgresTaskService:
                 include_task_types=owned_types,
                 exclude_image_pipeline=owned_types is None,
             )
-            # 普通 facade 需要恢复旧批次 finalizer；图片专用 facade 禁止重新
-            # 创建 scope 级 cache_generation。
+            # 普通 facade 恢复批次汇总，单图向量由各自的持久任务处理。
             pending_batches = environment.tasks.pending_finalizer_batches(limit=5000) if self._finalize_image_tasks else []
             cursor = None
             while True:
@@ -379,16 +368,7 @@ class PostgresTaskService:
                 if cursor is None:
                     break
             for batch_id in pending_batches:
-                task = environment.tasks.finalize_batch_with_task(
-                    batch_id,
-                    task_type="cache_generation",
-                    payload={},
-                    dedupe_key="cache_generation",
-                    settings_version=self.settings_version,
-                    max_attempts=self.max_attempts,
-                )
-                if task is not None:
-                    queued.append(task.id)
+                environment.tasks.finalize_batch(batch_id)
         for task_id in dict.fromkeys(queued):
             self._schedule(task_id)
 
@@ -1496,6 +1476,8 @@ class PostgresTaskService:
         record = self.get(task_id)
         if record is None:
             raise RuntimeError("task_not_found")
+        if record.task_type == "image_name_generation":
+            raise RuntimeError("image_stage_retry_forbidden")
         if record.task_type in IMAGE_PROCESSING_TASK_TYPES:
             raise RuntimeError("image_stage_retry_forbidden")
         if record.status != "failed":
@@ -1830,7 +1812,14 @@ class PostgresTaskService:
                     executor_attempt_id=executor_attempt_id,
                 )
             else:
-                if not task_payload.get("_agent_context_settled"):
+                if claim.task_type == "cache_generation" and isinstance(result, dict) and result.get("_pending"):
+                    with self.resources.environment(self.scope.scope_id) as environment:
+                        environment.tasks.defer_cache_fenced(task_id, generation, self.owner, result)
+                elif claim.task_type == "cache_generation" and isinstance(result, dict) and result.get("failed_count"):
+                    self._fenced_failure(task_id, generation, message="部分图片的文本修复失败",
+                        error={"error": "cache_items_failed", "message": "部分图片的文本修复失败", "items": result.get("errors", [])},
+                        retry=False, result=result)
+                elif not task_payload.get("_agent_context_settled"):
                     # 只有当前 claim 仍有效时才写入任务终态和 Meme provenance。
                     self._image_attempt_state(claim, task_payload, "completed")
                     audit_result = self._with_reverse_image_audit(task_id, result, write_provenance=False)
@@ -2070,6 +2059,7 @@ class PostgresTaskService:
                     "status": "succeeded" if saved else record.status,
                     "error": None if saved else public["error"],
                     "retryable": not saved and reason is None, "retry_reason": reason,
+                    "processing": sanitize_task_result("image_upload", receipt.get("processing_result")) if receipt else None,
                 })
             return result
 
@@ -2105,18 +2095,8 @@ class PostgresTaskService:
             return
         for current_batch_id in values:
             with self.resources.environment(self.scope.scope_id) as environment:
-                task = environment.tasks.finalize_batch_with_task(
-                    current_batch_id,
-                    task_type="cache_generation",
-                    payload={},
-                    dedupe_key="cache_generation",
-                    settings_version=self.settings_version,
-                    max_attempts=self.max_attempts,
-                )
-                created_task_id = task.id if task is not None else None
-            if created_task_id:
-                self._schedule(created_task_id)
-            if task is None or not self._batch_finalizer:
+                completed = environment.tasks.finalize_batch(current_batch_id)
+            if not completed or not self._batch_finalizer:
                 continue
             try:
                 self._batch_finalizer(current_batch_id)

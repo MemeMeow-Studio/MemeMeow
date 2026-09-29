@@ -50,6 +50,7 @@ from backend.image_stage_plan import (
     normalize_processing_mode,
 )
 from backend.metadata import MemeContext, semantic_document, semantic_document_hash
+from backend.embedding_input import build_text_input
 from backend.agent_resume import normalize_identifier
 from backend.operation_policy import (
     GrantAssociation,
@@ -82,6 +83,7 @@ AUTO_RENAME_WARNING_ERRORS = frozenset({
     "auto_rename_invalid_filename",
     "auto_rename_target_exists",
     "auto_rename_target_changed",
+    "name_protected",
 })
 AUTO_RENAME_UNKNOWN_ERRORS = frozenset({"auto_rename_unknown_execution"})
 ACTIVE_JOB_STATUSES = frozenset({"queued", "running"})
@@ -173,15 +175,20 @@ class ImageProcessingOptions:
 
     reverse_image_policy: str = "forbid"
     auto_name: bool = False
+    upload_mode: str = "analyze"
 
     @classmethod
     def normalize(cls, value: Mapping[str, object] | None = None, **kwargs: object) -> "ImageProcessingOptions":
         """从请求或内部映射构造严格、可序列化的处理选项。"""
         source = dict(value or {})
         source.update(kwargs)
+        upload_mode = source.get("upload_mode") or "analyze"
+        if upload_mode not in {"direct", "analyze"}:
+            raise ImageProcessingError("invalid_upload_mode")
         return cls(
             normalize_reverse_image_policy(source.get("reverse_image_policy")),
             normalize_auto_name(source.get("auto_name")),
+            upload_mode,
         )
 
 
@@ -716,7 +723,7 @@ class ImageProcessingRepository:
             select(Task.id)
             .where(
                 Task.scope_id == self.scope.scope_id,
-                Task.task_type.in_(tuple(STAGE_TASK_TYPES.values())),
+                Task.task_type.in_((*STAGE_TASK_TYPES.values(), "image_name_generation")),
                 Task.status.in_(tuple(ACTIVE_JOB_STATUSES)),
                 or_(target_match, legacy_match),
             )
@@ -825,7 +832,7 @@ class ImageProcessingRepository:
         stage_readiness["agent"] = stage_readiness["agent"] and agent_ready
 
         try:
-            current_metadata_hash = semantic_document_hash(MemeContext.model_validate(meme.meme_context or {}))
+            current_metadata_hash = build_text_input(meme.display_name, meme.meme_context, meme.context_status).fingerprint
         except Exception:  # noqa: BLE001 - 非法历史语境只能视为文本阶段未就绪
             current_metadata_hash = None
         stored_metadata_hash = getattr(meme, "search_metadata_hash", None)
@@ -1880,9 +1887,9 @@ class ImageProcessingWorker:
 
     @staticmethod
     def _metadata_hash(meme: Meme) -> str | None:
-        """按七个语义字段计算当前 Meme hash，并拒绝错误的已存值。"""
+        """按名称和有效语境计算当前指纹，并拒绝错误的已存值。"""
         try:
-            expected = semantic_document_hash(MemeContext.model_validate(meme.meme_context or {}))
+            expected = build_text_input(meme.display_name, meme.meme_context, meme.context_status).fingerprint
         except Exception:  # noqa: BLE001 - 非法历史元数据只表示阶段尚未有效
             return None
         stored = getattr(meme, "search_metadata_hash", None)
@@ -2369,6 +2376,7 @@ class ImageProcessingWorker:
             "reverse_image_policy": policy,
             "processing_config_hash": job.processing_config_hash,
             "stage": stage,
+            "force_embedding": job.processing_mode == "full_retry",
         }
         if stage == "text_embedding" and job.metadata_hash:
             payload["metadata_hash"] = job.metadata_hash
@@ -2486,6 +2494,8 @@ class ImageProcessingWorker:
         self._reconcile_cursor = identifiers[-1] if identifiers else None
         for identifier in identifiers:
             self.schedule(identifier)
+        if self._task_runner is not None:
+            self._task_runner._schedule_queued()
         if started - self._reconcile_logged_at >= 30:
             self._reconcile_logged_at = started
             with self._lock:
@@ -2582,12 +2592,12 @@ class SingleImageEmbeddingService:
         )
         if meme is None or str(meme.sha256).lower() != image_sha256:
             raise ImageProcessingError("target_changed")
-        if meme.context_status in {"pending", "repair_required"}:
+        if meme.context_status == "repair_required":
             raise ImageProcessingError("target_changed")
         try:
-            context = MemeContext.model_validate(meme.meme_context or {})
-            current_document = semantic_document(context)
-            current_hash = semantic_document_hash(context)
+            text_input = build_text_input(meme.display_name, meme.meme_context, meme.context_status)
+            current_document = text_input.text
+            current_hash = text_input.fingerprint
         except (TypeError, ValueError) as exc:
             raise ImageProcessingError("target_changed") from exc
         if (
@@ -2600,7 +2610,7 @@ class SingleImageEmbeddingService:
             raise ImageProcessingError("target_changed")
         return meme
 
-    def upsert(self, meme_id: UUID | str, *, image_sha256: str, metadata_hash: str, semantic_document: str, claim: tuple[str, int, str] | None = None) -> MemeTextEmbedding:
+    def upsert(self, meme_id: UUID | str, *, image_sha256: str, metadata_hash: str, semantic_document: str, claim: tuple[str, int, str] | None = None, force: bool = False) -> MemeTextEmbedding:
         """生成并原子提交单图向量；旧指纹不会覆盖新内容。
 
         可选 claim、scope、图片 SHA 和语义 hash 都在同一写事务中验证，供缓存回填
@@ -2626,10 +2636,8 @@ class SingleImageEmbeddingService:
         except (TypeError, ValueError) as exc:
             raise ImageProcessingError("target_changed") from exc
 
-        # 先做一次短读事务，避免在语境已经 pending/repair_required 或输入指纹
-        # 过期时调用外部模型；模型调用本身不能持有数据库锁。
+        # 请求模型前核验当前输入并复用有效结果，模型调用期间归还连接。
         with self.resources.factory() as session:
-            self._assert_claim(session, claim)
             self._locked_target(
                 session,
                 identifier,
@@ -2637,6 +2645,20 @@ class SingleImageEmbeddingService:
                 metadata_hash=metadata_hash,
                 semantic_value=semantic_document,
             )
+            self._assert_claim(session, claim)
+            if not force:
+                existing = session.scalar(select(MemeTextEmbedding).where(
+                    MemeTextEmbedding.scope_id == self.scope.scope_id,
+                    MemeTextEmbedding.meme_id == identifier,
+                    MemeTextEmbedding.image_sha256 == image_sha256,
+                    MemeTextEmbedding.metadata_hash == metadata_hash,
+                    MemeTextEmbedding.embedding_model_version == self.model,
+                    MemeTextEmbedding.dimensions == self.dimensions,
+                    MemeTextEmbedding.status == "ready",
+                    MemeTextEmbedding.embedding.is_not(None),
+                ))
+                if existing is not None:
+                    return existing
         vector = [float(value) for value in self.embedder(semantic_document)]
         if len(vector) != self.dimensions:
             raise ImageProcessingError("embedding_dimensions_mismatch")
@@ -2646,7 +2668,6 @@ class SingleImageEmbeddingService:
         if not math.isfinite(norm) or norm <= 0:
             raise ImageProcessingError("embedding_zero_norm")
         with self.resources.factory() as session:
-            self._assert_claim(session, claim)
             meme = self._locked_target(
                 session,
                 identifier,
@@ -2654,6 +2675,7 @@ class SingleImageEmbeddingService:
                 metadata_hash=metadata_hash,
                 semantic_value=semantic_document,
             )
+            self._assert_claim(session, claim)
             statement = select(MemeTextEmbedding).where(MemeTextEmbedding.scope_id == self.scope.scope_id, MemeTextEmbedding.meme_id == meme.id, MemeTextEmbedding.image_sha256 == image_sha256, MemeTextEmbedding.metadata_hash == metadata_hash, MemeTextEmbedding.embedding_model_version == self.model).with_for_update()
             row = session.scalar(statement)
             if row is None:

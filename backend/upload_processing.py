@@ -90,9 +90,12 @@ def run_upload_processing(
         services.thumbnails.enqueue(meme_id)
         processing = submit_processing(record, image, durable["options"])
         result = {"filename": durable["filename"], "batch_id": durable["batch_id"], "meme_id": meme_id, "image_sha256": digest, "processing_job_id": processing.job_id, "processing_status": processing.status, "saved_filename": services.metadata.saved_filename(record)}
+        result["upload_mode"] = durable["options"].get("upload_mode", "analyze")
+        if result["upload_mode"] == "direct":
+            result.update(task_ids=processing.task_ids, text_input_status=processing.text_input_status)
         with receipts.resources.environment(services.scope) as environment:
             receipt = environment.tasks.get(receipt_id, for_update=True)
-            receipt.payload = {**receipt.payload, "phase": "submitted", "processing_job_id": processing.job_id}
+            receipt.payload = {**receipt.payload, "phase": "submitted", "processing_job_id": processing.job_id, "processing_result": result}
         logger.info("upload_processing_submitted task_id={} meme_id={} processing_job_id={}", payload["_claim_task_id"], meme_id, processing.job_id)
         return result
 

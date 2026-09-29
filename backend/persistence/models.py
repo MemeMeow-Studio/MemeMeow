@@ -109,6 +109,8 @@ class Meme(Base):
     scope_id: Mapped[str] = mapped_column(String(128), ForeignKey("scopes.id", ondelete="CASCADE"), nullable=False)
     storage_key: Mapped[str] = mapped_column(String(1024), nullable=False)
     display_name: Mapped[str] = mapped_column(String(255), nullable=False, default="image", server_default=text("'image'"))
+    name_source: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown", server_default=text("'unknown'"))
+    text_input_status: Mapped[str] = mapped_column(String(32), nullable=False, default="waiting_for_text", server_default=text("'waiting_for_text'"))
     extension: Mapped[str] = mapped_column(String(16), nullable=False)
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -130,6 +132,8 @@ class Meme(Base):
         Index("ix_memes_scope_name_lower", scope_id, func.lower(display_name), id),
         Index("ix_memes_scope_updated", scope_id, updated_at.desc(), id.desc()),
         CheckConstraint("size_bytes >= 0", name="ck_memes_size_nonnegative"),
+        CheckConstraint("name_source IN ('uploaded','manual','automatic','unknown')", name="ck_memes_name_source"),
+        CheckConstraint("text_input_status IN ('eligible','waiting_for_text','repair_required')", name="ck_memes_text_input_status"),
         CheckConstraint("context_status IN ('pending','partial','ready','repair_required')", name="ck_memes_context_status"),
         CheckConstraint("search_metadata_hash IS NULL OR length(search_metadata_hash) = 64", name="ck_memes_search_metadata_hash"),
         CheckConstraint("extension = lower(extension) AND extension IN ('.png','.jpg','.jpeg','.gif')", name="ck_memes_extension_normalized"),
@@ -368,6 +372,17 @@ class MemeVisualEmbedding(Base):
         CheckConstraint("length(image_sha256) = 64", name="ck_visual_embedding_sha256"),
         UniqueConstraint("scope_id", "meme_id", "model", "preprocess_version", name="uq_visual_embedding_identity"),
     )
+
+
+class ImageNamingPool(Base):
+    """跨进程共享的命名容量、用户轮询位置及下一次检查时间。"""
+
+    __tablename__ = "image_naming_pools"
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    capacity: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    cursor_scope_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    next_check_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    __table_args__ = (CheckConstraint("capacity > 0", name="ck_image_naming_capacity"),)
 
 
 class Task(Base):
@@ -777,12 +792,13 @@ class SearchMigrationState(Base):
 
 
 class TaskBatch(Base):
-    """批次成员与索引刷新收束状态。"""
+    """批次成员、一次完成时间及成功和失败汇总。"""
 
     __tablename__ = "task_batches"
     scope_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     batch_id: Mapped[str] = mapped_column(String(255), primary_key=True)
     finalizer_state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    summary: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     sealed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

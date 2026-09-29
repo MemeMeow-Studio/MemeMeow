@@ -22,13 +22,13 @@ async def receive_uploads(request: Request, *, services: Any, options: Callable[
     limit = min(MAX_UPLOAD_FILES_PER_REQUEST, max(1, settings.max_files_per_request))
     form = await _parse_upload_form(request, max_files=limit, max_request_bytes=settings.max_request_bytes or settings.max_upload_size * limit, error=error)
     try:
-        if set(form) - {"files", "auto_name", "reverse_image_policy", "model", "request_id"}:
+        if set(form) - {"files", "auto_name", "reverse_image_policy", "model", "request_id", "upload_mode"}:
             raise error(400, "invalid_request", "上传请求包含未知字段")
         try:
             request_id = UUID(str(form.get("request_id") or uuid4())).hex
         except ValueError as exc:
             raise error(400, "invalid_request_id", "上传请求标识必须为 UUID") from exc
-        options_kwargs = {"reverse_image_policy": form.get("reverse_image_policy"), "auto_name": parse_bool(form.get("auto_name"), default=False)}
+        options_kwargs = {"reverse_image_policy": form.get("reverse_image_policy"), "auto_name": parse_bool(form.get("auto_name"), default=False), "upload_mode": form.get("upload_mode", "analyze")}
         if form.get("model") is not None:
             if not allow_model:
                 raise error(400, "invalid_request", "上传请求不支持 model 字段")
@@ -37,7 +37,7 @@ async def receive_uploads(request: Request, *, services: Any, options: Callable[
             normalized = await run_in_threadpool(options, request, **options_kwargs)
         except ImageProcessingError as exc:
             raise error(400, exc.code, str(exc)) from exc
-        frozen = {"reverse_image_policy": normalized.reverse_image_policy, "auto_name": normalized.auto_name}
+        frozen = {"reverse_image_policy": normalized.reverse_image_policy, "auto_name": normalized.auto_name, "upload_mode": normalized.upload_mode}
         if getattr(normalized, "model", None) is not None:
             frozen["model"] = normalized.model
         files = [item for item in form.getlist("files") if hasattr(item, "file")]

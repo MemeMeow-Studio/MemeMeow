@@ -44,6 +44,7 @@ from backend.metadata import (
     semantic_document_hash,
 )
 from backend.paths import SUPPORTED_EXTENSIONS
+from backend.embedding_input import build_text_input
 from backend.visual import VisualEmbeddingError, VisualInferenceClient, identity_from_settings
 
 # 统一使用旧 facade 的 logger 名称，保持现有安全审计筛选和运营日志聚合。
@@ -102,12 +103,16 @@ class PostgresMetadataService:
         provenance = Provenance.model_validate(record.provenance or {})
         payload: dict[str, object] = {
             "schema_version": record.metadata_schema_version,
+            "display_name": record.display_name,
+            "name_source": record.name_source,
+            "text_input_status": record.text_input_status,
             "image": {"relative_path": record.storage_key, "extension": record.extension, "size_bytes": record.size_bytes, "sha256": record.sha256},
             "context_status": record.context_status,
             "meme_context": context.model_dump(mode="json", exclude_none=False),
             "provenance": provenance.model_dump(mode="json", exclude_none=False),
         }
         payload.update(record.extensions or {})
+        payload.update(display_name=record.display_name, name_source=record.name_source, text_input_status=record.text_input_status)
         if image is not None:
             identity = self._identity(image)
             payload["image"] = identity
@@ -441,6 +446,7 @@ class PostgresMetadataService:
         self, meme_id: UUID | str, display_name: str, *,
         expected_display_name: str | None = None, expected_revision: int | None = None,
         expected_sha256: str | None = None, claim: tuple[str, int, str] | None = None,
+        name_source: str = "manual", expected_name_source: str | None = None,
     ) -> SidecarMetadata:
         """在事务外校验图片，再按当前身份和可选 Task 条件更新展示名称。"""
         snapshot, _image = self.image_for_meme(meme_id)
@@ -454,6 +460,7 @@ class PostgresMetadataService:
                 record = environment.memes.update_display_name(
                     meme_id, display_name, expected_display_name=expected_display_name,
                     expected_revision=expected_revision, expected_sha256=expected_sha256, claim=claim,
+                    name_source=name_source, expected_name_source=expected_name_source,
                 )
             except DatabaseError as exc:
                 raise MetadataError(exc.code) from exc
@@ -516,10 +523,9 @@ class PostgresMetadataService:
             metadata = self.load(image)
         except MetadataError as exc:
             return {"text": "", "indexable": False, "skip_reason": "metadata_invalid", "status": "repair_required", "metadata_schema_version": None, "metadata_hash": None, "image_sha256": image_sha, "error": exc.code}
-        context = metadata.meme_context
-        text = semantic_document(context) if metadata.context_status in {"partial", "ready"} else ""
-        reason = None if metadata.context_status in {"partial", "ready"} and text else ("metadata_pending" if metadata.context_status == "pending" else "semantic_text_empty" if metadata.context_status in {"partial", "ready"} else "metadata_unavailable")
-        return {"text": text, "indexable": reason is None, "skip_reason": reason, "status": metadata.context_status, "metadata_schema_version": metadata.schema_version, "metadata_hash": semantic_document_hash(context), "image_sha256": image_sha}
+        text_input = build_text_input(metadata.display_name, metadata.meme_context, metadata.context_status)
+        reason = None if text_input.status == "eligible" else text_input.status
+        return {"text": text_input.text, "indexable": reason is None, "skip_reason": reason, "status": metadata.context_status, "text_input_status": text_input.status, "metadata_schema_version": metadata.schema_version, "metadata_hash": text_input.fingerprint, "image_sha256": image_sha}
 
     def repair(self, progress: Any | None = None) -> dict[str, object]:
         """执行数据库与文件双向完整性扫描，不把孤立文件隐式导入业务列表。"""

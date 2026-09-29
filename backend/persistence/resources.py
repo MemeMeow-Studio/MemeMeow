@@ -76,7 +76,7 @@ class DatabaseResources:
         scope。构造期间会幂等补齐可选控制面表，但不会推进 migration revision。
         """
         self.engine = engine
-        self.factory = sessionmaker(engine, expire_on_commit=False, class_=Session)
+        self.factory = sessionmaker(engine, expire_on_commit=False, class_=Session, info={"embedding_model": getattr(settings, "embedding_model", None)})
         self.image_root = image_root
         self.data_root = data_root
         # 派生媒体使用独立根目录，StorageCoordinator 的原图扫描不会触碰这里。

@@ -251,6 +251,9 @@ const metadataFile = computed(() => {
 const metadataFileDetails = computed<FileDetail[]>(() => {
   const details: FileDetail[] = [
     { label: '文件名', value: metadataFile.value.filename },
+    { label: '名称来源', value: ({ uploaded: '上传文件名', manual: '人工命名，已保护', automatic: '自动命名', unknown: '历史名称，已保护' } as Record<string, string>)[firstString(metadataPayload.value?.name_source, props.image.name_source)] || '' },
+    { label: '文本索引', value: firstString(metadataPayload.value?.text_input_status, props.image.text_input_status) === 'waiting_for_text' ? '等待有效名称或语境' : props.image.embedding_status === 'ready' ? '已就绪' : '等待生成' },
+    { label: '图片向量', value: props.image.visual_embedding_status === 'ready' ? '已就绪' : '等待生成' },
     { label: '相对路径', value: metadataFile.value.relativePath },
     { label: '格式', value: metadataFile.value.extension },
     { label: '大小', value: metadataFile.value.size },

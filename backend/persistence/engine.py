@@ -26,7 +26,7 @@ from backend.persistence.models import (
 
 SCOPE_LOCAL = "local"
 # 当前代码要求的 Alembic head；数据库初始化脚本会显式传入同一 revision。
-CURRENT_SCHEMA_REVISION = "0028_image_library_sort"
+CURRENT_SCHEMA_REVISION = "0029_name_text_input"
 
 
 class DatabaseError(RuntimeError):

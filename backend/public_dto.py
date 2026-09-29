@@ -481,18 +481,20 @@ def sanitize_task_result(task_type: object, value: object) -> dict[str, Any] | N
         dimensions = _safe_int(value.get("dimensions"), maximum=100_000)
         if dimensions is not None:
             result["dimensions"] = dimensions
-    elif task_type == "image_auto_rename":
+    elif task_type in {"image_auto_rename", "image_name_generation"}:
         filename = _safe_filename(value.get("saved_filename"))
         if filename is not None:
             result["saved_filename"] = filename
         if isinstance(value.get("auto_named"), bool):
             result["auto_named"] = value["auto_named"]
     elif task_type == "text_embedding_generation":
+        if value.get("text_input_status") in {"eligible", "waiting_for_text", "repair_required"}:
+            result["text_input_status"] = value["text_input_status"]
         model = _safe_scalar(value.get("embedding_model"))
         if isinstance(model, str):
             result["embedding_model"] = model
     elif task_type == "cache_generation":
-        for key in ("indexed_count", "skipped_count"):
+        for key in ("indexed_count", "skipped_count", "reused_count", "active_count", "waiting_for_text_count", "generated_count", "failed_count", "needed_count"):
             safe = _safe_int(value.get(key))
             if safe is not None:
                 result[key] = safe
@@ -503,6 +505,12 @@ def sanitize_task_result(task_type: object, value: object) -> dict[str, Any] | N
         if dimensions is not None:
             result["dimensions"] = dimensions
     elif task_type == "image_upload":
+        if value.get("upload_mode") in {"direct", "analyze"}:
+            result["upload_mode"] = value["upload_mode"]
+        if value.get("text_input_status") in {"eligible", "waiting_for_text", "repair_required"}:
+            result["text_input_status"] = value["text_input_status"]
+        if isinstance(value.get("task_ids"), (list, tuple)):
+            result["task_ids"] = [identifier for item in value["task_ids"] if (identifier := normalize_public_identifier(item)) is not None]
         digest = normalize_public_digest(value.get("image_sha256"))
         if digest is not None:
             result["image_sha256"] = digest

@@ -197,6 +197,10 @@ stack_ready() {
     [[ "$state" == "running" && "$health" == "healthy" ]] || return 1
   done
 
+  line="$(service_line "$snapshot" mememeow-auto-rename)"
+  IFS='|' read -r _ state health exit_code <<< "$line"
+  [[ "$state" == "running" ]] || return 1
+
   line="$(service_line "$snapshot" mememeow)"
   IFS='|' read -r _ state health exit_code <<< "$line"
   [[ "$state" == "running" ]] || return 1

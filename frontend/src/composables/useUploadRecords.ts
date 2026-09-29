@@ -13,6 +13,7 @@ interface UploadRecord {
 }
 
 interface UploadStatus {
+  processing?: { upload_mode?: 'direct' | 'analyze'; text_input_status?: string; task_ids?: string[] }
   task_id: string
   upload: { receipt_id: string; batch_id: string; filename: string }
   status: string
@@ -70,6 +71,11 @@ export function useUploadRecords(items: () => UploadBatchItem[], storageScope: s
       if (task?.status === 'succeeded') {
         label = '上传成功'
         state = 'success'
+        if (task.processing?.upload_mode === 'direct') {
+          detail = task.processing.text_input_status === 'waiting_for_text'
+            ? '图片已保存，文本索引等待有效名称或语境。后台会自动命名。'
+            : '图片已保存，检索向量独立处理。后台会自动命名。'
+        }
       } else if (task?.status === 'failed') {
         const code = task.error?.error || 'task_failed'
         label = code === 'task_cancelled' ? '已取消' : '上传失败'

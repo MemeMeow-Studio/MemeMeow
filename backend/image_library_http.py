@@ -15,6 +15,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import Response
 
 from backend.database import DatabaseError
+from backend.embedding_input import build_text_input
 from backend.http_file_cache import revalidated_file_response
 from backend.image_naming import public_filename_fields, saved_filename
 from backend.metadata import MetadataError
@@ -101,15 +102,18 @@ async def list_images(
         latest_processing_by_meme = latest_for_targets((record.id, record.sha256) for record in valid_records)
     for record in valid_records:
         metadata_status = {"status": record.context_status}
+        text_input = build_text_input(record.display_name, record.meme_context, record.context_status)
         visual_ready = record.id in ready_visual_embedding_ids
         item: dict[str, object] = {
             "meme_id": str(record.id),
             "filename": saved_filename(record.display_name, record.extension),
+            "name_source": record.name_source,
+            "text_input_status": text_input.status,
             "extension": record.extension,
             "size": record.size_bytes,
             "media_url": f"/media/{record.id}",
             "metadata": metadata_status,
-            "embedding_status": "blocked" if metadata_status.get("status") == "repair_required" else "ready" if record.id in ready_text_embedding_ids else "pending",
+            "embedding_status": "blocked" if metadata_status.get("status") == "repair_required" else "waiting_for_text" if text_input.status == "waiting_for_text" else "ready" if record.id in ready_text_embedding_ids else "pending",
             "visual_embedding_status": "ready" if visual_batch_available and visual_ready else "pending",
         }
         if thumbnails is not None:

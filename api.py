@@ -381,13 +381,13 @@ def _parse_multipart_bool(value: object, *, default: bool = False) -> bool:
     raise ImageProcessingError("invalid_auto_name")
 
 
-def _normalize_processing_options(request: Request, *, reverse_image_policy: object = None, auto_name: object = None, check_availability: bool = True) -> ImageProcessingOptions:
+def _normalize_processing_options(request: Request, *, reverse_image_policy: object = None, auto_name: object = None, check_availability: bool = True, upload_mode: object = "analyze") -> ImageProcessingOptions:
     """统一规范化图片选项，并在产生 Job 前校验联网能力。"""
     try:
-        options = ImageProcessingOptions.normalize(reverse_image_policy=reverse_image_policy, auto_name=auto_name)
+        options = ImageProcessingOptions.normalize(reverse_image_policy=reverse_image_policy, auto_name=auto_name, upload_mode=upload_mode)
     except ImageProcessingError:
         raise
-    if check_availability and options.reverse_image_policy == "auto":
+    if options.upload_mode == "analyze" and check_availability and options.reverse_image_policy == "auto":
         try:
             available = bool(_service(request, "reverse_image").available)
         except Exception:  # noqa: BLE001 - 能力探测异常必须按不可用处理
@@ -677,6 +677,14 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("target_changed") from exc
         if current_sha != expected_sha:
             raise RuntimeError("target_changed")
+        identity = identity_from_settings(app.state.settings)
+        if any(payload.get(key) not in {None, value} for key, value in (("visual_model", identity.model), ("visual_dimensions", identity.dimensions), ("preprocess_version", identity.preprocess_version))):
+            raise RuntimeError("visual_model_identity_mismatch")
+        if payload.get("force_embedding") is not True:
+            with app.state.database.environment(service.scope) as environment:
+                existing = environment.visual.get(meme_id, model=identity.model, preprocess_version=identity.preprocess_version, dimensions=identity.dimensions, image_sha256=expected_sha)
+            if existing is not None:
+                return {"meme_id": meme_id, "visual_model": identity.model, "dimensions": identity.dimensions, "preprocess_version": identity.preprocess_version, "reused": True}
         if progress:
             progress(0.1, "正在生成视觉向量")
         try:
@@ -688,17 +696,16 @@ async def lifespan(app: FastAPI):
         identity = identity_from_settings(app.state.settings)
         if response.get("model") != identity.model or int(response.get("dimensions", -1)) != identity.dimensions or response.get("preprocess_version") != identity.preprocess_version:
             raise RuntimeError("visual_model_identity_mismatch")
+        latest_record, latest_image = service.metadata.image_for_meme(meme_id)
+        if latest_record.sha256 != expected_sha:
+            raise RuntimeError("target_changed")
         with app.state.database.environment(service.scope) as environment:
             meme = environment.memes.get(meme_id, for_update=True)
             if meme is None:
                 raise RuntimeError("target_changed")
-            try:
-                latest_image = service.metadata.blob_store.resolve(meme.storage_key)
-                latest_sha = service.metadata.image_sha256(latest_image)
-            except MetadataError as exc:
-                raise RuntimeError("target_changed") from exc
-            if meme.sha256 != expected_sha or latest_sha != expected_sha:
+            if meme.sha256 != expected_sha or meme.storage_key != latest_record.storage_key:
                 raise RuntimeError("target_changed")
+            environment.search.assert_claim((str(payload["_claim_task_id"]), int(payload["_claim_generation"]), str(payload["_claim_owner"])))
             environment.visual.upsert(
                 meme.id,
                 model=identity.model,
@@ -1087,8 +1094,7 @@ async def lifespan(app: FastAPI):
             result["visual_match_snapshot"] = visual_match_snapshot_summary(snapshot)
         metadata_hash = service.metadata.embedding_record(image)["metadata_hash"]
         if mode == "standalone":
-            # 独立 Agent 只使旧文本向量失效；这里不创建文本 Task，也不触碰
-            # image_processing_jobs 的 reconcile 状态。
+            # 语境事务已经提交文本后续任务，此处同步查询缓存资格。
             if not isinstance(metadata_hash, str) or not metadata_hash:
                 raise RuntimeError("target_changed")
             _invalidate_stale_text_embeddings(
@@ -1169,6 +1175,8 @@ async def lifespan(app: FastAPI):
                 expected_display_name=expected_display_name,
             )
         except DatabaseError as exc:
+            if exc.code == "name_protected":
+                raise RuntimeError("name_protected") from exc
             if exc.code == "target_exists":
                 raise RuntimeError("auto_rename_target_exists") from exc
             if exc.code == "target_changed":
@@ -1192,19 +1200,6 @@ async def lifespan(app: FastAPI):
             # 文件移动后无法重新读取 Meme 记录时，副作用结果无法证明，不能把
             # ``None`` 当作普通命名失败或让任务服务退化成 task_failed。
             raise RuntimeError("auto_rename_unknown_execution")
-        if payload.get("submission_mode") == "standalone":
-            # 独立阶段不创建文本 Task；保留一次 hash 复核，使旧运行时向量不会在
-            # 语境读取异常时继续作为成功事实暴露。
-            metadata_hash = ImageProcessingWorker._metadata_hash(renamed)
-            if metadata_hash is None:
-                raise RuntimeError("auto_rename_unknown_execution")
-            _invalidate_stale_text_embeddings(
-                app.state.database,
-                scope_id=service.scope.scope_id,
-                meme_id=meme_id,
-                image_sha256=expected_sha,
-                metadata_hash=metadata_hash,
-            )
         if progress:
             progress(1.0, "文件名已经符合标题" if same_name else "自动重命名已完成")
         if not same_name:
@@ -1220,6 +1215,8 @@ async def lifespan(app: FastAPI):
     def text_embedding_handler(payload: dict[str, object], progress):
         """为统一图片处理 job 的当前语境生成单图文本向量。"""
         service = services_for_task(payload)
+        if payload.get("embedding_model") not in {None, app.state.settings.embedding_model}:
+            raise RuntimeError("embedding_model_changed")
         meme_id = payload.get("meme_id")
         expected_sha = payload.get("image_sha256")
         if not isinstance(meme_id, str) or not isinstance(expected_sha, str):
@@ -1239,6 +1236,8 @@ async def lifespan(app: FastAPI):
         current_metadata_hash = embedding_record.get("metadata_hash")
         if embedding_record.get("image_sha256") != expected_sha:
             raise RuntimeError("target_changed")
+        if embedding_record.get("text_input_status") == "waiting_for_text":
+            return {"meme_id": meme_id, "text_input_status": "waiting_for_text", "message": "等待有效名称或语境"}
         if frozen_metadata_hash is not None and current_metadata_hash != frozen_metadata_hash:
             raise RuntimeError("target_changed")
         if not isinstance(current_metadata_hash, str) or not current_metadata_hash:
@@ -1263,6 +1262,8 @@ async def lifespan(app: FastAPI):
             image_sha256=expected_sha,
             metadata_hash=frozen_metadata_hash,
             semantic_document=str(embedding_record.get("text") or ""),
+            claim=(str(payload["_claim_task_id"]), int(payload["_claim_generation"]), str(payload["_claim_owner"])),
+            force=payload.get("force_embedding") is True,
         )
         # upsert 已在写事务内校验一次；写回后再次读取当前 Meme，确保并发语境或
         # storage key 变化不会被当作本次冻结 hash 的成功结果。
@@ -1287,6 +1288,12 @@ async def lifespan(app: FastAPI):
 
         def submit_processing(record: Meme, image: Path, options: dict[str, Any]) -> Any:
             """以接收时保存的选项提交图片处理 Job。"""
+            if options.get("upload_mode", "analyze") == "direct":
+                from backend.direct_upload import submit_direct_upload
+
+                result = submit_direct_upload(app.state.database, record, identity=identity_from_settings(app.state.settings))
+                worker.reconcile()
+                return result
             embedding = services.metadata.embedding_record(image)
             return worker.submit(record.id, record.sha256, metadata_hash=embedding.get("metadata_hash"), config=_application_processing_config(app), reverse_image_policy=options["reverse_image_policy"], auto_name=options["auto_name"], schedule=True)
 

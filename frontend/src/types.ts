@@ -28,6 +28,7 @@ export interface RepositoryMetadata {
 }
 
 export interface ImageProcessingOptions {
+  upload_mode?: 'direct' | 'analyze'
   reverse_image_policy: 'forbid' | 'auto'
   auto_name: boolean
 }
@@ -63,6 +64,8 @@ export interface ThumbnailInfo {
 }
 
 export interface MemeImage {
+  name_source?: 'uploaded' | 'manual' | 'automatic' | 'unknown'
+  text_input_status?: 'eligible' | 'waiting_for_text' | 'repair_required'
   meme_id: string
   filename: string
   media_url: string
@@ -138,6 +141,7 @@ export interface TaskItem {
   image?: TaskImage
   error?: { error?: string; message?: string }
   result?: {
+    text_input_status?: string
     scanned_count?: number
     submitted_count?: number
     conflict_count?: number
