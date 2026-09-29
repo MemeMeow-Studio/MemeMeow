@@ -5,8 +5,10 @@ import cProfile
 import hashlib
 import os
 import pstats
+import sys
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -17,13 +19,77 @@ from starlette.requests import Request
 
 from backend.collection_http import get_collection, list_collections
 from backend.config import Settings
-from backend.image_library_http import list_images
+from backend.image_library_http import list_images, media, thumbnail_media
 from backend.image_processing import ImageProcessingRepository
 from backend.persistence.models import Meme, Scope, ScopeContext, Task
 from backend.persistence.resources import DatabaseResources
+from backend.persistence.storage import StorageCoordinator
 from backend.scope import ScopeServiceFactory
+from backend.services.metadata import PostgresMetadataService
+from backend.services.thumbnails import DerivedThumbnailService
 from backend.services.thumbnails import ThumbnailError
 from backend.visual import identity_from_settings
+
+
+def test_media_conditionals_reuse_saved_hash_without_reading_files(tmp_path: Path) -> None:
+    """真实数据库与媒体文件验证条件请求不读取完整图片。"""
+    url = os.environ.get("MEMEMEOW_TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("需要显式提供开发测试 PostgreSQL 连接")
+    engine = create_engine(url, pool_size=1, max_overflow=0, pool_timeout=3)
+    scope = ScopeContext(f"media-cache-validation-{uuid4().hex}")
+    resources = DatabaseResources(engine, image_root=tmp_path / "images", data_root=tmp_path, require_local_scope=False)
+    with resources.factory() as session, session.begin():
+        session.add(Scope(id=scope.scope_id))
+    try:
+        buffer = BytesIO()
+        Image.new("RGB", (16, 8), color="green").save(buffer, format="PNG")
+        record = StorageCoordinator(resources, scope_id=scope).upload(buffer.getvalue(), extension=".png", context={}, provenance={})
+        services = SimpleNamespace(metadata=PostgresMetadataService(resources, scope_id=scope), thumbnails=DerivedThumbnailService(resources, scope_id=scope))
+        assert services.thumbnails.generate(record.id)["status"] == "available"
+
+        def request(path: str, etag: str | None = None) -> Request:
+            """构造带可选条件标签的实际 ASGI 请求。"""
+            headers = [] if etag is None else [(b"if-none-match", etag.encode("ascii"))]
+            return Request({"type": "http", "method": "GET", "path": path, "query_string": b"", "headers": headers})
+
+        def provide_services(_request: Request):
+            """返回本次 scope 的真实文件与数据库服务。"""
+            return services
+
+        def error(status: int, code: str, message: str) -> HTTPException:
+            """生成媒体入口使用的 HTTP 错误。"""
+            return HTTPException(status_code=status, detail={"error": code, "message": message})
+
+        original_url = f"/media/{record.id}"
+        thumbnail_url = f"{original_url}/thumbnail"
+        original = asyncio.run(media(request(original_url), meme_id=str(record.id), services=provide_services, error=error))
+        thumbnail = asyncio.run(thumbnail_media(request(thumbnail_url), meme_id=str(record.id), services=provide_services, error=error))
+        assert original.status_code == thumbnail.status_code == 200
+        assert original.headers["etag"] == f'"{record.sha256}"'
+        assert original.headers["cache-control"] == thumbnail.headers["cache-control"] == "private, no-cache"
+        assert thumbnail.headers["etag"] != original.headers["etag"]
+
+        observed = []
+
+        def observe_hash_calls(frame, event, argument):
+            """记录媒体请求中的图片哈希计算入口。"""
+            if event == "call" and frame.f_code.co_name in {"image_sha256", "_identity", "_output_is_valid"}:
+                observed.append(frame.f_code.co_name)
+
+        sys.setprofile(observe_hash_calls)
+        try:
+            original_cached = asyncio.run(media(request(original_url, original.headers["etag"]), meme_id=str(record.id), services=provide_services, error=error))
+            thumbnail_cached = asyncio.run(thumbnail_media(request(thumbnail_url, thumbnail.headers["etag"]), meme_id=str(record.id), services=provide_services, error=error))
+        finally:
+            sys.setprofile(None)
+        assert original_cached.status_code == thumbnail_cached.status_code == 304
+        assert original_cached.body == thumbnail_cached.body == b""
+        assert observed == []
+    finally:
+        with resources.factory() as session, session.begin():
+            session.execute(delete(Scope).where(Scope.id == scope.scope_id))
+        engine.dispose()
 
 
 def test_lists_use_database_without_reading_images(tmp_path: Path) -> None:

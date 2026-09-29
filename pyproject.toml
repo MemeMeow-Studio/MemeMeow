@@ -20,6 +20,7 @@ dependencies = [
   "pgvector>=0.3,<1",
   "google-auth[requests]>=2.40,<3",
   "loguru>=0.7.3",
+  "werkzeug>=3.1,<4",
 ]
 
 [dependency-groups]

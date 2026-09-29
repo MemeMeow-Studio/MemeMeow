@@ -7,15 +7,15 @@ services、数据库环境、处理 repository、视觉 identity 和路由注册
 
 from __future__ import annotations
 
-import mimetypes
 import re
 from collections.abc import Callable, Mapping
 from typing import Any
 
 from fastapi import HTTPException, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import Response
 
 from backend.database import DatabaseError
+from backend.http_file_cache import revalidated_file_response
 from backend.image_naming import public_filename_fields, saved_filename
 from backend.metadata import MetadataError
 from backend.persistence.repositories.memes import ImageSort
@@ -29,16 +29,7 @@ ProcessingRepositoryProvider = Callable[[Request], Any]
 VisualIdentityProvider = Callable[[Request], Any]
 ErrorFactory = Callable[[int, str, str], HTTPException]
 MISSING_MEDIA_ERRORS = frozenset({"metadata_missing", "file_not_found"})
-MEDIA_CACHE_HEADERS = {"Cache-Control": "private, no-cache", "Vary": "Cookie"}
-
-
-def _media_response(request: Request, path: Any, media_type: str, digest: str) -> Response:
-    """用已保存的内容哈希验证媒体请求，未变化时省去图片传输。"""
-    etag = f'"{digest}"'
-    headers = {**MEDIA_CACHE_HEADERS, "ETag": etag}
-    if request.headers.get("if-none-match") == etag:
-        return Response(status_code=304, headers=headers)
-    return FileResponse(path, media_type=media_type, headers=headers)
+MEDIA_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif"}
 
 
 def agent_analysis_summary(provenance: object) -> dict[str, str] | None:
@@ -204,8 +195,13 @@ async def media(
         if exc.code in MISSING_MEDIA_ERRORS:
             raise error(404, "meme_not_found", "图片不存在") from exc
         raise error(409, exc.code, "图片身份校验失败") from exc
-    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    return _media_response(request, path, media_type, record.sha256)
+    media_type = MEDIA_TYPES.get(path.suffix.lower())
+    if media_type is None:
+        raise error(409, "invalid_storage_key", "图片存储格式无效")
+    try:
+        return await revalidated_file_response(request, path, media_type=media_type, content_digest=record.sha256)
+    except FileNotFoundError as exc:
+        raise error(404, "meme_not_found", "图片不存在") from exc
 
 
 async def thumbnail_media(
@@ -223,7 +219,10 @@ async def thumbnail_media(
         path, media_type, digest = thumbnails.media_path(meme_id)
     except (ThumbnailError, DatabaseError, MetadataError) as exc:
         raise error(404, "meme_not_found", "图片不存在") from exc
-    return _media_response(request, path, media_type, digest)
+    try:
+        return await revalidated_file_response(request, path, media_type=media_type, content_digest=digest)
+    except FileNotFoundError as exc:
+        raise error(404, "meme_not_found", "图片不存在") from exc
 
 
 __all__ = ["image_metadata", "list_images", "media", "thumbnail_media"]

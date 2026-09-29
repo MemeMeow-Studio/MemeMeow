@@ -12,6 +12,7 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 from fastapi.responses import FileResponse
+from starlette.datastructures import Headers
 
 import api
 import backend.image_library_http as image_library_http
@@ -82,7 +83,7 @@ def _services(image, *, status: dict[str, object] | None = None, cache: bool = T
 
 def _request() -> SimpleNamespace:
     """构造只包含 query 参数的最小 Request 替身。"""
-    return SimpleNamespace(query_params={}, headers={})
+    return SimpleNamespace(query_params={}, headers=Headers({}), method="GET")
 
 
 def _call_list(request, records, environment, services, processing=None):
