@@ -58,7 +58,7 @@ def test_lists_use_database_without_reading_images(tmp_path: Path) -> None:
             source.write_bytes(content)
             records.append(record)
         assert services.thumbnails.generate(records[0].id)["status"] == "available"
-        thumbnail_path, _ = services.thumbnails.media_path(records[0].id)
+        thumbnail_path, _, _ = services.thumbnails.media_path(records[0].id)
         # 修改测试文件以确认列表展示数据库状态，媒体读取仍执行自身的检查。
         thumbnail_path.write_bytes(b"changed test thumbnail")
         for record in records:
@@ -128,8 +128,8 @@ def test_lists_use_database_without_reading_images(tmp_path: Path) -> None:
             assert tasks
             assert all(task.task_type == "derived_thumbnail_generation" for task in tasks)
             assert all(task.payload["meme_id"] == str(records[1].id) for task in tasks)
-        with pytest.raises(ThumbnailError, match="thumbnail_not_found"):
-            services.thumbnails.media_path(records[0].id)
+        # 媒体读取以持久化内容版本为准，文件完整性由维护流程检查。
+        assert services.thumbnails.media_path(records[0].id)[0] == thumbnail_path
     finally:
         factory.shutdown()
         with resources.factory() as session, session.begin():

@@ -57,11 +57,11 @@ class _Metadata:
         """返回图片状态摘要。"""
         return dict(self.status_value)
 
-    def image_for_meme(self, meme_id: str):
+    def image_for_meme(self, meme_id: str, *, verify_content: bool = True):
         """返回测试 Meme 与受控文件路径。"""
         if meme_id == "missing":
             raise MetadataError("metadata_missing")
-        return SimpleNamespace(id=meme_id, display_name="meme", extension=".png"), self.image
+        return SimpleNamespace(id=meme_id, display_name="meme", extension=".png", sha256="a" * 64), self.image
 
     def load(self, _image):
         """返回可投影的 metadata 对象。"""
@@ -82,7 +82,7 @@ def _services(image, *, status: dict[str, object] | None = None, cache: bool = T
 
 def _request() -> SimpleNamespace:
     """构造只包含 query 参数的最小 Request 替身。"""
-    return SimpleNamespace(query_params={})
+    return SimpleNamespace(query_params={}, headers={})
 
 
 def _call_list(request, records, environment, services, processing=None):
@@ -336,7 +336,7 @@ def test_image_media_maps_metadata_failure_to_not_found(tmp_path: Path) -> None:
     image = tmp_path / "meme.png"
     image.write_bytes(b"image-content")
     services = _services(image)
-    services.metadata.image_for_meme = lambda _meme_id: (_ for _ in ()).throw(MetadataError("metadata_image_mismatch"))
+    services.metadata.image_for_meme = lambda _meme_id, **_kwargs: (_ for _ in ()).throw(MetadataError("metadata_image_mismatch"))
     with pytest.raises(HTTPException) as caught:
         asyncio.run(image_library_http.media(_request(), meme_id="meme-1", services=lambda _request: services, error=_error))
     assert caught.value.status_code == 409
@@ -348,7 +348,7 @@ def test_image_media_maps_missing_metadata_to_not_found(tmp_path: Path) -> None:
     image = tmp_path / "meme.png"
     image.write_bytes(b"image-content")
     services = _services(image)
-    services.metadata.image_for_meme = lambda _meme_id: (_ for _ in ()).throw(MetadataError("file_not_found"))
+    services.metadata.image_for_meme = lambda _meme_id, **_kwargs: (_ for _ in ()).throw(MetadataError("file_not_found"))
     with pytest.raises(HTTPException) as caught:
         asyncio.run(image_library_http.media(_request(), meme_id="meme-1", services=lambda _request: services, error=_error))
     assert caught.value.status_code == 404

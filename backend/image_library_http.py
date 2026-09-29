@@ -13,7 +13,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from fastapi import HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from backend.database import DatabaseError
 from backend.image_naming import public_filename_fields, saved_filename
@@ -29,6 +29,16 @@ ProcessingRepositoryProvider = Callable[[Request], Any]
 VisualIdentityProvider = Callable[[Request], Any]
 ErrorFactory = Callable[[int, str, str], HTTPException]
 MISSING_MEDIA_ERRORS = frozenset({"metadata_missing", "file_not_found"})
+MEDIA_CACHE_HEADERS = {"Cache-Control": "private, no-cache", "Vary": "Cookie"}
+
+
+def _media_response(request: Request, path: Any, media_type: str, digest: str) -> Response:
+    """用已保存的内容哈希验证媒体请求，未变化时省去图片传输。"""
+    etag = f'"{digest}"'
+    headers = {**MEDIA_CACHE_HEADERS, "ETag": etag}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+    return FileResponse(path, media_type=media_type, headers=headers)
 
 
 def agent_analysis_summary(provenance: object) -> dict[str, str] | None:
@@ -182,20 +192,20 @@ async def media(
     meme_id: str,
     services: ServicesProvider,
     error: ErrorFactory,
-) -> FileResponse:
-    """按当前 scope 的稳定 meme_id 读取经过指纹校验的图片。
+) -> Response:
+    """按当前 scope 的稳定 meme_id 返回带内容版本的原图。
 
-    输入是路径中的稳定 Meme 标识；输出是受控文件的 `FileResponse`。调用场景是媒体读取，
-    既有 metadata service 负责 BlobStore 路径和数据库 SHA/size 一致性校验。
+    输入是路径中的稳定 Meme 标识；输出是文件或无内容的 304 响应。
+    调用场景是浏览器媒体读取，版本取自已经保存的图片 SHA。
     """
     try:
-        _record, path = services(request).metadata.image_for_meme(meme_id)
+        record, path = services(request).metadata.image_for_meme(meme_id, verify_content=False)
     except MetadataError as exc:
         if exc.code in MISSING_MEDIA_ERRORS:
             raise error(404, "meme_not_found", "图片不存在") from exc
         raise error(409, exc.code, "图片身份校验失败") from exc
     media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    return FileResponse(path, media_type=media_type, headers={"Cache-Control": "private, no-store", "Vary": "Cookie"})
+    return _media_response(request, path, media_type, record.sha256)
 
 
 async def thumbnail_media(
@@ -204,16 +214,16 @@ async def thumbnail_media(
     meme_id: str,
     services: ServicesProvider,
     error: ErrorFactory,
-) -> FileResponse:
+) -> Response:
     """按当前 scope 的稳定 Meme ID读取可用缩略图，隐藏内部输出 key。"""
     thumbnails = getattr(services(request), "thumbnails", None)
     if thumbnails is None:
         raise error(404, "meme_not_found", "图片不存在")
     try:
-        path, media_type = thumbnails.media_path(meme_id)
+        path, media_type, digest = thumbnails.media_path(meme_id)
     except (ThumbnailError, DatabaseError, MetadataError) as exc:
         raise error(404, "meme_not_found", "图片不存在") from exc
-    return FileResponse(path, media_type=media_type, headers={"Cache-Control": "private, no-store", "Vary": "Cookie"})
+    return _media_response(request, path, media_type, digest)
 
 
 __all__ = ["image_metadata", "list_images", "media", "thumbnail_media"]

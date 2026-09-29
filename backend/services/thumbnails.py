@@ -807,23 +807,17 @@ class DerivedThumbnailService:
                 failed += 1
         return {"scanned": len(memes[:max_items]), "submitted": submitted, "available": available, "failed": failed}
 
-    def media_path(self, meme_id: UUID | str) -> tuple[Path, str]:
-        """按可信 scope 与稳定 Meme ID 返回可访问缩略图路径和媒体类型。"""
+    def media_path(self, meme_id: UUID | str) -> tuple[Path, str, str]:
+        """按可信 scope 与稳定 Meme ID 返回缩略图路径、类型和已保存的内容哈希。"""
         try:
-            meme, _path = self._meme_and_source_identity(meme_id)
+            meme = self._meme(meme_id)
         except ThumbnailError as exc:
             raise ThumbnailError("thumbnail_not_found") from exc
         with self.resources.environment(self.scope) as environment:
             row = environment.thumbnails.current(meme, self.config.profile)
-            if row is None or row.status != "available" or not row.output_key:
+            if row is None or row.status != "available" or not row.output_key or not row.output_sha256:
                 raise ThumbnailError("thumbnail_not_found")
-        if not self._output_is_valid(meme, row):
-            with self.resources.environment(self.scope) as environment:
-                current = environment.thumbnails.current(meme, self.config.profile, for_update=True)
-                if current is not None and current.updated_at == row.updated_at:
-                    self._mark_row_stale(current, "thumbnail_output_unavailable")
-            raise ThumbnailError("thumbnail_not_found")
-        return self.store.resolve(row.output_key, must_exist=True), row.media_type or THUMBNAIL_OUTPUT_MEDIA_TYPE
+        return self.store.resolve(row.output_key, must_exist=True), row.media_type or THUMBNAIL_OUTPUT_MEDIA_TYPE, row.output_sha256
 
     def cleanup_for_meme(self, meme_id: UUID | str) -> int:
         """在原图身份锁内清理派生内容，与生成和删除使用同一互斥规则。"""

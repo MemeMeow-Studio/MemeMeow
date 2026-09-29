@@ -191,12 +191,12 @@ class PostgresMetadataService:
                 raise MetadataError("metadata_missing")
             return record.id
 
-    def image_for_meme(self, meme_id: UUID | str) -> tuple[Meme, Path]:
+    def image_for_meme(self, meme_id: UUID | str, *, verify_content: bool = True) -> tuple[Meme, Path]:
         """按当前 scope meme_id 返回经过完整身份校验的图片路径。
 
-        输入是稳定 Meme 标识；输出只在数据库 SHA/大小、扩展名、内容寻址 key
-        和实际文件路径全部一致时返回。缺失或身份不一致直接抛出 MetadataError，
-        不把异常记录改写成 repair_required。
+        输入是稳定 Meme 标识；默认完整核对数据库身份与文件内容。媒体读取传入
+        ``verify_content=False`` 时复用已保存的 SHA，避免每次请求扫描原图。
+        缺失或身份不一致直接抛出 MetadataError。
         """
         with self.resources.environment(self.scope.scope_id) as environment:
             record = environment.memes.get(meme_id)
@@ -224,13 +224,14 @@ class PostgresMetadataService:
             raise MetadataError(exc.code) from exc
         if image.name != expected_key or image.suffix != extension:
             raise MetadataError("metadata_image_mismatch")
-        identity = self._identity(image)
-        if (
-            identity["extension"] != extension
-            or record.sha256 != identity["sha256"]
-            or record.size_bytes != identity["size_bytes"]
-        ):
-            raise MetadataError("metadata_image_mismatch")
+        if verify_content:
+            identity = self._identity(image)
+            if (
+                identity["extension"] != extension
+                or record.sha256 != identity["sha256"]
+                or record.size_bytes != identity["size_bytes"]
+            ):
+                raise MetadataError("metadata_image_mismatch")
         return record, image
 
     def find_existing_upload(
