@@ -3,9 +3,13 @@
 from io import BytesIO
 from pathlib import Path
 import random
+from time import monotonic, sleep
+from uuid import uuid4
 
 import pytest
+from dotenv import dotenv_values
 from PIL import Image
+from sqlalchemy import delete
 
 from backend.gif_compression import (
     MAX_GIF_OUTPUT_BYTES, MAX_GIF_UPLOAD_BYTES, GifCompressionError,
@@ -13,6 +17,10 @@ from backend.gif_compression import (
 )
 from backend.image_safety import ImagePreflightError, preflight_upload_image
 from backend.persistence.file_lock import shared_file_lock
+from backend.persistence.engine import create_engine_for_url
+from backend.persistence.models import Scope, ScopeContext
+from backend.persistence.resources import DatabaseResources
+from backend.services.tasks import PostgresTaskService
 
 
 def animated_gif(size: tuple[int, int], count: int, *, loop: int | None = 0, transparent: bool = False, transparent_rows: int = 1) -> bytes:
@@ -40,7 +48,8 @@ def animated_gif(size: tuple[int, int], count: int, *, loop: int | None = 0, tra
 @pytest.fixture(scope="module")
 def large_animation() -> bytes:
     """提供超过 10MB 且超过 100 帧的可解码动画，实际执行压缩。"""
-    content = animated_gif((320, 320), 130, transparent=True)
+    content = animated_gif((320, 320), 560, transparent=True, transparent_rows=32)
+    assert len(content) > 64 * 1024 * 1024
     assert MAX_GIF_OUTPUT_BYTES < len(content) < MAX_GIF_UPLOAD_BYTES
     return content
 
@@ -129,6 +138,42 @@ def test_tiny_gif_deadline_cleans_up_worker_files() -> None:
         preflight_upload_image(animated_gif((3, 3), 2), ".gif", timeout_seconds=0.001)
     assert error.value.code == "gif_compression_timeout"
     assert set(root.glob("image-*")) == before
+
+
+def test_gif_resource_error_is_final_task_error(tmp_path: Path) -> None:
+    """真实锁占满时，PostgreSQL Task 保留 GIF 原因并以一次 attempt 结束。"""
+    engine = create_engine_for_url(dotenv_values(".env")["MEMEMEOW_DATABASE_URL"])
+    scope = ScopeContext("test-gif-error-" + uuid4().hex)
+    with engine.begin() as connection:
+        connection.execute(Scope.__table__.insert().values(id=scope.scope_id))
+    resources = DatabaseResources(engine, image_root=tmp_path / "images", data_root=tmp_path / "data", require_local_scope=False)
+    tasks = PostgresTaskService(resources, scope_id=scope)
+    content = animated_gif((3, 3), 2)
+
+    def handler(payload, progress):
+        """执行生产使用的图片预检入口，由真实共享锁触发资源错误。"""
+        preflight_upload_image(content, ".gif")
+        return {"validated": True}
+
+    tasks.register("image_upload", handler)
+    try:
+        root = gif_preflight_root()
+        with shared_file_lock(root / "slot-0.lock"), shared_file_lock(root / "slot-1.lock"):
+            accepted = tasks.submit("image_upload", {"receipt_id": uuid4().hex, "filename": "test-gif-error.gif", "batch_id": uuid4().hex})
+            deadline = monotonic() + 10
+            while monotonic() < deadline:
+                task = tasks.get(accepted.task_id)
+                if task.status in {"succeeded", "failed"}:
+                    break
+                sleep(0.02)
+            assert task.status == "failed", task.error
+            assert task.error["error"] == "gif_processing_busy"
+            assert task.attempts == 1
+    finally:
+        tasks.shutdown()
+        with engine.begin() as connection:
+            connection.execute(delete(Scope).where(Scope.id == scope.scope_id))
+        engine.dispose()
 
 
 def test_flashing_animation_keeps_every_brightness_change(tmp_path: Path) -> None:

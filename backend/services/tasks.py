@@ -47,6 +47,7 @@ from backend.agent_resume import (
 )
 from backend.agent_executor import ANALYSIS_CHECK_STAGES, ANALYSIS_TRIGGER_REASONS
 from backend.config import validate_agent_concurrency
+from backend.gif_compression import GIF_ERROR_CODES
 from executor.analysis_policy import AnalysisPolicyError, parse_analysis_policy
 from executor.agent_limits import validate_agent_concurrency_at_most
 from backend.image_stage_plan import IMAGE_PROCESSING_MAX_ATTEMPTS, image_task_requires_single_attempt
@@ -1798,6 +1799,9 @@ class PostgresTaskService:
                 audit_result = self._with_reverse_image_audit(task_id, None, write_provenance=False)
                 if code == "service_shutdown":
                     retry = self.resume_enabled and resume_available
+                if claim.task_type == "image_upload" and code in GIF_ERROR_CODES:
+                    # GIF 已耗尽本次处理预算或遇到明确故障，保留原因供用户显式重试。
+                    retry = False
                 self._fenced_failure(
                     task_id,
                     generation,

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from contextlib import contextmanager, ExitStack
 from io import BytesIO
+import math
 import os
 from pathlib import Path
 import resource
@@ -143,14 +144,19 @@ def compress_gif(content: bytes, directory: Path, *, max_output_bytes: int = MAX
     source.write_bytes(content)
     started = time.monotonic()
     # 每次都从原始文件编码；先调整颜色，再逐步缩小尺寸，保留全部动画帧。
-    profiles = [(256, 20, 1.0), (128, 40, 1.0), (64, 80, 1.0)]
+    profiles = [(256, 0, 1.0), (128, 0, 1.0), (64, 0, 1.0)]
     profiles.extend((64, 80, scale) for scale in (0.8, 0.6, 0.4, 0.25, 0.125, 0.0625, 0.015625))
     profiles.append((2, 100, 0.0))
     validation_error = None
+    previous_size = len(content)
+    previous_scale = 1.0
     for attempt, (colors, lossy, scale) in enumerate(profiles, 1):
         remaining = GIF_PROCESSING_TIMEOUT_SECONDS - (time.monotonic() - started)
         if remaining <= 0:
             raise GifCompressionError("gif_compression_timeout")
+        if attempt > 3 and previous_size > output_limit:
+            # GIF 图像面积决定主要编码量，使用已生成结果估算下一次尺寸并留出余量。
+            scale = min(scale, previous_scale * math.sqrt(output_limit / previous_size) * 0.95)
         width = max(1, int(original.size[0] * scale))
         height = max(1, int(original.size[1] * scale))
         command = [
@@ -178,6 +184,8 @@ def compress_gif(content: bytes, directory: Path, *, max_output_bytes: int = MAX
                 code = "gif_compression_output_limit_exceeded"
             raise GifCompressionError(code)
         size = target.stat().st_size
+        previous_size = size
+        previous_scale = scale
         logger.info("gif_compression attempt={} input_bytes={} output_bytes={} colors={} lossy={} width={} height={}", attempt, len(content), size, colors, lossy, width, height)
         if size > output_limit:
             continue
