@@ -60,7 +60,7 @@ from backend.tasks import (
     TERMINAL,
     STABLE_TASK_ERRORS,
 )
-from backend.upload_status import SAVED_UPLOAD_PHASES, upload_retry_error
+from backend.upload_status import PERMANENT_UPLOAD_ERRORS, SAVED_UPLOAD_PHASES, upload_retry_error
 from backend.scope import validate_scope_services
 from backend.services.worker_manager import PostgresTaskWorkerManager
 from backend.persistence.repositories.tasks import validate_lane_resource_key, validate_lane_resource_concurrency
@@ -1799,8 +1799,8 @@ class PostgresTaskService:
                 audit_result = self._with_reverse_image_audit(task_id, None, write_provenance=False)
                 if code == "service_shutdown":
                     retry = self.resume_enabled and resume_available
-                if claim.task_type == "image_upload" and code in GIF_ERROR_CODES:
-                    # GIF 已耗尽本次处理预算或遇到明确故障，保留原因供用户显式重试。
+                if claim.task_type == "image_upload" and (code in GIF_ERROR_CODES or code in PERMANENT_UPLOAD_ERRORS):
+                    # 永久上传错误及 GIF 处理错误保留为本次 Task 的终态原因。
                     retry = False
                 self._fenced_failure(
                     task_id,

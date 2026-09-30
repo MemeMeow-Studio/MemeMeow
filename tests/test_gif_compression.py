@@ -140,18 +140,19 @@ def test_tiny_gif_deadline_cleans_up_worker_files() -> None:
     assert set(root.glob("image-*")) == before
 
 
-def test_gif_resource_error_is_final_task_error(tmp_path: Path) -> None:
-    """真实锁占满时，PostgreSQL Task 保留 GIF 原因并以一次 attempt 结束。"""
+@pytest.mark.parametrize("error_code", ["gif_processing_busy", "invalid_image"])
+def test_upload_error_is_final_task_error(tmp_path: Path, error_code: str) -> None:
+    """真实锁占满或图片损坏时，PostgreSQL Task 保留原因并以一次 attempt 结束。"""
     engine = create_engine_for_url(dotenv_values(".env")["MEMEMEOW_DATABASE_URL"])
     scope = ScopeContext("test-gif-error-" + uuid4().hex)
     with engine.begin() as connection:
         connection.execute(Scope.__table__.insert().values(id=scope.scope_id))
     resources = DatabaseResources(engine, image_root=tmp_path / "images", data_root=tmp_path / "data", require_local_scope=False)
     tasks = PostgresTaskService(resources, scope_id=scope)
-    content = animated_gif((3, 3), 2)
+    content = animated_gif((3, 3), 2) if error_code == "gif_processing_busy" else b"invalid image"
 
     def handler(payload, progress):
-        """执行生产使用的图片预检入口，由真实共享锁触发资源错误。"""
+        """执行生产图片预检，由真实共享锁或解码错误触发指定终态。"""
         preflight_upload_image(content, ".gif")
         return {"validated": True}
 
@@ -167,7 +168,7 @@ def test_gif_resource_error_is_final_task_error(tmp_path: Path) -> None:
                     break
                 sleep(0.02)
             assert task.status == "failed", task.error
-            assert task.error["error"] == "gif_processing_busy"
+            assert task.error["error"] == error_code
             assert task.attempts == 1
     finally:
         tasks.shutdown()
