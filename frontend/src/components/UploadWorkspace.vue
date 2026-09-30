@@ -2,12 +2,13 @@
 /** 上传工作区：管理文件选择、选项确认与逐文件结果。 */
 import { computed, onMounted, onUnmounted, shallowRef } from 'vue'
 import type { ImageProcessingOptions, ServiceConfig } from '../types'
-import { uploadErrorMessage } from '../utils/presentation'
+import { errorMessage, uploadErrorMessage } from '../utils/presentation'
 import ImageProcessingOptionsDialog from './ImageProcessingOptionsDialog.vue'
 import UploadPendingItem from './UploadPendingItem.vue'
 import UploadTaskHistory from './UploadTaskHistory.vue'
 import { useUploadBatch } from '../composables/useUploadBatch'
 import { defaultUploadMode } from '../utils/uploadMode'
+import { isAndroidApp, pickAlbumImages } from '../utils/nativeMedia'
 
 const props = defineProps<{
   config: ServiceConfig | null
@@ -37,6 +38,7 @@ const pendingItems = computed(() => batchItems.value.filter((item) => item.statu
 const busy = batch.busy
 const paused = batch.paused
 const isDragActive = shallowRef(false)
+const pickingImages = shallowRef(false)
 const queuedItemCount = computed(() => batchItems.value.filter((item) => (
   item.status === 'pending'
   || item.status === 'uploading'
@@ -64,6 +66,22 @@ function onFiles(event: Event): void {
   appendLocalFiles([...(input.files || [])])
   // 文件已复制到批次状态；清空原生值后，删除后再次选择同一文件仍会触发 change。
   input.value = ''
+}
+
+/** 安卓应用的文件入口打开系统照片选择器，选择结果进入现有队列。 */
+async function onSelectImages(event: MouseEvent): Promise<void> {
+  if (!isAndroidApp) return
+  event.preventDefault()
+  if (busy.value || pickingImages.value) return
+  emit('clearError')
+  pickingImages.value = true
+  try {
+    appendLocalFiles(await pickAlbumImages())
+  } catch (reason) {
+    emit('error', `相册图片选择失败：${errorMessage(reason)}`)
+  } finally {
+    pickingImages.value = false
+  }
 }
 
 /** 将一组本地文件追加到批次，供剪贴板和后续拖放入口共用。 */
@@ -256,18 +274,19 @@ async function retryTransfer(requestId: string): Promise<void> {
       <label
         class="drop-zone"
         :class="{ 'is-dragging': isDragActive }"
+        @click="onSelectImages"
         @dragenter="onDragEnter"
         @dragover="onDragOver"
         @dragleave="onDragLeave"
         @drop="onDrop"
       >
-        <input type="file" multiple accept=".png,.jpg,.jpeg,.gif" aria-label="选择图片文件" :disabled="busy" @change="onFiles" />
-        <span class="drop-title">选择图片文件</span>
-        <span class="drop-sub">{{ queuedItemCount ? `已选择 ${queuedItemCount} 个文件，可继续添加` : '点击选择或拖入文件' }}</span>
-        <span class="drop-hint">支持 Ctrl+V 连续添加图片，最后统一上传</span>
+        <input type="file" multiple accept=".png,.jpg,.jpeg,.gif" :aria-label="isAndroidApp ? '选择相册图片' : '选择图片文件'" :disabled="busy || pickingImages" @change="onFiles" />
+        <span class="drop-title">{{ pickingImages ? '正在读取相册图片…' : isAndroidApp ? '选择相册图片' : '选择图片文件' }}</span>
+        <span class="drop-sub">{{ queuedItemCount ? `已选择 ${queuedItemCount} 个文件，可继续添加` : isAndroidApp ? '点击打开相册，可选择多张图片' : '点击选择或拖入文件' }}</span>
+        <span v-if="!isAndroidApp" class="drop-hint">支持 Ctrl+V 连续添加图片，最后统一上传</span>
         <span class="drop-hint">GIF 最大 100MB，超过 10MB 自动有损压缩，保留完整动画时长和循环设置</span>
       </label>
-      <button class="primary wide" type="button" :disabled="busy || !submitFiles.length" @click="openOptions">
+      <button class="primary wide" type="button" :disabled="busy || pickingImages || !submitFiles.length" @click="openOptions">
         {{ busy ? '上传中...' : '上传所选图片' }}
       </button>
       <div v-if="busy" class="upload-summary" aria-live="polite">

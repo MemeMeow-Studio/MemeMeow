@@ -1,8 +1,8 @@
 <script setup lang="ts">
-/** 检索工作区：拥有检索表单、结果去重与图片复制行为。 */
+/** 检索工作区：管理检索表单、结果去重与图片操作。 */
 import { computed, shallowRef } from 'vue'
 import { api } from '../api'
-import { useImageClipboard } from '../composables/useImageClipboard'
+import { useImageAction } from '../composables/useImageAction'
 import type { MemeImage, SearchResponse, SearchResultMedia, ServiceConfig } from '../types'
 import ImagePreviewDialog from './ImagePreviewDialog.vue'
 import SearchResultDetailsDialog from './SearchResultDetailsDialog.vue'
@@ -37,7 +37,7 @@ const detailItem = shallowRef<SearchItem | null>(null)
 const detailTrigger = shallowRef<HTMLElement | null>(null)
 const previewImage = shallowRef<MemeImage | null>(null)
 const previewTrigger = shallowRef<HTMLElement | null>(null)
-const { copyNotice, copyImage } = useImageClipboard()
+const { imageNotice, imageActionLabel, performImageAction, saving } = useImageAction()
 
 const uniqueResults = computed(() => {
   const seen = new Set<string>()
@@ -78,7 +78,7 @@ function openDetails(item: SearchItem, event: MouseEvent): void {
 
 /** 兼容旧结果卡片的直接点击；点击内部按钮时由按钮自身处理。 */
 function handleResultItemClick(event: MouseEvent, item: SearchItem): void {
-  if (event.target === event.currentTarget) copyImage(item.media_url)
+  if (event.target === event.currentTarget) performImageAction(item.media_url)
 }
 
 /** 从轻量详情跳转到复用的图片库完整详情，确保两个模态不会同时存在。 */
@@ -224,10 +224,10 @@ async function runSearch(): Promise<void> {
           v-for="(item, index) in searchItems"
           :key="`${item.meme_id}:${index}`"
           class="result-item"
-          :aria-label="`复制检索结果 ${index + 1}`"
+          :aria-label="`${imageActionLabel}检索结果 ${index + 1}`"
           @click="handleResultItemClick($event, item)"
         >
-          <button class="result-image-button" type="button" :aria-label="`复制检索结果 ${index + 1}`" title="复制图片" @click="copyImage(item.media_url)">
+          <button class="result-image-button" type="button" :aria-label="`${imageActionLabel}检索结果 ${index + 1}`" :title="`${imageActionLabel}图片`" :disabled="saving" @click="performImageAction(item.media_url)">
             <span class="result-media-frame">
               <img v-if="!visibleFailed.has(item.meme_id)" :src="resultSource(item)" alt="检索结果" loading="lazy" @error="handleResultImageError($event, item)" />
               <span v-else class="image-load-fallback" role="img" aria-label="图片暂不可用">图片暂不可用</span>
@@ -249,7 +249,7 @@ async function runSearch(): Promise<void> {
           />
         </article>
       </div>
-      <p v-if="copyNotice" class="copy-notice" role="status" aria-live="polite">{{ copyNotice }}</p>
+      <p v-if="imageNotice" class="copy-notice" role="status" aria-live="polite">{{ imageNotice }}</p>
     </template>
     <div v-else class="empty-state" :class="{ loading: busy }" role="status" aria-live="polite">
       <h2>{{ busy ? '正在分析你的描述' : '还没有检索结果' }}</h2>
