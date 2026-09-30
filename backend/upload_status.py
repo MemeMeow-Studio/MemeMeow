@@ -10,6 +10,8 @@ PERMANENT_UPLOAD_ERRORS = frozenset({
     "empty_file", "file_too_large", "image_frame_count_exceeded", "image_frame_pixels_exceeded",
     "image_total_pixels_exceeded", "upload_request_conflict", "upload_input_size_changed",
     "upload_reconciliation_required", "upload_receiving_interrupted", "upload_receipt_missing", "task_cancelled",
+    "gif_processing_memory_exceeded", "gif_compression_output_limit_exceeded",
+    "gif_compression_animation_changed", "gif_compression_transparency_changed", "gif_compression_target_exceeded",
 })
 
 

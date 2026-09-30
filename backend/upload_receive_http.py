@@ -14,6 +14,7 @@ from backend.image_processing import ImageProcessingError
 from backend.operation_policy import OperationPolicyError
 from backend.persistence.engine import DatabaseError
 from backend.upload_receipts import UploadReceipts
+from backend.gif_compression import gif_upload_limit
 
 
 async def receive_uploads(request: Request, *, services: Any, options: Callable[..., Any], parse_bool: Callable[..., bool], sanitize: Callable[[str], str], authorization: Any, error: Callable[..., Any], allow_model: bool = False) -> dict[str, Any]:
@@ -52,7 +53,8 @@ async def receive_uploads(request: Request, *, services: Any, options: Callable[
                 results.append({"filename": original, "ok": False, "error": "invalid_filename"})
                 continue
             try:
-                result = await run_in_threadpool(receipts.accept, upload.file, request_id=request_id, index=index, filename=filename, options=frozen, size_bytes=upload.size, max_bytes=settings.max_upload_size, max_pending_bytes=settings.max_pending_upload_bytes, reserve=authorization.reserve)
+                max_bytes = gif_upload_limit(upload.file, settings.max_upload_size)
+                result = await run_in_threadpool(receipts.accept, upload.file, request_id=request_id, index=index, filename=filename, options=frozen, size_bytes=upload.size, max_bytes=max_bytes, max_pending_bytes=settings.max_pending_upload_bytes, reserve=authorization.reserve)
             except (DatabaseError, OperationPolicyError) as exc:
                 result = {"filename": original, "ok": False, "error": exc.code}
             results.append(result)

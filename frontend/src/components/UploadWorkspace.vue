@@ -265,6 +265,7 @@ async function retryTransfer(requestId: string): Promise<void> {
         <span class="drop-title">选择图片文件</span>
         <span class="drop-sub">{{ queuedItemCount ? `已选择 ${queuedItemCount} 个文件，可继续添加` : '点击选择或拖入文件' }}</span>
         <span class="drop-hint">支持 Ctrl+V 连续添加图片，最后统一上传</span>
+        <span class="drop-hint">GIF 最大 100MB，超过 10MB 自动有损压缩，保留完整动画时长和循环设置</span>
       </label>
       <button class="primary wide" type="button" :disabled="busy || !submitFiles.length" @click="openOptions">
         {{ busy ? '上传中...' : '上传所选图片' }}

@@ -41,15 +41,10 @@ def test_single_frame_pixel_limit_is_checked_before_decode() -> None:
     assert error.value.code == "image_frame_pixels_exceeded"
 
 
-def test_animation_frame_count_and_total_pixels_are_bounded() -> None:
-    """动画同时受 100 帧和 100M 累计帧像素边界约束。"""
-    with pytest.raises(ImagePreflightError) as frame_error:
-        validate_image_content(gif_bytes((1, 1), 101), ".gif")
-    assert frame_error.value.code == "image_frame_count_exceeded"
-
-    with pytest.raises(ImagePreflightError) as pixels_error:
-        validate_image_content(gif_bytes((3_200, 3_200), 10), ".gif")
-    assert pixels_error.value.code == "image_total_pixels_exceeded"
+def test_gif_frames_and_cumulative_pixels_use_processing_budgets() -> None:
+    """GIF 可以超过 100 帧和 100M 累计像素，处理仍受时间及内存预算约束。"""
+    validate_image_content(gif_bytes((1, 1), 101), ".gif")
+    validate_image_content(gif_bytes((3_200, 3_200), 10), ".gif")
 
 
 def test_extension_and_actual_format_must_match() -> None:

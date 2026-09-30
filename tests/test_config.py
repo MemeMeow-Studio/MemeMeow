@@ -32,12 +32,12 @@ def test_reverse_image_defaults_to_google_vision_and_keeps_status_redacted() -> 
 
 
 def test_upload_limits_default_to_public_two_lane_contract() -> None:
-    """上传边界默认公开 20 文件、客户端 2 并发提示，并关闭可选总字节预算。"""
+    """上传默认公开 20 文件、客户端两个并发提示和 128MB 请求预算。"""
     settings = Settings(_env_file=None)
     assert settings.max_files_per_request == 20
     assert settings.max_concurrent_upload_requests == 2
-    assert settings.max_request_bytes is None
-    assert settings.status()["max_request_bytes"] is None
+    assert settings.max_request_bytes == 128 * 1024 * 1024
+    assert settings.status()["max_request_bytes"] == 128 * 1024 * 1024
 
 
 def test_upload_limits_validate_deployment_bounds() -> None:

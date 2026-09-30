@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from loguru import logger
 
-from backend.image_safety import validate_image_content
+from backend.image_safety import preflight_upload_image
 from backend.collection_packages import sha256_bytes
 from backend.persistence.engine import DatabaseError
 from backend.persistence.file_lock import shared_file_lock
@@ -16,8 +16,8 @@ from backend.upload_receipts import UploadReceipts
 
 def prepare_upload(content: bytes, filename: str) -> tuple[bytes, str, str | None]:
     """校验上传图片，返回规范字节、存储名称和可选展示名称。"""
-    validate_image_content(content, Path(filename).suffix.lower())
-    return content, filename, None
+    prepared = preflight_upload_image(content, Path(filename).suffix.lower())
+    return prepared.content, filename, None
 
 
 def run_upload_processing(

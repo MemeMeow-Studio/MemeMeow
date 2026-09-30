@@ -19,7 +19,8 @@ from backend.collection_packages import sha256_bytes
 from backend.database import DatabaseError
 from backend.image_naming import is_content_addressed_key, public_filename_fields
 from backend.image_processing import ImageProcessingError
-from backend.image_safety import ImagePreflightError, validate_image_content
+from backend.image_safety import ImagePreflightError, ImageUploadPreparation, preflight_upload_image
+from backend.gif_compression import gif_upload_limit
 from backend.metadata import MetadataError
 from backend.operation_policy import OperationPolicyError, Operations
 from backend.paths import SUPPORTED_EXTENSIONS, validate_business_storage_key
@@ -228,7 +229,7 @@ async def upload_images(
     parse_multipart_bool: MultipartBoolParser,
     sanitize_filename: FilenameSanitizer,
     validate_storage_key: StorageKeyValidator = validate_business_storage_key,
-    validate_image: ImageValidator = validate_image_content,
+    validate_image: ImageValidator = preflight_upload_image,
     calculate_sha256: Sha256Calculator = sha256_bytes,
     processing_worker: ProcessingWorkerProvider,
     submit_processing_job: ProcessingSubmitter,
@@ -293,7 +294,7 @@ async def upload_images(
     for upload in files:
         # 释放上一项的内容缓冲后再触碰下一个 spool，避免请求内文件字节累积。
         content = b""
-        content, too_large = await _read_upload_content(upload, max_upload_size=configured_settings.max_upload_size)
+        content, too_large = await _read_upload_content(upload, max_upload_size=gif_upload_limit(upload.file, configured_settings.max_upload_size))
         original = upload.filename or "image"
         clean = sanitize_filename(original)
         if Path(clean).suffix.lower() not in SUPPORTED_EXTENSIONS:
@@ -308,7 +309,9 @@ async def upload_images(
             results.append({"filename": original, "ok": False, "error": "invalid_filename"})
             continue
         try:
-            validate_image(content, Path(clean).suffix.lower())
+            prepared = validate_image(content, Path(clean).suffix.lower())
+            if isinstance(prepared, ImageUploadPreparation):
+                content = prepared.content
         except ImagePreflightError as exc:
             results.append({"filename": original, "ok": False, "error": exc.code})
             continue

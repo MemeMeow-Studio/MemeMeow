@@ -26,6 +26,7 @@ from backend.image_stage_plan import (
 )
 from backend.opencode_workspace import SELECTOR_RE
 from backend.persistence.models import GLOBAL_LANE_RESOURCE_KEY
+from backend.gif_compression import GIF_ERROR_CODES
 from backend.public_dto import (
     PUBLIC_TASK_STATUSES,
     normalize_public_code,
@@ -37,7 +38,7 @@ from backend.public_dto import (
 )
 
 TERMINAL = {"succeeded", "failed"}
-STABLE_TASK_ERRORS = {
+STABLE_TASK_ERRORS = set(GIF_ERROR_CODES) | {
     "upload_receipt_missing",
     "upload_receiving_interrupted",
     "upload_input_size_changed",
