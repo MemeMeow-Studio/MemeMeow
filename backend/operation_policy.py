@@ -620,6 +620,10 @@ class GrantAssociationStore:
             association = self._values.get(key)
             if association is None or association.grant != grant:
                 return False
+            if association.state == "unknown" and state == "released":
+                # 宿主策略已确认没有副作用后，可将未知关联收束为已释放。
+                association.state = state
+                return True
             if association.state in {"committed", "released", "unknown"}:
                 return association.state == state
             association.state = state
@@ -882,6 +886,12 @@ class PersistentGrantRepository:
             if row is None:
                 session.commit()
                 return False
+            if row.state == "unknown" and state == "released":
+                # 该入口只登记宿主策略已经完成的释放结果。
+                row.state = state
+                row.updated_at = utcnow()
+                session.commit()
+                return True
             if row.state in {"committed", "released", "unknown"}:
                 session.commit()
                 return row.state == state

@@ -64,5 +64,6 @@ class UploadAuthorization:
         if not payload.get("input_digest"):
             return
         association = self.store.get(self.request(payload))
-        if association is not None and association.state == "acquired":
+        if association is not None and association.state in {"acquired", "unknown"}:
+            # 调用方已确认未登记图片，恢复程序记录的 unknown 也能依据该事实释放。
             self.release(association.grant)

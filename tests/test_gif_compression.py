@@ -1,6 +1,7 @@
 # 使用真实 GIF 和 gifsicle 核验大小、动画时间信息、透明背景以及资源错误。
 
 from io import BytesIO
+from hashlib import sha256
 from pathlib import Path
 import random
 from time import monotonic, sleep
@@ -18,9 +19,11 @@ from backend.gif_compression import (
 from backend.image_safety import ImagePreflightError, preflight_upload_image
 from backend.persistence.file_lock import shared_file_lock
 from backend.persistence.engine import create_engine_for_url
-from backend.persistence.models import Scope, ScopeContext
+from backend.persistence.models import Scope, ScopeContext, Task
 from backend.persistence.resources import DatabaseResources
 from backend.services.tasks import PostgresTaskService
+from backend.operation_policy import AllowAllOperationPolicy, OperationPolicyGateway, PersistentGrantAssociationStore
+from backend.upload_authorization import UploadAuthorization
 
 
 def animated_gif(size: tuple[int, int], count: int, *, loop: int | None = 0, transparent: bool = False, transparent_rows: int = 1) -> bytes:
@@ -191,3 +194,35 @@ def test_flashing_animation_keeps_every_brightness_change(tmp_path: Path) -> Non
             assert image.info["duration"] == 10 + index % 3 * 10
             expected = 255 if index % 2 else 0
             assert image.convert("RGB").getpixel((image.width // 2, image.height // 2)) == (expected, expected, expected)
+
+
+def test_absent_upload_releases_unknown_grant(tmp_path: Path) -> None:
+    """真实 PostgreSQL 关联已为 unknown 且没有登记图片时，释放本次上传授权。"""
+    engine = create_engine_for_url(dotenv_values(".env")["MEMEMEOW_DATABASE_URL"])
+    scope = ScopeContext("test-gif-discard-" + uuid4().hex)
+    receipt_id = uuid4().hex
+    payload = {"receipt_id": receipt_id, "input_digest": sha256(animated_gif((3, 3), 2)).hexdigest(), "phase": "accepted"}
+    resources = DatabaseResources(engine, image_root=tmp_path / "images", data_root=tmp_path / "data", require_local_scope=False)
+    with resources.factory.begin() as session:
+        session.add(Scope(id=scope.scope_id))
+        session.flush()
+        session.add(Task(id=receipt_id, scope_id=scope.scope_id, task_type="image_upload", lane="upload", payload=payload, status="failed"))
+    gateway = OperationPolicyGateway(AllowAllOperationPolicy())
+    store = PersistentGrantAssociationStore(resources)
+
+    def release(grant) -> None:
+        """使用开源运行环境的真实授权策略释放，并保存关联终态。"""
+        assert gateway.release(grant).ok
+        assert store.transition(grant, "released")
+
+    authorization = UploadAuthorization(scope, gateway, store, release=release)
+    try:
+        authorization.reserve(payload)
+        association = store.get(authorization.request(payload))
+        assert store.transition(association.grant, "unknown")
+        authorization.discard(payload)
+        assert store.get(authorization.request(payload)).state == "released"
+    finally:
+        with engine.begin() as connection:
+            connection.execute(delete(Scope).where(Scope.id == scope.scope_id))
+        engine.dispose()
