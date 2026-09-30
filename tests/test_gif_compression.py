@@ -9,7 +9,7 @@ from PIL import Image
 
 from backend.gif_compression import (
     MAX_GIF_OUTPUT_BYTES, MAX_GIF_UPLOAD_BYTES, GifCompressionError,
-    compress_gif, gif_upload_limit, scan_gif,
+    compress_gif, gif_preflight_root, gif_upload_limit, scan_gif,
 )
 from backend.image_safety import ImagePreflightError, preflight_upload_image
 from backend.persistence.file_lock import shared_file_lock
@@ -114,7 +114,7 @@ def test_receiving_limit_uses_content_and_restores_cursor() -> None:
 
 def test_busy_processing_returns_specific_error() -> None:
     """使用真实共享锁占用两个处理位置，第三个 GIF 明确返回并发限制。"""
-    root = Path.cwd() / "temp/gif-compression"
+    root = gif_preflight_root()
     with shared_file_lock(root / "slot-0.lock"), shared_file_lock(root / "slot-1.lock"):
         with pytest.raises(ImagePreflightError) as error:
             preflight_upload_image(animated_gif((3, 3), 2), ".gif")
@@ -123,7 +123,7 @@ def test_busy_processing_returns_specific_error() -> None:
 
 def test_tiny_gif_deadline_cleans_up_worker_files() -> None:
     """真实截止时间终止 GIF worker，临时目录由父进程清理。"""
-    root = Path.cwd() / "temp/gif-compression"
+    root = gif_preflight_root()
     before = set(root.glob("image-*"))
     with pytest.raises(ImagePreflightError) as error:
         preflight_upload_image(animated_gif((3, 3), 2), ".gif", timeout_seconds=0.001)

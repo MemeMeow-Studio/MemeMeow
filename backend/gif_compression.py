@@ -110,7 +110,7 @@ def gif_upload_limit(source: BinaryIO, ordinary_limit: int) -> int:
 @contextmanager
 def gif_preflight_resources(is_gif: bool) -> Iterator[Path]:
     """父进程持有并发位置及临时目录，启动失败和超时均能释放资源。"""
-    root = Path.cwd() / "temp" / "gif-compression"
+    root = gif_preflight_root()
     root.mkdir(parents=True, exist_ok=True)
     with ExitStack() as resources:
         if is_gif:
@@ -121,6 +121,11 @@ def gif_preflight_resources(is_gif: bool) -> Iterator[Path]:
                 raise GifCompressionError("gif_processing_busy")
         directory = resources.enter_context(tempfile.TemporaryDirectory(prefix="image-", dir=root))
         yield Path(directory)
+
+
+def gif_preflight_root() -> Path:
+    """返回 API 数据目录内的处理目录，兼容 Docker 中不同运行用户的可写权限。"""
+    return Path(os.environ.get("MEMEMEOW_DATA_ROOT", str(Path.cwd() / "data"))) / "temp" / "gif-compression"
 
 
 def compress_gif(content: bytes, directory: Path, *, max_output_bytes: int = MAX_GIF_OUTPUT_BYTES) -> bytes:
