@@ -1773,6 +1773,8 @@ class OpenCodeRunner:
                     active_image = resolved_workspace.image_path(context.image_relative_path)
                 except WorkspaceResolutionError as exc:
                     raise OpenCodeError(exc.code, str(exc), executor_attempt_id=local_executor_attempt_id) from exc
+            # 保留原始输入路径，供 Agent 读取 GIF 全部帧。
+            original_image = active_image.expanduser().resolve()
             if self.executor_mode:
                 if context.image_relative_path:
                     relative_image = context.image_relative_path.replace("\\", "/")
@@ -1887,6 +1889,7 @@ class OpenCodeRunner:
             )
             prompt = (
                 "使用 research-meme-context skill 分析这张表情包；不要使用本地以图搜图。"
+                f"原始图片路径（只读）：{json.dumps(str(original_image), ensure_ascii=False)}。"
                 "必须直接通过视觉模型查看输入图片并识别图片文字，禁止调用任何本地文字识别程序、命令或脚本。"
                 "遇到错误时自行尝试可行的替代方案；确认无法解决时，简短说明原因并退出。"
                 f"本任务 reverse_image_policy={reverse_image_policy if reverse_image_policy in {'forbid', 'auto'} else 'forbid'}；只能通过项目内部反向图片接口使用能力，绝不读取或请求供应商密钥。"

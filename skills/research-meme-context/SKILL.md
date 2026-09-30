@@ -12,6 +12,8 @@ description: Research evidence-backed structured representations of image memes,
 
 首次进行视觉观察前，读取 [references/observation-prompt.md](references/observation-prompt.md)。返回最终表示前，读取 [references/output-schema.json](references/output-schema.json)。当任务 payload 允许使用项目反向图片能力时，读取 [references/serpapi-google-lens.md](references/serpapi-google-lens.md)。供应商访问、缓存和计数由后端完成；视觉候选由后端在 Agent 启动前冻结并物化，Agent 不调用视觉匹配接口。
 
+原始输入为 GIF 时，在视觉观察前读取 [references/gif-analysis.md](references/gif-analysis.md)，使用任务提供的原始图片路径分析动画。
+
 不要使用本地以图搜图。
 
 ## 工作流

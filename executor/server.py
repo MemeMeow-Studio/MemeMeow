@@ -1292,6 +1292,7 @@ class Executor:
     def _prompt(self, task: TaskState) -> str:
         """生成唯一业务 prompt；调用方不能覆盖路径、命令或提示词。"""
         result_dir = RESULT_ROOT / task.task_id
+        image = (task.images_root or IMAGE_ROOT) / _relative_image_path(task.image_relative_path)
         resume_instruction = (
             "这是同一 OpenCode session 的受控续跑；保留并检查已有草稿和中间产物，只完成尚未完成的工作。"
             if task.is_resume
@@ -1300,6 +1301,7 @@ class Executor:
         return (
             "使用 research-meme-context skill 分析这张表情包；先读取本任务固定候选 manifest，"
             "候选只作为参考证据；只通过项目内部接口使用可选反向图片能力。"
+            f"原始图片路径（只读）：{json.dumps(str(image.absolute()), ensure_ascii=False)}。"
             "必须直接通过视觉模型查看输入图片并识别图片文字，禁止调用任何本地文字识别程序、命令或脚本。"
             f"本任务 reverse_image_policy={task.reverse_image_policy}。"
             f"{resume_instruction}"
