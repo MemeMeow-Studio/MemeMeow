@@ -36,7 +36,7 @@ const { floatingStyles, isPositioned } = useFloating(reference, popover, {
   open,
   placement: 'right-start',
   strategy: 'fixed',
-  middleware: [offset(8), flip(), shift({ padding: 8 })],
+  middleware: [offset(8), flip({ fallbackAxisSideDirection: 'end' }), shift({ padding: 8, crossAxis: true })],
   whileElementsMounted: autoUpdate,
 })
 
