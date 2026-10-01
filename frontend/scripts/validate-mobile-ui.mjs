@@ -56,6 +56,7 @@ async function capture(label) {
       viewport: { width: innerWidth, height: innerHeight },
       documentWidth: document.documentElement.scrollWidth,
       serviceStates: [...document.querySelectorAll(".mobile-service-state .embedding-global")].filter(visible).map((element) => ({ text: element.textContent, clientWidth: element.clientWidth, scrollWidth: element.scrollWidth })),
+      choiceTargets: read(".option-choice, .option-toggle"),
       controls: read(".library-toolbar button, .library-view-toggle button, .image-row-actions button, .image-dialog button, .topbar-actions button, .account-entry"),
       header: read('.topbar'), brand: read('.brand'), headerActions: read('.topbar-actions'),
       navigation: read('.sidebar'), navigationButtons: read('.sidebar nav button'),
@@ -71,6 +72,7 @@ async function capture(label) {
   assert.equal(measurements.documentWidth, measurements.viewport.width, `${label} 页面出现横向溢出`)
   if (measurements.viewport.width <= 760) {
     for (const state of measurements.serviceStates) assert(state.scrollWidth <= state.clientWidth, `${label} 手机服务状态文字截断`)
+    for (const target of measurements.choiceTargets) assert(target.width >= 44 && target.height >= 44, `${label} 选项点击区域 ${target.text}`)
     assert.equal(measurements.navigationButtons.length, 5, `${label} 手机导航入口数量`)
     for (const button of measurements.navigationButtons) {
       assert(button.width >= 44 && button.height >= 44, `${label} 导航点击区域 ${button.text}`)
@@ -93,6 +95,7 @@ try {
   if (serverMode) {
     assert(process.env.MOBILE_UI_CREDENTIALS, '服务器验证需要指定测试账户凭据文件')
     const credentials = JSON.parse(await readFile(process.env.MOBILE_UI_CREDENTIALS, 'utf8'))
+    assert(/^mobile-ui-.*@example\.test$/.test(credentials.email), "仅允许使用有 mobile-ui 标识的独立测试账户")
     await page.goto(`${baseURL}/login`)
     await page.locator('input[type="email"]').fill(credentials.email)
     await page.locator('input[type="password"]').fill(credentials.password)
@@ -286,7 +289,10 @@ try {
   await writeFile(resolve(outputDirectory, 'results.json'), JSON.stringify({ baseURL, serverMode, evidence, errors }, null, 2))
   console.log(`已通过 ${evidence.length} 个真实页面状态检查；截图与尺寸记录：${outputDirectory}`)
 } finally {
-  const lastState = await page.evaluate(() => ({ url: location.href, title: document.title, text: document.body.innerText, focusedElement: document.activeElement?.outerHTML }))
+  const lastState = await page.evaluate(() => {
+    const focused = document.activeElement
+    return { url: location.href, title: document.title, text: document.body.innerText, focusedElement: focused ? { tagName: focused.tagName, role: focused.getAttribute("role"), label: focused.getAttribute("aria-label"), type: focused.getAttribute("type") } : null }
+  })
   await writeFile(resolve(outputDirectory, "last-state.json"), JSON.stringify(lastState, null, 2))
   await page.screenshot({ path: resolve(outputDirectory, "last-state.png") })
   await writeFile(resolve(outputDirectory, 'latest-observations.json'), JSON.stringify({ evidence, errors }, null, 2))
