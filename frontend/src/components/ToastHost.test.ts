@@ -33,6 +33,7 @@ describe('ToastHost', () => {
     notifications.warning('部分图片未提交')
     await flushPromises()
     expect(document.querySelectorAll('[data-sonner-toast]')).toHaveLength(3)
+    expect(document.querySelector('[data-sonner-toaster]')?.getAttribute('data-y-position')).toBe('bottom')
     expect(toast.getToasts().map((item) => 'duration' in item ? item.duration : undefined)).toEqual([3000, Infinity, Infinity])
     await new Promise((resolve) => setTimeout(resolve, 3500))
     await flushPromises()
