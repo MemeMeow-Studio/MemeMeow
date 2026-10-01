@@ -7,7 +7,7 @@ import type { CoreImageProcessingStage, SelectedImageRetryMode } from '../types'
 const props = defineProps<{
   selectedCount: number
   busy: boolean
-  returnFocus?: HTMLElement | null
+  returnFocus?: HTMLElement | null | (() => HTMLElement | null)
 }>()
 
 const emit = defineEmits<{
@@ -66,27 +66,27 @@ function cancel(): void {
         <button class="quiet" type="button" :disabled="busy" aria-label="取消重试选中" @click="cancel">取消</button>
       </header>
       <form class="processing-options-form retry-selected-form" @submit.prevent="confirm">
-        <fieldset class="option-fieldset">
-          <legend>重试范围</legend>
-          <label class="option-choice">
-            <input ref="firstOption" v-model="mode" type="radio" value="full" :disabled="busy" />
-            <span><strong>完整重试</strong><small>按原有完整流水线重新处理所选图片</small></span>
-          </label>
-          <label class="option-choice">
-            <input v-model="mode" type="radio" value="parts" :disabled="busy" />
-            <span><strong>指定部分</strong><small>只重新提交下面勾选的核心处理阶段</small></span>
-          </label>
-        </fieldset>
-
-        <fieldset v-if="mode === 'parts'" class="option-fieldset retry-stage-fieldset" :aria-describedby="partsInvalid ? 'retry-stage-hint' : undefined">
-          <legend>处理部分</legend>
-          <label v-for="option in stageOptions" :key="option.value" class="option-choice">
-            <input v-model="stages" type="checkbox" :value="option.value" :disabled="busy" />
-            <span><strong>{{ option.label }}</strong><small>{{ option.description }}</small></span>
-          </label>
-          <small v-if="partsInvalid" id="retry-stage-hint" class="retry-stage-hint error" role="status">至少选择一个处理部分</small>
-        </fieldset>
-
+        <div class="processing-options-fields">
+          <fieldset class="option-fieldset">
+            <legend>重试范围</legend>
+            <label class="option-choice">
+              <input ref="firstOption" v-model="mode" type="radio" value="full" :disabled="busy" />
+              <span><strong>完整重试</strong><small>按原有完整流水线重新处理所选图片</small></span>
+            </label>
+            <label class="option-choice">
+              <input v-model="mode" type="radio" value="parts" :disabled="busy" />
+              <span><strong>指定部分</strong><small>只重新提交下面勾选的核心处理阶段</small></span>
+            </label>
+          </fieldset>
+          <fieldset v-if="mode === 'parts'" class="option-fieldset retry-stage-fieldset" :aria-describedby="partsInvalid ? 'retry-stage-hint' : undefined">
+            <legend>处理部分</legend>
+            <label v-for="option in stageOptions" :key="option.value" class="option-choice">
+              <input v-model="stages" type="checkbox" :value="option.value" :disabled="busy" />
+              <span><strong>{{ option.label }}</strong><small>{{ option.description }}</small></span>
+            </label>
+            <small v-if="partsInvalid" id="retry-stage-hint" class="retry-stage-hint error" role="status">至少选择一个处理部分</small>
+          </fieldset>
+        </div>
         <div class="processing-options-actions">
           <button class="quiet" type="button" :disabled="busy" @click="cancel">取消</button>
           <button class="primary" type="submit" :disabled="busy || partsInvalid">{{ busy ? '提交中...' : confirmLabel }}</button>

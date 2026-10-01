@@ -15,6 +15,7 @@ import {
   visualEmbeddingLabel,
 } from '../utils/presentation'
 import CollectionDialog from './CollectionDialog.vue'
+import ActionMenu from './ActionMenu.vue'
 import ImagePreviewDialog from './ImagePreviewDialog.vue'
 import ImageProcessingOptionsDialog from './ImageProcessingOptionsDialog.vue'
 import ImageRetryDialog from './ImageRetryDialog.vue'
@@ -57,6 +58,8 @@ const pageSize = 50
 const total = shallowRef(0)
 const busy = shallowRef(false)
 const selectedImages = shallowRef(new Set<string>())
+const selectionMode = shallowRef(false)
+const refreshTrigger = shallowRef<HTMLElement | null>(null)
 const retryBusy = shallowRef(false)
 const notifications = useToast()
 const collections = shallowRef<CollectionSummary[]>([])
@@ -86,6 +89,7 @@ const imageActionsDisabled = computed(() => busy.value || retryBusy.value || !!s
 
 const selectedIds = computed(() => [...selectedImages.value])
 const selectedCount = computed(() => selectedImages.value.size)
+const selectionActive = computed(() => selectionMode.value || selectedCount.value > 0)
 const cacheGenerating = computed(() => props.cacheBusy || ['queued', 'running'].includes(props.cacheTask?.status || ''))
 const cacheButtonLabel = computed(() => {
   if (!props.config) return '等待服务连接...'
@@ -157,11 +161,24 @@ function changePage(next: number): void {
 
 /** 切换一张图片的选择状态，并用新 Set 触发浅层响应式更新。 */
 function toggleImageSelection(item: MemeImage): void {
+  if (imageActionsDisabled.value) return
   const next = new Set(selectedImages.value)
   const key = imageKey(item)
   if (next.has(key)) next.delete(key)
   else next.add(key)
   selectedImages.value = next
+}
+
+/** 切换手机图片选择模式；结束选择时清理批量操作的目标。 */
+function toggleSelectionMode(): void {
+  selectionMode.value = !selectionActive.value
+  if (!selectionMode.value) selectedImages.value = new Set()
+}
+
+/** 成功提交后批量按钮会隐藏，将对话框焦点交给仍可访问的刷新按钮。 */
+function dialogReturnFocus(trigger: HTMLElement | null): HTMLElement | null {
+  if (!selectedCount.value && trigger?.closest('.library-batch-actions')) return refreshTrigger.value
+  return trigger
 }
 
 /** 加载当前 scope 的合集列表。 */
@@ -494,34 +511,39 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
       <div><h1>图片库</h1></div>
       <LibraryViewToggle v-model="view" />
     </div>
-    <div class="toolbar" aria-label="图片库工具">
+    <div class="toolbar library-toolbar" aria-label="图片库工具">
       <input v-model="filter" aria-label="筛选文件名" placeholder="筛选文件名" @keyup.enter="applyFilter" />
       <select v-model="sort" aria-label="图片排序方式" :disabled="retryBusy" @change="applyFilter">
         <option value="name_asc">名称 A–Z</option>
         <option value="updated_desc">最近更新</option>
       </select>
-      <button type="button" @click="loadLibrary">刷新</button>
+      <button ref="refreshTrigger" type="button" @click="loadLibrary">刷新</button>
+      <button class="quiet library-select-toggle" type="button" :disabled="imageActionsDisabled" :aria-pressed="selectionActive" @click="toggleSelectionMode">{{ selectionActive ? '结束选择' : '选择图片' }}</button>
       <span class="toolbar-spacer"></span>
       <div class="toolbar-group library-operations">
-        <button class="quiet" type="button" :disabled="retryBusy || !selectedCount" @click="openCollectionDialog">
+        <div class="library-batch-actions" :class="{ 'selection-active': selectedCount > 0 }" aria-label="选中图片操作">
+        <button class="quiet" type="button" :disabled="imageActionsDisabled || !selectedCount" @click="openCollectionDialog">
           加入合集<span v-if="selectedCount">（{{ selectedCount }}）</span>
         </button>
-        <button class="quiet" type="button" :disabled="retryBusy || !selectedCount" @click="openRetrySelectedDialog">
+        <button class="quiet" type="button" :disabled="imageActionsDisabled || !selectedCount" @click="openRetrySelectedDialog">
           重试选中<span v-if="selectedCount">（{{ selectedCount }}）</span>
         </button>
-        <button class="primary toolbar-primary" type="button" :disabled="retryBusy" @click="openUnreadyOptions">
+        </div>
+        <ActionMenu class="library-management" label="管理" :disabled="imageActionsDisabled">
+        <button class="primary toolbar-primary" type="button" :disabled="imageActionsDisabled" @click="openUnreadyOptions">
           {{ retryBusy ? '提交中...' : '修复所有未就绪' }}
         </button>
         <button
           class="primary toolbar-primary cache-action"
           type="button"
-          :disabled="cacheGenerating || !config"
+          :disabled="imageActionsDisabled || cacheGenerating || !config"
           :aria-busy="cacheGenerating"
           :title="cacheButtonTitle"
           @click="emit('generateCache')"
         >
           {{ cacheButtonLabel }}
         </button>
+        </ActionMenu>
         <span v-if="cacheTask || cacheBusy" class="cache-status" :class="cacheTask?.status || 'running'" role="status" aria-live="polite" aria-atomic="true">
           <span class="cache-status-dot" aria-hidden="true"></span>
           <span>{{ cacheTaskStatusLabel }}</span>
@@ -537,6 +559,7 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
     </ul>
     <LibraryImageGrid
       v-if="view === 'grid'"
+      :class="{ 'selection-active': selectionActive }"
       :images="images"
       :selected-ids="selectedImages"
       :disabled="imageActionsDisabled"
@@ -546,13 +569,13 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
       @rename="rename"
       @delete="deleteImage"
     />
-    <div v-else class="library-list" role="list">
+    <div v-else class="library-list" :class="{ 'selection-active': selectionActive }" role="list">
       <article v-for="item in images" :key="imageKey(item)" class="library-row" role="listitem">
         <label class="image-check">
           <input
             type="checkbox"
             :checked="selectedImages.has(imageKey(item))"
-            :disabled="retryBusy"
+            :disabled="imageActionsDisabled"
             :aria-label="`选择 ${item.filename}`"
             @change="toggleImageSelection(item)"
           />
@@ -574,8 +597,10 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
         </div>
         <div class="image-row-actions" aria-label="图片操作">
           <button class="quiet metadata-button" type="button" @click="openImagePreview(item, $event)">查看详情</button>
-          <button class="quiet" type="button" @click="rename(item)">重命名</button>
-          <button class="quiet" type="button" :disabled="imageActionsDisabled" @click="deleteImage(item)">{{ deletingImageId === item.meme_id ? '删除中...' : '删除' }}</button>
+          <ActionMenu label="更多" :disabled="imageActionsDisabled">
+            <button class="quiet" type="button" :disabled="imageActionsDisabled" @click="rename(item)">重命名</button>
+            <button class="quiet" type="button" :disabled="imageActionsDisabled" :aria-label="`删除图片 ${item.filename}`" @click="deleteImage(item)">{{ deletingImageId === item.meme_id ? '删除中...' : '删除' }}</button>
+          </ActionMenu>
         </div>
       </article>
       <div v-if="!images.length" class="empty-state compact"><h2>图片库还没有图片</h2></div>
@@ -613,7 +638,7 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
     v-if="retrySelectedDialogOpen"
     :selected-count="selectedCount"
     :busy="retryBusy"
-    :return-focus="retrySelectedDialogTrigger"
+    :return-focus="() => dialogReturnFocus(retrySelectedDialogTrigger)"
     @cancel="cancelRetrySelected"
     @confirm="confirmRetrySelected"
   />
@@ -622,7 +647,7 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
     :reverse-image-available="props.config?.reverse_image_available === true"
     :reverse-image-reason="props.config ? '反向图片服务不可用' : '服务状态未知'"
     :busy="retryBusy"
-    :return-focus="processingOptionsTrigger"
+    :return-focus="() => dialogReturnFocus(processingOptionsTrigger)"
     :processing-target="processingOptionsTarget === 'unready' ? 'repair' : 'full_retry'"
     :initial-options="processingOptionsTarget === 'selected'
       ? (preserveSelectedRetryOptions ? selectedRetryOptions : undefined)

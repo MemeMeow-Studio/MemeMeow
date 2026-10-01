@@ -8,7 +8,7 @@ const props = defineProps<{
   reverseImageAvailable: boolean
   reverseImageReason?: string
   busy: boolean
-  returnFocus?: HTMLElement | null
+  returnFocus?: HTMLElement | null | (() => HTMLElement | null)
   initialOptions?: ImageProcessingOptions
   processingTarget?: 'full_retry' | 'repair'
   upload?: boolean
@@ -86,32 +86,34 @@ function cancel(): void {
         <button class="quiet" type="button" :disabled="busy" aria-label="取消图片处理" @click="cancel">取消</button>
       </header>
       <form class="processing-options-form" @submit.prevent="confirm">
-        <fieldset v-if="props.upload" class="option-fieldset">
-          <legend>上传方式</legend>
-          <label class="option-choice">
-            <input ref="uploadOption" v-model="uploadMode" type="radio" value="direct" :disabled="busy" />
-            <span><strong>直接上传</strong><small>生成图片与有效文本向量，后台自动命名。</small></span>
+        <div class="processing-options-fields">
+          <fieldset v-if="props.upload" class="option-fieldset">
+            <legend>上传方式</legend>
+            <label class="option-choice">
+              <input ref="uploadOption" v-model="uploadMode" type="radio" value="direct" :disabled="busy" />
+              <span><strong>直接上传</strong><small>生成图片与有效文本向量，后台自动命名。</small></span>
+            </label>
+            <label class="option-choice">
+              <input v-model="uploadMode" type="radio" value="analyze" :disabled="busy" />
+              <span><strong>完整分析</strong><small>分析图片语境并生成文本向量。</small></span>
+            </label>
+          </fieldset>
+          <fieldset v-if="!props.upload || uploadMode === 'analyze'" class="option-fieldset">
+            <legend>反向图片检索</legend>
+            <label class="option-choice">
+              <input ref="firstOption" v-model="reversePolicy" type="radio" value="forbid" :disabled="busy" />
+              <span><strong>禁止联网</strong><small>仅使用本地处理能力</small></span>
+            </label>
+            <label class="option-choice" :class="{ disabled: !reverseImageAvailable }">
+              <input v-model="reversePolicy" type="radio" value="auto" :disabled="busy || !reverseImageAvailable" />
+              <span><strong>按需允许联网</strong><small>{{ reverseImageAvailable ? 'Agent 需要时才会使用' : reverseImageReason || '服务不可用' }}</small></span>
+            </label>
+          </fieldset>
+          <label v-if="!props.upload || uploadMode === 'analyze'" class="option-toggle">
+            <input v-model="autoName" type="checkbox" :disabled="busy" />
+            <span><strong>按标题自动命名</strong><small>完整分析后使用语境标题更新名称。</small></span>
           </label>
-          <label class="option-choice">
-            <input v-model="uploadMode" type="radio" value="analyze" :disabled="busy" />
-            <span><strong>完整分析</strong><small>分析图片语境并生成文本向量。</small></span>
-          </label>
-        </fieldset>
-        <fieldset v-if="!props.upload || uploadMode === 'analyze'" class="option-fieldset">
-          <legend>反向图片检索</legend>
-          <label class="option-choice">
-            <input ref="firstOption" v-model="reversePolicy" type="radio" value="forbid" :disabled="busy" />
-            <span><strong>禁止联网</strong><small>仅使用本地处理能力</small></span>
-          </label>
-          <label class="option-choice" :class="{ disabled: !reverseImageAvailable }">
-            <input v-model="reversePolicy" type="radio" value="auto" :disabled="busy || !reverseImageAvailable" />
-            <span><strong>按需允许联网</strong><small>{{ reverseImageAvailable ? 'Agent 需要时才会使用' : reverseImageReason || '服务不可用' }}</small></span>
-          </label>
-        </fieldset>
-        <label v-if="!props.upload || uploadMode === 'analyze'" class="option-toggle">
-          <input v-model="autoName" type="checkbox" :disabled="busy" />
-          <span><strong>按标题自动命名</strong><small>完整分析后使用语境标题更新名称。</small></span>
-        </label>
+        </div>
         <div class="processing-options-actions">
           <button class="quiet" type="button" :disabled="busy" @click="cancel">取消</button>
           <button class="primary" type="submit" :disabled="busy">{{ busy ? '提交中...' : '确认并提交' }}</button>

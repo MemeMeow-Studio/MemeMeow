@@ -10,7 +10,7 @@ const notificationDialogs: HTMLElement[] = []
 interface ModalDialogOptions {
   dialog: Ref<HTMLElement | null>
   initialFocus: Ref<HTMLElement | null>
-  returnFocus?: HTMLElement | null
+  returnFocus?: HTMLElement | null | (() => HTMLElement | null)
   close: () => void
 }
 
@@ -22,6 +22,9 @@ const focusableSelector = [
   'textarea:not([disabled])',
   '[tabindex]:not([tabindex="-1"])',
 ].join(', ')
+
+let modalCount = 0
+let previousBodyOverflow = ''
 
 /**
  * 为当前已挂载的模态框注册 Escape 与 Tab 约束。
@@ -67,6 +70,11 @@ export function useModalDialog(options: ModalDialogOptions): void {
   })
 
   onMounted(async () => {
+    if (modalCount === 0) {
+      previousBodyOverflow = document.body.style.overflow
+      document.body.style.overflow = 'hidden'
+    }
+    modalCount += 1
     document.addEventListener('keydown', onKeydown)
     await nextTick()
     if (options.dialog.value) {
@@ -77,9 +85,11 @@ export function useModalDialog(options: ModalDialogOptions): void {
   })
 
   onBeforeUnmount(() => {
+    modalCount -= 1
+    if (modalCount === 0) document.body.style.overflow = previousBodyOverflow
     document.removeEventListener('keydown', onKeydown)
-    const trigger = options.returnFocus
     nextTick(() => {
+      const trigger = typeof options.returnFocus === 'function' ? options.returnFocus() : options.returnFocus
       if (trigger?.isConnected) trigger.focus()
     })
   })

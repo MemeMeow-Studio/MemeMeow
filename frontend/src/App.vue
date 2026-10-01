@@ -7,6 +7,7 @@ import AppFooter from './components/AppFooter.vue'
 import CollectionsWorkspace from './components/CollectionsWorkspace.vue'
 import LibraryWorkspace from './components/LibraryWorkspace.vue'
 import SearchWorkspace from './components/SearchWorkspace.vue'
+import ServiceStatus from './components/ServiceStatus.vue'
 import TasksWorkspace from './components/TasksWorkspace.vue'
 import UploadWorkspace from './components/UploadWorkspace.vue'
 import ToastHost from './components/ToastHost.vue'
@@ -134,6 +135,7 @@ onMounted(async () => {
     <div class="body">
       <WorkspaceNav :pages="pages" :active-page="page" @navigate="changePage" />
       <main class="content">
+        <ServiceStatus class="mobile-service-state" :config="config" :embedding-state="embeddingState" :embedding-state-label="embeddingStateLabel" />
         <div v-if="error" class="error-banner" role="alert">
           <span>{{ error }}</span>
           <button type="button" aria-label="关闭错误" @click="clearError">关闭</button>
