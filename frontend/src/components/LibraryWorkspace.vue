@@ -567,9 +567,9 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
           </div>
         </div>
         <div class="image-status-summary" aria-label="图片状态摘要">
+          <span class="visual-embedding-state" :class="item.visual_embedding_status || 'unknown'">{{ visualEmbeddingLabel(item.visual_embedding_status) }}</span>
           <span class="metadata-state" :class="item.metadata?.status || 'unknown'">{{ metadataLabel(item.metadata?.status) }}</span>
           <span class="embedding-state" :class="item.embedding_status || 'unknown'">{{ embeddingLabel(item.embedding_status) }}</span>
-          <span class="visual-embedding-state" :class="item.visual_embedding_status || 'unknown'">{{ visualEmbeddingLabel(item.visual_embedding_status) }}</span>
         </div>
         <div class="image-row-actions" aria-label="图片操作">
           <button class="quiet metadata-button" type="button" @click="openImagePreview(item, $event)">查看详情</button>

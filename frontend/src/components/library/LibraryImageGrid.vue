@@ -129,9 +129,9 @@ onBeforeUnmount(() => {
           >⋯</button>
         </div>
         <div class="library-tile-status" aria-label="图片状态摘要">
+          <span class="library-status-bar" :data-state="item.visual_embedding_status || 'unknown'" data-stage="visual" role="img" :title="visualEmbeddingLabel(item.visual_embedding_status)" :aria-label="visualEmbeddingLabel(item.visual_embedding_status)"></span>
           <span class="library-status-bar" :data-state="item.metadata?.status || 'unknown'" data-stage="context" role="img" :title="`语境：${metadataLabel(item.metadata?.status)}`" :aria-label="`语境：${metadataLabel(item.metadata?.status)}`"></span>
           <span class="library-status-bar" :data-state="item.embedding_status || 'unknown'" data-stage="text" role="img" :title="embeddingLabel(item.embedding_status)" :aria-label="embeddingLabel(item.embedding_status)"></span>
-          <span class="library-status-bar" :data-state="item.visual_embedding_status || 'unknown'" data-stage="visual" role="img" :title="visualEmbeddingLabel(item.visual_embedding_status)" :aria-label="visualEmbeddingLabel(item.visual_embedding_status)"></span>
         </div>
       </div>
       <strong class="library-tile-name" :title="props.displayName(item)">{{ props.displayName(item) }}</strong>
