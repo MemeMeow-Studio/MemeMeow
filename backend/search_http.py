@@ -87,7 +87,7 @@ def _search_images_sync(
         if "cache_not_ready" in str(exc):
             raise error(503, "cache_not_ready", "检索缓存尚未就绪") from exc
         if "embedding_not_configured" in str(exc):
-            raise error(503, "configuration_missing", "嵌入模型配置未完成") from exc
+            raise error(503, "configuration_missing", "文本向量模型配置未完成") from exc
         if not payload.llm_enhance:
             raise error(500, "search_failed", "检索失败") from exc
         try:
@@ -96,7 +96,7 @@ def _search_images_sync(
             if "cache_not_ready" in str(fallback_exc):
                 raise error(503, "cache_not_ready", "检索缓存尚未就绪") from fallback_exc
             if "embedding_not_configured" in str(fallback_exc):
-                raise error(503, "configuration_missing", "嵌入模型配置未完成") from fallback_exc
+                raise error(503, "configuration_missing", "文本向量模型配置未完成") from fallback_exc
             raise error(500, "search_failed", "检索失败") from fallback_exc
     # 保留原入口的 service 访问顺序，确保 metadata scope/service 不会被隐式放宽。
     service(request, "metadata")
