@@ -12,6 +12,7 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
+    "@floating-ui/vue": "2.0.1",
     "@capacitor/core": "8.5.2",
     "@capacitor/file-transfer": "2.0.5",
     "@capacitor/filesystem": "8.1.3",

@@ -113,12 +113,12 @@ export function resultIdentity(url: string): string {
 
 /** 将图片语境元数据状态转换为用户可读标签。 */
 export function metadataLabel(status?: string): string {
-  return { ready: '语境就绪', pending: '待生成', repair_required: '需修复' }[status || ''] || '状态未知'
+  return { ready: '语境就绪', pending: '待生成', partial: '语境不完整', repair_required: '需修复' }[status || ''] || '状态未知'
 }
 
 /** 将文本语义索引状态转换为用户可读标签。 */
 export function embeddingLabel(status?: string): string {
-  return { ready: '文本索引已就绪', pending: '文本索引待生成', blocked: '文本索引需修复' }[status || ''] || '文本索引状态未知'
+  return { ready: '文本索引已就绪', pending: '文本索引待生成', waiting_for_text: '文本索引等待文本', blocked: '文本索引需修复' }[status || ''] || '文本索引状态未知'
 }
 
 /** 将视觉向量状态转换为用户可读标签。 */

@@ -17,6 +17,8 @@ import ImagePreviewDialog from './ImagePreviewDialog.vue'
 import ImageProcessingOptionsDialog from './ImageProcessingOptionsDialog.vue'
 import ImageRetryDialog from './ImageRetryDialog.vue'
 import ResilientImage from './ResilientImage.vue'
+import LibraryImageGrid from './library/LibraryImageGrid.vue'
+import LibraryViewToggle from './library/LibraryViewToggle.vue'
 
 const props = defineProps<{
   config: ServiceConfig | null
@@ -76,6 +78,9 @@ const selectedRetrySubmission = shallowRef<SelectedRetrySubmission | null>(null)
 const selectedRetryOptions = shallowRef<ImageProcessingOptions>(defaultProcessingOptions())
 const preserveSelectedRetryOptions = shallowRef(false)
 let libraryRequestId = 0
+const view = shallowRef<'grid' | 'list'>('grid')
+const deletingImageId = shallowRef<string | null>(null)
+const imageActionsDisabled = computed(() => busy.value || retryBusy.value || !!stageBusy.value || !!deletingImageId.value)
 
 const selectedIds = computed(() => [...selectedImages.value])
 const selectedCount = computed(() => selectedImages.value.size)
@@ -438,6 +443,28 @@ function openImagePreview(item: MemeImage, event: MouseEvent): void {
   previewImage.value = item
 }
 
+/** 从方块图片打开详情，并保留图片上的按钮作为关闭后的焦点返回位置。 */
+function openGridImagePreview(item: MemeImage, trigger: HTMLElement): void {
+  previewTrigger.value = trigger
+  previewImage.value = item
+}
+
+/** 确认后按稳定 ID 删除图片，刷新真实列表并保留服务端给出的错误原因。 */
+async function deleteImage(item: MemeImage): Promise<void> {
+  if (imageActionsDisabled.value || !window.confirm(`确定删除「${item.filename}」？图片及其语境和索引将被删除。`)) return
+  deletingImageId.value = item.meme_id
+  emit('clearError')
+  try {
+    await api.deleteImage({ meme_id: item.meme_id })
+    await loadLibrary()
+  } catch (reason) {
+    await loadLibrary()
+    emit('error', errorMessage(reason))
+  } finally {
+    deletingImageId.value = null
+  }
+}
+
 /** 将详情中的阶段恢复动作交回工作区，保持稳定 meme_id 和现有提交契约。 */
 function retryPreviewStage(stage: ImageProcessingStageName): void {
   if (previewImage.value) void retryStage(previewImage.value, stage)
@@ -463,6 +490,7 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
   <section class="workspace" :aria-busy="busy">
     <div class="section-head">
       <div><h1>图片库</h1></div>
+      <LibraryViewToggle v-model="view" />
     </div>
     <div class="toolbar" aria-label="图片库工具">
       <input v-model="filter" aria-label="筛选文件名" placeholder="筛选文件名" @keyup.enter="applyFilter" />
@@ -506,7 +534,18 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
         <span>{{ retryResultMessage(result) }}</span>
       </li>
     </ul>
-    <div class="library-list" role="list">
+    <LibraryImageGrid
+      v-if="view === 'grid'"
+      :images="images"
+      :selected-ids="selectedImages"
+      :disabled="imageActionsDisabled"
+      :deleting-image-id="deletingImageId"
+      @toggle-selection="toggleImageSelection"
+      @preview="openGridImagePreview"
+      @rename="rename"
+      @delete="deleteImage"
+    />
+    <div v-else class="library-list" role="list">
       <article v-for="item in images" :key="imageKey(item)" class="library-row" role="listitem">
         <label class="image-check">
           <input
@@ -535,6 +574,7 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
         <div class="image-row-actions" aria-label="图片操作">
           <button class="quiet metadata-button" type="button" @click="openImagePreview(item, $event)">查看详情</button>
           <button class="quiet" type="button" @click="rename(item)">重命名</button>
+          <button class="quiet" type="button" :disabled="imageActionsDisabled" @click="deleteImage(item)">{{ deletingImageId === item.meme_id ? '删除中...' : '删除' }}</button>
         </div>
       </article>
       <div v-if="!images.length" class="empty-state compact"><h2>图片库还没有图片</h2></div>

@@ -89,6 +89,8 @@ export const api = {
     return request(`/images/metadata?meme_id=${encodeURIComponent(memeId)}`, { cache: 'no-store' })
   },
   rename: (payload) => request('/images/rename', { method: 'POST', body: JSON.stringify(payload) }),
+  /** 按稳定 Meme ID 删除图片，服务端负责处理文件和元数据清理。 */
+  deleteImage: (payload) => request('/images/delete', { method: 'POST', body: JSON.stringify(payload) }),
   upload: (files, options = {}, requestOptions = {}) => {
     const normalized = typeof options === 'boolean'
       ? { reverse_image_policy: 'forbid', auto_name: options }
