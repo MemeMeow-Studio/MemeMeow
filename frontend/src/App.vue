@@ -9,6 +9,8 @@ import LibraryWorkspace from './components/LibraryWorkspace.vue'
 import SearchWorkspace from './components/SearchWorkspace.vue'
 import TasksWorkspace from './components/TasksWorkspace.vue'
 import UploadWorkspace from './components/UploadWorkspace.vue'
+import ToastHost from './components/ToastHost.vue'
+import { useToast } from './composables/useToast'
 import WorkspaceNav from './components/WorkspaceNav.vue'
 import type { ImageProcessingTerminalEvent, NavigationItem, PageId, RepositoryMetadata, ServiceConfig, TaskItem } from './types'
 import { errorMessage } from './utils/presentation'
@@ -22,6 +24,7 @@ const pages: NavigationItem[] = [
 ]
 
 const page = shallowRef<PageId>('search')
+const notifications = useToast()
 const error = shallowRef('')
 const config = shallowRef<ServiceConfig | null>(null)
 const repositoryMetadata = shallowRef<RepositoryMetadata | null>(null)
@@ -52,10 +55,13 @@ function clearError(): void {
   error.value = ''
 }
 
-/** 展示子工作区上报的可读错误消息。 */
+/** 将用户操作错误显示为可关闭的 toast。 */
 function showError(message: string): void {
-  error.value = message || '请求失败'
+  notifications.error(message)
 }
+
+/** 保留当前工作区的读取故障，供用户持续查看并重试。 */
+function showLoadError(message: string): void { error.value = message }
 
 /** 切换工作区并清理上一工作区的错误和待打开任务。 */
 function changePage(next: PageId): void {
@@ -116,12 +122,13 @@ onMounted(async () => {
   try {
     config.value = await api.config()
   } catch (reason) {
-    showError(errorMessage(reason))
+    error.value = errorMessage(reason)
   }
 })
 </script>
 
 <template>
+  <ToastHost />
   <div class="shell">
     <AppHeader :config="config" :embedding-state="embeddingState" :embedding-state-label="embeddingStateLabel" />
     <div class="body">
@@ -139,10 +146,11 @@ onMounted(async () => {
           :cache-busy="cacheBusy"
           :refresh-token="libraryRefreshToken"
           @error="showError"
+          @load-error="showLoadError"
           @clear-error="clearError"
           @generate-cache="generateCache"
         />
-        <CollectionsWorkspace v-else-if="page === 'collections'" @error="showError" />
+        <CollectionsWorkspace v-else-if="page === 'collections'" @error="showError" @load-error="showLoadError" />
         <UploadWorkspace
           v-else-if="page === 'upload'"
           :config="config"
@@ -150,7 +158,7 @@ onMounted(async () => {
           @clear-error="clearError"
           @open-task="openUploadTask"
         />
-        <TasksWorkspace v-else :initial-task-id="pendingTaskId" @error="showError" @image-processing-terminal="handleImageProcessingTerminal" />
+        <TasksWorkspace v-else :initial-task-id="pendingTaskId" @error="showError" @load-error="showLoadError" @image-processing-terminal="handleImageProcessingTerminal" />
       </main>
     </div>
     <AppFooter :metadata="repositoryMetadata" :loading="repositoryMetadataLoading" />

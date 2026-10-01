@@ -2,7 +2,7 @@
  * 检索结果图片剪贴板能力，封装浏览器兼容、PNG 转换和竞态提示。
  */
 
-import { onBeforeUnmount, shallowRef } from 'vue'
+import { useToast } from './useToast'
 
 const clipboardImageMime = 'image/png'
 
@@ -81,18 +81,17 @@ async function fetchImageForClipboard(url: string): Promise<Blob> {
 
 /**
  * 创建图片复制状态与动作，供检索工作区按用户点击写入图片二进制。
- * @returns 当前提示和复制动作；组件卸载时自动清理提示计时器。
+ * @returns 图片复制动作，结果由全局 toast 显示。
  */
 export function useImageClipboard() {
-  const copyNotice = shallowRef('')
-  let copyNoticeTimer: number | undefined
+  const notifications = useToast()
   let copyRequestId = 0
 
   /** 将一张检索结果图片写入系统剪贴板，禁止降级成 URL 文本。 */
   async function copyImage(url: string): Promise<void> {
     const requestId = ++copyRequestId
-    window.clearTimeout(copyNoticeTimer)
     let notice = ''
+    let failed = false
     try {
       if (window.isSecureContext === false) throw new Error('image_clipboard_insecure_context')
       if (!supportsImageClipboard()) throw new Error('image_clipboard_unsupported')
@@ -118,6 +117,7 @@ export function useImageClipboard() {
       }
       notice = '图片已复制'
     } catch (reason) {
+      failed = true
       const code = reason instanceof Error ? reason.message : ''
       notice = {
         image_clipboard_unsupported: '图片复制失败：当前浏览器不支持复制图片',
@@ -131,10 +131,8 @@ export function useImageClipboard() {
       }[code] || '图片复制失败，图片未复制'
     }
     if (requestId !== copyRequestId) return
-    copyNotice.value = notice
-    copyNoticeTimer = window.setTimeout(() => { copyNotice.value = '' }, 2600)
+    notifications.show(notice, failed ? 'error' : 'success')
   }
 
-  onBeforeUnmount(() => window.clearTimeout(copyNoticeTimer))
-  return { copyNotice, copyImage }
+  return { copyImage }
 }

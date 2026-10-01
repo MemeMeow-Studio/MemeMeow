@@ -2,6 +2,7 @@
 /** 合集工作区：管理合集列表、详情与成员关系，不复制图片身份。 */
 import { onMounted, shallowRef } from 'vue'
 import { api } from '../api'
+import { useToast } from '../composables/useToast'
 import type { CollectionSummary, MemeImage } from '../types'
 import { errorMessage, imageDisplayUrl, thumbnailMediaUrl } from '../utils/presentation'
 import ImagePreviewDialog from './ImagePreviewDialog.vue'
@@ -9,6 +10,7 @@ import ResilientImage from './ResilientImage.vue'
 
 const emit = defineEmits<{
   error: [message: string]
+  loadError: [message: string]
 }>()
 
 const collections = shallowRef<CollectionSummary[]>([])
@@ -16,15 +18,13 @@ const selectedCollection = shallowRef<CollectionSummary | null>(null)
 const members = shallowRef<MemeImage[]>([])
 const collectionName = shallowRef('')
 const busy = shallowRef(false)
-const notice = shallowRef('')
-const noticeTone = shallowRef<'success' | 'error'>('success')
+const notifications = useToast()
 const previewImage = shallowRef<MemeImage | null>(null)
 const previewTrigger = shallowRef<HTMLElement | null>(null)
 
 /** 更新合集操作提示及其视觉语义，避免失败反馈沿用成功颜色。 */
 function setNotice(message: string, tone: 'success' | 'error' = 'success'): void {
-  notice.value = message
-  noticeTone.value = tone
+  notifications.show(message, tone)
 }
 
 /** 加载合集列表，供初始进入和修改后刷新。 */
@@ -33,7 +33,7 @@ async function loadCollections(): Promise<void> {
   try {
     collections.value = (await api.collections()).items
   } catch (reason) {
-    emit('error', errorMessage(reason))
+    emit('loadError', errorMessage(reason))
   } finally {
     busy.value = false
   }
@@ -97,9 +97,8 @@ async function openCollection(item: CollectionSummary): Promise<void> {
   try {
     selectedCollection.value = await api.collection(item.collection_id)
     members.value = selectedCollection.value?.members || []
-    notice.value = ''
   } catch (reason) {
-    emit('error', errorMessage(reason))
+    emit('loadError', errorMessage(reason))
   } finally {
     busy.value = false
   }
@@ -187,7 +186,6 @@ onMounted(loadCollections)
           <h2>这个合集还没有图片</h2>
         </div>
       </div>
-      <p v-if="notice" class="inline-notice" :class="{ error: noticeTone === 'error' }" role="status">{{ notice }}</p>
     </template>
     <template v-else>
       <form class="collection-create-form" aria-label="创建合集" @submit.prevent="createCollection">
@@ -197,7 +195,6 @@ onMounted(loadCollections)
           {{ busy ? '创建中...' : '创建合集' }}
         </button>
       </form>
-      <p v-if="notice" class="inline-notice" :class="{ error: noticeTone === 'error' }" role="status">{{ notice }}</p>
       <div v-if="busy && !collections.length" class="empty-state compact collection-loading" role="status">
         <h2>正在加载合集</h2>
       </div>

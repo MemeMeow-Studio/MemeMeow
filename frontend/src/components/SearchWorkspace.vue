@@ -37,7 +37,7 @@ const detailItem = shallowRef<SearchItem | null>(null)
 const detailTrigger = shallowRef<HTMLElement | null>(null)
 const previewImage = shallowRef<MemeImage | null>(null)
 const previewTrigger = shallowRef<HTMLElement | null>(null)
-const { imageNotice, imageActionLabel, performImageAction, saving } = useImageAction()
+const { imageActionLabel, performImageAction, saving } = useImageAction()
 
 const uniqueResults = computed(() => {
   const seen = new Set<string>()
@@ -249,7 +249,6 @@ async function runSearch(): Promise<void> {
           />
         </article>
       </div>
-      <p v-if="imageNotice" class="copy-notice" role="status" aria-live="polite">{{ imageNotice }}</p>
     </template>
     <div v-else class="empty-state" :class="{ loading: busy }" role="status" aria-live="polite">
       <h2>{{ busy ? '正在分析你的描述' : '还没有检索结果' }}</h2>

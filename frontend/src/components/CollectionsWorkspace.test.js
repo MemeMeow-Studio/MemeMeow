@@ -1,5 +1,6 @@
 /** 合集列表、详情和成员维护行为测试，确保视觉整理不改变业务契约。 */
 import { flushPromises, mount } from '@vue/test-utils'
+import { toast } from 'vue-sonner'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { collections, createCollection, collection, renameCollection, deleteCollection, removeCollectionMember, collectionExportUrl, imageMetadata } = vi.hoisted(() => ({
@@ -60,7 +61,7 @@ describe('CollectionsWorkspace', () => {
 
     expect(createCollection).toHaveBeenCalledWith({ name: '新合集' })
     expect(wrapper.findAll('.collection-row')).toHaveLength(2)
-    expect(wrapper.text()).toContain('合集已创建')
+    expect(toast.getToasts().some((item) => item.title === '合集已创建')).toBe(true)
   })
 
   it('进入详情后保留重命名、返回和删除操作', async () => {
@@ -106,13 +107,12 @@ describe('CollectionsWorkspace', () => {
     expect(wrapper.get('[aria-label="下载合集 ZIP"]').attributes('href')).toBe('/api/collections/collection-1/export')
     await wrapper.get('[aria-label="复制动态下载链接"]').trigger('click')
     expect(writeText).toHaveBeenCalledWith(`${window.location.origin}/api/collections/collection-1/export`)
-    expect(wrapper.text()).toContain('下载链接已复制')
+    expect(toast.getToasts().some((item) => item.title === '下载链接已复制')).toBe(true)
 
     writeText.mockRejectedValueOnce(new Error('clipboard_denied'))
     await wrapper.get('[aria-label="复制动态下载链接"]').trigger('click')
     await flushPromises()
-    expect(wrapper.text()).toContain('无法复制下载链接，请手动复制浏览器地址')
-    expect(wrapper.get('.inline-notice').classes()).toContain('error')
+    expect(toast.getToasts().some((item) => item.title === '无法复制下载链接，请手动复制浏览器地址' && item.type === 'error')).toBe(true)
   })
 
   it('在资产卡片内移除成员并刷新详情', async () => {
@@ -127,7 +127,7 @@ describe('CollectionsWorkspace', () => {
 
     expect(removeCollectionMember).toHaveBeenCalledWith('collection-1', 'meme-1')
     expect(wrapper.get('.collection-empty').text()).toContain('这个合集还没有图片')
-    expect(wrapper.text()).toContain('图片已从合集移除')
+    expect(toast.getToasts().some((item) => item.title === '图片已从合集移除')).toBe(true)
   })
 
   it('封面和成员优先显示缩略图，加载失败回退原图，预览仍使用原图', async () => {

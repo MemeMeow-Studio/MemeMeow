@@ -23,6 +23,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   error: [message: string]
+  loadError: [message: string]
   imageProcessingTerminal: [event: ImageProcessingTerminalEvent]
 }>()
 
@@ -174,7 +175,7 @@ async function loadProcessingJobs(): Promise<void> {
       syncPolling()
     }
   } catch (reason) {
-    if (!disposed) emit('error', errorMessage(reason))
+    if (!disposed) emit('loadError', errorMessage(reason))
   }
 }
 
@@ -197,7 +198,7 @@ async function loadTasks({ append = false }: { append?: boolean } = {}): Promise
     }
     void loadProcessingJobs()
   } catch (reason) {
-    if (!disposed && requestId === listRequestId) emit('error', errorMessage(reason))
+    if (!disposed && requestId === listRequestId) emit('loadError', errorMessage(reason))
   } finally {
     if (!disposed && requestId === listRequestId) {
       loading.value = false
@@ -214,7 +215,7 @@ async function openTask(id: string, event?: MouseEvent): Promise<void> {
     const response = await api.task(id)
     if (!disposed && requestId === detailRequestId) selectedTask.value = response
   } catch (reason) {
-    if (!disposed && requestId === detailRequestId) emit('error', errorMessage(reason))
+    if (!disposed && requestId === detailRequestId) emit('loadError', errorMessage(reason))
   }
 }
 

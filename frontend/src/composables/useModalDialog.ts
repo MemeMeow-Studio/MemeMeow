@@ -3,6 +3,9 @@
  */
 
 import { nextTick, onBeforeUnmount, onMounted, type Ref } from 'vue'
+import { toastTarget } from './useToast'
+
+const notificationDialogs: HTMLElement[] = []
 
 interface ModalDialogOptions {
   dialog: Ref<HTMLElement | null>
@@ -28,6 +31,7 @@ const focusableSelector = [
 export function useModalDialog(options: ModalDialogOptions): void {
   function onKeydown(event: KeyboardEvent): void {
     if (event.key === 'Escape') {
+      if (document.activeElement instanceof HTMLElement && document.activeElement.closest('[data-sonner-toaster]')) return
       event.preventDefault()
       options.close()
       return
@@ -56,9 +60,19 @@ export function useModalDialog(options: ModalDialogOptions): void {
     }
   }
 
+  onBeforeUnmount(() => {
+    const index = notificationDialogs.indexOf(options.dialog.value!)
+    if (index !== -1) notificationDialogs.splice(index, 1)
+    toastTarget.value = notificationDialogs.at(-1) || 'body'
+  })
+
   onMounted(async () => {
     document.addEventListener('keydown', onKeydown)
     await nextTick()
+    if (options.dialog.value) {
+      notificationDialogs.push(options.dialog.value)
+      toastTarget.value = options.dialog.value
+    }
     ;(options.initialFocus.value || options.dialog.value)?.focus()
   })
 

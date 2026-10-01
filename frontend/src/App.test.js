@@ -1,5 +1,6 @@
 /** Vue 核心页面切换和检索流程测试。 */
 import { flushPromises, mount } from '@vue/test-utils'
+import { toast } from 'vue-sonner'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { search, images, imageMetadata, contextBatch, retryImageStagesBatch, unreadyProcessing, generateCache, pollTask, tasks, task, repositoryMetadata } = vi.hoisted(() => ({ search: vi.fn(), images: vi.fn(), imageMetadata: vi.fn(), contextBatch: vi.fn(), retryImageStagesBatch: vi.fn(), unreadyProcessing: vi.fn(), generateCache: vi.fn(), pollTask: vi.fn(), tasks: vi.fn(), task: vi.fn(), repositoryMetadata: vi.fn() }))
@@ -71,12 +72,13 @@ describe('App', () => {
     await wrapper.get('.search-form').trigger('submit')
     await flushPromises()
 
-    expect(wrapper.get('[role="alert"]').text()).toContain('检索服务暂不可用')
+    expect(document.body.textContent).toContain('检索服务暂不可用')
     expect(wrapper.get('.search-form .primary').attributes('disabled')).toBeUndefined()
     expect(wrapper.get('.search-form .primary').text()).toBe('开始检索')
 
-    await wrapper.get('[aria-label="关闭错误"]').trigger('click')
-    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    document.querySelector('[aria-label="关闭提示"]').click()
+    await flushPromises()
+    expect(toast.getToasts()).toHaveLength(0)
   })
 
   it('对相同媒体路径的查询结果稳定去重', async () => {
@@ -116,7 +118,7 @@ describe('App', () => {
     expect(items[0].data).toEqual({ 'image/png': expect.any(Promise) })
     await expect(items[0].data['image/png']).resolves.toBe(imageBlob)
     expect(writeText).not.toHaveBeenCalled()
-    expect(wrapper.text()).toContain('图片已复制')
+    expect(document.body.textContent).toContain('图片已复制')
   })
 
   it('浏览器不支持图片剪贴板时显示失败且不复制地址', async () => {
@@ -131,7 +133,7 @@ describe('App', () => {
     await flushPromises()
     expect(fetch).not.toHaveBeenCalled()
     expect(writeText).not.toHaveBeenCalled()
-    expect(wrapper.text()).toContain('当前浏览器不支持复制图片')
+    expect(document.body.textContent).toContain('当前浏览器不支持复制图片')
   })
 
   it('图片加载失败时不写入剪贴板或复制地址', async () => {
@@ -153,7 +155,7 @@ describe('App', () => {
     await flushPromises()
     expect(write).toHaveBeenCalledTimes(1)
     expect(writeText).not.toHaveBeenCalled()
-    expect(wrapper.text()).toContain('图片加载失败，无法复制')
+    expect(document.body.textContent).toContain('图片加载失败，无法复制')
   })
 
   it('图片 MIME 不可用或 Chrome 拒绝剪贴板时均显示失败原因', async () => {
@@ -175,7 +177,7 @@ describe('App', () => {
     await flushPromises()
     expect(write).toHaveBeenCalledTimes(1)
     expect(writeText).not.toHaveBeenCalled()
-    expect(wrapper.text()).toContain('图片 MIME 类型不可用，无法复制')
+    expect(document.body.textContent).toContain('图片 MIME 类型不可用，无法复制')
 
     fetch.mockResolvedValue({ ok: true, blob: vi.fn().mockResolvedValue(new Blob(['data'], { type: 'image/png' })) })
     write.mockRejectedValue(new DOMException('被 Chrome 拒绝', 'NotAllowedError'))

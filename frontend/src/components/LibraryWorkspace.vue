@@ -2,6 +2,7 @@
 /** 图片库工作区：管理筛选、选择、语境重试、缓存任务和加入合集流程。 */
 import { computed, onMounted, shallowRef, watch } from 'vue'
 import { api } from '../api'
+import { useToast } from '../composables/useToast'
 import { showTaskDiagnostics } from '../config/debug'
 import type { CollectionSummary, CoreImageProcessingStage, ImageProcessingBatchResponse, ImageProcessingOptions, ImageProcessingStage, MemeImage, SelectedImageRetryMode, ServiceConfig, TaskItem, UnreadyProcessingResponse } from '../types'
 import {
@@ -9,6 +10,7 @@ import {
   errorMessage,
   imageDisplayUrl,
   imageKey,
+  imageStageLabel,
   metadataLabel,
   visualEmbeddingLabel,
 } from '../utils/presentation'
@@ -29,6 +31,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   error: [message: string]
+  loadError: [message: string]
   clearError: []
   generateCache: []
 }>()
@@ -55,10 +58,9 @@ const total = shallowRef(0)
 const busy = shallowRef(false)
 const selectedImages = shallowRef(new Set<string>())
 const retryBusy = shallowRef(false)
-const retryNotice = shallowRef('')
+const notifications = useToast()
 const collections = shallowRef<CollectionSummary[]>([])
 const collectionBusy = shallowRef(false)
-const collectionNotice = shallowRef('')
 const collectionDialogOpen = shallowRef(false)
 const collectionTarget = shallowRef('')
 const dialogCollectionName = shallowRef('')
@@ -69,7 +71,7 @@ const stageBusy = shallowRef('')
 const processingOptionsOpen = shallowRef(false)
 const processingOptionsTarget = shallowRef<ProcessingOptionsTarget | null>(null)
 const processingOptionsTrigger = shallowRef<HTMLElement | null>(null)
-const retryDetails = shallowRef<ImageProcessingBatchResponse['results']>([])
+const retryDetails = shallowRef<RetryResult[]>([])
 const retryOptions = shallowRef<ImageProcessingOptions>(defaultProcessingOptions())
 const preserveRetryOptions = shallowRef(false)
 const retrySelectedDialogOpen = shallowRef(false)
@@ -131,7 +133,7 @@ async function loadLibrary(): Promise<void> {
     const keys = new Set(images.value.map(imageKey))
     selectedImages.value = new Set([...selectedImages.value].filter((key) => keys.has(key)))
   } catch (reason) {
-    if (requestId === libraryRequestId) emit('error', errorMessage(reason))
+    if (requestId === libraryRequestId) emit('loadError', errorMessage(reason))
   } finally {
     if (requestId === libraryRequestId) busy.value = false
   }
@@ -168,7 +170,7 @@ async function loadCollections(): Promise<void> {
   try {
     collections.value = (await api.collections()).items
   } catch (reason) {
-    emit('error', errorMessage(reason))
+    emit('loadError', errorMessage(reason))
   } finally {
     collectionBusy.value = false
   }
@@ -181,7 +183,6 @@ function openCollectionDialog(event: MouseEvent): void {
   collectionDialogOpen.value = true
   collectionTarget.value = ''
   dialogCollectionName.value = ''
-  collectionNotice.value = ''
   void loadCollections()
 }
 
@@ -196,7 +197,7 @@ async function addSelectedToCollection(): Promise<void> {
   collectionBusy.value = true
   try {
     const result = await api.addCollectionItems(collectionTarget.value, selectedIds.value)
-    collectionNotice.value = `已加入 ${result.added_count} 张图片`
+    notifications.success(`已加入 ${result.added_count} 张图片`)
     collectionDialogOpen.value = false
     selectedImages.value = new Set()
   } catch (reason) {
@@ -213,7 +214,7 @@ async function createCollectionAndAdd(): Promise<void> {
   try {
     const created = await api.createCollection({ name: dialogCollectionName.value })
     await api.addCollectionItems(created.collection_id, selectedIds.value)
-    collectionNotice.value = '合集已创建并加入图片'
+    notifications.success('合集已创建并加入图片')
     collectionDialogOpen.value = false
     selectedImages.value = new Set()
   } catch (reason) {
@@ -232,7 +233,7 @@ async function retryStage(item: MemeImage, stage: 'visual' | 'agent' | 'auto_ren
     const request: Record<string, unknown> = { meme_id: item.meme_id, stage }
     if (stage !== 'visual') request.reverse_image_policy = 'forbid'
     await api.submitImageStage(request)
-    retryNotice.value = `${item.filename}：已提交${stage === 'visual' ? '视觉向量生成' : stage === 'agent' ? '图片语境分析' : stage === 'auto_rename' ? '自动重命名' : '文本向量生成'}独立任务`
+    notifications.success(`${item.filename}：已提交${stage === 'visual' ? '视觉向量生成' : stage === 'agent' ? '图片语境分析' : stage === 'auto_rename' ? '自动重命名' : '文本向量生成'}独立任务`)
     await loadLibrary()
   } catch (reason) {
     emit('error', errorMessage(reason))
@@ -248,7 +249,7 @@ function processingStage(item: MemeImage, stage: ImageProcessingStageName): Imag
 
 type ImageProcessingStageName = 'visual' | 'agent' | 'auto_rename' | 'text_embedding'
 
-type RetryResult = ImageProcessingBatchResponse['results'][number]
+type RetryResult = ImageProcessingBatchResponse['results'][number] & { stage?: CoreImageProcessingStage }
 
 /** 将服务端逐图结果收束为新的四种提交分类，兼容旧字段读取。 */
 function retryResultCategory(result: RetryResult): 'submitted' | 'processing_active' | 'not_needed' | 'failed' {
@@ -262,6 +263,7 @@ function retryResultCategory(result: RetryResult): 'submitted' | 'processing_act
 /** 将逐图分类和稳定错误收束为用户可扫描的一行反馈。 */
 function retryResultMessage(result: RetryResult): string {
   const category = retryResultCategory(result)
+  if (result.stage) return `${imageStageLabel(result.stage)}：${result.error ? `提交失败：${result.error}` : '已提交处理任务'}`
   if (category === 'processing_active') return `正在处理${result.reason || result.error ? `：${result.reason || result.error}` : ''}`
   if (category === 'not_needed') return `无需修复${result.reason || result.error ? `：${result.reason || result.error}` : ''}`
   if (category === 'failed') return `提交失败${result.error || result.reason ? `：${result.error || result.reason}` : ''}`
@@ -289,7 +291,6 @@ function cancelRetrySelected(): void {
 async function submitSelectedRetry(submission: SelectedRetrySubmission, options?: ImageProcessingOptions): Promise<void> {
   if (retryBusy.value) return
   emit('clearError')
-  retryNotice.value = ''
   retryBusy.value = true
   try {
     if (submission.mode === 'full') {
@@ -309,7 +310,7 @@ async function submitSelectedRetry(submission: SelectedRetrySubmission, options?
         },
         { submitted: 0, processing_active: 0, not_needed: 0, failed: 0 },
       )
-      retryNotice.value = `重试选中：提交 ${counts.submitted} 个完整任务，处理中 ${counts.processing_active}，无需修复 ${counts.not_needed}，失败 ${counts.failed}`
+      notifications.show(`重试选中：提交 ${counts.submitted} 个完整任务，处理中 ${counts.processing_active}，无需修复 ${counts.not_needed}，失败 ${counts.failed}`, counts.failed ? 'warning' : 'success')
     } else {
       const payload: Record<string, unknown> = { items: submission.items, stages: submission.stages }
       if (options) {
@@ -317,7 +318,9 @@ async function submitSelectedRetry(submission: SelectedRetrySubmission, options?
         payload.auto_name = options.auto_name
       }
       const response = await api.retryImageStagesBatch(payload)
-      retryNotice.value = `重试选中：已提交 ${response.submitted_count ?? 0} 个阶段任务${response.failed_count ? `，${response.failed_count} 项未提交` : ''}`
+      if (!Array.isArray(response.results)) throw new Error('阶段批量提交响应缺少逐项结果')
+      retryDetails.value = response.results
+      notifications.show(`重试选中：已提交 ${response.submitted_count ?? 0} 个阶段任务${response.failed_count ? `，${response.failed_count} 项未提交` : ''}`, response.failed_count ? 'warning' : 'success')
     }
     retrySelectedDialogOpen.value = false
     processingOptionsOpen.value = false
@@ -396,7 +399,6 @@ function cancelUnreadyOptions(): void {
 async function confirmUnreadyOptions(options: ImageProcessingOptions): Promise<void> {
   if (retryBusy.value) return
   emit('clearError')
-  retryNotice.value = ''
   retryOptions.value = options
   preserveRetryOptions.value = true
   const submitUnreadyProcessing = api.unreadyProcessing
@@ -409,7 +411,7 @@ async function confirmUnreadyOptions(options: ImageProcessingOptions): Promise<v
   try {
     const response = await submitUnreadyProcessing(options) as UnreadyProcessingResponse
     retryDetails.value = []
-    retryNotice.value = `后台扫描已接收，可在任务页面查看进度。任务：${response.task_id}`
+    notifications.success(`后台扫描已接收，可在任务页面查看进度。任务：${response.task_id}`)
     processingOptionsOpen.value = false
     processingOptionsTarget.value = null
     // 请求已经返回后关闭本次确认；下一次打开不得继承可能更高风险的选择。
@@ -527,9 +529,8 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
         </span>
       </div>
     </div>
-    <div v-if="retryNotice" class="inline-notice" role="status">{{ retryNotice }}</div>
     <ul v-if="retryDetails.length" class="processing-result-details" aria-label="图片处理逐图结果">
-      <li v-for="result in retryDetails" :key="result.meme_id" :class="retryResultCategory(result)">
+      <li v-for="result in retryDetails" :key="`${result.meme_id}:${result.stage || 'pipeline'}`" :class="retryResultCategory(result)">
         <strong v-if="showTaskDiagnostics">{{ result.meme_id }}</strong>
         <span>{{ retryResultMessage(result) }}</span>
       </li>
@@ -579,7 +580,6 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
       </article>
       <div v-if="!images.length" class="empty-state compact"><h2>图片库还没有图片</h2></div>
     </div>
-    <p v-if="collectionNotice" class="inline-notice" role="status">{{ collectionNotice }}</p>
     <nav class="library-pagination" aria-label="图片库分页">
       <button type="button" :disabled="busy || page <= 1" @click="changePage(page - 1)">上一页</button>
       <span>第 {{ page }} / {{ pageCount }} 页，共 {{ total }} 张</span>

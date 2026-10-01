@@ -1,5 +1,6 @@
 /** 图片库完整重试、阶段恢复和共享选项对话框的行为测试。 */
 import { flushPromises, mount } from '@vue/test-utils'
+import { toast } from 'vue-sonner'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { images, imageMetadata, contextBatch, retryImageStagesBatch, unreadyProcessing, submitImageStage } = vi.hoisted(() => ({
@@ -186,7 +187,7 @@ describe('LibraryWorkspace', () => {
     await wrapper.get('.processing-options-dialog form').trigger('submit')
     await flushPromises()
 
-    expect(wrapper.text()).toContain('提交 1 个完整任务，处理中 1，无需修复 0，失败 1')
+    expect(toast.getToasts().some((item) => String(item.title).includes('提交 1 个完整任务，处理中 1，无需修复 0，失败 1') && item.type === 'warning')).toBe(true)
     expect(wrapper.get('.processing-result-details').text()).toContain('正在处理：image_processing_active')
     expect(wrapper.get('.processing-result-details').text()).toContain('提交失败：target_changed')
   })
