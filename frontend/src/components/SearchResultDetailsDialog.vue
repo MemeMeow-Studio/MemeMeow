@@ -31,7 +31,7 @@ useModalDialog({ dialog, initialFocus: closeButton, returnFocus: props.returnFoc
       <div class="search-result-dialog-body">
         <img :src="mediaUrl" alt="检索结果图片" />
         <dl>
-          <div><dt>Embedding 匹配度</dt><dd>{{ scoreLabel }}</dd></div>
+          <div><dt>文本向量匹配度</dt><dd>{{ scoreLabel }}</dd></div>
         </dl>
       </div>
       <footer class="search-result-dialog-actions">

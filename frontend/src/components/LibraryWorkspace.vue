@@ -232,7 +232,7 @@ async function retryStage(item: MemeImage, stage: 'visual' | 'agent' | 'auto_ren
     const request: Record<string, unknown> = { meme_id: item.meme_id, stage }
     if (stage !== 'visual') request.reverse_image_policy = 'forbid'
     await api.submitImageStage(request)
-    retryNotice.value = `${item.filename}：已提交${stage === 'visual' ? '视觉向量生成' : stage === 'agent' ? '图片语境分析' : stage === 'auto_rename' ? '自动重命名' : '文本语义检索'}独立任务`
+    retryNotice.value = `${item.filename}：已提交${stage === 'visual' ? '视觉向量生成' : stage === 'agent' ? '图片语境分析' : stage === 'auto_rename' ? '自动重命名' : '文本向量生成'}独立任务`
     await loadLibrary()
   } catch (reason) {
     emit('error', errorMessage(reason))

@@ -73,8 +73,8 @@ export function useUploadRecords(items: () => UploadBatchItem[], storageScope: s
         state = 'success'
         if (task.processing?.upload_mode === 'direct') {
           detail = task.processing.text_input_status === 'waiting_for_text'
-            ? '图片已保存，文本索引等待有效名称或语境。后台会自动命名。'
-            : '图片已保存，检索向量独立处理。后台会自动命名。'
+            ? '图片已保存，文本向量等待有效名称或语境。后台会自动命名。'
+            : '图片已保存，文本向量独立处理。后台会自动命名。'
         }
       } else if (task?.status === 'failed') {
         const code = task.error?.error || 'task_failed'

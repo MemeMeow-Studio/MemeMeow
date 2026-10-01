@@ -94,7 +94,7 @@ function cancel(): void {
           </label>
           <label class="option-choice">
             <input v-model="uploadMode" type="radio" value="analyze" :disabled="busy" />
-            <span><strong>完整分析</strong><small>分析图片语境并生成检索向量。</small></span>
+            <span><strong>完整分析</strong><small>分析图片语境并生成文本向量。</small></span>
           </label>
         </fieldset>
         <fieldset v-if="!props.upload || uploadMode === 'analyze'" class="option-fieldset">

@@ -234,7 +234,7 @@ describe('App', () => {
     expect(wrapper.get('.cache-action').element.disabled).toBe(false)
     expect(wrapper.get('.cache-action').text()).toBe('重新生成检索缓存')
     expect(wrapper.get('.cache-status').text()).toContain('任务执行失败')
-    expect(wrapper.get('.embedding-global').text()).toBe('Embedding 生成失败')
+    expect(wrapper.get('.embedding-global').text()).toBe('文本向量生成失败')
   })
 
   it('任务列表和详情展示完整的 Agent 工作回合摘要', async () => {
@@ -287,7 +287,7 @@ describe('App', () => {
       reverse_image_policy: 'forbid',
       auto_name: false,
     })
-    expect(wrapper.text()).toContain('文本索引已就绪')
+    expect(wrapper.text()).toContain('文本向量已就绪')
     expect(wrapper.findAll('.visual-embedding-state')[0].text()).toBe('图片向量待生成')
     expect(wrapper.findAll('.visual-embedding-state')[1].text()).toBe('图片向量已就绪')
   })

@@ -397,7 +397,7 @@ test('重试选中默认可选择并按指定阶段提交', async ({ page }) => 
 
   await dialog.getByRole('radio', { name: '指定部分' }).check()
   await dialog.getByRole('checkbox', { name: '图片语境' }).check()
-  await dialog.getByRole('checkbox', { name: '文本索引' }).check()
+  await dialog.getByRole('checkbox', { name: '文本向量生成' }).check()
   await page.setViewportSize({ width: 390, height: 844 })
   await expect(page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).resolves.toBe(true)
   await page.screenshot({ path: '/home/infstellar/vscode/MemeMeow/frontend/test-results/retry-selected-mobile.png', fullPage: true })
@@ -440,8 +440,8 @@ test('搜索表单拒绝空查询并保留工作区', async ({ page }) => {
   await expect(submit).toBeEnabled()
 })
 
-/** 使用真实浏览器核对文本索引和图片视觉向量不会被混成同一个状态。 */
-test('图片库分别显示文本索引和图片向量状态', async ({ page }) => {
+/** 核对文本向量和图片视觉向量的独立状态。 */
+test('图片库分别显示文本向量和图片向量状态', async ({ page }) => {
   await page.route('**/api/images?**', (route) => route.fulfill({
     status: 200,
     contentType: 'application/json',
@@ -458,7 +458,7 @@ test('图片库分别显示文本索引和图片向量状态', async ({ page }) 
 
   await page.goto('/')
   await page.getByRole('button', { name: '图片库' }).click()
-  await expect(page.locator('.embedding-state')).toHaveText(['文本索引待生成', '文本索引已就绪'])
+  await expect(page.locator('.embedding-state')).toHaveText(['文本向量待生成', '文本向量已就绪'])
   await expect(page.locator('.visual-embedding-state')).toHaveText(['图片向量已就绪', '图片向量待生成'])
 })
 

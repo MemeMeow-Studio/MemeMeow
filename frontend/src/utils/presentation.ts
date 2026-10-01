@@ -116,9 +116,9 @@ export function metadataLabel(status?: string): string {
   return { ready: '语境就绪', pending: '待生成', partial: '语境不完整', repair_required: '需修复' }[status || ''] || '状态未知'
 }
 
-/** 将文本语义索引状态转换为用户可读标签。 */
+/** 将文本向量状态转换为用户可读标签。 */
 export function embeddingLabel(status?: string): string {
-  return { ready: '文本索引已就绪', pending: '文本索引待生成', waiting_for_text: '文本索引等待文本', blocked: '文本索引需修复' }[status || ''] || '文本索引状态未知'
+  return { ready: '文本向量已就绪', pending: '文本向量待生成', waiting_for_text: '文本向量等待文本', blocked: '文本向量需修复' }[status || ''] || '文本向量状态未知'
 }
 
 /** 将视觉向量状态转换为用户可读标签。 */
@@ -152,7 +152,7 @@ export function taskTypeLabel(type?: string): string {
     visual_embedding_generation: '图片向量生成',
     image_auto_rename: '自动重命名',
     image_name_generation: '后台图片命名',
-    text_embedding_generation: '文本语义检索',
+    text_embedding_generation: '文本向量生成',
     image_processing: '完整图片处理',
   }[type || ''] || type || '未知任务'
 }
@@ -164,7 +164,7 @@ export function submissionModeLabel(mode?: string | null): string {
 
 /** 将图片阶段转换为工作台标签。 */
 export function imageStageLabel(stage?: string | null): string {
-  return { visual: '视觉向量生成', agent: '图片语境分析', auto_rename: '自动重命名', text_embedding: '文本语义检索' }[stage || ''] || '图片阶段'
+  return { visual: '视觉向量生成', agent: '图片语境分析', auto_rename: '自动重命名', text_embedding: '文本向量生成' }[stage || ''] || '图片阶段'
 }
 
 /** 将图片处理 Job 阶段状态转换为短标签。 */

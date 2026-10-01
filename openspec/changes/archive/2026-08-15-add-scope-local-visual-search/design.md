@@ -2,7 +2,7 @@
 
 当前 PostgreSQL 是 Meme、结构化语境、任务和文本向量的运行时事实来源；文本检索使用固定 1024 维、按 generation 激活的索引。上传成功后会直接提交 Agent 语境任务，Agent 可通过任务限定的内部接口使用外部反向图片能力，但不能利用当前 scope 中已经研究完成的相似 Meme。
 
-本变更涉及上传链路、持久任务、PostgreSQL 向量数据、Agent Skill 和 Docker 部署。具体动机见 [proposal.md](proposal.md)，可观察行为见本 change 的 delta specs。活动模型固定使用公开 DINOv2 ViT-B/14（`dinov2_vitb14`，约 86M 参数、768 维输出），因此视觉索引不复用当前文本索引的 1024 维。
+本变更涉及上传链路、持久任务、PostgreSQL 向量数据、Agent Skill 和 Docker 部署。具体动机见 [proposal.md](proposal.md)，可观察行为见本 change 的 delta specs。活动模型固定使用公开 DINOv2 ViT-B/14（`dinov2_vitb14`，约 86M 参数、768 维输出），因此视觉索引不复用当前文本向量的 1024 维。
 
 ## Goals / Non-Goals
 
@@ -87,13 +87,13 @@ dedupe = visual:{meme_id}:{image_sha256}:{model}:{preprocess_version}
 
 不同图片没有相互依赖：图片 A 的视觉任务成功后可以立即启动 Agent A，不等待同批图片 B。视觉任务重复完成时先检查有效 Agent provenance 和同输入 Agent 任务，避免活动任务去重只覆盖 `queued/running` 而在已成功后重复研究。
 
-自动链路的 Agent 输入指纹继续包含 `meme_id`、图片 SHA、Agent 模型、Skill hash 和反向图片策略。视觉模型升级只创建新视觉向量，不自动重跑已有 Agent；Agent 重试复用有效视觉向量；文本索引重试只处理文本 generation。图片 SHA 变化被视为新版本，不是旧任务重试。
+自动链路的 Agent 输入指纹继续包含 `meme_id`、图片 SHA、Agent 模型、Skill hash 和反向图片策略。视觉模型升级只创建新视觉向量，不自动重跑已有 Agent；Agent 重试复用有效视觉向量；文本向量重试只处理文本 generation。图片 SHA 变化按新版本处理。
 
-### 4. 批量上传只在文本索引收束处使用批次 finalizer
+### 4. 批量上传只在文本向量生成完成时使用批次 finalizer
 
 视觉和 Agent 阶段按单图链并发。每个视觉任务继承上传批次 ID，成功创建的 Agent 任务加入对应的 Agent 批次；当该上传批次的视觉任务全部进入终态后，系统封口 Agent 批次，使其不再接受成员，但不等待该时刻才启动 Agent。
 
-Agent 批次全部进入终态后，现有 finalizer 创建或复用一次 `cache_generation`。单图上传使用单项批次或在 Agent 成功后直接创建同一去重的文本索引任务。失败 Agent 不阻塞成功语境进入下一次文本索引，但自身不产生文本 embedding。
+Agent 批次全部进入终态后，现有 finalizer 创建或复用一次 `cache_generation`。单图上传使用单项批次或在 Agent 成功后直接创建同一去重的文本向量任务。失败 Agent 不阻塞成功语境进入下一次文本向量生成，但自身不产生文本向量。
 
 备选方案是每个 Agent 成功都立即完整重建文本 generation。它会放大批量上传成本并产生并发 generation，因此继续使用已有批次收束。全局“所有视觉完成后才启动所有 Agent”的阶段屏障会产生队头阻塞，也没有业务依赖，因此不采用。
 
@@ -180,7 +180,7 @@ Skill 新增薄 CLI，例如 `local_visual_match.py --top-k 20`。它读取 Runn
 2. 通过 `0009_dinov2_vitb14_visual_search` 激活 768 维 DINOv2 表，并保留 0008 的 1280 维 DINOv3 表；迁移不删除向量或图片，显式降级可回切 DINOv3。
 3. 部署只读权重挂载的 CPU 推理服务和健康检查，先保持上传链路未启用。
 4. 增加后端视觉任务处理器、输入校验、事务内向量写入与 Agent 任务创建，并为现有图片提供显式批量回填入口。
-5. 切换上传链路为视觉任务起点，更新任务列表、单项重试和批次文本索引收束。
+5. 切换上传链路为视觉任务起点，更新任务列表、单项重试和批次文本向量生成完成后的处理。
 6. 发布内部匹配接口、Skill 薄客户端和 research workflow，验证 Agent 容器没有数据库凭据、模型权重和推理服务地址。
 7. 对现有图片分批生成视觉向量；已有 Agent-ready 图片在向量就绪后成为候选，不自动重跑其 Agent 语境。
 8. 回滚时停止提交新视觉任务并恢复上传后直接提交 Agent 的旧路径；保留新表和已生成向量供再次前滚，旧文本搜索继续工作。

@@ -281,7 +281,7 @@ async def submit_image_stage_batch(
     """
     allowed_stages = {"visual", "agent", "text_embedding"}
     if len(set(payload.stages)) != len(payload.stages) or any(stage not in allowed_stages for stage in payload.stages):
-        raise error(422, "invalid_image_stage", "批量阶段只能选择视觉向量、图片语境或文本索引，且不能重复")
+        raise error(422, "invalid_image_stage", "批量阶段只能选择视觉向量、图片语境或文本向量，且不能重复")
     if "visual" in payload.stages and len(payload.stages) == 1 and payload.reverse_image_policy is not None:
         raise error(400, "invalid_visual_stage_parameter", "视觉向量生成不接受 reverse_image_policy")
     if not payload.items:

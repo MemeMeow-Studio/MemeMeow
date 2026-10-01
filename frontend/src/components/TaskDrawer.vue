@@ -92,7 +92,7 @@ useModalDialog({
           <dt>后台命名</dt><dd>{{ task.error?.message }} 符合条件的图片会在后续用户轮询中再次处理。</dd>
         </div>
         <div v-if="task.result?.text_input_status === 'waiting_for_text'">
-          <dt>文本索引</dt><dd>等待有效名称或语境，图片向量独立处理。</dd>
+          <dt>文本向量</dt><dd>等待有效名称或语境，图片向量独立处理。</dd>
         </div>
         <div v-if="task.task_type === 'image_library_processing' && task.result">
           <dt>扫描结果</dt>

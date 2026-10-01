@@ -777,7 +777,7 @@ class ImageProcessingRepository:
             for stage in ("visual", "agent", "text_embedding"):
                 stage_readiness[stage] = False
         if reverse_image_policy is not None and getattr(job, "reverse_image_policy", None) != reverse_image_policy:
-            # 联网策略只影响 Agent 语境及其派生文本索引，不影响视觉向量。
+            # 联网策略只影响 Agent 语境及其派生文本向量，不影响视觉向量。
             stage_readiness["agent"] = False
             stage_readiness["text_embedding"] = False
         if metadata_hash is None or getattr(job, "metadata_hash", None) != metadata_hash:

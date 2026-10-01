@@ -40,11 +40,11 @@ const embeddingState = computed(() => {
 })
 
 const embeddingStateLabel = computed(() => ({
-  ready: 'Embedding 已就绪',
-  running: 'Embedding 生成中',
-  failed: 'Embedding 生成失败',
-  missing: 'Embedding 未生成',
-  unknown: 'Embedding 状态未知',
+  ready: '文本向量已就绪',
+  running: '文本向量生成中',
+  failed: '文本向量生成失败',
+  missing: '文本向量未生成',
+  unknown: '文本向量状态未知',
 }[embeddingState.value]))
 
 /** 清空全局错误提示，供工作区在发起新请求前调用。 */

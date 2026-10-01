@@ -25,7 +25,7 @@
 - **AND** 不将提示时间表示为已调度的自动重试
 
 ### Requirement: 批量图片处理必须逐图隔离而非批次收束
-系统 MUST 将批量上传和图片库一键处理中的每张图片作为独立图片处理 job 跟踪。系统 MUST NOT 以一批视觉或 Agent 任务的全部终态为条件自动提交 scope 级文本索引刷新；一张图片的失败、`blocked`、重试、服务恢复或完成不得阻塞、回滚或提前终结其他图片的 job。
+系统 MUST 将批量上传和图片库一键处理中的每张图片作为独立图片处理 job 跟踪。系统 MUST NOT 以一批视觉或 Agent 任务的全部终态为条件自动提交 scope 级文本向量刷新；一张图片的失败、`blocked`、重试、服务恢复或完成不得阻塞、回滚或提前终结其他图片的 job。
 
 #### Scenario: 同一批图片处于不同阶段
 - **WHEN** 一次批量处理中的图片分别处于视觉执行、Agent 失败和文本 embedding 成功状态
@@ -69,6 +69,6 @@
 **Reason**: 阶段推进责任转移到统一图片处理 job，避免视觉任务与 Agent 任务之间的隐式耦合。
 **Migration**: 视觉 Task 仅提交其自身产物；图片处理 Worker 在确认其成功和产物有效后创建或复用独立 Agent Task。
 
-### Requirement: Agent 成功后必须收敛文本索引刷新
+### Requirement: Agent 成功后必须收敛文本向量刷新
 **Reason**: Agent 结果的文本向量按单图增量生成，不再自动触发 scope 级全库索引刷新。
 **Migration**: Agent Task 仅提交自身语境产物；图片处理 Worker 在确认其成功后创建或复用独立 `text_embedding_generation` Task。维护者需要全库重建时显式提交 `cache_generation`。

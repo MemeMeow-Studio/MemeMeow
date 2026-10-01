@@ -29,8 +29,8 @@
 - **WHEN** Agent 运行槽位已满但请求没有命中活动图片处理或通用任务去重
 - **THEN** 已接受的新任务继续保持 `queued`，不因排队数量增加而拒绝，也不能通过增加应用进程突破运行槽位
 
-### Requirement: Agent 成功后必须收敛文本索引刷新
-Agent 成功写入有效语境后，系统 MUST 使不匹配新语境的文本向量不再作为当前结果。pipeline Agent Task MUST 只唤醒父 Job，由父 Job 根据创建时固定的阶段计划决定是否执行自动重命名和文本向量；standalone Agent Task MUST 不自动创建文本向量、自动重命名或父 Job。批量中的每张图片 MUST 各自服从其父 Job 计划，不得恢复按整个批次隐式触发共享文本索引刷新的旧链路。
+### Requirement: Agent 成功后必须收敛文本向量刷新
+Agent 成功写入有效语境后，系统 MUST 使不匹配新语境的文本向量不再作为当前结果。pipeline Agent Task MUST 只唤醒父 Job，由父 Job 根据创建时固定的阶段计划决定是否执行自动重命名和文本向量；standalone Agent Task MUST 不自动创建文本向量、自动重命名或父 Job。批量中的每张图片 MUST 各自服从其父 Job 计划，不得恢复按整个批次隐式触发共享文本向量刷新的旧链路。
 
 #### Scenario: 单图 Agent 成功
 - **WHEN** 单张图片的 pipeline Agent Task 成功写回当前图片版本
@@ -39,7 +39,7 @@ Agent 成功写入有效语境后，系统 MUST 使不匹配新语境的文本�
 #### Scenario: 批量 Agent 任务完成
 - **WHEN** 批量请求创建的各图片 Agent Task 分别进入终态
 - **THEN** 每个父 Job 独立按其固定计划继续或收束
-- **AND** 系统不因批次完成隐式创建计划外的共享文本索引任务
+- **AND** 系统不因批次完成隐式创建计划外的共享文本向量任务
 
 #### Scenario: 独立 Agent 成功
 - **WHEN** standalone Agent Task 成功写入新的有效语境

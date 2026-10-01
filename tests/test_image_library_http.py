@@ -193,7 +193,7 @@ def test_image_list_projects_status_and_processing_summary(tmp_path: Path) -> No
 
 
 def test_image_list_projects_text_embedding_status_per_image(tmp_path: Path) -> None:
-    """同一 scope 中只有实际拥有有效向量的图片才显示文本索引已就绪。"""
+    """同一 scope 中只有实际拥有有效向量的图片才显示文本向量已就绪。"""
     image = tmp_path / "meme.png"
     image.write_bytes(b"image-content")
     ready = SimpleNamespace(id=uuid4(), storage_key="a" * 64 + ".png", display_name="ready", extension=".png", size_bytes=13, sha256="a" * 64, context_status="ready")
