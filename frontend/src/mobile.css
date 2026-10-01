@@ -23,6 +23,7 @@
   .brand strong { font-size: 17px; }
   .desktop-service-state { display: none; }
   .mobile-service-state { display: flex; justify-content: flex-start; gap: 7px; margin-bottom: 12px; }
+  .mobile-service-state .embedding-global { max-width: none; overflow: visible; font-size: 14px; white-space: normal; overflow-wrap: anywhere; }
   .body { min-height: calc(100dvh - var(--mobile-header-height) - var(--mobile-nav-height) - var(--safe-area-top) - var(--safe-area-bottom)); }
   .sidebar { position: fixed; z-index: 7; top: auto; bottom: 0; left: 0; width: 100%; height: calc(var(--mobile-nav-height) + var(--safe-area-bottom)); padding: 6px 8px calc(6px + var(--safe-area-bottom)); border: 0; border-top: 1px solid var(--line); background: var(--surface); }
   .sidebar .workspace-desktop-nav { display: none; }

@@ -55,6 +55,7 @@ async function capture(label) {
     return {
       viewport: { width: innerWidth, height: innerHeight },
       documentWidth: document.documentElement.scrollWidth,
+      serviceStates: [...document.querySelectorAll(".mobile-service-state .embedding-global")].filter(visible).map((element) => ({ text: element.textContent, clientWidth: element.clientWidth, scrollWidth: element.scrollWidth })),
       controls: read(".library-toolbar button, .library-view-toggle button, .image-row-actions button, .image-dialog button, .topbar-actions button, .account-entry"),
       header: read('.topbar'), brand: read('.brand'), headerActions: read('.topbar-actions'),
       navigation: read('.sidebar'), navigationButtons: read('.sidebar nav button'),
@@ -69,6 +70,7 @@ async function capture(label) {
   evidence.push({ label, ...measurements })
   assert.equal(measurements.documentWidth, measurements.viewport.width, `${label} 页面出现横向溢出`)
   if (measurements.viewport.width <= 760) {
+    for (const state of measurements.serviceStates) assert(state.scrollWidth <= state.clientWidth, `${label} 手机服务状态文字截断`)
     assert.equal(measurements.navigationButtons.length, 5, `${label} 手机导航入口数量`)
     for (const button of measurements.navigationButtons) {
       assert(button.width >= 44 && button.height >= 44, `${label} 导航点击区域 ${button.text}`)
