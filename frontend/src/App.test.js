@@ -77,6 +77,7 @@ describe('App', () => {
     expect(wrapper.get('.search-form .primary').text()).toBe('开始检索')
 
     document.querySelector('[aria-label="关闭提示"]').click()
+    await new Promise((resolve) => setTimeout(resolve, 400))
     await flushPromises()
     expect(toast.getToasts()).toHaveLength(0)
   })
@@ -184,7 +185,7 @@ describe('App', () => {
     await wrapper.get('.result-item').trigger('click')
     await flushPromises()
     expect(writeText).not.toHaveBeenCalled()
-    expect(wrapper.text()).toContain('Chrome 拒绝剪贴板写入，请在网站设置中允许剪贴板后重试')
+    expect(document.body.textContent).toContain('Chrome 拒绝剪贴板写入，请在网站设置中允许剪贴板后重试')
   })
 
   it('切换图片库时加载图片列表', async () => {
