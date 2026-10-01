@@ -219,9 +219,9 @@ try {
       await expect(fixture).toBeVisible()
       await fixture.locator(".image-check input").check()
       await page.getByRole("button", { name: /重试选中/ }).click()
-      await page.getByLabel("指定部分", { exact: false }).check()
+      await page.getByRole("radio", { name: /指定部分/ }).check()
       await page.setViewportSize({ width: 390, height: 480 })
-      await page.getByLabel("视觉向量生成", { exact: false }).check()
+      await page.getByRole("checkbox", { name: /视觉向量生成/ }).check()
       await capture("selected-retry-short")
       const retryResponse = page.waitForResponse((response) => new URL(response.url()).pathname === `${apiPrefix}/images/stages/batch` && response.request().method() === "POST")
       await page.getByRole("button", { name: "重试已选部分（1）", exact: true }).click()
@@ -284,6 +284,9 @@ try {
   await writeFile(resolve(outputDirectory, 'results.json'), JSON.stringify({ baseURL, serverMode, evidence, errors }, null, 2))
   console.log(`已通过 ${evidence.length} 个真实页面状态检查；截图与尺寸记录：${outputDirectory}`)
 } finally {
+  const lastState = await page.evaluate(() => ({ url: location.href, title: document.title, text: document.body.innerText, focusedElement: document.activeElement?.outerHTML }))
+  await writeFile(resolve(outputDirectory, "last-state.json"), JSON.stringify(lastState, null, 2))
+  await page.screenshot({ path: resolve(outputDirectory, "last-state.png") })
   await writeFile(resolve(outputDirectory, 'latest-observations.json'), JSON.stringify({ evidence, errors }, null, 2))
   await browser.close()
 }
