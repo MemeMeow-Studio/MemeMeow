@@ -170,7 +170,7 @@ try {
   await expect(page.locator(".library-image-tile")).toHaveCount(20)
   checks.push("翻页与状态变化清空选择、状态变化返回第一页、全部就绪时禁用批量选择")
 
-  await context.setViewportSize({ width: 390, height: 844 })
+  await page.setViewportSize({ width: 390, height: 844 })
   await expect(page.getByLabel("图片状态类别")).toBeVisible()
   await expect(page.getByLabel("每页图片数量")).toBeVisible()
   await openManagement()

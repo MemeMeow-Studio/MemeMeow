@@ -24,7 +24,6 @@ vi.mock('../api', () => ({ api: apiMocks }))
 vi.mock('../config/debug', () => ({ showTaskDiagnostics: true }))
 
 import ImagePreviewDialog from './ImagePreviewDialog.vue'
-import LibraryWorkspace from './LibraryWorkspace.vue'
 import TaskDrawer from './TaskDrawer.vue'
 import TasksWorkspace from './TasksWorkspace.vue'
 
@@ -77,7 +76,7 @@ describe('任务诊断模式', () => {
     wrapper.unmount()
   })
 
-  it('任务详情、图片详情和重试结果显示诊断标识', async () => {
+  it('任务详情和图片详情显示诊断标识', async () => {
     const taskWrapper = mount(TaskDrawer, {
       props: {
         task: {
