@@ -32,6 +32,11 @@ async function actionAndList(action) {
   const response = await responsePromise
   assert.ok(response.ok(), `HTTP ${response.status()}: ${await response.text()}`)
   const payload = await response.json()
+  const requestUrl = new URL(response.url())
+  assert.equal(requestUrl.searchParams.get("search"), configuration.prefix)
+  assert.equal(requestUrl.searchParams.get("page_size"), await page.getByLabel("每页图片数量").inputValue())
+  assert.equal(requestUrl.searchParams.get("status") || "all", await page.getByLabel("图片状态类别").inputValue())
+  assert.equal(requestUrl.searchParams.get("sort"), await page.getByLabel("图片排序方式").inputValue())
   await expect(page.locator(".library-image-tile")).toHaveCount(payload.items.length)
   return payload
 }
@@ -85,6 +90,13 @@ try {
         assert.equal(matches({ contextReady: image.metadata.status === "ready", textReady: image.embedding_status === "ready", visualReady: image.visual_embedding_status === "ready" }, status), true)
       }
       assert.equal(new Set([...first.items, ...second.items].map(image => image.meme_id)).size, first.items.length + second.items.length)
+      if (sort === "name_asc") {
+        const names = [...first.items, ...second.items].map(image => image.display_name.toLowerCase())
+        assert.deepEqual(names, [...names].sort())
+      }
+      const full = await list({ search: configuration.prefix, status, page: "1", page_size: "200", sort })
+      assert.deepEqual([...first.items, ...second.items].map(image => image.meme_id), full.items.slice(0, 40).map(image => image.meme_id))
+      if (sort === "updated_desc") assert.equal(first.items[0].meme_id, expected.at(-1).meme_id)
     }
   }
   for (const pageSize of ["20", "50", "100", "200"]) {
@@ -139,13 +151,14 @@ try {
 
   await actionAndList(() => page.getByRole("button", { name: "下一页", exact: true }).click())
   assert.equal(await page.locator(".library-image-tile input:checked").count(), 0)
+  await page.locator(".library-image-tile").first().getByRole("checkbox").check()
   await actionAndList(() => page.getByLabel("图片状态类别").selectOption("ready"))
   await expect(page.locator(".library-pagination")).toContainText("第 1 /")
   assert.equal(await page.locator(".library-image-tile input:checked").count(), 0)
   await openManagement()
   await expect(page.getByRole("button", { name: "选中当前页所有未就绪", exact: true })).toBeDisabled()
   await page.keyboard.press("Escape")
-  await page.getByLabel("图片状态类别").selectOption("unready")
+  await actionAndList(() => page.getByLabel("图片状态类别").selectOption("unready"))
   await expect(page.locator(".library-image-tile")).toHaveCount(20)
   checks.push("翻页与状态变化清空选择、状态变化返回第一页、全部就绪时禁用批量选择")
 
