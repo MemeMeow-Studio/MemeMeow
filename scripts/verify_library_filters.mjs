@@ -105,9 +105,11 @@ try {
     assert.equal(payload.total, 201)
   }
   const tooLarge = await context.request.get("/images?page_size=201")
-  assert.equal(tooLarge.status(), 422)
+  assert.equal(tooLarge.status(), 400)
+  assert.equal((await tooLarge.json()).error, "invalid_request")
   const invalidStatus = await context.request.get("/images?status=invalid")
-  assert.equal(invalidStatus.status(), 422)
+  assert.equal(invalidStatus.status(), 400)
+  assert.equal((await invalidStatus.json()).error, "invalid_request")
   checks.push("真实 API 六类状态、搜索、两种排序、筛选后计数与分页、四档数量及参数上限")
 
   await actionAndList(() => page.getByLabel("每页图片数量").selectOption("20"))
