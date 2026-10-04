@@ -57,6 +57,12 @@ async function openManagement() {
   if (await trigger.isVisible() && await trigger.getAttribute("aria-expanded") !== "true") await trigger.click()
 }
 
+/** 手机启用图片选择，桌面沿用已经展示的选择框。 */
+async function enableSelection() {
+  const trigger = page.getByRole("button", { name: "选择图片", exact: true })
+  if (await trigger.isVisible()) await trigger.click()
+}
+
 try {
   if (configuration.email) {
     assert.match(configuration.email, /^test-library-filters-[a-f0-9]+@example\.test$/)
@@ -115,7 +121,7 @@ try {
   await actionAndList(() => page.getByLabel("每页图片数量").selectOption("20"))
   await actionAndList(() => page.getByRole("button", { name: "下一页", exact: true }).click())
   await expect(page.locator(".library-pagination")).toContainText("第 2 /")
-  await page.getByRole("button", { name: "选择图片", exact: true }).click()
+  await enableSelection()
   await page.locator(".library-image-tile").first().getByRole("checkbox").check()
   await actionAndList(() => page.getByLabel("每页图片数量").selectOption("100"))
   await expect(page.locator(".library-pagination")).toContainText("第 1 /")
@@ -128,7 +134,7 @@ try {
 
   await actionAndList(() => page.getByLabel("图片排序方式").selectOption("name_asc"))
   const first = await actionAndList(() => page.getByLabel("每页图片数量").selectOption("20"))
-  await page.getByRole("button", { name: "选择图片", exact: true }).click()
+  await enableSelection()
   const readyIndex = first.items.findIndex(image => image.metadata.status === "ready" && image.embedding_status === "ready" && image.visual_embedding_status === "ready")
   assert.ok(readyIndex >= 0)
   await page.locator(".library-image-tile").nth(readyIndex).getByRole("checkbox").check()
