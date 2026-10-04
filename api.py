@@ -51,6 +51,7 @@ from backend.collection_packages import (
 from backend.image_safety import ImagePreflightError, validate_image_content
 from backend.image_naming import normalize_display_name, saved_filename
 from backend.persistence.repositories.memes import ImageSort
+from backend.image_library_status import ImageStatus
 from backend.errors import ErrorBody
 from backend.metadata import MetadataError
 from backend.database import DatabaseError, DatabaseResources, Meme, MemeTextEmbedding, ScopeContext, Task, check_database, create_engine_for_settings, utcnow
@@ -1964,6 +1965,7 @@ async def list_images(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=200),
     sort: ImageSort = Query(default="name_asc"),
+    status: ImageStatus = Query(default="all"),
 ) -> dict[str, object]:
     """按文件名筛选并分页列出当前 scope 的扁平图片。"""
     return await _list_images_http(
@@ -1972,6 +1974,7 @@ async def list_images(
         page=page,
         page_size=page_size,
         sort=sort,
+        status=status,
         services=_request_services,
         environment=_environment,
         processing_repository=_processing_repository,

@@ -14,6 +14,7 @@ from uuid import UUID
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from backend.image_naming import normalize_display_name, normalize_extension, saved_filename
 from backend.embedding_input import build_text_input
@@ -96,8 +97,8 @@ class MemeRepository:
         """返回 `by_content` 的语义别名，供上传和合集导入统一调用。"""
         return self.by_content(sha256, extension, for_update=for_update)
 
-    def list(self, *, search: str | None = None, page: int = 1, page_size: int = 200, sort: ImageSort = "name_asc") -> list[Meme]:
-        """按名称或更新时间排序当前 scope 的图片，再返回指定页；名称忽略大小写。"""
+    def list(self, *, search: str | None = None, page: int = 1, page_size: int = 200, sort: ImageSort = "name_asc", condition: ColumnElement[bool] | None = None) -> list[Meme]:
+        """按名称和可选状态条件筛选当前 scope 图片，排序后返回指定页。"""
         if sort == "name_asc":
             ordering = (func.lower(Meme.display_name).asc(), Meme.id.asc())
         elif sort == "updated_desc":
@@ -107,14 +108,18 @@ class MemeRepository:
         statement = select(Meme).where(*self._visible_predicate())
         if search:
             statement = statement.where(Meme.display_name.ilike(f"%{search}%"))
+        if condition is not None:
+            statement = statement.where(condition)
         statement = statement.order_by(*ordering).offset(max(0, page - 1) * page_size).limit(max(1, min(page_size, 200)))
         return list(self.session.scalars(statement))
 
-    def count(self, *, search: str | None = None) -> int:
-        """返回当前 scope 的可见 Meme 数量，筛选在数据库执行。"""
+    def count(self, *, search: str | None = None, condition: ColumnElement[bool] | None = None) -> int:
+        """返回名称和状态条件筛选后的可见图片数量，供图片库分页使用。"""
         statement = select(func.count()).select_from(Meme).where(*self._visible_predicate())
         if search:
             statement = statement.where(Meme.display_name.ilike(f"%{search}%"))
+        if condition is not None:
+            statement = statement.where(condition)
         return int(self.session.scalar(statement) or 0)
 
     def list_all(self, *, search: str | None = None) -> list[Meme]:

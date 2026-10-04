@@ -95,9 +95,9 @@ export function fallbackImageToOriginal(event: Event, originalUrl: string): void
   image.src = originalUrl
 }
 
-/** 判断图片语境是否需要重新处理。 */
+/** 判断图片三项核心状态是否至少有一项尚未就绪，供当前页批量选择使用。 */
 export function isRetryable(item: MemeImage): boolean {
-  return item.metadata?.status !== 'ready'
+  return item.metadata?.status !== 'ready' || item.embedding_status !== 'ready' || item.visual_embedding_status !== 'ready'
 }
 
 /** 去掉缓存查询参数和片段，得到检索结果的稳定媒体身份。 */

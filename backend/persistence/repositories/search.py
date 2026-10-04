@@ -17,6 +17,7 @@ from uuid import UUID
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from backend.persistence.engine import DatabaseError
 from backend.embedding_input import build_text_input
@@ -319,6 +320,21 @@ class SearchRepository:
         """兼容控制面查询；旧 generation 永不作为运行时来源。"""
         return False
 
+    def text_embedding_ready_clause(self, model: str) -> ColumnElement[bool]:
+        """返回当前图片有效文本向量的 SQL 条件，供列表筛选和状态投影共同使用。"""
+        return select(MemeTextEmbedding.meme_id).where(
+            MemeTextEmbedding.scope_id == self.scope.scope_id,
+            MemeTextEmbedding.meme_id == Meme.id,
+            MemeTextEmbedding.embedding_model_version == model.strip(),
+            MemeTextEmbedding.dimensions == EMBEDDING_DIMENSIONS,
+            MemeTextEmbedding.status == "ready",
+            MemeTextEmbedding.embedding.is_not(None),
+            Meme.context_status.in_(("pending", "partial", "ready")),
+            Meme.text_input_status == "eligible",
+            Meme.sha256 == MemeTextEmbedding.image_sha256,
+            Meme.search_metadata_hash == MemeTextEmbedding.metadata_hash,
+        ).correlate(Meme).exists()
+
     def valid_text_embedding_ids(self, model: str, memes: Sequence[Meme]) -> set[UUID]:
         """返回给定图片中具有当前有效文本向量的 Meme ID。
 
@@ -337,18 +353,11 @@ class SearchRepository:
             return set()
 
         rows = self.session.execute(
-            select(MemeTextEmbedding.meme_id)
-            .join(Meme, (Meme.scope_id == MemeTextEmbedding.scope_id) & (Meme.id == MemeTextEmbedding.meme_id))
+            select(Meme.id)
             .where(
-                MemeTextEmbedding.scope_id == self.scope.scope_id,
-                MemeTextEmbedding.meme_id.in_(meme_ids),
-                MemeTextEmbedding.embedding_model_version == model,
-                MemeTextEmbedding.dimensions == EMBEDDING_DIMENSIONS,
-                MemeTextEmbedding.status == "ready",
-                MemeTextEmbedding.embedding.is_not(None),
-                Meme.context_status.in_(("pending", "partial", "ready")),
-                Meme.sha256 == MemeTextEmbedding.image_sha256,
-                Meme.search_metadata_hash == MemeTextEmbedding.metadata_hash,
+                Meme.scope_id == self.scope.scope_id,
+                Meme.id.in_(meme_ids),
+                self.text_embedding_ready_clause(model),
             )
         )
         return {row[0] for row in rows}

@@ -4,12 +4,15 @@ import { computed, onMounted, shallowRef, watch } from 'vue'
 import { api } from '../api'
 import { useToast } from '../composables/useToast'
 import { showTaskDiagnostics } from '../config/debug'
-import type { CollectionSummary, CoreImageProcessingStage, ImageProcessingBatchResponse, ImageProcessingOptions, ImageProcessingStage, MemeImage, SelectedImageRetryMode, ServiceConfig, TaskItem, UnreadyProcessingResponse } from '../types'
+import type { CollectionSummary, CoreImageProcessingStage, ImageProcessingBatchResponse, ImageProcessingOptions, ImageProcessingStage, MemeImage, SelectedImageRetryMode, ServiceConfig, TaskItem } from '../types'
+import { loadLibraryPageSize, saveLibraryPageSize, type ImageLibraryStatus } from '../utils/libraryPreferences'
+import LibraryFilters from './library/LibraryFilters.vue'
 import {
   embeddingLabel,
   errorMessage,
   imageDisplayUrl,
   imageKey,
+  isRetryable,
   imageStageLabel,
   metadataLabel,
   visualEmbeddingLabel,
@@ -48,13 +51,14 @@ type SelectedRetrySubmission = {
   items: Array<{ meme_id: string }>
 }
 
-type ProcessingOptionsTarget = 'unready' | 'selected'
+type ProcessingOptionsTarget = 'selected'
 
 const images = shallowRef<MemeImage[]>([])
 const filter = shallowRef('')
 const sort = shallowRef('name_asc')
 const page = shallowRef(1)
-const pageSize = 50
+const pageSize = shallowRef(loadLibraryPageSize())
+const status = shallowRef<ImageLibraryStatus>('all')
 const total = shallowRef(0)
 const busy = shallowRef(false)
 const selectedImages = shallowRef(new Set<string>())
@@ -75,8 +79,6 @@ const processingOptionsOpen = shallowRef(false)
 const processingOptionsTarget = shallowRef<ProcessingOptionsTarget | null>(null)
 const processingOptionsTrigger = shallowRef<HTMLElement | null>(null)
 const retryDetails = shallowRef<RetryResult[]>([])
-const retryOptions = shallowRef<ImageProcessingOptions>(defaultProcessingOptions())
-const preserveRetryOptions = shallowRef(false)
 const retrySelectedDialogOpen = shallowRef(false)
 const retrySelectedDialogTrigger = shallowRef<HTMLElement | null>(null)
 const selectedRetrySubmission = shallowRef<SelectedRetrySubmission | null>(null)
@@ -90,6 +92,7 @@ const imageActionsDisabled = computed(() => busy.value || retryBusy.value || !!s
 const selectedIds = computed(() => [...selectedImages.value])
 const selectedCount = computed(() => selectedImages.value.size)
 const selectionActive = computed(() => selectionMode.value || selectedCount.value > 0)
+const unreadyImages = computed(() => images.value.filter(isRetryable))
 const cacheGenerating = computed(() => props.cacheBusy || ['queued', 'running'].includes(props.cacheTask?.status || ''))
 const cacheButtonLabel = computed(() => {
   if (!props.config) return '等待服务连接...'
@@ -111,7 +114,7 @@ const cacheTaskStatusLabel = computed(() => {
   if (props.cacheTask?.status === 'failed') return props.cacheTask.message || '缓存生成失败'
   return ''
 })
-const pageCount = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
+const pageCount = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
 
 /** 加载当前筛选下的图片，并清理不再存在的选中项。 */
 async function loadLibrary(): Promise<void> {
@@ -119,11 +122,11 @@ async function loadLibrary(): Promise<void> {
   emit('clearError')
   busy.value = true
   try {
-    const data = await api.images({ search: filter.value, page: page.value, page_size: pageSize, sort: sort.value })
+    const data = await api.images({ search: filter.value, page: page.value, page_size: pageSize.value, sort: sort.value, ...(status.value === "all" ? {} : { status: status.value }) })
     if (requestId !== libraryRequestId) return
     images.value = data.items
     total.value = Number.isInteger(data.total) ? data.total : data.items.length
-    const nextPageCount = Math.max(1, Math.ceil(total.value / pageSize))
+    const nextPageCount = Math.max(1, Math.ceil(total.value / pageSize.value))
     if (page.value > nextPageCount) {
       // 删除或筛选可能让当前深页失效；先清空页内选择，再重新读取合法末页。
       page.value = nextPageCount
@@ -148,6 +151,26 @@ function applyFilter(): void {
   page.value = 1
   selectedImages.value = new Set()
   void loadLibrary()
+}
+
+/** 更新状态条件，返回第一页并清空本次查询之前的选择。 */
+function changeStatus(value: ImageLibraryStatus): void {
+  status.value = value
+  applyFilter()
+}
+
+/** 保存每页数量偏好，返回第一页并清空已有选择。 */
+function changePageSize(value: number): void {
+  saveLibraryPageSize(value)
+  pageSize.value = value
+  applyFilter()
+}
+
+/** 勾选当前页三项状态中尚有未就绪的图片，并保留当前页手动选择。 */
+function selectCurrentPageUnready(): void {
+  if (imageActionsDisabled.value || !unreadyImages.value.length) return
+  selectionMode.value = true
+  selectedImages.value = new Set([...selectedImages.value, ...unreadyImages.value.map(imageKey)])
 }
 
 /** 翻页时清理当前页之外的选择，避免跨页误操作。 */
@@ -392,68 +415,14 @@ async function confirmSelectedRetryOptions(options: ImageProcessingOptions): Pro
   await submitSelectedRetry(submission, options)
 }
 
-/** 打开 scope 级完整重试的共享选项对话框。 */
-function openUnreadyOptions(event: MouseEvent): void {
-  if (retryBusy.value) return
-  if (!preserveRetryOptions.value) retryOptions.value = defaultProcessingOptions()
-  retryDetails.value = []
-  processingOptionsTrigger.value = event.currentTarget instanceof HTMLElement ? event.currentTarget : null
-  processingOptionsTarget.value = 'unready'
-  processingOptionsOpen.value = true
-}
-
-/** 取消完整重试确认，不产生请求。 */
-function cancelUnreadyOptions(): void {
-  if (!retryBusy.value) {
-    processingOptionsOpen.value = false
-    processingOptionsTarget.value = null
-    preserveRetryOptions.value = false
-    retryOptions.value = defaultProcessingOptions()
-  }
-}
-
-/** 让服务端枚举当前 scope 全部核心未就绪图片，并显示分类摘要。 */
-async function confirmUnreadyOptions(options: ImageProcessingOptions): Promise<void> {
-  if (retryBusy.value) return
-  emit('clearError')
-  retryOptions.value = options
-  preserveRetryOptions.value = true
-  const submitUnreadyProcessing = api.unreadyProcessing
-  if (typeof submitUnreadyProcessing !== 'function') {
-    // API 能力尚未注入时也先保留选项弹层，避免点击主按钮变成无反馈操作。
-    emit('error', '完整重试服务不可用')
-    return
-  }
-  retryBusy.value = true
-  try {
-    const response = await submitUnreadyProcessing(options) as UnreadyProcessingResponse
-    retryDetails.value = []
-    notifications.success(`后台扫描已接收，可在任务页面查看进度。任务：${response.task_id}`)
-    processingOptionsOpen.value = false
-    processingOptionsTarget.value = null
-    // 请求已经返回后关闭本次确认；下一次打开不得继承可能更高风险的选择。
-    // 请求异常不会进入这里，因此仍会在当前对话框内保留选择供安全重试。
-    preserveRetryOptions.value = false
-    retryOptions.value = defaultProcessingOptions()
-    await loadLibrary()
-  } catch (reason) {
-    emit('error', errorMessage(reason))
-    // 网络或服务错误时保持对话框和本次选项，避免安全重试丢失用户选择。
-  } finally {
-    retryBusy.value = false
-  }
-}
-
 /** 将共享选项对话框的取消事件路由到当前重试场景。 */
 function cancelProcessingOptions(): void {
-  if (processingOptionsTarget.value === 'selected') cancelSelectedRetryOptions()
-  else cancelUnreadyOptions()
+  cancelSelectedRetryOptions()
 }
 
 /** 将共享选项对话框的确认事件路由到当前重试场景。 */
 async function confirmProcessingOptions(options: ImageProcessingOptions): Promise<void> {
-  if (processingOptionsTarget.value === 'selected') await confirmSelectedRetryOptions(options)
-  else await confirmUnreadyOptions(options)
+  await confirmSelectedRetryOptions(options)
 }
 
 /** 打开图片预览并保留触发按钮，供关闭后恢复键盘焦点。 */
@@ -517,6 +486,7 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
         <option value="name_asc">名称 A–Z</option>
         <option value="updated_desc">最近更新</option>
       </select>
+      <LibraryFilters :status="status" :page-size="pageSize" :disabled="imageActionsDisabled" @update:status="changeStatus" @update:page-size="changePageSize" />
       <button ref="refreshTrigger" type="button" @click="loadLibrary">刷新</button>
       <button class="quiet library-select-toggle" type="button" :disabled="imageActionsDisabled" :aria-pressed="selectionActive" @click="toggleSelectionMode">{{ selectionActive ? '结束选择' : '选择图片' }}</button>
       <span class="toolbar-spacer"></span>
@@ -530,8 +500,8 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
         </button>
         </div>
         <ActionMenu class="library-management" label="管理" :disabled="imageActionsDisabled">
-        <button class="primary toolbar-primary" type="button" :disabled="imageActionsDisabled" @click="openUnreadyOptions">
-          {{ retryBusy ? '提交中...' : '修复所有未就绪' }}
+        <button class="primary toolbar-primary" type="button" :disabled="imageActionsDisabled || !unreadyImages.length" @click="selectCurrentPageUnready">
+          选中当前页所有未就绪
         </button>
         <button
           class="primary toolbar-primary cache-action"
@@ -648,10 +618,8 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
     :reverse-image-reason="props.config ? '反向图片服务不可用' : '服务状态未知'"
     :busy="retryBusy"
     :return-focus="() => dialogReturnFocus(processingOptionsTrigger)"
-    :processing-target="processingOptionsTarget === 'unready' ? 'repair' : 'full_retry'"
-    :initial-options="processingOptionsTarget === 'selected'
-      ? (preserveSelectedRetryOptions ? selectedRetryOptions : undefined)
-      : (preserveRetryOptions ? retryOptions : undefined)"
+    processing-target="full_retry"
+    :initial-options="preserveSelectedRetryOptions ? selectedRetryOptions : undefined"
     @cancel="cancelProcessingOptions"
     @confirm="confirmProcessingOptions"
   />

@@ -13,6 +13,7 @@ from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from backend.persistence.engine import DatabaseError
 from backend.persistence.models import (
@@ -122,6 +123,18 @@ class VisualEmbeddingRepository:
         self.session.flush()
         return row
 
+    def visual_embedding_ready_clause(self, *, model: str, preprocess_version: str, dimensions: int) -> ColumnElement[bool]:
+        """返回当前图片视觉向量有效性的 SQL 条件，供筛选和状态投影复用。"""
+        model, preprocess_version, dimensions = self._identity(model, preprocess_version, dimensions)
+        return select(MemeVisualEmbedding.meme_id).where(
+            MemeVisualEmbedding.scope_id == self.scope.scope_id,
+            MemeVisualEmbedding.meme_id == Meme.id,
+            MemeVisualEmbedding.model == model,
+            MemeVisualEmbedding.preprocess_version == preprocess_version,
+            MemeVisualEmbedding.dimensions == dimensions,
+            MemeVisualEmbedding.image_sha256 == Meme.sha256,
+        ).correlate(Meme).exists()
+
     def ready_ids(
         self,
         memes: Sequence[Meme],
@@ -136,15 +149,11 @@ class VisualEmbeddingRepository:
         if not ids:
             return set()
         rows = self.session.execute(
-            select(MemeVisualEmbedding.meme_id)
-            .join(Meme, (Meme.scope_id == MemeVisualEmbedding.scope_id) & (Meme.id == MemeVisualEmbedding.meme_id))
+            select(Meme.id)
             .where(
-                MemeVisualEmbedding.scope_id == self.scope.scope_id,
-                MemeVisualEmbedding.meme_id.in_(ids),
-                MemeVisualEmbedding.model == model,
-                MemeVisualEmbedding.preprocess_version == preprocess_version,
-                MemeVisualEmbedding.dimensions == dimensions,
-                MemeVisualEmbedding.image_sha256 == Meme.sha256,
+                Meme.scope_id == self.scope.scope_id,
+                Meme.id.in_(ids),
+                self.visual_embedding_ready_clause(model=model, preprocess_version=preprocess_version, dimensions=dimensions),
             )
         )
         return {row[0] for row in rows}

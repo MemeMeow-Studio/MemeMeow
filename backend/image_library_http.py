@@ -18,6 +18,7 @@ from backend.database import DatabaseError
 from backend.embedding_input import build_text_input
 from backend.http_file_cache import revalidated_file_response
 from backend.image_naming import public_filename_fields, saved_filename
+from backend.image_library_status import ImageStatus, image_status_condition
 from backend.metadata import MetadataError
 from backend.persistence.repositories.memes import ImageSort
 from backend.public_dto import sanitize_public_timestamp
@@ -56,6 +57,7 @@ async def list_images(
     page: int,
     page_size: int,
     sort: ImageSort = "name_asc",
+    status: ImageStatus = "all",
     services: ServicesProvider,
     environment: EnvironmentProvider,
     processing_repository: ProcessingRepositoryProvider,
@@ -68,18 +70,20 @@ async def list_images(
     最新处理摘要。调用场景是公共图片库只读请求，所有数据均从入口注入的当前 scope
     services/environment 派生。
     """
-    unknown = set(request.query_params) - {"search", "page", "page_size", "sort"}
+    unknown = set(request.query_params) - {"search", "page", "page_size", "sort", "status"}
     if unknown:
         raise error(400, "invalid_request", "图片列表不接受已废弃的目录参数")
     scoped_services = services(request)
+    identity = visual_identity(request)
     with environment(request) as database_environment:
-        records = database_environment.memes.list(search=search, page=page, page_size=page_size, sort=sort)
-        total = database_environment.memes.count(search=search)
+        condition = image_status_condition(database_environment, status, embedding_model=scoped_services.search.model, visual_identity=identity) if status != "all" else None
+        filters = {"condition": condition} if condition is not None else {}
+        records = database_environment.memes.list(search=search, page=page, page_size=page_size, sort=sort, **filters)
+        total = database_environment.memes.count(search=search, **filters)
     valid_records = records
     # 图片列表复用数据库保存的 SHA 和大小，缩略图状态查询使用同一份记录。
     source_identities = {record.id: (record.size_bytes, str(record.sha256)) for record in records}
     items: list[dict[str, object]] = []
-    identity = visual_identity(request)
     thumbnails = getattr(scoped_services, "thumbnails", None)
     projection_batch = getattr(thumbnails, "projections", None) if thumbnails is not None else None
     thumbnail_projections: dict[Any, dict[str, object]] = {}
