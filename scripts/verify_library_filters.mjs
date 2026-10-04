@@ -46,6 +46,12 @@ function matches(image, status) {
   return status === "ready" ? ready : !ready
 }
 
+/** 手机展开管理菜单，桌面使用已经展示的操作按钮。 */
+async function openManagement() {
+  const trigger = page.getByRole("button", { name: "管理", exact: true })
+  if (await trigger.isVisible() && await trigger.getAttribute("aria-expanded") !== "true") await trigger.click()
+}
+
 try {
   if (configuration.email) {
     assert.match(configuration.email, /^test-library-filters-[a-f0-9]+@example\.test$/)
@@ -113,7 +119,7 @@ try {
   assert.ok(readyIndex >= 0)
   await page.locator(".library-image-tile").nth(readyIndex).getByRole("checkbox").check()
   const beforeSelection = mutationRequests.length
-  await page.getByRole("button", { name: "管理", exact: true }).click()
+  await openManagement()
   await page.getByRole("button", { name: "选中当前页所有未就绪", exact: true }).click()
   for (const [index, image] of first.items.entries()) {
     const checkbox = page.locator(".library-image-tile").nth(index).getByRole("checkbox")
@@ -136,7 +142,7 @@ try {
   await actionAndList(() => page.getByLabel("图片状态类别").selectOption("ready"))
   await expect(page.locator(".library-pagination")).toContainText("第 1 /")
   assert.equal(await page.locator(".library-image-tile input:checked").count(), 0)
-  await page.getByRole("button", { name: "管理", exact: true }).click()
+  await openManagement()
   await expect(page.getByRole("button", { name: "选中当前页所有未就绪", exact: true })).toBeDisabled()
   await page.keyboard.press("Escape")
   await page.getByLabel("图片状态类别").selectOption("unready")
@@ -146,7 +152,7 @@ try {
   await context.setViewportSize({ width: 390, height: 844 })
   await expect(page.getByLabel("图片状态类别")).toBeVisible()
   await expect(page.getByLabel("每页图片数量")).toBeVisible()
-  await page.getByRole("button", { name: "管理", exact: true }).click()
+  await openManagement()
   await page.getByRole("button", { name: "选中当前页所有未就绪", exact: true }).click()
   await expect(page.getByRole("button", { name: "结束选择", exact: true })).toHaveAttribute("aria-pressed", "true")
   assert.equal(await page.locator(".library-image-tile input:checked").count(), 20)
