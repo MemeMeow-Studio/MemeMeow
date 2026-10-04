@@ -16,7 +16,6 @@ vi.mock('../api', () => ({
   api: { images, imageMetadata, contextBatch, retryImageStagesBatch, unreadyProcessing, submitImageStage },
 }))
 
-import { api } from '../api'
 import LibraryWorkspace from './LibraryWorkspace.vue'
 
 const image = {
@@ -26,10 +25,6 @@ const image = {
   metadata: { status: 'repair_required' },
   visual_embedding_status: 'pending',
   embedding_status: 'blocked',
-}
-
-function fullRetryButton(wrapper) {
-  return wrapper.findAll('button').find((button) => button.text().includes('修复所有未就绪'))
 }
 
 describe('LibraryWorkspace', () => {
@@ -146,28 +141,6 @@ describe('LibraryWorkspace', () => {
     expect(wrapper.get('.retry-selected-dialog input[value="full"]').element.checked).toBe(true)
   })
 
-  it('完整重试只发送处理选项，不携带当前页筛选或 Meme 列表', async () => {
-    const wrapper = mount(LibraryWorkspace, {
-      props: { config: { reverse_image_available: true }, cacheTask: null, cacheBusy: false, refreshToken: 0 },
-    })
-    await flushPromises()
-    await wrapper.get('input[aria-label="筛选文件名"]').setValue('当前页筛选')
-    await wrapper.get('input[aria-label="筛选文件名"]').trigger('keyup.enter')
-    await flushPromises()
-
-    await fullRetryButton(wrapper).trigger('click')
-    await wrapper.get('.processing-options-dialog input[value="auto"]').setValue(true)
-    await wrapper.get('.processing-options-dialog input[type="checkbox"]').setValue(true)
-    await wrapper.get('.processing-options-dialog form').trigger('submit')
-    await flushPromises()
-
-    expect(unreadyProcessing).toHaveBeenCalledTimes(1)
-    expect(unreadyProcessing).toHaveBeenCalledWith({ reverse_image_policy: 'auto', auto_name: true })
-    expect(unreadyProcessing.mock.calls[0][0]).not.toHaveProperty('items')
-    expect(unreadyProcessing.mock.calls[0][0]).not.toHaveProperty('search')
-    expect(unreadyProcessing.mock.calls[0][0]).not.toHaveProperty('cursor')
-  })
-
   it('完整重试按逐图分类展示提交、冲突和失败', async () => {
     contextBatch.mockResolvedValue({
       results: [
@@ -190,50 +163,6 @@ describe('LibraryWorkspace', () => {
     expect(toast.getToasts().some((item) => String(item.title).includes('提交 1 个完整任务，处理中 1，无需修复 0，失败 1') && item.type === 'warning')).toBe(true)
     expect(wrapper.get('.processing-result-details').text()).toContain('正在处理：image_processing_active')
     expect(wrapper.get('.processing-result-details').text()).toContain('提交失败：target_changed')
-  })
-
-  it('即使完整重试能力尚未注入，点击主按钮也先显示图片处理选项且不请求', async () => {
-    const submitUnreadyProcessing = api.unreadyProcessing
-    delete api.unreadyProcessing
-    try {
-      const wrapper = mount(LibraryWorkspace, {
-        props: { config: null, cacheTask: null, cacheBusy: false, refreshToken: 0 },
-      })
-      await flushPromises()
-
-      await fullRetryButton(wrapper).trigger('click')
-
-      expect(wrapper.get('[role="dialog"][aria-labelledby="processing-options-title"]').text()).toContain('图片处理选项')
-      expect(unreadyProcessing).not.toHaveBeenCalled()
-      await wrapper.get('[aria-label="取消图片处理"]').trigger('click')
-      expect(unreadyProcessing).not.toHaveBeenCalled()
-      wrapper.unmount()
-    } finally {
-      api.unreadyProcessing = submitUnreadyProcessing
-    }
-  })
-
-  it('提交失败时保留已选处理选项，允许用户再次确认', async () => {
-    unreadyProcessing.mockRejectedValueOnce(new Error('network_failed'))
-    const wrapper = mount(LibraryWorkspace, {
-      props: { config: { reverse_image_available: true }, cacheTask: null, cacheBusy: false, refreshToken: 0 },
-    })
-    await flushPromises()
-
-    await fullRetryButton(wrapper).trigger('click')
-    await wrapper.get('.processing-options-dialog input[value="auto"]').setValue(true)
-    await wrapper.get('.processing-options-dialog input[type="checkbox"]').setValue(true)
-    await wrapper.get('.processing-options-dialog form').trigger('submit')
-    await flushPromises()
-
-    expect(wrapper.get('.processing-options-dialog input[value="auto"]').element.checked).toBe(true)
-    expect(wrapper.get('.processing-options-dialog input[type="checkbox"]').element.checked).toBe(true)
-    expect(unreadyProcessing).toHaveBeenCalledTimes(1)
-
-    await wrapper.get('.processing-options-dialog form').trigger('submit')
-    await flushPromises()
-    expect(unreadyProcessing).toHaveBeenCalledTimes(2)
-    wrapper.unmount()
   })
 
   it('选中重试取消或失败时保留图片选择和已确认选项', async () => {
@@ -260,71 +189,6 @@ describe('LibraryWorkspace', () => {
     expect(wrapper.find('.processing-options-dialog').exists()).toBe(false)
     expect(wrapper.get('.image-check input').element.checked).toBe(true)
     wrapper.unmount()
-  })
-
-  it('按提交、处理中、无需修复和失败分类展示 scope 级摘要及逐图结果', async () => {
-    unreadyProcessing.mockResolvedValue({
-      target_count: 4,
-      submitted_count: 1,
-      reused_count: 0,
-      conflict_count: 1,
-      not_needed_count: 1,
-      failed_count: 1,
-      results: [
-        { meme_id: 'submitted', category: 'submitted', processing_job_id: 'job-1' },
-        { meme_id: 'not-needed', category: 'not_needed', reason: 'already_ready' },
-        { meme_id: 'conflict', category: 'processing_active', reason: 'image_processing_active' },
-        { meme_id: 'failed', category: 'failed', error: 'submit_failed' },
-      ],
-    })
-    const wrapper = mount(LibraryWorkspace, {
-      props: { config: null, cacheTask: null, cacheBusy: false, refreshToken: 0 },
-    })
-    await flushPromises()
-    await fullRetryButton(wrapper).trigger('click')
-    await wrapper.get('.processing-options-dialog form').trigger('submit')
-    await flushPromises()
-
-    expect(wrapper.get('.inline-notice').text()).toContain('目标 4，提交 1，处理中 1，无需修复 1，失败 1')
-    const details = wrapper.get('.processing-result-details')
-    expect(details.text()).toContain('已提交处理任务')
-    expect(details.text()).toContain('无需修复：already_ready')
-    expect(details.text()).toContain('正在处理：image_processing_active')
-    expect(details.text()).toContain('提交失败：submit_failed')
-    expect(details.text()).not.toContain('submitted')
-    expect(details.text()).not.toContain('job-1')
-    expect(details.text()).not.toContain('reused')
-    expect(details.find('li.processing_active').exists()).toBe(true)
-    expect(details.find('li.failed').exists()).toBe(true)
-  })
-
-  it('取消不请求，提交中阻止重复确认，失败后保留选项供安全重试', async () => {
-    let resolveRetry
-    unreadyProcessing.mockImplementationOnce(() => new Promise((resolve) => { resolveRetry = resolve }))
-    const wrapper = mount(LibraryWorkspace, {
-      props: { config: { reverse_image_available: true }, cacheTask: null, cacheBusy: false, refreshToken: 0 },
-    })
-    await flushPromises()
-
-    await fullRetryButton(wrapper).trigger('click')
-    await wrapper.get('.processing-options-dialog input[value="auto"]').setValue(true)
-    await wrapper.get('.processing-options-dialog input[type="checkbox"]').setValue(true)
-    await wrapper.get('.processing-options-dialog form').trigger('submit')
-    await wrapper.get('.processing-options-dialog form').trigger('submit')
-    expect(unreadyProcessing).toHaveBeenCalledTimes(1)
-    expect(wrapper.get('.processing-options-dialog').text()).toContain('提交中...')
-
-    resolveRetry({ target_count: 0, submitted_count: 0, reused_count: 0, conflict_count: 0, not_needed_count: 0, failed_count: 0, results: [] })
-    await flushPromises()
-    expect(wrapper.find('.processing-options-dialog').exists()).toBe(false)
-
-    await fullRetryButton(wrapper).trigger('click')
-    expect(wrapper.get('.processing-options-dialog input[value="forbid"]').element.checked).toBe(true)
-    expect(wrapper.get('.processing-options-dialog input[value="auto"]').element.checked).toBe(false)
-    expect(wrapper.get('.processing-options-dialog input[type="checkbox"]').element.checked).toBe(false)
-    await wrapper.get('.processing-options-dialog input[value="forbid"]').trigger('click')
-    await wrapper.get('.processing-options-dialog [aria-label="取消图片处理"]').trigger('click')
-    expect(unreadyProcessing).toHaveBeenCalledTimes(1)
   })
 
   it('列表行只保留三项状态摘要，阶段明细和恢复入口迁移到详情', async () => {

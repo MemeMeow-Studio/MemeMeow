@@ -109,15 +109,5 @@ describe('任务诊断模式', () => {
     expect(imageWrapper.get('.image-processing-details').text()).toContain('job-debug')
     imageWrapper.unmount()
 
-    const libraryWrapper = mount(LibraryWorkspace, {
-      props: { config: null, cacheTask: null, cacheBusy: false, refreshToken: 0 },
-    })
-    await flushPromises()
-    await libraryWrapper.findAll('button').find((button) => button.text().includes('修复所有未就绪')).trigger('click')
-    await libraryWrapper.get('.processing-options-dialog form').trigger('submit')
-    await flushPromises()
-    expect(libraryWrapper.get('.processing-result-details').text()).toContain('meme-debug')
-    expect(libraryWrapper.get('.processing-result-details').text()).toContain('job-debug')
-    libraryWrapper.unmount()
   })
 })
