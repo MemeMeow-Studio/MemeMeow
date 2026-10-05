@@ -2,22 +2,14 @@
 
 from __future__ import annotations
 
-import json
-import subprocess
-from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
-from io import BytesIO
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from loguru import logger
-from PIL import Image, ImageOps
-
-from backend.gif_compression import (
-    GifCompressionError, MAX_GIF_OUTPUT_BYTES, gif_preflight_resources, limit_gif_worker, scan_gif,
-)
+from backend.gif_compression import GifCompressionError, MAX_GIF_OUTPUT_BYTES, gif_preflight_resources
+from backend.image_export_worker import image_export_worker
 from backend.persistence.engine import DatabaseError
 from backend.persistence.models import Meme
 from backend.services.thumbnails import DerivedThumbnailService, RenderedThumbnail, ThumbnailError, _render_thumbnail
@@ -45,90 +37,11 @@ class ImageExportConfig(ThumbnailConfig):
         self._validate_resources()
 
 
-def _image_export_worker(
-    content: bytes, extension: str, max_edge: int, output_limit: int, temp_limit: int,
-    connection: Any, *, directory: Path,
-) -> None:
-    """在受限进程中缩小静态图片或 GIF；返回字节及尺寸，供父进程提交缓存。"""
-    try:
-        expected = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".gif": "GIF"}.get(extension.lower())
-        if expected is None:
-            raise ThumbnailError("unsupported_format")
-        if expected == "GIF":
-            limit_gif_worker()
-        with Image.open(BytesIO(content)) as image:
-            if image.format != expected:
-                raise ThumbnailError("invalid_image")
-            width, height = image.size
-            if width < 1 or height < 1 or width * height * 8 > temp_limit:
-                raise ThumbnailError("image_export_temp_limit_exceeded")
-            if max(width, height) <= max_edge:
-                result = content
-            elif expected == "GIF":
-                original = scan_gif(image)
-                target = directory / "resized.gif"
-                diagnostics = directory / "gifsicle.log"
-                command = [
-                    "gifsicle", "--no-ignore-errors", "--conserve-memory", "--threads=1",
-                    "--optimize=keep-empty", "--resize-method=sample", f"--resize-fit={max_edge}x{max_edge}",
-                ]
-                with target.open("wb") as output, diagnostics.open("wb") as errors:
-                    try:
-                        completed = subprocess.run(command, input=content, stdout=output, stderr=errors, check=False)
-                    except FileNotFoundError as exc:
-                        raise ThumbnailError("image_export_tool_missing") from exc
-                if completed.returncode != 0:
-                    detail = diagnostics.read_text(errors="replace")[-2000:].replace(str(directory), "<image-export>")
-                    logger.error("image_export encoder_exit={} diagnostic={}", completed.returncode, detail)
-                    raise ThumbnailError("image_export_encoder_failed")
-                if target.stat().st_size > output_limit:
-                    raise ThumbnailError("image_export_output_limit_exceeded")
-                result = target.read_bytes()
-                with Image.open(BytesIO(result)) as resized:
-                    final = scan_gif(resized)
-                    width, height = final.size
-                if original.durations != final.durations or original.loop != final.loop:
-                    raise ThumbnailError("image_export_animation_changed")
-                if original.transparent_frames != final.transparent_frames:
-                    raise ThumbnailError("image_export_transparency_changed")
-            else:
-                image.load()
-                converted = ImageOps.exif_transpose(image)
-                converted.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
-                if expected == "JPEG" and converted.mode not in {"RGB", "L"}:
-                    converted = converted.convert("RGB")
-                if expected == "PNG" and converted.mode in {"P", "1"}:
-                    converted = converted.convert("RGBA")
-                output = BytesIO()
-                options = {"quality": 95} if expected == "JPEG" else {}
-                converted.save(output, format=expected, **options)
-                result = output.getvalue()
-                width, height = converted.size
-        if not result or len(result) > output_limit:
-            raise ThumbnailError("image_export_output_limit_exceeded")
-        connection.send_bytes(b"M" + json.dumps({"width": width, "height": height, "size": len(result)}).encode("ascii"))
-        for offset in range(0, len(result), 64 * 1024):
-            connection.send_bytes(b"D" + result[offset : offset + 64 * 1024])
-        connection.send_bytes(b"E")
-    except (ThumbnailError, GifCompressionError) as exc:
-        with suppress(BrokenPipeError, EOFError, OSError):
-            connection.send_bytes(b"X" + exc.code.encode("ascii"))
-    except MemoryError:
-        with suppress(BrokenPipeError, EOFError, OSError):
-            connection.send_bytes(b"Ximage_export_memory_exceeded")
-    except Exception as exc:
-        logger.exception("image_export stage=encode error_type={}", type(exc).__name__)
-        with suppress(BrokenPipeError, EOFError, OSError):
-            connection.send_bytes(b"Ximage_export_encode_failed")
-    finally:
-        connection.close()
-
-
 def render_image_export(content: bytes, extension: str, config: ImageExportConfig) -> RenderedThumbnail:
     """使用父进程临时目录生成输出；GIF 共享处理预算，超时回收编码器。"""
     try:
         with gif_preflight_resources(extension.lower() == ".gif") as directory:
-            worker = partial(_image_export_worker, directory=directory)
+            worker = partial(image_export_worker, directory=directory)
             return _render_thumbnail(content, extension, config, worker=worker)
     except GifCompressionError as exc:
         raise ThumbnailError(exc.code) from exc

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
+import sys
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +28,14 @@ from backend.services.metadata import PostgresMetadataService
 from backend.services.thumbnails import DerivedThumbnailService, ThumbnailError
 from backend.scope import ScopeServiceFactory
 from backend.system_http import error
+
+
+def test_encoding_worker_imports_only_image_dependencies() -> None:
+    """实际启动解释器验证编码入口保持独立，不加载 NumPy 和数据库服务。"""
+    subprocess.run(
+        [sys.executable, "-c", "import sys; import backend.image_export_worker; assert all(name not in sys.modules for name in (\"numpy\", \"backend.services\", \"backend.persistence.models\"))"],
+        check=True,
+    )
 
 
 def image_bytes(size: tuple[int, int], image_format: str = "PNG", **options) -> bytes:
