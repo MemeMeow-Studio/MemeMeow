@@ -52,8 +52,9 @@ async function convertImageBlobToPng(blob: Blob): Promise<Blob> {
     return await new Promise((resolve, reject) => {
       canvas.toBlob((result) => result ? resolve(result) : reject(new Error('image_encode_failed')), clipboardImageMime)
     })
-  } catch {
-    throw new Error('image_decode_failed')
+  } catch (reason) {
+    if (reason instanceof Error && reason.message === 'image_encode_failed') throw reason
+    throw new Error('image_decode_failed', { cause: reason })
   } finally {
     if (bitmap && 'close' in bitmap) bitmap.close()
     if (objectUrl) URL.revokeObjectURL(objectUrl)
