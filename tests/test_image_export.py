@@ -68,7 +68,7 @@ def animation_bytes(loop: int | None) -> bytes:
     return output.getvalue()
 
 
-@pytest.mark.parametrize("max_edge", [240, 360, 480, 640])
+@pytest.mark.parametrize("max_edge", [60, 120, 240, 360, 480, 640])
 @pytest.mark.parametrize("image_format,extension", [("PNG", ".png"), ("JPEG", ".jpeg")])
 def test_static_resize_keeps_ratio_and_format(max_edge: int, image_format: str, extension: str) -> None:
     """解码真实输出验证全部档位保持比例、格式和 PNG 透明通道。"""
@@ -82,12 +82,14 @@ def test_static_resize_keeps_ratio_and_format(max_edge: int, image_format: str, 
             assert result.getpixel((10, 10))[3] == 128
 
 
-def test_small_image_keeps_original_bytes() -> None:
+@pytest.mark.parametrize("max_edge", [60, 120, 480])
+def test_small_image_keeps_original_bytes(max_edge: int) -> None:
     """尺寸小于档位时保留原始字节，图片不放大。"""
-    content = image_bytes((100, 50))
-    rendered = render_image_export(content, ".png", ImageExportConfig())
+    content = image_bytes((20, 10))
+    config = ImageExportConfig(profile=f"export-v1-{max_edge}", max_edge=max_edge)
+    rendered = render_image_export(content, ".png", config)
     assert rendered.content == content
-    assert (rendered.width, rendered.height) == (100, 50)
+    assert (rendered.width, rendered.height) == (20, 10)
 
 
 def test_small_image_obeys_output_limit() -> None:
@@ -107,15 +109,17 @@ def test_jpeg_orientation_is_applied() -> None:
         assert result.getexif().get(274) in {None, 1}
 
 
+@pytest.mark.parametrize("max_edge", [60, 120, 240, 360, 480, 640])
 @pytest.mark.parametrize("loop", [None, 0, 3])
-def test_gif_resize_keeps_animation(loop: int | None) -> None:
+def test_gif_resize_keeps_animation(loop: int | None, max_edge: int) -> None:
     """使用实际 GIF 编码器验证帧数、帧时长、循环和透明区域。"""
     content = animation_bytes(loop)
-    rendered = render_image_export(content, ".gif", ImageExportConfig())
+    config = ImageExportConfig(profile=f"export-v1-{max_edge}", max_edge=max_edge)
+    rendered = render_image_export(content, ".gif", config)
     with Image.open(BytesIO(content)) as source, Image.open(BytesIO(rendered.content)) as result:
         original = scan_gif(source)
         final = scan_gif(result)
-        assert final.size == (480, 240)
+        assert final.size == (max_edge, max_edge // 2)
         assert final.durations == original.durations
         assert final.loop == original.loop
         assert final.transparent_frames == original.transparent_frames == (True, True, True)
@@ -190,12 +194,12 @@ def test_export_cache_scope_and_delete(tmp_path: Path) -> None:
         finally:
             source_path.chmod(source_permissions)
 
-        paths = []
-        for max_edge in (240, 360, 480, 640):
+        paths = {}
+        for max_edge in (60, 120, 240, 360, 480, 640):
             exports = DerivedImageExportService(thumbnails, max_edge)
             assert exports.generation_slots is thumbnails.generation_slots
             path, media_type, digest = exports.prepare_media(record.id)
-            paths.append(path)
+            paths[max_edge] = path
             identity = (path.stat().st_mtime_ns, path.read_bytes())
             assert exports.prepare_media(record.id) == (path, media_type, digest)
             assert (path.stat().st_mtime_ns, path.read_bytes()) == identity
@@ -215,7 +219,7 @@ def test_export_cache_scope_and_delete(tmp_path: Path) -> None:
         foreign = DerivedImageExportService(DerivedThumbnailService(resources, scope_id=other_scope), 480)
         with pytest.raises(ThumbnailError, match="meme_not_found"):
             foreign.prepare_media(record.id)
-        paths[2].unlink()
+        paths[480].unlink()
         assert DerivedImageExportService(thumbnails, 480).prepare_media(record.id)[0].is_file()
         for _index in range(thumbnails.config.concurrency):
             assert thumbnails.generation_slots.acquire(blocking=False)
@@ -226,7 +230,7 @@ def test_export_cache_scope_and_delete(tmp_path: Path) -> None:
             for _index in range(thumbnails.config.concurrency):
                 thumbnails.generation_slots.release()
         storage.delete(record.id)
-        assert all(not path.exists() for path in paths)
+        assert all(not path.exists() for path in paths.values())
         with resources.factory() as session:
             assert not session.scalars(select(DerivedImageThumbnail).where(DerivedImageThumbnail.meme_id == record.id)).all()
         for content, extension, media_type in [

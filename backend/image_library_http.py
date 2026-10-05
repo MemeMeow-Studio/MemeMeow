@@ -203,7 +203,7 @@ async def media(
     调用场景是预览、复制和相册保存；尺寸生成在数据库事务之外执行。
     """
     if max_edge is not None and (type(max_edge) is not int or max_edge not in IMAGE_EXPORT_EDGES):
-        raise error(422, "image_export_size_invalid", "图片最长边只允许 240、360、480 或 640 像素")
+        raise error(422, "image_export_size_invalid", "图片最长边只允许 60、120、240、360、480 或 640 像素")
     scope_services = services(request)
     try:
         record, path = scope_services.metadata.image_for_meme(meme_id, verify_content=False)

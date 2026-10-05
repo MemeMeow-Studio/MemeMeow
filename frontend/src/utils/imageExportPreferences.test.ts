@@ -5,6 +5,10 @@ import { imageExportSizes, imageExportStorageKey, imageExportUrl, loadImageExpor
 afterEach(() => localStorage.removeItem(imageExportStorageKey))
 
 describe('检索图片尺寸偏好', () => {
+  it('固定档位按最长边从小到大排列', () => {
+    expect(imageExportSizes).toEqual([60, 120, 240, 360, 480, 640])
+  })
+
   it('首次使用选择原图，保存后重新读取保留档位', () => {
     expect(loadImageExportSize()).toBe('original')
     for (const size of imageExportSizes) {

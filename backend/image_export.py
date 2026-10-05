@@ -16,7 +16,7 @@ from backend.services.thumbnails import DerivedThumbnailService, RenderedThumbna
 from backend.thumbnail_config import ThumbnailConfig
 
 
-IMAGE_EXPORT_EDGES = (240, 360, 480, 640)
+IMAGE_EXPORT_EDGES = (60, 120, 240, 360, 480, 640)
 EXPORT_MEDIA_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif"}
 
 

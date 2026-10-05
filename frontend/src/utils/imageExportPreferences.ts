@@ -1,5 +1,5 @@
 /** 检索图片输出的浏览器偏好及受控尺寸 URL，供网页复制与相册保存共用。 */
-export const imageExportSizes = [240, 360, 480, 640] as const
+export const imageExportSizes = [60, 120, 240, 360, 480, 640] as const
 export type ImageExportSize = "original" | typeof imageExportSizes[number]
 export const imageExportStorageKey = "mememeow.search.image-export-size"
 
