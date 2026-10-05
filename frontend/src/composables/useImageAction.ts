@@ -1,4 +1,6 @@
-// 检索结果统一入口：网页复制图片，安卓应用保存原图到相册。
+// 检索结果统一入口：按浏览器尺寸偏好复制图片或保存到 Android 相册。
+import { imageExportSizes, imageExportUrl, loadImageExportSize, saveImageExportSize } from "../utils/imageExportPreferences"
+import type { ImageExportSize } from '../utils/imageExportPreferences'
 import { shallowRef } from 'vue'
 import { useToast } from './useToast'
 import { useImageClipboard } from './useImageClipboard'
@@ -10,22 +12,40 @@ export function useImageAction() {
   const { copyImage } = useImageClipboard()
   const notifications = useToast()
   const saving = shallowRef(false)
+  const imageExportSize = shallowRef<ImageExportSize | null>(null)
+  try {
+    imageExportSize.value = loadImageExportSize()
+  } catch (reason) {
+    notifications.error(`图片尺寸设置读取失败：${errorMessage(reason)}`)
+  }
+
+  /** 保存用户选择；浏览器拒绝存储时明确显示原因。 */
+  function persistImageExportSize(): void {
+    try {
+      if (imageExportSize.value === null) throw new Error('image_export_size_invalid: 请重新选择图片尺寸')
+      saveImageExportSize(imageExportSize.value)
+    } catch (reason) {
+      notifications.error(`图片尺寸设置未保存：${errorMessage(reason)}`)
+    }
+  }
   const imageActionLabel = isAndroidApp ? '保存' : '复制'
 
   /** 根据当前运行平台执行图片操作，保存期间防止重复点击。 */
   async function performImageAction(url: string): Promise<void> {
-    if (!isAndroidApp) return copyImage(url)
     if (saving.value) return
-    saving.value = true
     try {
-      await saveImageToAlbum(url)
+      if (imageExportSize.value === null) throw new Error('image_export_size_invalid: 请重新选择图片尺寸')
+      const actionUrl = imageExportUrl(url, imageExportSize.value)
+      if (!isAndroidApp) return await copyImage(actionUrl)
+      saving.value = true
+      await saveImageToAlbum(actionUrl)
       notifications.success('图片已保存到 MemeMeow 相册')
     } catch (reason) {
-      notifications.error(`图片保存失败：${errorMessage(reason)}`)
+      notifications.error(`图片${imageActionLabel}失败：${errorMessage(reason)}`)
     } finally {
       saving.value = false
     }
   }
 
-  return { imageActionLabel, performImageAction, saving }
+  return { imageActionLabel, performImageAction, saving, imageExportSize, imageExportSizes, persistImageExportSize }
 }

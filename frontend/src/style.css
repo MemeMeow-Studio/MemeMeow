@@ -98,6 +98,7 @@ button, input, select, textarea { border-radius: var(--radius-control); }
 .primary:active:not(:disabled) { transform: translateY(0); }
 .primary:disabled { border-color: var(--line); background: #d8d5e3; color: #514b61; opacity: 1; }
 .controls { display: flex; align-items: center; flex-wrap: wrap; gap: 18px 30px; margin: 18px 0 30px; color: var(--muted); font-size: 15px; }
+.controls select { height: 42px; border: 1px solid var(--line-strong); border-radius: 5px; padding: 0 10px; color: var(--ink); background: var(--surface); font-size: 16px; }
 .number-control { display: inline-flex; align-items: center; gap: 10px; }
 .controls input[type="number"] { width: 66px; height: 42px; border: 1px solid var(--line-strong); padding: 0 10px; color: var(--ink); background: var(--surface); font-size: 15px; }
 .switch { display: inline-flex; align-items: center; gap: 10px; min-height: 44px; cursor: pointer; }

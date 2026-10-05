@@ -10,13 +10,14 @@ from __future__ import annotations
 import inspect
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from threading import RLock
+from threading import BoundedSemaphore, RLock
 from typing import Any, Callable, Protocol, TYPE_CHECKING
 
 from sqlalchemy import select
 from starlette.concurrency import run_in_threadpool
 
 from backend.database import ScopeContext, Task, utcnow
+from backend.thumbnail_config import ThumbnailConfig
 
 if TYPE_CHECKING:  # pragma: no cover - 仅用于类型检查，避免运行时循环导入
     from backend.config import Settings
@@ -246,8 +247,8 @@ class ScopeServices:
 class ScopeServiceFactory:
     """复用重资源并为每个 scope 创建轻量业务服务。
 
-    工厂不保存可变的当前 scope。每次 ``for_scope`` 都创建新的服务视图，因而
-    并发请求或后台任务无法通过原地修改共享 singleton 互相污染。
+    工厂不保存可变的当前 scope。请求和后台任务使用独立服务视图，图片生成
+    共享进程级并发预算，避免每次创建服务视图都产生新的生成额度。
     """
 
     def __init__(
@@ -263,6 +264,12 @@ class ScopeServiceFactory:
         self.settings = settings
         self._task_config = dict(task_config or {})
         self._services: dict[str, ScopeServices] = dict(preloaded or {})
+        self._thumbnail_generation_slots = next(
+            (services.thumbnails.generation_slots for services in self._services.values() if services.thumbnails is not None),
+            None,
+        )
+        if self._thumbnail_generation_slots is None:
+            self._thumbnail_generation_slots = BoundedSemaphore(ThumbnailConfig.from_settings(settings).concurrency)
         self._initialized_scopes: set[str] = set()
         self._lock = RLock()
         configured_executor = self._task_config.get("executor")
@@ -288,7 +295,7 @@ class ScopeServiceFactory:
         self._worker_manager.set_service_resolvers(self.for_task, self.for_scope)
 
     def for_scope(self, scope: ScopeContext | str) -> ScopeServices:
-        """为指定 scope 创建独立的元数据、检索、任务和回调服务。"""
+        """为指定 scope 创建独立服务视图，并共享图片生成额度。"""
         context = scope if isinstance(scope, ScopeContext) else ScopeContext(scope)
         with self._lock:
             existing = self._services.get(context.scope_id)
@@ -344,6 +351,7 @@ class ScopeServiceFactory:
                     self.settings,
                     scope_id=context,
                     task_service=tasks,
+                    generation_slots=self._thumbnail_generation_slots,
                 )
                 if callable(thumbnail_store)
                 else None

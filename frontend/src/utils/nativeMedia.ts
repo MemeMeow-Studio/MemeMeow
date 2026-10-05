@@ -5,6 +5,7 @@ import { FilePicker } from '@capawesome/capacitor-file-picker'
 import { FileTransfer, type FileTransferError } from '@capacitor/file-transfer'
 import { Directory, Filesystem } from '@capacitor/filesystem'
 import { errorMessage } from './presentation'
+import { imageHttpError } from './imageHttpError'
 
 export const isAndroidApp = Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android'
 const albumName = 'MemeMeow'
@@ -35,7 +36,7 @@ function getAlbumIdentifier(): Promise<string> {
   return pendingAlbum
 }
 
-/** 查询原图的 Content-Type，使用网站支持的格式生成本地文件扩展名。 */
+/** 查询所选尺寸图片的 Content-Type，使用网站支持的格式生成本地文件扩展名。 */
 async function imageExtension(url: string): Promise<string> {
   const response = await fetch(url, {
     credentials: 'same-origin',
@@ -43,15 +44,15 @@ async function imageExtension(url: string): Promise<string> {
     redirect: 'error',
     cache: 'no-store',
   })
+  if (!response.ok) throw await imageHttpError(response)
   await response.body?.cancel()
-  if (!response.ok) throw new Error(`android_image_http_error: 读取图片返回 HTTP ${response.status}`)
   const extensions: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif' }
   const extension = extensions[response.headers.get('Content-Type') || '']
   if (!extension) throw new Error('android_image_mime_invalid: 网站没有返回支持的图片类型')
   return extension
 }
 
-/** 原生下载沿用 WebView 登录会话，保存原图后删除本次缓存目录。 */
+/** 原生下载沿用 WebView 登录会话，保存所选尺寸图片后删除本次缓存目录。 */
 export async function saveImageToAlbum(url: string): Promise<void> {
   requirePlugin('Media')
   requirePlugin('Filesystem')

@@ -2016,9 +2016,9 @@ async def image_metadata(
 
 
 @app.get("/media/{meme_id}", tags=["images"])
-async def media(request: Request, meme_id: str):
-    """按当前 scope 的稳定 meme_id 读取经过指纹校验的图片。"""
-    return await _media_http(request, meme_id=meme_id, services=_request_services, error=_error)
+async def media(request: Request, meme_id: str, max_edge: int | None = Query(default=None)):
+    """按当前 scope 的稳定 meme_id 读取原图或固定最长边的尺寸输出。"""
+    return await _media_http(request, meme_id=meme_id, max_edge=max_edge, services=_request_services, error=_error)
 
 
 @app.get("/media/{meme_id}/thumbnail", tags=["images"])

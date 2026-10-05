@@ -13,7 +13,7 @@ import logging
 import multiprocessing
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from io import BytesIO
@@ -25,7 +25,7 @@ from uuid import UUID, uuid4
 from PIL import Image
 from sqlalchemy import func, select
 
-from backend.image_safety import ImagePreflightError, validate_image_content
+from backend.image_safety import ImagePreflightError, _terminate_process, validate_image_content
 from backend.persistence.engine import DatabaseError
 from backend.persistence.models import DerivedImageThumbnail, Meme, ScopeContext, Task, utcnow
 from backend.persistence.resources import DatabaseResources
@@ -118,12 +118,14 @@ def _process_context() -> Any:
     return multiprocessing.get_context("fork" if "fork" in methods else "spawn")
 
 
-def _render_thumbnail(content: bytes, extension: str, config: ThumbnailConfig) -> RenderedThumbnail:
+def _render_thumbnail(
+    content: bytes, extension: str, config: ThumbnailConfig, *, worker: Callable[..., None] = _thumbnail_worker,
+) -> RenderedThumbnail:
     """以超时和消息大小边界运行图片缩略图生成子进程。"""
     context = _process_context()
     parent, child = context.Pipe(duplex=False)
     process = context.Process(
-        target=_thumbnail_worker,
+        target=worker,
         args=(content, extension, config.max_edge, config.max_output_bytes, config.max_temp_bytes, child),
         daemon=True,
     )
@@ -188,12 +190,7 @@ def _render_thumbnail(content: bytes, extension: str, config: ThumbnailConfig) -
     except (EOFError, OSError) as exc:
         raise ThumbnailError("thumbnail_generation_failed") from exc
     finally:
-        if process.is_alive():
-            process.terminate()
-        process.join(timeout=1.0)
-        if process.is_alive() and callable(getattr(process, "kill", None)):
-            process.kill()
-            process.join(timeout=1.0)
+        _terminate_process(process)
         parent.close()
 
 
@@ -210,6 +207,7 @@ class DerivedThumbnailService:
         scope_id: str | ScopeContext = "local",
         config: ThumbnailConfig | None = None,
         task_service: Any | None = None,
+        generation_slots: BoundedSemaphore | None = None,
     ):
         """绑定数据库、独立派生存储、配置和可选的 durable task service。"""
         self.resources = resources
@@ -217,12 +215,26 @@ class DerivedThumbnailService:
         self.config = config or (ThumbnailConfig.from_settings(settings) if settings is not None else ThumbnailConfig())
         self.store = resources.thumbnail_store_for_scope(self.scope)
         self.task_service = task_service
-        self._slots = BoundedSemaphore(self.config.concurrency)
+        self._slots = generation_slots if generation_slots is not None else BoundedSemaphore(self.config.concurrency)
+
+    @property
+    def generation_slots(self) -> BoundedSemaphore:
+        """向同一 scope 的其他派生用途提供共享并发预算。"""
+        return self._slots
 
     @staticmethod
     def _output_key(meme: Meme, profile: str) -> str:
         """为源版本计算内部唯一输出 key，不将其暴露给客户端。"""
         return f"{meme.id.hex}-{str(meme.sha256).lower()}-{profile}{THUMBNAIL_OUTPUT_EXTENSION}"
+
+    def _render(self, content: bytes, extension: str) -> RenderedThumbnail:
+        """按当前 profile 生成图片；其他派生用途可复用提交与清理流程。"""
+        return _render_thumbnail(content, extension, self.config)
+
+    @staticmethod
+    def _media_type(meme: Meme) -> str:
+        """返回展示缩略图的固定 JPEG 类型，供生成和缓存校验共用。"""
+        return THUMBNAIL_OUTPUT_MEDIA_TYPE
 
     @staticmethod
     def _task_dedupe_key(payload: dict[str, object]) -> str:
@@ -338,7 +350,7 @@ class DerivedThumbnailService:
             return False
         if max(width, height) > self.config.max_edge:
             return False
-        if row.media_type != THUMBNAIL_OUTPUT_MEDIA_TYPE:
+        if row.media_type != self._media_type(meme):
             return False
         return self.store.exists_with_identity(row.output_key, sha256=output_sha.lower(), size_bytes=output_size)
 
@@ -577,7 +589,7 @@ class DerivedThumbnailService:
                 environment.thumbnails.mark_pending(meme, self.config.profile)
             try:
                 validate_image_content(content, meme.extension, timeout_seconds=self.config.timeout_seconds)
-                rendered = _render_thumbnail(content, meme.extension, self.config)
+                rendered = self._render(content, meme.extension)
             except ImagePreflightError as exc:
                 raise ThumbnailError(exc.code) from exc
             # 生成可能跨越原图重命名；再次以 SHA/大小复核即可保留同一派生身份。
@@ -613,7 +625,7 @@ class DerivedThumbnailService:
                     output_size_bytes=len(rendered.content),
                     width=rendered.width,
                     height=rendered.height,
-                    media_type=THUMBNAIL_OUTPUT_MEDIA_TYPE,
+                    media_type=self._media_type(final_meme),
                 )
                 row = environment.thumbnails.current(final_meme, self.config.profile)
                 return self._projection(row, meme_id=final_meme.id)

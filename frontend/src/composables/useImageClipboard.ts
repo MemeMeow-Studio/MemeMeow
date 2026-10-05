@@ -3,6 +3,7 @@
  */
 
 import { useToast } from './useToast'
+import { imageHttpError } from '../utils/imageHttpError'
 
 const clipboardImageMime = 'image/png'
 
@@ -64,10 +65,10 @@ async function fetchImageForClipboard(url: string): Promise<Blob> {
   let response: Response
   try {
     response = await fetch(url, { credentials: 'same-origin' })
-    if (!response.ok) throw new Error('image_fetch_failed')
   } catch {
     throw new Error('image_fetch_failed')
   }
+  if (!response.ok) throw await imageHttpError(response)
   let blob: Blob
   try {
     blob = await response.blob()
@@ -128,7 +129,7 @@ export function useImageClipboard() {
         image_clipboard_insecure_context: '图片复制失败：当前页面不是安全上下文，请使用 http://localhost:5275 或 HTTPS',
         image_clipboard_permission_denied: '图片复制失败：Chrome 拒绝剪贴板写入，请在网站设置中允许剪贴板后重试',
         image_clipboard_write_failed: '图片复制失败：剪贴板写入被拒绝，图片未复制',
-      }[code] || '图片复制失败，图片未复制'
+      }[code] || (code ? `图片复制失败：${code}` : '图片复制失败，图片未复制')
     }
     if (requestId !== copyRequestId) return
     notifications.show(notice, failed ? 'error' : 'success')

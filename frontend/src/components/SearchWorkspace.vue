@@ -37,7 +37,7 @@ const detailItem = shallowRef<SearchItem | null>(null)
 const detailTrigger = shallowRef<HTMLElement | null>(null)
 const previewImage = shallowRef<MemeImage | null>(null)
 const previewTrigger = shallowRef<HTMLElement | null>(null)
-const { imageActionLabel, performImageAction, saving } = useImageAction()
+const { imageActionLabel, performImageAction, saving, imageExportSize, imageExportSizes, persistImageExportSize } = useImageAction()
 
 const uniqueResults = computed(() => {
   const seen = new Set<string>()
@@ -208,6 +208,14 @@ async function runSearch(): Promise<void> {
       </button>
     </form>
     <div class="controls">
+      <label class="number-control">
+        <span>{{ imageActionLabel }}尺寸</span>
+        <select v-model="imageExportSize" aria-label="复制／保存尺寸" @change="persistImageExportSize">
+          <option v-if="imageExportSize === null" :value="null" disabled>请选择尺寸</option>
+          <option value="original">原图</option>
+          <option v-for="size in imageExportSizes" :key="size" :value="size">最长边 {{ size }}px</option>
+        </select>
+      </label>
       <label class="number-control">
         <span>结果数量</span>
         <input v-model.number="resultCount" type="number" min="1" max="30" aria-label="结果数量" />

@@ -9,14 +9,18 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Mapping
+from functools import partial
 from typing import Any
 
+from anyio import to_thread
 from fastapi import HTTPException, Request
 from fastapi.responses import Response
+from loguru import logger
 
 from backend.database import DatabaseError
 from backend.embedding_input import build_text_input
 from backend.http_file_cache import revalidated_file_response
+from backend.image_export import DerivedImageExportService, IMAGE_EXPORT_EDGES
 from backend.image_naming import public_filename_fields, saved_filename
 from backend.image_library_status import ImageStatus, image_status_condition
 from backend.metadata import MetadataError
@@ -191,14 +195,18 @@ async def media(
     meme_id: str,
     services: ServicesProvider,
     error: ErrorFactory,
+    max_edge: int | None = None,
 ) -> Response:
-    """按当前 scope 的稳定 meme_id 返回带内容版本的原图。
+    """按当前 scope 的稳定 meme_id 返回原图或指定最长边的图片。
 
     输入是路径中的稳定 Meme 标识；输出是文件或无内容的 304 响应。
-    调用场景是浏览器媒体读取，版本取自已经保存的图片 SHA。
+    调用场景是预览、复制和相册保存；尺寸生成在数据库事务之外执行。
     """
+    if max_edge is not None and (type(max_edge) is not int or max_edge not in IMAGE_EXPORT_EDGES):
+        raise error(422, "image_export_size_invalid", "图片最长边只允许 240、360、480 或 640 像素")
+    scope_services = services(request)
     try:
-        record, path = services(request).metadata.image_for_meme(meme_id, verify_content=False)
+        record, path = scope_services.metadata.image_for_meme(meme_id, verify_content=False)
     except MetadataError as exc:
         if exc.code in MISSING_MEDIA_ERRORS:
             raise error(404, "meme_not_found", "图片不存在") from exc
@@ -206,8 +214,34 @@ async def media(
     media_type = MEDIA_TYPES.get(path.suffix.lower())
     if media_type is None:
         raise error(409, "invalid_storage_key", "图片存储格式无效")
+    digest = record.sha256
+    if max_edge is not None:
+        thumbnails = scope_services.thumbnails
+        if thumbnails is None:
+            raise error(503, "image_export_service_unavailable", "图片尺寸服务尚未初始化")
+        try:
+            exports = DerivedImageExportService(thumbnails, max_edge)
+            path, media_type, digest = await to_thread.run_sync(partial(exports.prepare_media, meme_id))
+        except (ThumbnailError, DatabaseError) as exc:
+            logger.warning("image_export stage=prepare error_code={}", exc.code)
+            if exc.code in {"meme_not_found", "thumbnail_not_found", "file_not_found", "thumbnail_source_unavailable"}:
+                raise error(404, "meme_not_found", "图片不存在或原图文件无法读取") from exc
+            status = 429 if exc.code in {"thumbnail_backpressure", "gif_processing_busy"} else 504 if exc.code == "thumbnail_generation_timeout" else 409
+            messages = {
+                "thumbnail_backpressure": "图片处理并发数量已达到上限，请稍后重试",
+                "gif_processing_busy": "图片处理并发数量已达到上限，请稍后重试",
+                "thumbnail_generation_timeout": "图片尺寸处理超时",
+                "thumbnail_source_changed": "原图版本发生变化，请重新检索",
+                "image_export_temp_limit_exceeded": "图片解码所需内存超过处理上限",
+                "image_export_memory_exceeded": "图片处理所需内存超过处理上限",
+                "image_export_output_limit_exceeded": "处理后的图片文件超过大小上限",
+                "image_export_tool_missing": "服务器缺少 GIF 尺寸处理程序 gifsicle",
+                "image_export_animation_changed": "GIF 处理结果的动画时间信息发生变化",
+                "image_export_transparency_changed": "GIF 处理结果的透明背景发生变化",
+            }
+            raise error(status, exc.code, messages.get(exc.code, f"图片尺寸处理异常：{exc.code}")) from exc
     try:
-        return await revalidated_file_response(request, path, media_type=media_type, content_digest=record.sha256)
+        return await revalidated_file_response(request, path, media_type=media_type, content_digest=digest)
     except FileNotFoundError as exc:
         raise error(404, "meme_not_found", "图片不存在") from exc
 

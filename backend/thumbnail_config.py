@@ -44,6 +44,10 @@ class ThumbnailConfig:
             raise ValueError("thumbnail_profile_mismatch")
         if self.max_edge != THUMBNAIL_MAX_EDGE:
             raise ValueError("thumbnail_max_edge_mismatch")
+        self._validate_resources()
+
+    def _validate_resources(self) -> None:
+        """校验派生图片共用的时间、内存、输出及并发预算。"""
         if not isinstance(self.max_output_bytes, int) or not 1 <= self.max_output_bytes <= 64 * 1024 * 1024:
             raise ValueError("thumbnail_output_limit_invalid")
         if not isinstance(self.timeout_seconds, (int, float)) or not 0 < float(self.timeout_seconds) <= 120:
