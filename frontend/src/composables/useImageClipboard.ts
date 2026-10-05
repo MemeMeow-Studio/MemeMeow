@@ -4,6 +4,7 @@
 
 import { useToast } from './useToast'
 import { imageHttpError } from '../utils/imageHttpError'
+import { desktopClipboard } from '../utils/nativeClipboard'
 
 const clipboardImageMime = 'image/png'
 
@@ -62,7 +63,7 @@ async function convertImageBlobToPng(blob: Blob): Promise<Blob> {
 }
 
 /** 请求并准备检索结果图片，HTTP 和 MIME 异常都转换为用户可解释错误。 */
-async function fetchImageForClipboard(url: string): Promise<Blob> {
+async function fetchImageForClipboard(url: string, maxGifBytes?: number): Promise<Blob> {
   let response: Response
   try {
     response = await fetch(url, { credentials: 'same-origin' })
@@ -70,6 +71,25 @@ async function fetchImageForClipboard(url: string): Promise<Blob> {
     throw new Error('image_fetch_failed')
   }
   if (!response.ok) throw await imageHttpError(response)
+  const responseMime = response.headers.get('content-type')?.split(';')[0].trim().toLowerCase()
+  if (maxGifBytes !== undefined && responseMime === 'image/gif') {
+    if (!response.body) throw new Error('image_fetch_failed')
+    const reader = response.body.getReader()
+    const chunks: Uint8Array<ArrayBuffer>[] = []
+    let length = 0
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        length += value.byteLength
+        if (length > maxGifBytes) throw new Error('image_gif_too_large: GIF 文件超过 64 MiB，无法复制')
+        chunks.push(value)
+      }
+    } finally {
+      await reader.cancel()
+    }
+    return new Blob(chunks, { type: 'image/gif' })
+  }
   let blob: Blob
   try {
     blob = await response.blob()
@@ -98,6 +118,23 @@ export function useImageClipboard() {
       if (window.isSecureContext === false) throw new Error('image_clipboard_insecure_context')
       if (!supportsImageClipboard()) throw new Error('image_clipboard_unsupported')
       if (typeof fetch !== 'function') throw new Error('image_fetch_unavailable')
+
+      const bridge = desktopClipboard()
+      if (bridge) {
+        const blob = await fetchImageForClipboard(url, bridge.maxGifBytes)
+        if (requestId !== copyRequestId) return
+        if (blob.type.trim().toLowerCase() === 'image/gif') {
+          if (blob.size > bridge.maxGifBytes) throw new Error('image_gif_too_large: GIF 文件超过 64 MiB，无法复制')
+          const data = await blob.arrayBuffer()
+          if (requestId !== copyRequestId) return
+          await bridge.copyGif(data)
+        } else {
+          await navigator.clipboard.write([new ClipboardItem({ [clipboardImageMime]: blob })])
+        }
+        if (requestId !== copyRequestId) return
+        notifications.show('图片已复制', 'success')
+        return
+      }
 
       let imageDataFailure: unknown = null
       const imageData = fetchImageForClipboard(url).catch((reason) => {
