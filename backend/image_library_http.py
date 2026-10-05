@@ -224,13 +224,14 @@ async def media(
             path, media_type, digest = await to_thread.run_sync(partial(exports.prepare_media, meme_id))
         except (ThumbnailError, DatabaseError) as exc:
             logger.warning("image_export stage=prepare error_code={}", exc.code)
-            if exc.code in {"meme_not_found", "thumbnail_not_found", "file_not_found", "thumbnail_source_unavailable"}:
-                raise error(404, "meme_not_found", "图片不存在或原图文件无法读取") from exc
+            if exc.code in {"meme_not_found", "thumbnail_not_found", "file_not_found"}:
+                raise error(404, "meme_not_found", "图片不存在") from exc
             status = 429 if exc.code in {"thumbnail_backpressure", "gif_processing_busy"} else 504 if exc.code == "thumbnail_generation_timeout" else 409
             messages = {
                 "thumbnail_backpressure": "图片处理并发数量已达到上限，请稍后重试",
                 "gif_processing_busy": "图片处理并发数量已达到上限，请稍后重试",
                 "thumbnail_generation_timeout": "图片尺寸处理超时",
+                "thumbnail_source_unavailable": "原图文件无法读取，请检查存储读取权限及文件状态",
                 "thumbnail_source_changed": "原图版本发生变化，请重新检索",
                 "image_export_temp_limit_exceeded": "图片解码所需内存超过处理上限",
                 "image_export_memory_exceeded": "图片处理所需内存超过处理上限",

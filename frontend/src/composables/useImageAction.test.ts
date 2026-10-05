@@ -19,10 +19,12 @@ describe('检索图片操作设置', () => {
       const actions = scope.run(() => useImageAction())!
       expect(actions.imageExportSize.value).toBeNull()
       await actions.performImageAction('/media/example')
-      expect(toast.getToasts().some(item => 'title' in item && String(item.title).includes('image_export_size_invalid'))).toBe(true)
+      const sizeErrors = () => toast.getToasts().filter(item => 'title' in item && String(item.title).includes('image_export_size_invalid'))
+      expect(sizeErrors()).toHaveLength(1)
       actions.imageExportSize.value = 360
       actions.persistImageExportSize()
       expect(loadImageExportSize()).toBe(360)
+      expect(sizeErrors()).toHaveLength(0)
     } finally {
       scope.stop()
     }

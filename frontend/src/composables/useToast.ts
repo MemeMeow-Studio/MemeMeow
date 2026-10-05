@@ -15,11 +15,16 @@ export function useToast() {
   let active = true
   onScopeDispose(() => { active = false })
 
-  /** 显示操作结果；错误和需要处理的警告由用户手动关闭。 */
-  function show(message: string, kind: ToastKind = 'success'): void {
+  /** 显示操作结果并返回提示 ID；错误和警告持续显示，供用户处理。 */
+  function show(message: string, kind: ToastKind = 'success'): string | number | undefined {
     if (!active) return
-    toast[kind](message, { duration: kind === 'error' || kind === 'warning' ? Infinity : 3000 })
+    return toast[kind](message, { duration: kind === 'error' || kind === 'warning' ? Infinity : 3000 })
   }
 
-  return { show, success: (message: string) => show(message), error: (message: string) => show(message, 'error'), warning: (message: string) => show(message, 'warning') }
+  /** 根据已显示的提示 ID 关闭对应消息，供问题修复后的操作调用。 */
+  function dismiss(id: string | number): void {
+    if (active) toast.dismiss(id)
+  }
+
+  return { show, dismiss, success: (message: string) => show(message), error: (message: string) => show(message, 'error'), warning: (message: string) => show(message, 'warning') }
 }

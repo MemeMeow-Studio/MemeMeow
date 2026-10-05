@@ -178,6 +178,18 @@ def test_export_cache_scope_and_delete(tmp_path: Path) -> None:
             headers = [] if etag is None else [(b"if-none-match", etag.encode("ascii"))]
             return Request({"type": "http", "method": "GET", "path": f"/media/{record.id}", "query_string": b"max_edge=480", "headers": headers})
 
+        source_path = resources.blob_store_for_scope(scope).resolve(record.storage_key, must_exist=True)
+        source_permissions = source_path.stat().st_mode
+        try:
+            source_path.chmod(0)
+            with pytest.raises(HTTPException) as unreadable:
+                asyncio.run(media(request(), meme_id=str(record.id), max_edge=480, services=provide_services, error=error))
+            assert unreadable.value.status_code == 409
+            assert unreadable.value.detail["error"] == "thumbnail_source_unavailable"
+            assert "读取权限" in unreadable.value.detail["message"]
+        finally:
+            source_path.chmod(source_permissions)
+
         paths = []
         for max_edge in (240, 360, 480, 640):
             exports = DerivedImageExportService(thumbnails, max_edge)
