@@ -16,6 +16,7 @@ from anyio import to_thread
 from fastapi import HTTPException, Request
 from fastapi.responses import Response
 from loguru import logger
+from starlette.concurrency import run_in_threadpool
 
 from backend.database import DatabaseError
 from backend.embedding_input import build_text_input
@@ -259,7 +260,7 @@ async def thumbnail_media(
     if thumbnails is None:
         raise error(404, "meme_not_found", "图片不存在")
     try:
-        path, media_type, digest = thumbnails.media_path(meme_id)
+        path, media_type, digest = await run_in_threadpool(thumbnails.media_path, meme_id)
     except (ThumbnailError, DatabaseError, MetadataError) as exc:
         raise error(404, "meme_not_found", "图片不存在") from exc
     try:

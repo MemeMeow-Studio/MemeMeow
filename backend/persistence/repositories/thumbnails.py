@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any, Iterable
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -70,6 +70,36 @@ class DerivedThumbnailRepository:
     def current(self, meme: Meme, profile: str, *, for_update: bool = False) -> DerivedImageThumbnail | None:
         """按数据库 Meme 当前 SHA/大小读取同 profile 派生事实。"""
         return self.get(meme.id, meme.sha256, meme.size_bytes, profile, for_update=for_update)
+
+    def media_output(self, meme_id: UUID | str, profile: str) -> tuple[str, str | None, str] | None:
+        """一次查询当前 scope 与源版本的可用缩略图，返回文件定位快照。
+
+        输入是稳定 Meme ID 和 profile；输出只包含输出 key、媒体类型和内容摘要，
+        供媒体服务结束数据库事务后解析文件路径。
+        """
+        row = self.session.execute(
+            select(
+                DerivedImageThumbnail.output_key,
+                DerivedImageThumbnail.media_type,
+                DerivedImageThumbnail.output_sha256,
+            )
+            .join(
+                Meme,
+                (Meme.scope_id == DerivedImageThumbnail.scope_id)
+                & (Meme.id == DerivedImageThumbnail.meme_id)
+                & (func.lower(Meme.sha256) == DerivedImageThumbnail.source_sha256)
+                & (Meme.size_bytes == DerivedImageThumbnail.source_size_bytes),
+            )
+            .where(
+                Meme.scope_id == self.scope.scope_id,
+                Meme.id == _uuid(meme_id),
+                DerivedImageThumbnail.profile == profile,
+                DerivedImageThumbnail.status == "available",
+                DerivedImageThumbnail.output_key != "",
+                DerivedImageThumbnail.output_sha256 != "",
+            )
+        ).one_or_none()
+        return tuple(row) if row is not None else None
 
     def ensure_pending(
         self,

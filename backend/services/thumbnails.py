@@ -820,16 +820,17 @@ class DerivedThumbnailService:
         return {"scanned": len(memes[:max_items]), "submitted": submitted, "available": available, "failed": failed}
 
     def media_path(self, meme_id: UUID | str) -> tuple[Path, str, str]:
-        """按可信 scope 与稳定 Meme ID 返回缩略图路径、类型和已保存的内容哈希。"""
+        """一次读取当前源版本的输出快照，结束事务后解析受控缩略图路径。"""
         try:
-            meme = self._meme(meme_id)
-        except ThumbnailError as exc:
+            identifier = meme_id if isinstance(meme_id, UUID) else UUID(str(meme_id))
+        except (TypeError, ValueError) as exc:
             raise ThumbnailError("thumbnail_not_found") from exc
         with self.resources.environment(self.scope) as environment:
-            row = environment.thumbnails.current(meme, self.config.profile)
-            if row is None or row.status != "available" or not row.output_key or not row.output_sha256:
+            output = environment.thumbnails.media_output(identifier, self.config.profile)
+            if output is None:
                 raise ThumbnailError("thumbnail_not_found")
-        return self.store.resolve(row.output_key, must_exist=True), row.media_type or THUMBNAIL_OUTPUT_MEDIA_TYPE, row.output_sha256
+        output_key, media_type, digest = output
+        return self.store.resolve(output_key, must_exist=True), media_type or THUMBNAIL_OUTPUT_MEDIA_TYPE, digest
 
     def cleanup_for_meme(self, meme_id: UUID | str) -> int:
         """在原图身份锁内清理派生内容，与生成和删除使用同一互斥规则。"""

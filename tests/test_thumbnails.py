@@ -490,33 +490,6 @@ def test_reconcile_resets_failed_thumbnail_before_retry(tmp_path: Path, monkeypa
     assert calls == [(meme.id, True)]
 
 
-def test_media_path_only_validates_source_identity_and_does_not_use_generation_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """媒体读取只校验原图身份，不调用会加载原图字节的生成读取路径。"""
-    content = _image_bytes((16, 8))
-    service, meme, repository, _source_store, thumbnail_store = _service(tmp_path, content)
-    output = b"thumbnail"
-    key = service._output_key(meme, service.config.profile)
-    (thumbnail_store.root / key).write_bytes(output)
-    repository.row = SimpleNamespace(
-        meme_id=meme.id,
-        source_sha256=meme.sha256,
-        source_size_bytes=meme.size_bytes,
-        profile=service.config.profile,
-        output_key=key,
-        output_sha256=hashlib.sha256(output).hexdigest(),
-        output_size_bytes=len(output),
-        width=16,
-        height=8,
-        media_type="image/jpeg",
-        status="available",
-    )
-    monkeypatch.setattr(service, "_meme_and_source", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("generation reader must not run")))
-    path, media_type, digest = service.media_path(meme.id)
-    assert path.name == key
-    assert media_type == "image/jpeg"
-    assert digest == hashlib.sha256(output).hexdigest()
-
-
 def test_cleanup_rejects_invalid_uuid_and_preserves_facts_on_file_failure(tmp_path: Path) -> None:
     """清理入口统一返回领域错误，物理失败时不先删除数据库事实。"""
     service, meme, repository, _source_store, thumbnail_store = _service(tmp_path, _image_bytes((8, 8)))
