@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from loguru import logger
 from httpx import TimeoutException
+from requests import Session
 from requests.exceptions import Timeout as RequestsTimeout
 from opentelemetry import metrics, trace
 from opentelemetry.context import Context
@@ -48,6 +49,13 @@ SECONDS_HISTOGRAM_BOUNDARIES = (0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.25, 0.5, 1
 def duration_views() -> list[View]:
     """为秒数 histogram 提供包含数据库与 HTTP 告警阈值的官方 View。"""
     return [View(instrument_type=metrics.Histogram, instrument_unit="s", aggregation=ExplicitBucketHistogramAggregation(boundaries=SECONDS_HISTOGRAM_BOUNDARIES))]
+
+
+def otlp_session() -> Session:
+    """独立导出客户端直接连接宿主配置的 Collector，不使用业务出口代理。"""
+    session = Session()
+    session.trust_env = False
+    return session
 
 
 @dataclass(frozen=True)
@@ -203,13 +211,13 @@ class TelemetryRuntime:
         self.closed = False
         headers = {"Authorization": config.authorization} if config.authorization else {}
         resource = Resource.create({"service.name": config.service, "deployment.environment.name": config.environment})
-        self.span_exporter = _ProtectedExporter(OTLPSpanExporter(endpoint=f"{config.endpoint}/v1/traces", timeout=5, headers=headers))
+        self.span_exporter = _ProtectedExporter(OTLPSpanExporter(endpoint=f"{config.endpoint}/v1/traces", timeout=5, headers=headers, session=otlp_session()))
         self.tracer_provider = TracerProvider(resource=resource, sampler=ALWAYS_ON, span_limits=SpanLimits(max_attributes=1024, max_events=1024, max_attribute_length=None))
         self.tracer_provider.add_span_processor(BatchSpanProcessor(self.span_exporter, max_queue_size=2048, max_export_batch_size=128, schedule_delay_millis=2000, export_timeout_millis=5000))
-        self.metric_exporter = _MetricExporter(endpoint=f"{config.endpoint}/v1/metrics", timeout=5, headers=headers)
+        self.metric_exporter = _MetricExporter(endpoint=f"{config.endpoint}/v1/metrics", timeout=5, headers=headers, session=otlp_session())
         reader = PeriodicExportingMetricReader(self.metric_exporter, export_interval_millis=10000, export_timeout_millis=5000)
         self.meter_provider = MeterProvider(resource=resource, metric_readers=[reader], views=duration_views())
-        self.log_exporter = _LogExporter(endpoint=f"{config.endpoint}/v1/logs", timeout=5, headers=headers)
+        self.log_exporter = _LogExporter(endpoint=f"{config.endpoint}/v1/logs", timeout=5, headers=headers, session=otlp_session())
         self.logger_provider = LoggerProvider(resource=resource, meter_provider=self.meter_provider)
         self.logger_provider.add_log_record_processor(BatchLogRecordProcessor(self.log_exporter, max_queue_size=2048, max_export_batch_size=128, schedule_delay_millis=2000, export_timeout_millis=5000))
         meter = self.meter_provider.get_meter("mememeow.runtime")
