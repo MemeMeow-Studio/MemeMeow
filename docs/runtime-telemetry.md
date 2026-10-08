@@ -15,9 +15,9 @@ API SDK 随 FastAPI lifespan 启动和关闭；executor SDK 随主进程启动�
 
 OTLP 使用独立 HTTP Session 直接连接宿主声明的 Collector；业务出口代理与 Agent 子进程环境保持原有规则。秒数 histogram 通过官方 View 设置 5 毫秒至 300 秒边界，包含 200 毫秒数据库等待与三秒搜索阈值。
 
-FastAPI、HTTPX、requests、urllib 和 SQLAlchemy 使用对应官方 instrumentation。HTTP 请求的路由由 FastAPI instrumentation 识别，SQL 执行与连接池等待分别测量。线程上下文使用官方 threading instrumentation。
+FastAPI、HTTPX、HTTPX2、requests、urllib 和 SQLAlchemy 使用对应官方 instrumentation。HTTP 请求的路由由 FastAPI instrumentation 识别，SQL 执行与连接池等待分别测量。线程上下文使用官方 threading instrumentation。
 
-OpenAI SDK 使用其 `DefaultHttpxClient` 与 `DefaultAsyncHttpxClient`，通过官方 `HTTPXClientInstrumentor.instrument_client` 采集客户端实例。同步检索、查询改写和异步命名继续使用 SDK 的默认连接参数，命名请求的原有超时与重试参数保持有效。
+进程启动时分别启用 `HTTPXClientInstrumentor` 和 `HTTPX2ClientInstrumentor`，自动采集对应库的同步及异步客户端。`instruments-any` 依赖确保两个客户端库可用。OpenAI SDK 使用默认客户端与连接参数，命名请求的超时与重试参数保持有效。
 
 `runtime_operations` 和 `runtime_operation_duration` 的单位由 `unit` 标签声明。Python Provider 的客户端操作使用 `python_provider_call`，底层 HTTP instrumentation 提供各次实际网络请求，SDK 内部重试保留在该 HTTP 来源中。缓存未调用客户端时不增加 Provider 操作指标。Task 指标在持久提交成功后增加，重新排队使用独立状态。
 

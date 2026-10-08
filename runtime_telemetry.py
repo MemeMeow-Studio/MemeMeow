@@ -9,11 +9,11 @@ from pathlib import Path
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any, Iterator, Mapping, TypeVar
+from typing import Any, Iterator, Mapping
 from urllib.parse import urlsplit
 
 from loguru import logger
-from httpx import AsyncClient, Client, TimeoutException
+from httpx import TimeoutException
 from requests import Session
 from requests.exceptions import Timeout as RequestsTimeout
 from opentelemetry import metrics, trace
@@ -23,7 +23,7 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
 from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor, LogRecordExportResult
-from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor, HTTPX2ClientInstrumentor
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry.instrumentation.threading import ThreadingInstrumentor
 from opentelemetry.instrumentation.urllib import URLLibInstrumentor
@@ -43,7 +43,6 @@ _BINARY_KEY = re.compile(r"(?i)(base64|image_url|image_data|file_content|binary)
 _PROPAGATOR = TraceContextTextMapPropagator()
 _LOCK = Lock()
 _RUNTIME: TelemetryRuntime | None = None
-HTTPXClientType = TypeVar("HTTPXClientType", Client, AsyncClient)
 SECONDS_HISTOGRAM_BOUNDARIES = (0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.25, 0.5, 1, 2, 3, 5, 10, 30, 60, 120, 300)
 
 
@@ -85,13 +84,6 @@ class TelemetryConfig:
         if authorization_file and enabled == "true" and (not authorization.startswith("Basic ") or "\n" in authorization):
             raise ValueError("MEMEMEOW_TELEMETRY_AUTH_FILE 必须包含单行 Basic Authorization")
         return cls(enabled == "true", endpoint.rstrip("/"), service, os.getenv("MEMEMEOW_TELEMETRY_ENVIRONMENT", "development"), authorization)
-
-
-def instrument_httpx_client(client: HTTPXClientType) -> HTTPXClientType:
-    """对 SDK 自带的 HTTPX 客户端使用官方实例采集接口，保持原客户端配置。"""
-    if _RUNTIME is not None and not _RUNTIME.closed:
-        HTTPXClientInstrumentor.instrument_client(client)
-    return client
 
 
 def protected_content(value: Any, secrets: tuple[str, ...] = ()) -> Any:
@@ -257,6 +249,7 @@ def start_telemetry(service: str = "mememeow-api") -> TelemetryRuntime | None:
             trace.set_tracer_provider(_RUNTIME.tracer_provider)
             metrics.set_meter_provider(_RUNTIME.meter_provider)
             HTTPXClientInstrumentor().instrument()
+            HTTPX2ClientInstrumentor().instrument()
             RequestsInstrumentor().instrument()
             URLLibInstrumentor().instrument()
             ThreadingInstrumentor().instrument()

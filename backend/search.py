@@ -13,12 +13,11 @@ from threading import Lock
 from typing import Callable
 
 import numpy as np
-from openai import DefaultHttpxClient, OpenAI
+from openai import OpenAI
 
 from backend.config import Settings
 from backend.metadata import MetadataError, MetadataService
 from backend.paths import SUPPORTED_EXTENSIONS
-from runtime_telemetry import instrument_httpx_client
 
 
 CACHE_VERSION = 4
@@ -38,7 +37,7 @@ class SearchService:
         """按需创建嵌入客户端，缺少配置时只影响相关操作。"""
         if not self.settings.embedding_api_key or not self.settings.embedding_base_url:
             raise RuntimeError("embedding_not_configured")
-        return OpenAI(api_key=self.settings.embedding_api_key, base_url=self.settings.embedding_base_url, http_client=instrument_httpx_client(DefaultHttpxClient()))
+        return OpenAI(api_key=self.settings.embedding_api_key, base_url=self.settings.embedding_base_url)
 
     def _load_cache(self) -> list[dict[str, object]] | None:
         """读取当前版本缓存；格式不匹配时明确拒绝。"""

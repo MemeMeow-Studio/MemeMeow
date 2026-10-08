@@ -6,7 +6,7 @@ from typing import Any
 from uuid import UUID
 
 import numpy as np
-from openai import DefaultHttpxClient, OpenAI
+from openai import OpenAI
 from sqlalchemy import select
 
 from backend.persistence.models import (
@@ -21,7 +21,7 @@ from backend.metadata import MetadataError
 from backend.services.metadata import PostgresMetadataService
 from backend.embedding_input import build_text_input
 from backend.text_updates import enqueue_text_update
-from runtime_telemetry import instrument_httpx_client, observed_operation, record_content
+from runtime_telemetry import observed_operation, record_content
 
 # 检索服务沿用旧 logger 名称，避免服务拆分改变日志路由。
 logger = logging.getLogger("backend.pg_services")
@@ -43,7 +43,7 @@ class PostgresSearchService:
         """创建嵌入客户端，缺少配置时返回稳定错误。"""
         if not self.settings.embedding_api_key or not self.settings.embedding_base_url:
             raise RuntimeError("embedding_not_configured")
-        return OpenAI(api_key=self.settings.embedding_api_key, base_url=self.settings.embedding_base_url, http_client=instrument_httpx_client(DefaultHttpxClient()))
+        return OpenAI(api_key=self.settings.embedding_api_key, base_url=self.settings.embedding_base_url)
 
     def _embedding(self, text: str) -> list[float]:
         """调用模型并拒绝非 1024 维或零向量响应。"""
