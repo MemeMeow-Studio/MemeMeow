@@ -1101,7 +1101,9 @@ class ReverseImageService:
                     )
                     if binding is not None:
                         environment.callback_requests.finish(request_id, state="completed", result={"cache_status": "hit"})
-                    return self._event_output(event, diagnostics=diagnostics)
+                    result = self._event_output(event, diagnostics=diagnostics)
+                with observed_operation("reverse_image_cache", unit="cache_hit", attributes={"scope.id": self.scope.scope_id, "provider": self.provider_name}):
+                    return result
             diagnostics.phase("validation")
             with self.resources.environment(self.scope.scope_id) as environment:
                 task = self._locked_auto_task(environment.tasks.get(request.task_id), request, scope_id=self.scope.scope_id)
