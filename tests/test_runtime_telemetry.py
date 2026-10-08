@@ -1,4 +1,7 @@
 # 使用真实 OpenTelemetry SDK 检查内容保护、导出属性与执行上下文。
+import base64
+import io
+from PIL import Image
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -7,6 +10,17 @@ from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
 from runtime_telemetry import SECONDS_HISTOGRAM_BOUNDARIES, _ProtectedExporter, correlation_attributes, duration_views, extract_carrier, protected_content, record_content, telemetry_snapshot
+
+
+def test_real_image_data_uri_preserves_only_reference_metadata():
+    """实际 PNG 的 data URI 只提供来源大小，遥测不复制图片正文。"""
+    content = io.BytesIO()
+    Image.new("RGB", (8, 8), "white").save(content, format="PNG")
+    encoded = base64.b64encode(content.getvalue()).decode("ascii")
+    result = protected_content({"type": "file", "url": "data:image/png;base64," + encoded, "filename": "monitoring-acceptance.png"})
+    assert result["filename"] == "monitoring-acceptance.png"
+    assert result["url"]["content_status"] == "binary_reference_required"
+    assert encoded not in str(result)
 
 
 def test_correlation_copies_only_trusted_investigation_fields():

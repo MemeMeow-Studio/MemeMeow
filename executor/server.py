@@ -1325,6 +1325,7 @@ class Executor:
 
     def _run(self, task: TaskState) -> None:
         """执行 attempt，并将线程入口异常保存为明确终态及诊断后继续抛出。"""
+        started_at = time.monotonic()
         try:
             self._run_with_telemetry(task)
         except Exception as error:
@@ -1340,6 +1341,11 @@ class Executor:
                     finally:
                         task.done.set()
             raise
+        finally:
+            if TelemetryConfig.from_env("mememeow-executor").enabled:
+                meter = metrics.get_meter("mememeow.executor")
+                meter.create_counter("agent_attempts", unit="{attempt}").add(1, {"result": task.status})
+                meter.create_histogram("agent_attempt_duration", unit="s").record(time.monotonic() - started_at)
 
     def _run_with_telemetry(self, task: TaskState) -> None:
         """绑定当前 attempt 的观测上下文，业务结果由既有执行流程提供。"""
@@ -1359,9 +1365,6 @@ class Executor:
                 observer.close()
                 span.set_attribute("attempt.result", task.status)
                 span.set_attribute("attempt.reason", protected_content(str(task.error or {}), observer.secrets))
-                meter = metrics.get_meter("mememeow.executor")
-                meter.create_counter("agent_attempts", unit="{attempt}").add(1, {"result": task.status})
-                meter.create_histogram("agent_attempt_duration", unit="s").record(time.time() - started_at)
 
     def _run_observed_task(self, task: TaskState) -> None:
         """执行 OpenCode 任务并更新状态，失败时保存脱敏后的有限诊断。"""

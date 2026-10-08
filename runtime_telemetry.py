@@ -100,6 +100,8 @@ def protected_content(value: Any, secrets: tuple[str, ...] = ()) -> Any:
     if isinstance(value, bytes):
         return {"content_status": "binary_reference_required", "size_bytes": len(value)}
     if isinstance(value, str):
+        if value.lower().startswith("data:"):
+            return {"content_status": "binary_reference_required", "encoded_size_bytes": len(value.encode("utf-8"))}
         result = value
         for secret in secrets:
             if secret:
