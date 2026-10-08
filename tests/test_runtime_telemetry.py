@@ -90,6 +90,15 @@ def test_usage_tokens_remain_available():
     assert "credential-value" not in str(result)
 
 
+def test_camel_case_credentials_preserve_token_usage():
+    """对保存记录与原始文本过滤认证字段，消息用量继续可查询。"""
+    result = protected_content({"tokens": {"input": 100, "output": 20}, "tool": {"accessToken": "access-credential", "refreshToken": "refresh-credential", "sessionToken": "session-credential", "idToken": "identity-credential"}, "text": "response={\"accessToken\":\"text-credential\"}; connection timeout"})
+    assert result["tokens"] == {"input": 100, "output": 20}
+    for credential in ("access-credential", "refresh-credential", "session-credential", "identity-credential", "text-credential"):
+        assert credential not in str(result)
+    assert "connection timeout" in result["text"]
+
+
 def test_duration_histogram_keeps_subsecond_thresholds():
     """真实 SDK 使用秒数边界，将 200 毫秒前后的等待分别聚合。"""
     reader = InMemoryMetricReader()
