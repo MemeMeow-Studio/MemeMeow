@@ -1902,7 +1902,6 @@ class PostgresTaskService:
             if not callable(complete):
                 self._write_reverse_image_provenance(task_id, generation)
             trace.get_current_span().set_attribute("task.result", "succeeded")
-            metrics.get_meter("mememeow.tasks").create_counter("task_terminals", unit="{task}").add(1, {"result": "succeeded"})
         return changed
 
     def _fenced_failure(self, task_id: str, generation: int, *, message: str, error: dict[str, Any], retry: bool, result: Any | None = None, retry_delay_seconds: int = 0, resume_available: bool | None = None, resume_reason: str | None = None, session_id: str | None = None, executor_attempt_id: str | None = None) -> bool:
@@ -1932,8 +1931,6 @@ class PostgresTaskService:
         if changed:
             trace.get_current_span().set_attribute("task.result", "queued" if _should_retry else "failed")
             record_content(trace.get_current_span(), "task.error", error)
-            if not _should_retry:
-                metrics.get_meter("mememeow.tasks").create_counter("task_terminals", unit="{task}").add(1, {"result": "failed"})
         return changed
 
     def _with_reverse_image_audit(self, task_id: str, result: Any, *, write_provenance: bool = False) -> dict[str, Any]:
@@ -2053,9 +2050,6 @@ class PostgresTaskService:
             if record is None:
                 return False
             changed = environment.tasks.cancel(task_id, error={"error": "task_cancelled", "message": "任务已取消"}, message="任务已取消")
-        if changed:
-            handler = self._handlers.get(record.task_type)
-            _ = handler  # 仅保留任务类型快照，实际 session 清理由运行器按 task_id 完成。
         return changed
 
     def upload_status(self, request_ids: list[str]) -> list[dict[str, Any]]:

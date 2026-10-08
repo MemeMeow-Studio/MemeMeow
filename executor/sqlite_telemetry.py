@@ -54,7 +54,8 @@ def read_saved_records(database: Path, *, directory: Path, session_id: str) -> l
             raise ValueError("sqlite_child_session_directory_mismatch")
         identifiers = [row[0] for row in sessions]
         placeholders = ",".join("?" for identifier in identifiers)
-        records = []
+        session_rows = connection.execute(f"SELECT id, time_created, time_updated, parent_id, title, version, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write FROM session WHERE id IN ({placeholders}) ORDER BY time_updated, id", identifiers)
+        records = [{"kind": "session", "id": row[0], "session_id": row[0], "created_ms": row[1], "updated_ms": row[2], "data": dict(zip(("parent_id", "title", "version", "cost", "tokens_input", "tokens_output", "tokens_reasoning", "tokens_cache_read", "tokens_cache_write"), row[3:]))} for row in session_rows]
         for table in ("message", "part"):
             rows = connection.execute(f"SELECT id, session_id, time_created, time_updated, data FROM {table} WHERE session_id IN ({placeholders}) ORDER BY time_updated, id", identifiers)
             for identifier, bound_session, created, updated, data in rows:
@@ -108,15 +109,17 @@ class SQLiteTelemetry:
         while not self.stop.is_set():
             self._poll()
             self.stop.wait(2.0)
-        self._poll()
+        self._poll(final=True)
 
-    def _poll(self) -> None:
+    def _poll(self, *, final: bool = False) -> None:
         """记录真实读取错误及中断区间，恢复后已有终态用于调查。"""
         session_id = self.session()
-        if session_id is None:
-            return
         observed_at = time.time()
         try:
+            if session_id is None:
+                if final:
+                    raise ValueError("sqlite_session_binding_missing_at_attempt_end")
+                return
             records = read_saved_records(self.database, directory=self.directory, session_id=session_id)
             for record in records:
                 self._record(record, observed_at)
@@ -149,7 +152,7 @@ class SQLiteTelemetry:
         if self.versions.get(identity) == version:
             return
         self.versions[identity] = version
-        unit = "message" if record["kind"] == "message" else "tool" if content.get("type") == "tool" else "step" if content.get("type") == "step-finish" else "content"
+        unit = "session" if record["kind"] == "session" else "message" if record["kind"] == "message" else "tool" if content.get("type") == "tool" else "step" if content.get("type") == "step-finish" else "content"
         clock = content.get("time") or (content.get("state") or {}).get("time") or {}
         terminal = (record["kind"] == "message" and content.get("role") == "assistant" and (clock.get("completed") is not None or content.get("error") is not None)) or (unit == "tool" and (content.get("state") or {}).get("status") in {"completed", "error"}) or unit == "step"
         labels = {"unit": unit, "result": "failed" if content.get("error") or (content.get("state") or {}).get("status") == "error" else "succeeded"}

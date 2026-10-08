@@ -20,6 +20,8 @@ from backend.persistence.engine import DatabaseError, SCOPE_LOCAL, ensure_option
 from backend.persistence.models import Scope, ScopeContext
 from backend.persistence.storage import BlobStore, StorageCoordinator
 from backend.persistence.unit_of_work import UnitOfWork
+from backend.persistence.task_telemetry import instrument_task_sessions
+from runtime_telemetry import TelemetryConfig
 
 
 class DataEnvironment:
@@ -77,6 +79,8 @@ class DatabaseResources:
         """
         self.engine = engine
         self.factory = sessionmaker(engine, expire_on_commit=False, class_=Session, info={"embedding_model": getattr(settings, "embedding_model", None)})
+        if TelemetryConfig.from_env().enabled:
+            instrument_task_sessions(self.factory)
         self.image_root = image_root
         self.data_root = data_root
         # 派生媒体使用独立根目录，StorageCoordinator 的原图扫描不会触碰这里。

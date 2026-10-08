@@ -19,6 +19,8 @@ FastAPI、HTTPX、requests、urllib 和 SQLAlchemy 使用对应官方 instrument
 
 `runtime_operations` 和 `runtime_operation_duration` 的单位由 `unit` 标签声明。Python Provider 的客户端操作使用 `python_provider_call`，底层 HTTP instrumentation 提供各次实际网络请求，SDK 内部重试保留在该 HTTP 来源中。缓存未调用客户端时不增加 Provider 操作指标。Task 指标在持久提交成功后增加，重新排队使用独立状态。
 
+`task_terminals` 使用所属 Session 工厂的标准事件观察已有 Task 更新；SQL fencing 更新使用同一个事务快照入口。保存点只合入父事务，最外层提交成功后计数，回滚不计数。标签包含 `task_type`、`result` 和稳定 `reason`；业务 `failed` 且原因为 `task_cancelled` 时结果类别为 `cancelled`。队列扫描按串行内存快照更新 `task_queued`，清零已消失类别，网络导出仍由 SDK 执行。
+
 executor 使用独立 attempt trace，并通过 W3C 上下文的 Span Link 关联 Worker。callback 薄客户端传递当前 attempt 的 traceparent；追踪字段不参与业务授权。调查字段保留 Task、scope、attempt、session 和业务图片相对路径，metrics 不使用这些标识作为标签。
 
 ## OpenCode SQLite

@@ -774,7 +774,12 @@ class ReverseImageService:
 
     async def _network_search_async(self, request: ReverseImageRequest) -> dict[str, Any]:
         """异步调用当前 Provider；同步实现只在线程中执行网络阶段。"""
-        with observed_operation("reverse_image", unit="python_provider_call", attributes={"provider": self.provider_name, "scope.id": self.scope.scope_id}) as span:
+        attributes = {"provider": self.provider_name, "scope.id": self.scope.scope_id, "task.id": request.task_id, "operation.name": "analysis.reverse_image_search"}
+        if isinstance(request.callback_binding, CallbackBinding):
+            attributes["attempt.number"] = request.callback_binding.attempt
+            attributes["claim.generation"] = request.callback_binding.claim_generation
+        with observed_operation("reverse_image", unit="python_provider_call", attributes=attributes) as span:
+            record_content(span, "provider.request", {"filename": request.filename, "image_bytes": len(request.image), "image_sha256": request.source_image_sha256, "query": request.query, "search_type": request.search_type, "language": request.language, "country": request.country, "auto_crop": request.auto_crop})
             result = await NetworkReverseImageSearchAdapter(self._provider()).search_async(request)
             record_content(span, "provider.response", result)
             return result

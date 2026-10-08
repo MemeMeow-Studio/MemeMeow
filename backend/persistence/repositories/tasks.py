@@ -19,6 +19,7 @@ from backend.agent_resume import append_error_history, append_task_error_history
 from executor.agent_limits import validate_agent_concurrency, validate_agent_concurrency_at_most
 from backend.persistence.engine import DatabaseError
 from backend.task_deadline import ensure_task_deadline
+from backend.persistence.task_telemetry import stage_terminal, terminal_snapshot
 from backend.persistence.models import (
     Meme,
     ImageProcessingJob,
@@ -1577,10 +1578,11 @@ class TaskRepository:
                 values["resume_available"] = False
                 values["resume_reason"] = None
         values["updated_at"] = now
-        result = self.session.execute(update(Task).where(Task.scope_id == self.scope.scope_id, Task.id == task_id, Task.claim_generation == claim_generation, Task.lease_owner == owner, Task.status == "running", Task.lease_expires_at > now).values(**values))
-        if result.rowcount != 1:
+        result = self.session.execute(update(Task).where(Task.scope_id == self.scope.scope_id, Task.id == task_id, Task.claim_generation == claim_generation, Task.lease_owner == owner, Task.status == "running", Task.lease_expires_at > now).values(**values).returning(Task.task_type)).scalar_one_or_none()
+        if result is None:
             return False
         if requested_status in {"succeeded", "failed"}:
+            stage_terminal(self.session, task_id, terminal_snapshot(result, requested_status, values.get("error")))
             self._release_lane_slots(self.scope.scope_id, task_id, owner=owner, claim_generation=claim_generation)
             self.session.flush()
         return True

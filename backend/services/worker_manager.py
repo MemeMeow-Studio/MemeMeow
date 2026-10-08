@@ -6,7 +6,8 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock, Thread
 from typing import Any, Callable, Mapping
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
+from opentelemetry import metrics
 from loguru import logger as diagnostic_logger
 
 from backend.persistence.models import (
@@ -98,6 +99,8 @@ class PostgresTaskWorkerManager:
         self._recovery_thread: Thread | None = None
         self._maintenance: list[Callable[[], None]] = []
         self._scheduled: set[str] = set()
+        self._queue_scan_lock = Lock()
+        self._telemetry_queue_labels: set[tuple[str, str]] = set()
         self.owner = f"worker-{os.getpid()}-{id(self)}"
 
     def resource_capacity(self, resource_key: str | None) -> int:
@@ -470,7 +473,15 @@ class PostgresTaskWorkerManager:
         """跨 scope 唤醒 queued 任务，保持全局运行槽位释放后的前进性。"""
         if self._stopped.is_set():
             return
+        with self._queue_scan_lock:
+            task_ids = self._queued_snapshot()
+        for task_id in task_ids:
+            self.schedule(task_id)
+
+    def _queued_snapshot(self) -> list[str]:
+        """读取已有队列扫描结果，按串行快照更新 gauge 并归还数据库连接。"""
         with self.resources.factory() as session:
+            queue_counts = list(session.execute(select(Task.task_type, Task.lane, func.count()).where(Task.status == "queued", _generic_task_filter()).group_by(Task.task_type, Task.lane)))
             task_ids = list(
                 session.scalars(
                     select(Task.id)
@@ -483,8 +494,15 @@ class PostgresTaskWorkerManager:
                     .limit(500)
                 )
             )
-        for task_id in task_ids:
-            self.schedule(task_id)
+        meter = metrics.get_meter("mememeow.tasks")
+        queue_gauge = meter.create_gauge("task_queued", unit="{task}")
+        current_labels = {(task_type, lane) for task_type, lane, count in queue_counts}
+        for task_type, lane in self._telemetry_queue_labels - current_labels:
+            queue_gauge.set(0, {"task_type": task_type, "lane": lane})
+        for task_type, lane, count in queue_counts:
+            queue_gauge.set(count, {"task_type": task_type, "lane": lane})
+        self._telemetry_queue_labels = current_labels
+        return task_ids
 
     def stop_claiming(self) -> None:
         """停止任务认领和恢复扫描，保留运行任务的写回能力。"""
