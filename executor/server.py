@@ -153,6 +153,7 @@ _EXECUTOR_ERROR_CODES = frozenset(
         "agent_timeout",
         "task_interrupted",
         "agent_process_failed",
+        "agent_executor_internal_error",
         "unknown_execution",
         "agent_output_invalid_json",
         "agent_result_file_missing",
@@ -1323,6 +1324,24 @@ class Executor:
         )
 
     def _run(self, task: TaskState) -> None:
+        """执行 attempt，并将线程入口异常保存为明确终态及诊断后继续抛出。"""
+        try:
+            self._run_with_telemetry(task)
+        except Exception as error:
+            reason = _redact_diagnostic(f"{type(error).__name__}: {error}", secret_inventory_from_mapping(os.environ) + (self.token, task.callback_token or "", task.workspace_capability or "", task.model_capability or ""))
+            logger.error("agent_executor_internal_error: task={} attempt={} exception={} reason={}", task.business_task_id, task.executor_attempt_id, type(error).__name__, reason)
+            with self.lock:
+                if not task.done.is_set():
+                    task.status = "failed"
+                    task.error = _json_error("agent_executor_internal_error", reason)
+                    task.completed_at = time.time()
+                    try:
+                        self._persist_attempt_metadata_locked(task)
+                    finally:
+                        task.done.set()
+            raise
+
+    def _run_with_telemetry(self, task: TaskState) -> None:
         """绑定当前 attempt 的观测上下文，业务结果由既有执行流程提供。"""
         if not TelemetryConfig.from_env("mememeow-executor").enabled:
             self._run_observed_task(task)

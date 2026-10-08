@@ -6,6 +6,7 @@ import re
 from opentelemetry import metrics
 from sqlalchemy import event, inspect
 from sqlalchemy.orm import Session, sessionmaker
+from runtime_telemetry import telemetry_snapshot
 
 from backend.persistence.models import Task
 
@@ -36,8 +37,10 @@ def stage_terminal(session: Session, identifier: object, snapshot: dict[str, str
 
 
 def _before_flush(session: Session, flush_context: object, instances: object) -> None:
-    """观察 ORM 已修改的 Task，不执行查询或创建 Session。"""
+    """在既有事务保存新 Task 关联及终态快照，不执行查询或创建 Session。"""
     for record in session.new | session.dirty:
+        if isinstance(record, Task) and (record in session.new or "_telemetry" not in (record.payload or {})):
+            record.payload = {**(record.payload or {}), "_telemetry": telemetry_snapshot()}
         if isinstance(record, Task) and (record in session.new or inspect(record).attrs.status.history.has_changes()):
             stage_terminal(session, record.id, terminal_snapshot(record.task_type, record.status, record.error))
 

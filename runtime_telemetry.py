@@ -283,6 +283,22 @@ def correlation_attributes() -> dict[str, str]:
     return {key: value for key, value in (attributes or {}).items() if key in {"account.id", "scope.id"} and isinstance(value, str)}
 
 
+def telemetry_snapshot() -> dict[str, Any]:
+    """复制当前受信追踪及调查字段，供业务已有持久记录恢复执行关联。"""
+    return {"trace_context": trace_carrier(), "attributes": correlation_attributes()}
+
+
+@contextmanager
+def restored_operation(operation: str, *, snapshot: Mapping[str, Any] | None, attributes: Mapping[str, Any]) -> Iterator[trace.Span]:
+    """从持久快照创建独立后台 span，前序请求作为 link，身份字段仅用于调查。"""
+    saved = snapshot or {}
+    parent = trace.get_current_span(extract_carrier(saved.get("trace_context", {}))).get_span_context()
+    links = [trace.Link(parent)] if parent.is_valid else []
+    correlation = {key: value for key, value in saved.get("attributes", {}).items() if key in {"account.id", "scope.id"} and isinstance(value, str)}
+    with trace.get_tracer("mememeow.runtime").start_as_current_span(operation, context=Context(), links=links, attributes={**correlation, **attributes}) as span:
+        yield span
+
+
 def extract_carrier(carrier: Mapping[str, str]) -> Context:
     """读取仅用于关联的 W3C traceparent 与 tracestate。"""
     return _PROPAGATOR.extract(dict(carrier))

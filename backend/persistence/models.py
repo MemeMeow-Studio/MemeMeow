@@ -613,6 +613,7 @@ class ImageProcessingJob(Base):
     metadata_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     processing_config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     processing_config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    telemetry_context: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     reverse_image_policy: Mapped[str] = mapped_column(String(16), nullable=False, default="forbid")
     auto_name: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     processing_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="normal", server_default=text("'normal'"))

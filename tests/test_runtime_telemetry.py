@@ -6,7 +6,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
-from runtime_telemetry import SECONDS_HISTOGRAM_BOUNDARIES, _ProtectedExporter, correlation_attributes, duration_views, extract_carrier, protected_content, record_content
+from runtime_telemetry import SECONDS_HISTOGRAM_BOUNDARIES, _ProtectedExporter, correlation_attributes, duration_views, extract_carrier, protected_content, record_content, telemetry_snapshot
 
 
 def test_correlation_copies_only_trusted_investigation_fields():
@@ -15,6 +15,20 @@ def test_correlation_copies_only_trusted_investigation_fields():
     with provider.get_tracer("telemetry-test").start_as_current_span("request", attributes={"account.id": "acceptance-account", "scope.id": "acceptance-scope", "authorization": "secret-value"}):
         assert correlation_attributes() == {"account.id": "acceptance-account", "scope.id": "acceptance-scope"}
     assert correlation_attributes() == {}
+    provider.shutdown()
+
+
+def test_persisted_snapshot_preserves_trusted_request_link():
+    """真实请求 span 的持久快照保留身份调查字段与可恢复的追踪链接。"""
+    provider = TracerProvider()
+    with provider.get_tracer("telemetry-test").start_as_current_span("upload", attributes={"account.id": "acceptance-account", "scope.id": "acceptance-scope", "api_key": "credential-value"}) as span:
+        snapshot = telemetry_snapshot()
+        expected = span.get_span_context()
+    assert snapshot["attributes"] == {"account.id": "acceptance-account", "scope.id": "acceptance-scope"}
+    restored = trace.get_current_span(extract_carrier(snapshot["trace_context"])).get_span_context()
+    assert restored.trace_id == expected.trace_id
+    assert restored.span_id == expected.span_id
+    assert "credential-value" not in str(snapshot)
     provider.shutdown()
 
 

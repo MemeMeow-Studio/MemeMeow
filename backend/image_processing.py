@@ -22,6 +22,7 @@ from typing import Any, Callable, Iterable, Mapping
 from uuid import UUID, uuid4
 
 from sqlalchemy import and_, func, or_, select, text, tuple_, update
+from runtime_telemetry import restored_operation, telemetry_snapshot
 
 from backend.database import (
     DatabaseError,
@@ -894,6 +895,7 @@ class ImageProcessingRepository:
             metadata_hash=metadata_hash,
             processing_config_hash=config_hash,
             processing_config=dict(config or {}),
+            telemetry_context=telemetry_snapshot(),
             reverse_image_policy=policy,
             auto_name=auto_name_value,
             processing_mode=processing_mode,
@@ -2362,6 +2364,11 @@ class ImageProcessingWorker:
                 return None
 
     def _prepare_task(self, job: ImageProcessingJob, stage: str) -> str:
+        """使用已有 job 快照恢复调查字段，跨线程及恢复调度均保留提交关联。"""
+        with restored_operation("image.stage.submit", snapshot=job.telemetry_context, attributes={"scope.id": job.scope_id, "job.id": str(job.id), "image.stage": stage}):
+            return self._prepare_observed_task(job, stage)
+
+    def _prepare_observed_task(self, job: ImageProcessingJob, stage: str) -> str:
         """创建/复用唯一叶子 Task；Agent acquire 发生在 Task dedupe 后。"""
         if stage not in STAGE_TASK_TYPES:
             raise ImageProcessingError("invalid_stage_transition")
