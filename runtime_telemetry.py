@@ -37,8 +37,8 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExportResult,
 from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 from opentelemetry.trace import Status, StatusCode
 
-_CREDENTIAL_KEY = re.compile(r"(?i)(password|passwd|secret|(?:access|refresh|session|auth|bearer|id)[_ .-]?token(?:$|[_ .-])|(?:^|[_ .-])token(?:$|[_ .-])|authorization|cookie|api[_-]?key|credential)")
-_CREDENTIAL_TEXT = re.compile(r"(?i)(?:bearer\s+[^\s\"\x27,;]+|(?:api[_-]?key|password|token|secret|authorization)[\"\x27]?\s*[=:]\s*[\"\x27]?[^\s\"\x27,;]+)")
+_CREDENTIAL_KEY = re.compile(r"(?i)(password|passwd|secret|(?:access|refresh|session|auth|bearer|id)[_ .-]?token(?:$|[_ .-])|(?:^|[_ .-])token(?:$|[_ .-])|authorization|cookie|api[_-]?key|credential|signature|(?:^|[_ .-])sig(?:$|[_ .-]))")
+_CREDENTIAL_TEXT = re.compile(r"(?i)(?:bearer\s+[^\s\"\x27,;&]+|(?:api[_-]?key|password|token|secret|authorization|signature|sig)[\"\x27]?\s*[=:]\s*[\"\x27]?[^\s\"\x27,;&]+)")
 _BINARY_KEY = re.compile(r"(?i)(base64|image_url|image_data|file_content|binary)")
 _PROPAGATOR = TraceContextTextMapPropagator()
 _LOCK = Lock()

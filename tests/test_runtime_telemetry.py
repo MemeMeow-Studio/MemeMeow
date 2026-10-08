@@ -99,6 +99,24 @@ def test_camel_case_credentials_preserve_token_usage():
     assert "connection timeout" in result["text"]
 
 
+def test_real_sdk_filters_signed_url_credentials():
+    """自动请求属性中的签名值在真实 SDK 导出边界过滤，其他查询字段保留。"""
+    memory = InMemorySpanExporter()
+    exporter = _ProtectedExporter(memory)
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with provider.get_tracer("telemetry-test").start_as_current_span("http.request") as span:
+        span.set_attribute("url.full", "https://example.com/file?signature=signature-credential&sig=short-credential&operation=inspect")
+        record_content(span, "saved.record", {"signature": "structured-credential", "text": "request timeout"})
+    records = memory.get_finished_spans()
+    assert len(records) == 1
+    assert "operation=inspect" in records[0].attributes["url.full"]
+    assert "request timeout" in records[0].attributes["saved.record"]
+    for credential in ("signature-credential", "short-credential", "structured-credential"):
+        assert credential not in str(records[0].attributes)
+    provider.shutdown()
+
+
 def test_duration_histogram_keeps_subsecond_thresholds():
     """真实 SDK 使用秒数边界，将 200 毫秒前后的等待分别聚合。"""
     reader = InMemoryMetricReader()
