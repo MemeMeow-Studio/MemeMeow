@@ -130,6 +130,7 @@ ALLOWED_REQUEST_FIELDS = frozenset(
         "timeout_seconds",
         "wait",
         "callback_token",
+        "trace_context",
         "workspace_selector",
         "workspace_capability",
         "visual_snapshot_sha256",
