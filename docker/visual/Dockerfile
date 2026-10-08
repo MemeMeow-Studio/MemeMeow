@@ -24,6 +24,7 @@ COPY backend ./backend
 # backend.database 的 Repository 导入会复用 executor.agent_limits 的公共校验。
 COPY executor ./executor
 COPY visual_service.py ./visual_service.py
+COPY runtime_telemetry.py ./runtime_telemetry.py
 
 ENV PYTHONUNBUFFERED=1 \
     MEMEMEOW_VISUAL_MODEL_REPO=/opt/dinov2 \

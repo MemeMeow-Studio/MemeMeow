@@ -29,6 +29,7 @@ from opentelemetry.instrumentation.urllib import URLLibInstrumentor
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import MetricExportResult, PeriodicExportingMetricReader
+from opentelemetry.sdk.metrics.view import ExplicitBucketHistogramAggregation, View
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import Event, SpanLimits, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExportResult, SpanExporter
@@ -41,6 +42,12 @@ _BINARY_KEY = re.compile(r"(?i)(base64|image_url|image_data|file_content|binary)
 _PROPAGATOR = TraceContextTextMapPropagator()
 _LOCK = Lock()
 _RUNTIME: TelemetryRuntime | None = None
+SECONDS_HISTOGRAM_BOUNDARIES = (0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.25, 0.5, 1, 2, 3, 5, 10, 30, 60, 120, 300)
+
+
+def duration_views() -> list[View]:
+    """为秒数 histogram 提供包含数据库与 HTTP 告警阈值的官方 View。"""
+    return [View(instrument_type=metrics.Histogram, instrument_unit="s", aggregation=ExplicitBucketHistogramAggregation(boundaries=SECONDS_HISTOGRAM_BOUNDARIES))]
 
 
 @dataclass(frozen=True)
@@ -201,7 +208,7 @@ class TelemetryRuntime:
         self.tracer_provider.add_span_processor(BatchSpanProcessor(self.span_exporter, max_queue_size=2048, max_export_batch_size=128, schedule_delay_millis=2000, export_timeout_millis=5000))
         self.metric_exporter = _MetricExporter(endpoint=f"{config.endpoint}/v1/metrics", timeout=5, headers=headers)
         reader = PeriodicExportingMetricReader(self.metric_exporter, export_interval_millis=10000, export_timeout_millis=5000)
-        self.meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
+        self.meter_provider = MeterProvider(resource=resource, metric_readers=[reader], views=duration_views())
         self.log_exporter = _LogExporter(endpoint=f"{config.endpoint}/v1/logs", timeout=5, headers=headers)
         self.logger_provider = LoggerProvider(resource=resource, meter_provider=self.meter_provider)
         self.logger_provider.add_log_record_processor(BatchLogRecordProcessor(self.log_exporter, max_queue_size=2048, max_export_batch_size=128, schedule_delay_millis=2000, export_timeout_millis=5000))

@@ -3,8 +3,10 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
-from runtime_telemetry import _ProtectedExporter, extract_carrier, protected_content, record_content
+from runtime_telemetry import SECONDS_HISTOGRAM_BOUNDARIES, _ProtectedExporter, duration_views, extract_carrier, protected_content, record_content
 
 
 def test_content_preserves_debug_and_filters_credentials():
@@ -49,3 +51,17 @@ def test_usage_tokens_remain_available():
     result = protected_content({"tokens": {"input": 100, "output": 20}, "session_token": "credential-value", "token": "credential-value"})
     assert result["tokens"] == {"input": 100, "output": 20}
     assert "credential-value" not in str(result)
+
+
+def test_duration_histogram_keeps_subsecond_thresholds():
+    """真实 SDK 使用秒数边界，将 200 毫秒前后的等待分别聚合。"""
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader], views=duration_views())
+    histogram = provider.get_meter("telemetry-test").create_histogram("db_pool_wait", unit="s")
+    histogram.record(0.19)
+    histogram.record(0.21)
+    data = reader.get_metrics_data().resource_metrics[0].scope_metrics[0].metrics[0].data.data_points[0]
+    assert data.explicit_bounds == SECONDS_HISTOGRAM_BOUNDARIES
+    assert data.bucket_counts[5] == 1
+    assert data.bucket_counts[6] == 1
+    provider.shutdown()
