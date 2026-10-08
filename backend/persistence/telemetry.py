@@ -2,12 +2,23 @@
 from __future__ import annotations
 
 import time
+from threading import Lock
 
 from opentelemetry import metrics
 from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.pool import QueuePool
+
+_INSTRUMENT_LOCK = Lock()
+
+
+def instrument_engine_creation() -> None:
+    """注册成熟库的全局 Engine 创建观测，依赖不兼容时立即报错。"""
+    with _INSTRUMENT_LOCK:
+        instrumentor = SQLAlchemyInstrumentor()
+        if not instrumentor.is_instrumented_by_opentelemetry:
+            instrumentor.instrument(raise_exception_on_conflict=True)
 
 
 class TelemetryQueuePool(QueuePool):
@@ -29,7 +40,7 @@ class TelemetryQueuePool(QueuePool):
 
 def instrument_engine(engine: Engine) -> None:
     """为现有 Engine 注册 SQL span 与连接池 gauges，只读取池内存状态。"""
-    SQLAlchemyInstrumentor().instrument(engine=engine)
     meter = metrics.get_meter("mememeow.database")
+    meter.create_counter("db_pool_acquire_timeouts", unit="{timeout}").add(0)
     for name, getter in (("checked_out", engine.pool.checkedout), ("checked_in", engine.pool.checkedin), ("size", engine.pool.size)):
         meter.create_observable_gauge(f"db_pool_{name}", unit="{connection}", callbacks=[lambda options, read=getter: [metrics.Observation(read())]])

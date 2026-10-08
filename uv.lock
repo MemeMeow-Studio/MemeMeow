@@ -494,7 +494,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.0,<3" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "python-multipart", specifier = ">=0.0.9" },
-    { name = "sqlalchemy", specifier = ">=2.0,<3" },
+    { name = "sqlalchemy", specifier = ">=2.0,<2.1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
     { name = "werkzeug", specifier = ">=3.1,<4" },
 ]
