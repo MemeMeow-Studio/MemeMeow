@@ -14,6 +14,7 @@ from uuid import UUID
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
+from runtime_telemetry import correlation_attributes, trace_carrier
 
 from backend.agent_resume import append_error_history, append_task_error_history, normalize_identifier, sanitize_error
 from executor.agent_limits import validate_agent_concurrency, validate_agent_concurrency_at_most
@@ -527,6 +528,7 @@ class TaskRepository:
             active = self.session.scalar(select(func.count()).select_from(Task).where(*active_filters)) or 0
             if int(active) >= int(lane_backpressure):
                 raise DatabaseError("agent_backpressure")
+        payload = {**payload, "_telemetry": {"trace_context": trace_carrier(), "attributes": correlation_attributes()}}
         task = Task(
             id=task_id or uuid.uuid4().hex,
             scope_id=self.scope.scope_id,

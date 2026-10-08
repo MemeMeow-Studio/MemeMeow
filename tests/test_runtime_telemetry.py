@@ -6,7 +6,16 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
-from runtime_telemetry import SECONDS_HISTOGRAM_BOUNDARIES, _ProtectedExporter, duration_views, extract_carrier, protected_content, record_content
+from runtime_telemetry import SECONDS_HISTOGRAM_BOUNDARIES, _ProtectedExporter, correlation_attributes, duration_views, extract_carrier, protected_content, record_content
+
+
+def test_correlation_copies_only_trusted_investigation_fields():
+    """真实 SDK span 的关联快照仅包含账户与范围，不携带凭据或授权内容。"""
+    provider = TracerProvider()
+    with provider.get_tracer("telemetry-test").start_as_current_span("request", attributes={"account.id": "acceptance-account", "scope.id": "acceptance-scope", "authorization": "secret-value"}):
+        assert correlation_attributes() == {"account.id": "acceptance-account", "scope.id": "acceptance-scope"}
+    assert correlation_attributes() == {}
+    provider.shutdown()
 
 
 def test_content_preserves_debug_and_filters_credentials():

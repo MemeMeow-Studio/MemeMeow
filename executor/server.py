@@ -131,6 +131,7 @@ ALLOWED_REQUEST_FIELDS = frozenset(
         "wait",
         "callback_token",
         "trace_context",
+        "trace_attributes",
         "workspace_selector",
         "workspace_capability",
         "visual_snapshot_sha256",
@@ -369,6 +370,7 @@ class TaskState:
     reminder_sent: bool = False
     database_maintenance: dict[str, object] | None = None
     trace_context: dict[str, str] = field(default_factory=dict, repr=False)
+    trace_attributes: dict[str, str] = field(default_factory=dict, repr=False)
 
     def public(self) -> dict[str, object]:
         """返回 API 可见状态，不暴露进程对象和 executor 本地实现细节。"""
@@ -933,6 +935,7 @@ class Executor:
             "workspace_capability": workspace_capability,
             MODEL_CAPABILITY_FIELD: model_capability,
             "trace_context": {key: value for key, value in (payload.get("trace_context") or {}).items() if key in {"traceparent", "tracestate"} and isinstance(value, str) and len(value) <= 512} if isinstance(payload.get("trace_context"), dict) else {},
+            "trace_attributes": {key: value for key, value in (payload.get("trace_attributes") or {}).items() if key in {"account.id", "scope.id"} and isinstance(value, str) and len(value) <= 128} if isinstance(payload.get("trace_attributes"), dict) else {},
         }
         self._verify_workspace_capability(values)
         policy = payload.get("analysis_policy")
@@ -1067,6 +1070,7 @@ class Executor:
                 analysis_policy=values.get("analysis_policy"),
                 observed_cost=source.observed_cost if source else None,
                 trace_context=values["trace_context"],
+                trace_attributes=values["trace_attributes"],
             )
             self.tasks[task.executor_attempt_id] = task
             self.futures[task.executor_attempt_id] = self.pool.submit(self._run, task)
@@ -1323,7 +1327,7 @@ class Executor:
         if not TelemetryConfig.from_env("mememeow-executor").enabled:
             self._run_observed_task(task)
             return
-        attributes = {"task.id": task.business_task_id, "attempt.id": task.executor_attempt_id, "workspace.selector": task.workspace_selector, "business.image_relative_path": task.image_relative_path}
+        attributes = {**task.trace_attributes, "task.id": task.business_task_id, "attempt.id": task.executor_attempt_id, "workspace.selector": task.workspace_selector, "business.image_relative_path": task.image_relative_path}
         started_at = time.time()
         parent = extract_carrier(task.trace_context)
         links = [trace.Link(trace.get_current_span(parent).get_span_context())] if trace.get_current_span(parent).get_span_context().is_valid else []

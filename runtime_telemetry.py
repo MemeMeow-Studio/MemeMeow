@@ -32,7 +32,7 @@ from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import MetricExportResult, PeriodicExportingMetricReader
 from opentelemetry.sdk.metrics.view import ExplicitBucketHistogramAggregation, View
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import Event, SpanLimits, TracerProvider
+from opentelemetry.sdk.trace import Event, ReadableSpan, SpanLimits, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExportResult, SpanExporter
 from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 from opentelemetry.trace import Status, StatusCode
@@ -276,6 +276,13 @@ def trace_carrier() -> dict[str, str]:
     return carrier
 
 
+def correlation_attributes() -> dict[str, str]:
+    """从当前 SDK span 复制受信调查字段，供已有执行快照传递。"""
+    span = trace.get_current_span()
+    attributes = span.attributes if isinstance(span, ReadableSpan) else {}
+    return {key: value for key, value in (attributes or {}).items() if key in {"account.id", "scope.id"} and isinstance(value, str)}
+
+
 def extract_carrier(carrier: Mapping[str, str]) -> Context:
     """读取仅用于关联的 W3C traceparent 与 tracestate。"""
     return _PROPAGATOR.extract(dict(carrier))
@@ -287,7 +294,7 @@ def observed_operation(operation: str, *, unit: str, attributes: Mapping[str, An
     started = time.monotonic()
     meter = metrics.get_meter("mememeow.runtime")
     labels = {"operation": operation, "unit": unit, **{key: value for key, value in (attributes or {}).items() if key in {"provider", "model"} and isinstance(value, str)}}
-    with trace.get_tracer("mememeow.runtime").start_as_current_span(operation, context=context, attributes=protected_content(dict(attributes or {}), environment_credentials())) as span:
+    with trace.get_tracer("mememeow.runtime").start_as_current_span(operation, context=context, attributes=protected_content({**correlation_attributes(), **dict(attributes or {})}, environment_credentials())) as span:
         result = "succeeded"
         try:
             yield span

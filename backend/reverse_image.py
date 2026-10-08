@@ -843,6 +843,7 @@ class ReverseImageService:
                     raise ValueError("callback_execution_mismatch")
             except Exception as exc:  # noqa: BLE001 - callback 失败不得暴露任务状态
                 raise ReverseImageError("agent_callback_invalid_execution", "内部执行绑定无效", status_code=401) from exc
+        trace.get_current_span().set_attributes((task.payload.get("_telemetry") or {}).get("attributes") or {})
         return task
 
     @staticmethod

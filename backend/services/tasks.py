@@ -17,7 +17,7 @@ import threading
 from sqlalchemy import select
 from opentelemetry import metrics, trace
 from opentelemetry.context import Context
-from runtime_telemetry import record_content
+from runtime_telemetry import extract_carrier, record_content
 
 from backend.persistence.models import (
     EMBEDDING_DIMENSIONS,
@@ -1587,6 +1587,11 @@ class PostgresTaskService:
                     return
                 task_payload["_claim_scope_id"] = claim_scope.scope_id
             current_span = trace.get_current_span()
+            snapshot = task_payload.get("_telemetry") or {}
+            submitted = trace.get_current_span(extract_carrier(snapshot.get("trace_context") or {})).get_span_context()
+            if submitted.is_valid:
+                current_span.add_link(submitted)
+            current_span.set_attributes(snapshot.get("attributes") or {})
             current_span.set_attribute("attempt.number", claim.attempt_count)
             current_span.set_attribute("task.type", claim.task_type)
             current_span.set_attribute("task.result", "unknown")
