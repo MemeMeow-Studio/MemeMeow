@@ -33,6 +33,7 @@ from starlette.concurrency import run_in_threadpool
 
 from backend.config import Settings
 from backend.callbacks import (
+    CallbackBinding,
     CallbackError,
     DEFAULT_CALLBACK_REGISTRY,
     callback_input_digest,
@@ -44,7 +45,6 @@ from backend.callbacks import (
 from backend.database import DatabaseError, DatabaseResources, ReverseImageUsageEvent, ScopeContext, Task, utcnow
 from backend.operation_policy import AllowAllOperationPolicy, GrantAssociation, GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations, PolicyFailure, require_allowed
 from backend.operation_diagnostics import OperationDiagnostics
-from backend.security.callbacks import CallbackBinding
 from runtime_telemetry import observed_operation, record_content
 
 
