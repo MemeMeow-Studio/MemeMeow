@@ -10,10 +10,12 @@ from backend.background_naming import BackgroundNamingWorker, NamingConfig
 from backend.config import Settings
 from backend.persistence.engine import check_database, create_engine_for_settings
 from backend.persistence.resources import DatabaseResources
+from runtime_telemetry import start_telemetry
 
 
 def run_naming_service(settings: Settings, config: NamingConfig, *, scope_pool: Callable[[Session, str], str | None] | None = None, require_local_scope: bool = True, expected_revision: str | None = None) -> None:
     """校验数据库并运行命名进程，接收终止信号后等待当前请求完成。"""
+    telemetry = start_telemetry("mememeow-auto-rename")
     engine = create_engine_for_settings(settings)
     try:
         check_database(engine, expected_revision=expected_revision or settings.expected_database_revision, require_local_installation=require_local_scope)
@@ -31,6 +33,8 @@ def run_naming_service(settings: Settings, config: NamingConfig, *, scope_pool: 
         worker.run()
     finally:
         engine.dispose()
+        if telemetry is not None:
+            telemetry.close()
 
 
 if __name__ == "__main__":

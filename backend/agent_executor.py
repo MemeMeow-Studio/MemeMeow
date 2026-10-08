@@ -20,6 +20,7 @@ from urllib.parse import quote, urlsplit
 
 from executor.model_capability import MODEL_CAPABILITY_FIELD, ModelCapabilityError, validate_model_capability
 from executor.analysis_policy import parse_analysis_policy
+from runtime_telemetry import trace_carrier
 
 
 class AgentExecutorError(RuntimeError):
@@ -463,6 +464,7 @@ class AgentExecutorClient:
                     "reverse_image_policy": reverse_image_policy,
                     "timeout_seconds": timeout_value,
                     "wait": False,
+                    "trace_context": trace_carrier(),
                     **({"session_id": session_id} if session_id else {}),
                     **({"resume_of_attempt_id": resume_of_attempt_id} if resume_of_attempt_id else {}),
                     **({"processing_config_hash": processing_config_hash} if processing_config_hash else {}),

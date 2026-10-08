@@ -1,0 +1,44 @@
+# 使用真实 OpenTelemetry SDK 检查内容保护、导出属性与执行上下文。
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+from runtime_telemetry import _ProtectedExporter, extract_carrier, protected_content, record_content
+
+
+def test_content_preserves_debug_and_filters_credentials():
+    """业务正文可调查，结构化凭据、认证文本和二进制内容被处理。"""
+    result = protected_content({"prompt": "数据库等待", "api_key": "credential-value", "error": "request timeout; token=credential-value", "tool": {"authorization": "Bearer credential-value"}, "image_data": b"image bytes"})
+    assert result["prompt"] == "数据库等待"
+    assert "credential-value" not in str(result)
+    assert "request timeout" in result["error"]
+    assert "binary content omitted" in result["image_data"]
+
+
+def test_real_sdk_exports_protected_attributes_events_and_status():
+    """生成实际 SDK span，验证专用 exporter 处理自动事件与关联字段。"""
+    memory = InMemorySpanExporter()
+    exporter = _ProtectedExporter(memory)
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with provider.get_tracer("telemetry-test").start_as_current_span("sqlite.read") as span:
+        span.set_attribute("task.id", "telemetry-test-task")
+        span.set_attribute("authorization", "Bearer credential-value")
+        span.add_event("sqlite.error", {"message": "database locked; password=credential-value"})
+        record_content(span, "saved.record", {"text": "调查正文", "password": "credential-value"})
+    records = memory.get_finished_spans()
+    assert len(records) == 1
+    assert records[0].attributes["task.id"] == "telemetry-test-task"
+    assert "credential-value" not in str(records[0].attributes)
+    assert "credential-value" not in str(records[0].events[0].attributes)
+    assert "database locked" in records[0].events[0].attributes["message"]
+    assert exporter.last_success > 0
+    provider.shutdown()
+
+
+def test_trace_carrier_does_not_supply_business_authorization():
+    """W3C parser 只生成追踪上下文，不产生身份或授权字段。"""
+    context = extract_carrier({"traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01", "authorization": "Bearer credential-value"})
+    assert trace.get_current_span(context).get_span_context().is_valid
+    assert context.get("authorization") is None

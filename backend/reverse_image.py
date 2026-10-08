@@ -44,6 +44,7 @@ from backend.callbacks import (
 from backend.database import DatabaseError, DatabaseResources, ReverseImageUsageEvent, ScopeContext, Task, utcnow
 from backend.operation_policy import AllowAllOperationPolicy, GrantAssociation, GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations, PolicyFailure, require_allowed
 from backend.operation_diagnostics import OperationDiagnostics
+from runtime_telemetry import observed_operation, record_content
 
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
@@ -773,7 +774,10 @@ class ReverseImageService:
 
     async def _network_search_async(self, request: ReverseImageRequest) -> dict[str, Any]:
         """异步调用当前 Provider；同步实现只在线程中执行网络阶段。"""
-        return await NetworkReverseImageSearchAdapter(self._provider()).search_async(request)
+        with observed_operation("reverse_image", unit="python_provider_call", attributes={"provider": self.provider_name, "scope.id": self.scope.scope_id}) as span:
+            result = await NetworkReverseImageSearchAdapter(self._provider()).search_async(request)
+            record_content(span, "provider.response", result)
+            return result
 
     async def _settle_started_provider(
         self,

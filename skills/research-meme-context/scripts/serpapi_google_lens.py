@@ -201,8 +201,12 @@ def main(arguments: list[str] | None = None) -> int:
         print("缺少当前任务 callback 凭据，请从 Runner 注入", file=sys.stderr)
         return 2
     body, content_type = _multipart(fields, content, image.name)
+    headers = {"Content-Type": content_type, "Accept": "application/json", "X-MemeMeow-Callback": callback_token}
+    traceparent = os.getenv("MEMEMEOW_AGENT_TRACEPARENT")
+    if traceparent:
+        headers["traceparent"] = traceparent
     try:
-        response = urlopen(Request(endpoint, data=body, headers={"Content-Type": content_type, "Accept": "application/json", "X-MemeMeow-Callback": callback_token}, method="POST"), timeout=60)
+        response = urlopen(Request(endpoint, data=body, headers=headers, method="POST"), timeout=60)
         payload = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         try:

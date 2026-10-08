@@ -16,7 +16,12 @@ RUN npm install --global --no-fund --no-audit opencode-ai@1.18.18
 
 # Executor 使用与项目一致的校验库和日志库，依赖随镜像安装。
 RUN python3 -m venv /opt/mememeow/python \
-    && /opt/mememeow/python/bin/pip install --no-cache-dir pydantic==2.13.4 loguru==0.7.3
+    && /opt/mememeow/python/bin/pip install --no-cache-dir pydantic==2.13.4 loguru==0.7.3 \
+       opentelemetry-sdk==1.45.1 opentelemetry-exporter-otlp-proto-http==1.45.1 \
+       opentelemetry-instrumentation-httpx==0.66b1 opentelemetry-instrumentation-requests==0.66b1 \
+       opentelemetry-instrumentation-urllib==0.66b1 opentelemetry-instrumentation-threading==0.66b1 \
+       httpx requests
+COPY runtime_telemetry.py /opt/mememeow/runtime_telemetry.py
 COPY .opencode/plugins /opt/mememeow/plugins
 
 COPY skills/research-meme-context /skills/research-meme-context

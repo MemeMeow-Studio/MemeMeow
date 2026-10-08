@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
@@ -18,6 +19,8 @@ from backend.errors import ErrorBody
 from backend.operation_policy import AllowAllOperationPolicy, OperationPolicyError
 from backend.reverse_image import ReverseImageProviderBinding
 from backend.scope import LocalScopeResolver, ScopeResolutionError, ScopeServiceFactory
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from runtime_telemetry import TelemetryConfig, start_telemetry
 
 
 def _validate_resolver(scope_resolver: object) -> None:
@@ -65,11 +68,25 @@ def create_application(
         # 自定义 factory 完全拥有 scope 服务装配，不能同时声明一个不会被它消费的绑定。
         raise ValueError("reverse_image_provider_binding_requires_managed_factory")
     configured_extensions = tuple(extensions or ())
+    telemetry_config = TelemetryConfig.from_env()
+
+    @asynccontextmanager
+    async def observed_lifespan(application: FastAPI):
+        """把 SDK 生命周期与应用资源生命周期绑定，启动时报告配置状态。"""
+        runtime = start_telemetry()
+        application.state.telemetry_enabled = runtime is not None
+        try:
+            async with lifespan(application):
+                yield
+        finally:
+            if runtime is not None:
+                runtime.close()
+
     created = FastAPI(
         title=route_template.title,
         version=route_template.version,
         description=route_template.description,
-        lifespan=lifespan,
+        lifespan=observed_lifespan,
         responses={
             400: {"model": ErrorBody},
             403: {"model": ErrorBody},
@@ -107,6 +124,8 @@ def create_application(
         created.state.model_capability_provider = model_capability_provider
     if reverse_image_provider_binding is not None:
         created.state.reverse_image_provider_binding = reverse_image_provider_binding
+    if telemetry_config.enabled:
+        FastAPIInstrumentor.instrument_app(created, excluded_urls="/health", http_capture_headers_server_request=[], http_capture_headers_server_response=[])
     return created
 
 

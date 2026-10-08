@@ -15,6 +15,9 @@ from uuid import UUID, uuid4
 
 import threading
 from sqlalchemy import select
+from opentelemetry import metrics, trace
+from opentelemetry.context import Context
+from runtime_telemetry import record_content
 
 from backend.persistence.models import (
     EMBEDDING_DIMENSIONS,
@@ -1516,6 +1519,11 @@ class PostgresTaskService:
         self._executor.submit(self._run, task_id)
 
     def _run(self, task_id: str, *, preclaimed: Task | None = None) -> None:
+        """建立独立 Worker 执行 trace，最终状态由持久提交位置记录。"""
+        with trace.get_tracer("mememeow.tasks").start_as_current_span("task.execution", context=Context(), attributes={"task.id": task_id, "scope.id": self.scope.scope_id}):
+            self._run_with_telemetry(task_id, preclaimed=preclaimed)
+
+    def _run_with_telemetry(self, task_id: str, *, preclaimed: Task | None = None) -> None:
         """执行已认领任务并以 claim generation fencing 写回终态。"""
         claim = preclaimed
         try:
@@ -1578,6 +1586,11 @@ class PostgresTaskService:
                 if claim_scope.scope_id != self.scope.scope_id:
                     return
                 task_payload["_claim_scope_id"] = claim_scope.scope_id
+            current_span = trace.get_current_span()
+            current_span.set_attribute("attempt.number", claim.attempt_count)
+            current_span.set_attribute("task.type", claim.task_type)
+            current_span.set_attribute("task.result", "unknown")
+            metrics.get_meter("mememeow.tasks").create_histogram("task_queue_wait", unit="s").record(max(0.0, (utcnow() - claim.created_at).total_seconds()), {"task_type": claim.task_type})
             handler = self._worker_manager.handler(claim.task_type) if self._worker_manager is not None else self._handlers.get(claim.task_type)
             if handler is None:
                 self._fenced_failure(task_id, generation, message="任务处理器不可用", error={"error": "task_handler_missing", "message": "当前服务未注册此任务类型"}, retry=False)
@@ -1880,20 +1893,16 @@ class PostgresTaskService:
                 changed = bool(complete(task_id, generation, self.owner, result=result))
                 if changed and self._operation_policy is not None:
                     self._operation_policy.settle_task(environment.uow.session, self.scope, task_id)
-                return changed
-            # 兼容尚未提供原子扩展的宿主 repository；标准 PostgreSQL
-            # repository 始终走上面的单事务路径。
-            changed = environment.tasks.update_fenced(
-                task_id,
-                generation,
-                self.owner,
-                status="succeeded",
-                progress=1.0,
-                message="任务完成",
-                result=result,
-            )
+            else:
+                changed = environment.tasks.update_fenced(
+                    task_id, generation, self.owner, status="succeeded",
+                    progress=1.0, message="任务完成", result=result,
+                )
         if changed:
-            self._write_reverse_image_provenance(task_id, generation)
+            if not callable(complete):
+                self._write_reverse_image_provenance(task_id, generation)
+            trace.get_current_span().set_attribute("task.result", "succeeded")
+            metrics.get_meter("mememeow.tasks").create_counter("task_terminals", unit="{task}").add(1, {"result": "succeeded"})
         return changed
 
     def _fenced_failure(self, task_id: str, generation: int, *, message: str, error: dict[str, Any], retry: bool, result: Any | None = None, retry_delay_seconds: int = 0, resume_available: bool | None = None, resume_reason: str | None = None, session_id: str | None = None, executor_attempt_id: str | None = None) -> bool:
@@ -1920,6 +1929,11 @@ class PostgresTaskService:
         # 任务。这里不能提前按 task_id 单独提交新的 future：preclaimed 的
         # 兼容调用可能尚未登记调度标记，会让同一任务在旧 claim 收束事务刚
         # 完成后被重复认领，既造成恢复竞态，也让调用方无法观察到 queued 快照。
+        if changed:
+            trace.get_current_span().set_attribute("task.result", "queued" if _should_retry else "failed")
+            record_content(trace.get_current_span(), "task.error", error)
+            if not _should_retry:
+                metrics.get_meter("mememeow.tasks").create_counter("task_terminals", unit="{task}").add(1, {"result": "failed"})
         return changed
 
     def _with_reverse_image_audit(self, task_id: str, result: Any, *, write_provenance: bool = False) -> dict[str, Any]:

@@ -21,6 +21,7 @@ from backend.metadata import MetadataError
 from backend.services.metadata import PostgresMetadataService
 from backend.embedding_input import build_text_input
 from backend.text_updates import enqueue_text_update
+from runtime_telemetry import observed_operation, record_content
 
 # 检索服务沿用旧 logger 名称，避免服务拆分改变日志路由。
 logger = logging.getLogger("backend.pg_services")
@@ -46,7 +47,10 @@ class PostgresSearchService:
 
     def _embedding(self, text: str) -> list[float]:
         """调用模型并拒绝非 1024 维或零向量响应。"""
-        response = self._client().embeddings.create(model=self.model, input=text, encoding_format="float")
+        with observed_operation("embedding", unit="python_provider_call", attributes={"provider": "openai_compatible", "model": self.model, "scope.id": self.scope.scope_id}) as span:
+            record_content(span, "provider.input", {"input": text})
+            response = self._client().embeddings.create(model=self.model, input=text, encoding_format="float")
+            record_content(span, "provider.response", {"model": response.model, "usage": response.usage.model_dump() if response.usage else None, "dimension": len(response.data[0].embedding)})
         vector = np.asarray(response.data[0].embedding, dtype=float)
         if vector.shape != (EMBEDDING_DIMENSIONS,) or not np.linalg.norm(vector):
             raise RuntimeError("embedding_dimensions_mismatch")
@@ -158,7 +162,10 @@ class PostgresSearchService:
         """使用可选 LLM 改写查询；失败由 API 回退普通查询。"""
         if not self.settings.llm_enhance_model:
             raise RuntimeError("llm_enhance_not_configured")
-        response = self._client().chat.completions.create(model=self.settings.llm_enhance_model, messages=[{"role": "user", "content": f"将下面内容改写为一句适合检索表情包的简短描述，只输出描述：{query}"}], temperature=0.2)
+        with observed_operation("query_enhancement", unit="python_provider_call", attributes={"provider": "openai_compatible", "model": self.settings.llm_enhance_model, "scope.id": self.scope.scope_id}) as span:
+            record_content(span, "provider.input", {"query": query})
+            response = self._client().chat.completions.create(model=self.settings.llm_enhance_model, messages=[{"role": "user", "content": f"将下面内容改写为一句适合检索表情包的简短描述，只输出描述：{query}"}], temperature=0.2)
+            record_content(span, "provider.response", response.model_dump())
         value = response.choices[0].message.content
         if not value or not value.strip():
             raise RuntimeError("llm_enhance_invalid")

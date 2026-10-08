@@ -28,6 +28,9 @@ from typing import Any
 from decimal import Decimal
 from loguru import logger
 from urllib.parse import unquote, urlsplit
+from opentelemetry import metrics, trace
+from runtime_telemetry import TelemetryConfig, extract_carrier, protected_content, start_telemetry, trace_carrier
+from executor.sqlite_telemetry import SQLiteTelemetry
 
 try:
     from backend.opencode import RUNTIME_OPENCODE_CONFIG
@@ -364,6 +367,7 @@ class TaskState:
     usage_checked_at: str | None = None
     reminder_sent: bool = False
     database_maintenance: dict[str, object] | None = None
+    trace_context: dict[str, str] = field(default_factory=dict, repr=False)
 
     def public(self) -> dict[str, object]:
         """返回 API 可见状态，不暴露进程对象和 executor 本地实现细节。"""
@@ -927,6 +931,7 @@ class Executor:
             "workspace_selector": workspace_selector,
             "workspace_capability": workspace_capability,
             MODEL_CAPABILITY_FIELD: model_capability,
+            "trace_context": {key: value for key, value in (payload.get("trace_context") or {}).items() if key in {"traceparent", "tracestate"} and isinstance(value, str) and len(value) <= 512} if isinstance(payload.get("trace_context"), dict) else {},
         }
         self._verify_workspace_capability(values)
         policy = payload.get("analysis_policy")
@@ -1060,6 +1065,7 @@ class Executor:
                 result_path=f"task-results/{values['business_task_id']}/{RESULT_FILE_NAME}",
                 analysis_policy=values.get("analysis_policy"),
                 observed_cost=source.observed_cost if source else None,
+                trace_context=values["trace_context"],
             )
             self.tasks[task.executor_attempt_id] = task
             self.futures[task.executor_attempt_id] = self.pool.submit(self._run, task)
@@ -1262,6 +1268,7 @@ class Executor:
             "MEMEMEOW_OPENCODE_SLOT": "0",
             "MEMEMEOW_AGENT_TASK_ID": task.business_task_id,
             "MEMEMEOW_AGENT_EXECUTOR_ATTEMPT_ID": task.executor_attempt_id,
+            "MEMEMEOW_AGENT_TRACEPARENT": trace_carrier().get("traceparent", ""),
             **({"MEMEMEOW_AGENT_CALLBACK_TOKEN": task.callback_token} if task.callback_token else {}),
             "MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL": os.getenv("MEMEMEOW_AGENT_REVERSE_IMAGE_INTERNAL_URL", ""),
             "MEMEMEOW_AGENT_CANDIDATE_MANIFEST": str((task.candidate_root or (RUNTIME_ROOT / "candidates" / task.business_task_id)) / "manifest.json"),
@@ -1311,6 +1318,28 @@ class Executor:
         )
 
     def _run(self, task: TaskState) -> None:
+        """绑定当前 attempt 的观测上下文，业务结果由既有执行流程提供。"""
+        if not TelemetryConfig.from_env("mememeow-executor").enabled:
+            self._run_observed_task(task)
+            return
+        attributes = {"task.id": task.business_task_id, "attempt.id": task.executor_attempt_id, "workspace.selector": task.workspace_selector, "business.image_relative_path": task.image_relative_path}
+        started_at = time.time()
+        parent = extract_carrier(task.trace_context)
+        links = [trace.Link(trace.get_current_span(parent).get_span_context())] if trace.get_current_span(parent).get_span_context().is_valid else []
+        with trace.get_tracer("mememeow.executor").start_as_current_span("agent.attempt", context=extract_carrier({}), links=links, attributes=attributes) as span:
+            observer = SQLiteTelemetry(database=Path(self._task_environment(task)["OPENCODE_DB"]), directory=self._process_directory(task), session=lambda: task.session_id, attributes=attributes, context=trace.set_span_in_context(span), started_at=started_at, secrets=(self.token, self.legacy_api_key, task.callback_token or "", task.workspace_capability or "", task.model_capability or ""))
+            observer.start()
+            try:
+                self._run_observed_task(task)
+            finally:
+                observer.close()
+                span.set_attribute("attempt.result", task.status)
+                span.set_attribute("attempt.reason", protected_content(str(task.error or {}), observer.secrets))
+                meter = metrics.get_meter("mememeow.executor")
+                meter.create_counter("agent_attempts", unit="{attempt}").add(1, {"result": task.status})
+                meter.create_histogram("agent_attempt_duration", unit="s").record(time.time() - started_at)
+
+    def _run_observed_task(self, task: TaskState) -> None:
         """执行 OpenCode 任务并更新状态，失败时保存脱敏后的有限诊断。"""
         with self.lock:
             if task.done.is_set():
@@ -1933,6 +1962,7 @@ def main() -> None:
     configure_executor_diagnostics(Path(os.getenv("MEMEMEOW_EXECUTOR_DIAGNOSTICS_ROOT", str(RUNTIME_ROOT / "executor-logs"))))
     host = os.getenv("MEMEMEOW_AGENT_EXECUTOR_HOST", "0.0.0.0")
     port = _env_int("MEMEMEOW_AGENT_EXECUTOR_PORT", 8277, 1, 65535)
+    telemetry = start_telemetry("mememeow-executor")
     executor = Executor()
     server = ExecutorHTTPServer((host, port), executor)
     try:
@@ -1942,6 +1972,8 @@ def main() -> None:
     finally:
         executor.close()
         server.server_close()
+        if telemetry is not None:
+            telemetry.close()
 
 
 if __name__ == "__main__":

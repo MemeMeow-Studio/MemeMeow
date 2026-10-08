@@ -21,6 +21,7 @@ from openai import AsyncOpenAI
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
+from runtime_telemetry import observed_operation, record_content
 
 from backend.agent_resume import sanitize_error
 from backend.image_naming import normalize_display_name, saved_filename
@@ -186,6 +187,14 @@ class BackgroundNamingWorker:
         return count
 
     async def _request_name(self, content: bytes, extension: str) -> str:
+        """测量已配置命名客户端，图片只记录类型和大小。"""
+        with observed_operation("auto_rename", unit="python_provider_call", attributes={"provider": "openai_compatible", "model": self.config.model}) as span:
+            record_content(span, "provider.input", {"extension": extension, "image_size_bytes": len(content)})
+            name = await self._request_name_observed(content, extension)
+            record_content(span, "provider.response", {"display_name": name}, secrets=(self.config.api_key,))
+            return name
+
+    async def _request_name_observed(self, content: bytes, extension: str) -> str:
         """直接发送受控图片并返回合法名称，以总时间限制包围唯一模型请求。"""
         mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif"}[extension]
         async with AsyncOpenAI(base_url=self.config.base_url, api_key=self.config.api_key, max_retries=0, timeout=self.config.timeout_seconds) as client:
