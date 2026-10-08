@@ -10,12 +10,13 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from sqlalchemy import create_engine, select, text
+import sqlalchemy
+from sqlalchemy import select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from backend.persistence.query_diagnostics import attach_query_diagnostics
-from backend.persistence.telemetry import TelemetryQueuePool, instrument_engine
+from backend.persistence.telemetry import TelemetryQueuePool, instrument_engine, instrument_engine_creation
 from runtime_telemetry import TelemetryConfig
 
 from backend.persistence.models import (
@@ -49,14 +50,16 @@ def database_url_from_env() -> str:
 
 def create_engine_for_url(url: str | None = None, **kwargs: Any) -> Engine:
     """创建进程级 SQLAlchemy Engine 与连接池。"""
-    if TelemetryConfig.from_env().enabled:
+    enabled = TelemetryConfig.from_env().enabled
+    if enabled:
         kwargs.setdefault("poolclass", TelemetryQueuePool)
+        instrument_engine_creation()
     try:
-        engine = create_engine(url or database_url_from_env(), pool_pre_ping=True, future=True, **kwargs)
+        engine = sqlalchemy.create_engine(url or database_url_from_env(), pool_pre_ping=True, future=True, **kwargs)
     except SQLAlchemyError as exc:
         raise DatabaseError("database_engine_failed") from exc
     attach_query_diagnostics(engine)
-    if TelemetryConfig.from_env().enabled:
+    if enabled:
         instrument_engine(engine)
     return engine
 
