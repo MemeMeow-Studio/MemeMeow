@@ -7,6 +7,7 @@
 - `MEMEMEOW_TELEMETRY_ENABLED`：只接受 `true` 或 `false`。
 - `MEMEMEOW_TELEMETRY_ENDPOINT`：Collector OTLP HTTP 基础地址，不包含凭据、查询参数或 fragment。
 - `MEMEMEOW_TELEMETRY_ENVIRONMENT`：部署环境，默认 `development`。
+- `MEMEMEOW_TELEMETRY_AUTH_FILE`：可选的受保护文件，包含单行 Basic Authorization；配置后供三种 OTLP 信号共同使用。
 
 API SDK 随 FastAPI lifespan 启动和关闭；executor SDK 随主进程启动和关闭。导出使用官方 HTTP exporter 与后台 SDK，trace 队列最多 2048 条，每批 128 条，导出超时 5 秒。trace 全量采集，metrics 每 10 秒独立导出。超过 SDK 属性或事件数量限制时，SDK 保留丢弃数量；文本属性不设置额外长度上限。Collector 与后端的接收限制需要由宿主配置并验证。
 
@@ -24,7 +25,9 @@ executor 使用独立 attempt trace，并通过 W3C 上下文的 Span Link 关�
 
 后台每两秒读取，结束时读取一次最终内容。消息、步骤和工具分别统计；记录使用来源 ID 和保存内容识别更新，连续采集期间同一终态只统计一次。初次读取及错误恢复后的已有终态作为基线，只提供调查。记录时间不足以确认 attempt 时保留 Task/session，标明 `undetermined`。
 
-读取错误、恢复与已知中断区间进入 trace；项目来源 metrics 记录成功时间、读取错误、活动来源及活动错误数量。组件接收、发送和队列状态由 Collector 自身指标提供。
+读取错误、恢复与已知中断区间进入 trace 和结构化日志；项目来源 metrics 记录成功时间、读取错误、活动来源及活动错误数量。组件接收、发送和队列状态由 Collector 自身指标提供。
+
+`emit_event` 从已有内存快照发送结构化日志，使用官方日志 SDK 与 OTLP exporter，独立队列最多 2048 条、每批 128 条、发送超时 5 秒。日志及 trace 导出错误分别保留实际原因与最后成功、错误时间。SDK 关闭后再次启动会明确报告进程生命周期错误。
 
 ## 内容保护
 

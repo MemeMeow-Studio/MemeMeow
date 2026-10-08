@@ -14,7 +14,7 @@ from opentelemetry import metrics, trace
 from opentelemetry.context import Context
 from pydantic import BaseModel, ConfigDict
 
-from runtime_telemetry import protected_content, record_content
+from runtime_telemetry import emit_event, protected_content, record_content
 
 
 class SavedContent(BaseModel):
@@ -129,10 +129,12 @@ class SQLiteTelemetry:
             with trace.get_tracer("mememeow.agent").start_as_current_span("agent.sqlite.read_error", context=self.context, attributes=self.attributes) as span:
                 record_content(span, "source.error", {"reason": str(error), "error_code": getattr(error, "sqlite_errorname", type(error).__name__), "missing_since": self.failed_since, "last_success": self.last_success}, secrets=self.secrets)
             logger.error("agent_sqlite_read_error: {}", protected_content(str(error), self.secrets))
+            emit_event("sqlite_diagnostics", {"event": "read_error", "reason": str(error), "error_code": getattr(error, "sqlite_errorname", type(error).__name__), "missing_since": self.failed_since, "last_success": self.last_success, **self.attributes})
             return
         if self.failed_since is not None:
             with trace.get_tracer("mememeow.agent").start_as_current_span("agent.sqlite.read_recovered", context=self.context, attributes=self.attributes) as span:
                 record_content(span, "source.missing_interval", {"from": self.failed_since, "to": observed_at}, secrets=self.secrets)
+            emit_event("sqlite_diagnostics", {"event": "read_recovered", "missing_from": self.failed_since, "missing_to": observed_at, **self.attributes})
             self.failed_since = None
             self.active_failures.add(-1)
         self.last_success = observed_at
@@ -151,9 +153,10 @@ class SQLiteTelemetry:
         clock = content.get("time") or (content.get("state") or {}).get("time") or {}
         terminal = (record["kind"] == "message" and content.get("role") == "assistant" and (clock.get("completed") is not None or content.get("error") is not None)) or (unit == "tool" and (content.get("state") or {}).get("status") in {"completed", "error"}) or unit == "step"
         labels = {"unit": unit, "result": "failed" if content.get("error") or (content.get("state") or {}).get("status") == "error" else "succeeded"}
+        labels.update({label: content[field] for label, field in (("provider", "providerID"), ("model", "modelID")) if isinstance(content.get(field), str)})
         if terminal and identity not in self.terminals:
             self.terminals.add(identity)
-            if not self.baseline:
+            if not self.baseline or (self.last_success == 0 and self.failed_since is None and record["created_ms"] / 1000 >= self.started_at):
                 self.terminal_count.add(1, labels)
                 start = clock.get("created", clock.get("start"))
                 end = clock.get("completed", clock.get("end"))
@@ -169,3 +172,5 @@ class SQLiteTelemetry:
             span.set_attribute("content.source", "opencode_sqlite")
             if not clock:
                 span.set_attribute("content.missing_fields", "saved_time_fields")
+            elif terminal and not (isinstance(clock.get("created", clock.get("start")), (int, float)) and isinstance(clock.get("completed", clock.get("end")), (int, float))):
+                span.set_attribute("content.missing_fields", "saved_duration_fields")

@@ -42,3 +42,10 @@ def test_trace_carrier_does_not_supply_business_authorization():
     context = extract_carrier({"traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01", "authorization": "Bearer credential-value"})
     assert trace.get_current_span(context).get_span_context().is_valid
     assert context.get("authorization") is None
+
+
+def test_usage_tokens_remain_available():
+    """保留已保存的用量字段，同时过滤用于认证的 token 字段。"""
+    result = protected_content({"tokens": {"input": 100, "output": 20}, "session_token": "credential-value", "token": "credential-value"})
+    assert result["tokens"] == {"input": 100, "output": 20}
+    assert "credential-value" not in str(result)

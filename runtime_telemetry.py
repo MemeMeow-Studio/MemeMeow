@@ -5,6 +5,7 @@ import json
 import os
 import re
 import time
+from pathlib import Path
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Lock
@@ -12,10 +13,15 @@ from typing import Any, Iterator, Mapping
 from urllib.parse import urlsplit
 
 from loguru import logger
+from httpx import TimeoutException
+from requests.exceptions import Timeout as RequestsTimeout
 from opentelemetry import metrics, trace
 from opentelemetry.context import Context
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+from opentelemetry.sdk._logs import LoggerProvider
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor, LogRecordExportResult
 from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry.instrumentation.threading import ThreadingInstrumentor
@@ -29,7 +35,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExportResult,
 from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 from opentelemetry.trace import Status, StatusCode
 
-_CREDENTIAL_KEY = re.compile(r"(?i)(password|passwd|secret|token|authorization|cookie|api[_-]?key|credential)")
+_CREDENTIAL_KEY = re.compile(r"(?i)(password|passwd|secret|(?:^|[_ .-])token(?:$|[_ .-])|authorization|cookie|api[_-]?key|credential)")
 _CREDENTIAL_TEXT = re.compile(r"(?i)(?:bearer\s+[^\s\"\x27,;]+|(?:api[_-]?key|password|token|secret|authorization)\s*[=:]\s*[^\s,;]+)")
 _BINARY_KEY = re.compile(r"(?i)(base64|image_url|image_data|file_content|binary)")
 _PROPAGATOR = TraceContextTextMapPropagator()
@@ -45,6 +51,7 @@ class TelemetryConfig:
     endpoint: str = ""
     service: str = "mememeow-api"
     environment: str = "development"
+    authorization: str = ""
 
     @classmethod
     def from_env(cls, service: str = "mememeow-api") -> TelemetryConfig:
@@ -57,7 +64,11 @@ class TelemetryConfig:
             parsed = urlsplit(endpoint)
             if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
                 raise ValueError("MEMEMEOW_TELEMETRY_ENDPOINT 必须为不包含凭据或查询参数的 HTTP(S) 地址")
-        return cls(enabled == "true", endpoint.rstrip("/"), service, os.getenv("MEMEMEOW_TELEMETRY_ENVIRONMENT", "development"))
+        authorization_file = os.getenv("MEMEMEOW_TELEMETRY_AUTH_FILE", "")
+        authorization = Path(authorization_file).read_text().strip() if enabled == "true" and authorization_file else ""
+        if authorization_file and enabled == "true" and (not authorization.startswith("Basic ") or "\n" in authorization):
+            raise ValueError("MEMEMEOW_TELEMETRY_AUTH_FILE 必须包含单行 Basic Authorization")
+        return cls(enabled == "true", endpoint.rstrip("/"), service, os.getenv("MEMEMEOW_TELEMETRY_ENVIRONMENT", "development"), authorization)
 
 
 def protected_content(value: Any, secrets: tuple[str, ...] = ()) -> Any:
@@ -115,7 +126,12 @@ class _ProtectedExporter(SpanExporter):
             links=span.links, kind=span.kind, status=Status(span.status.status_code, protected_content(span.status.description, secrets)),
             start_time=span.start_time, end_time=span.end_time, instrumentation_scope=span.instrumentation_scope,
         ) for span in spans]
-        result = self.delegate.export(cleaned)
+        try:
+            result = self.delegate.export(cleaned)
+        except Exception as error:
+            self.last_failure = time.time()
+            logger.error("telemetry_trace_export_error: {}: {}", type(error).__name__, protected_content(str(error), secrets))
+            raise
         if result == SpanExportResult.SUCCESS:
             self.last_success = time.time()
         else:
@@ -136,7 +152,12 @@ class _MetricExporter(OTLPMetricExporter):
 
     def export(self, metrics_data: Any, timeout_millis: float = 10000, **kwargs: Any) -> MetricExportResult:
         """通过官方 exporter 发送 metrics 并报告发送状态。"""
-        result = super().export(metrics_data, timeout_millis=timeout_millis, **kwargs)
+        try:
+            result = super().export(metrics_data, timeout_millis=timeout_millis, **kwargs)
+        except Exception as error:
+            self.last_failure = time.time()
+            logger.error("telemetry_metric_export_error: {}: {}", type(error).__name__, protected_content(str(error), environment_credentials()))
+            raise
         if result == MetricExportResult.SUCCESS:
             self.last_success = time.time()
         else:
@@ -145,24 +166,56 @@ class _MetricExporter(OTLPMetricExporter):
         return result
 
 
+class _LogExporter(OTLPLogExporter):
+    """保存标准日志导出的成功与错误时间，供来源健康指标查询。"""
+
+    last_success = 0.0
+    last_failure = 0.0
+
+    def export(self, batch: Any) -> LogRecordExportResult:
+        """导出已保护的结构化事件，明确保留网络错误原因。"""
+        try:
+            result = super().export(batch)
+        except Exception as error:
+            self.last_failure = time.time()
+            logger.error("telemetry_log_export_error: {}: {}", type(error).__name__, protected_content(str(error), environment_credentials()))
+            raise
+        if result == LogRecordExportResult.SUCCESS:
+            self.last_success = time.time()
+        else:
+            self.last_failure = time.time()
+            logger.error("telemetry_log_export_failed: OTLP exporter 返回 {}", result.name)
+        return result
+
+
 class TelemetryRuntime:
     """管理 SDK 生命周期，提供内存测量与后台导出状态。"""
 
     def __init__(self, config: TelemetryConfig):
         self.config = config
+        self.closed = False
+        headers = {"Authorization": config.authorization} if config.authorization else {}
         resource = Resource.create({"service.name": config.service, "deployment.environment.name": config.environment})
-        self.span_exporter = _ProtectedExporter(OTLPSpanExporter(endpoint=f"{config.endpoint}/v1/traces", timeout=5))
+        self.span_exporter = _ProtectedExporter(OTLPSpanExporter(endpoint=f"{config.endpoint}/v1/traces", timeout=5, headers=headers))
         self.tracer_provider = TracerProvider(resource=resource, sampler=ALWAYS_ON, span_limits=SpanLimits(max_attributes=1024, max_events=1024, max_attribute_length=None))
         self.tracer_provider.add_span_processor(BatchSpanProcessor(self.span_exporter, max_queue_size=2048, max_export_batch_size=128, schedule_delay_millis=2000, export_timeout_millis=5000))
-        self.metric_exporter = _MetricExporter(endpoint=f"{config.endpoint}/v1/metrics", timeout=5)
+        self.metric_exporter = _MetricExporter(endpoint=f"{config.endpoint}/v1/metrics", timeout=5, headers=headers)
         reader = PeriodicExportingMetricReader(self.metric_exporter, export_interval_millis=10000, export_timeout_millis=5000)
         self.meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
+        self.log_exporter = _LogExporter(endpoint=f"{config.endpoint}/v1/logs", timeout=5, headers=headers)
+        self.logger_provider = LoggerProvider(resource=resource, meter_provider=self.meter_provider)
+        self.logger_provider.add_log_record_processor(BatchLogRecordProcessor(self.log_exporter, max_queue_size=2048, max_export_batch_size=128, schedule_delay_millis=2000, export_timeout_millis=5000))
         meter = self.meter_provider.get_meter("mememeow.runtime")
-        meter.create_observable_gauge("telemetry_export_last_success", unit="s", callbacks=[lambda options: [metrics.Observation(self.span_exporter.last_success, {"signal": "traces"}), metrics.Observation(self.metric_exporter.last_success, {"signal": "metrics"})]])
-        meter.create_observable_gauge("telemetry_export_last_failure", unit="s", callbacks=[lambda options: [metrics.Observation(self.span_exporter.last_failure, {"signal": "traces"}), metrics.Observation(self.metric_exporter.last_failure, {"signal": "metrics"})]])
+        signals = {"traces": self.span_exporter, "metrics": self.metric_exporter, "logs": self.log_exporter}
+        meter.create_observable_gauge("telemetry_export_last_success", unit="s", callbacks=[lambda options: [metrics.Observation(exporter.last_success, {"signal": signal}) for signal, exporter in signals.items()]])
+        meter.create_observable_gauge("telemetry_export_last_failure", unit="s", callbacks=[lambda options: [metrics.Observation(exporter.last_failure, {"signal": signal}) for signal, exporter in signals.items()]])
 
     def close(self) -> None:
         """等待有界导出并关闭 SDK，关闭错误由调用位置报告。"""
+        if self.closed:
+            return
+        self.closed = True
+        self.logger_provider.shutdown()
         self.tracer_provider.shutdown()
         self.meter_provider.shutdown()
 
@@ -182,7 +235,23 @@ def start_telemetry(service: str = "mememeow-api") -> TelemetryRuntime | None:
             RequestsInstrumentor().instrument()
             URLLibInstrumentor().instrument()
             ThreadingInstrumentor().instrument()
+        elif _RUNTIME.closed:
+            raise RuntimeError("telemetry_runtime_closed: SDK 已随进程生命周期关闭")
+        elif _RUNTIME.config != config:
+            raise RuntimeError("telemetry_runtime_configuration_changed: 同一进程必须使用相同 SDK 配置")
         return _RUNTIME
+
+
+def emit_event(source: str, event: Mapping[str, Any], *, attributes: Mapping[str, Any] | None = None) -> None:
+    """从已取得的内存快照发送结构化日志，后台导出不占用业务连接。"""
+    if _RUNTIME is None or _RUNTIME.closed:
+        return
+    secrets = environment_credentials() + (_RUNTIME.config.authorization,)
+    _RUNTIME.logger_provider.get_logger("mememeow.events").emit(
+        timestamp=time.time_ns(),
+        body=json.dumps(protected_content(dict(event), secrets), ensure_ascii=False, default=str),
+        attributes={"source": source, **protected_content(dict(attributes or {}), secrets)},
+    )
 
 
 def trace_carrier() -> dict[str, str]:
@@ -208,7 +277,7 @@ def observed_operation(operation: str, *, unit: str, attributes: Mapping[str, An
         try:
             yield span
         except BaseException as error:
-            result = "timeout" if isinstance(error, TimeoutError) else "failed"
+            result = "timeout" if isinstance(error, (TimeoutError, TimeoutException, RequestsTimeout)) else "failed"
             span.set_status(Status(StatusCode.ERROR, protected_content(str(error), environment_credentials())))
             span.set_attribute("error.type", type(error).__name__)
             raise
