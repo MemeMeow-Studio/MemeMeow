@@ -44,6 +44,7 @@ let listRequestId = 0
 let processingRequestId = 0
 let detailRequestId = 0
 let pendingTaskId: string | null = null
+const taskDetailPromises = new Map<string, Promise<TaskItem>>()
 const latestProcessingByMeme = new Map<string, ImageProcessingJob>()
 const fallbackCreatedAtByKey = new Map<string, string>()
 
@@ -218,13 +219,19 @@ async function openTask(id: string, event?: MouseEvent): Promise<void> {
   pendingTaskId = id
   const requestId = ++detailRequestId
   if (event?.currentTarget instanceof HTMLElement) taskTrigger.value = event.currentTarget
-  if (event) notifications.show('开始读取任务详情', 'info')
   try {
-    const response = await api.task(id)
+    let promise = taskDetailPromises.get(id)
+    if (!promise) {
+      if (event) notifications.show('开始读取任务详情', 'info')
+      promise = api.task(id) as Promise<TaskItem>
+      taskDetailPromises.set(id, promise)
+    }
+    const response = await promise
     if (!disposed && requestId === detailRequestId) selectedTask.value = response
   } catch (reason) {
     if (!disposed && requestId === detailRequestId) emit('loadError', errorMessage(reason))
   } finally {
+    taskDetailPromises.delete(id)
     if (requestId === detailRequestId) pendingTaskId = null
   }
 }
