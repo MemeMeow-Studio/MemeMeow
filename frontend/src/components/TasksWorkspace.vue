@@ -2,6 +2,7 @@
 /** 处理任务工作区：管理筛选、分页、轮询和详情打开状态。 */
 import { computed, onBeforeUnmount, onMounted, shallowRef } from 'vue'
 import { api } from '../api'
+import { useToast } from '../composables/useToast'
 import { showTaskDiagnostics } from '../config/debug'
 import type { ImageProcessingJob, ImageProcessingTerminalEvent, TaskItem } from '../types'
 import {
@@ -36,6 +37,7 @@ const type = shallowRef('')
 const selectedTask = shallowRef<TaskItem | null>(null)
 const taskTrigger = shallowRef<HTMLElement | null>(null)
 const retrying = shallowRef(false)
+const notifications = useToast()
 let taskTimer: number | undefined
 let disposed = false
 let listRequestId = 0
@@ -180,7 +182,9 @@ async function loadProcessingJobs(): Promise<void> {
 }
 
 /** 加载任务列表，可选追加分页，并同步已打开任务的最新摘要。 */
-async function loadTasks({ append = false }: { append?: boolean } = {}): Promise<void> {
+async function loadTasks({ append = false, feedback = false }: { append?: boolean; feedback?: boolean } = {}): Promise<void> {
+  if (append && loading.value) return
+  if (feedback) notifications.show(append ? '开始加载更多任务' : '开始刷新任务列表', 'info')
   const requestId = ++listRequestId
   loading.value = true
   try {
@@ -211,6 +215,7 @@ async function loadTasks({ append = false }: { append?: boolean } = {}): Promise
 async function openTask(id: string, event?: MouseEvent): Promise<void> {
   const requestId = ++detailRequestId
   if (event?.currentTarget instanceof HTMLElement) taskTrigger.value = event.currentTarget
+  if (event) notifications.show('开始读取任务详情', 'info')
   try {
     const response = await api.task(id)
     if (!disposed && requestId === detailRequestId) selectedTask.value = response
@@ -298,11 +303,11 @@ onBeforeUnmount(() => {
   <section class="workspace task-workspace" :class="{ detail: selectedTask }">
     <div class="section-head">
       <div><h1>处理任务</h1></div>
-      <button class="quiet" type="button" :disabled="loading" @click="loadTasks()">刷新</button>
+      <button class="quiet" type="button" :disabled="loading" @click="loadTasks({ feedback: true })">刷新</button>
     </div>
     <div class="task-toolbar">
-      <label>状态<select v-model="status" aria-label="按状态筛选" @change="loadTasks()"><option value="">全部</option><option value="queued">排队中</option><option value="running">处理中</option><option value="succeeded">已完成</option><option value="failed">失败</option><option value="blocked">已阻止</option><option value="unknown_execution">执行状态未知</option></select></label>
-      <label>类型<select v-model="type" aria-label="按类型筛选" @change="loadTasks()"><option value="">全部</option><option value="image_upload">图片上传</option><option value="meme_context_generation">图片语境分析</option><option value="visual_embedding_generation">视觉向量生成</option><option value="image_auto_rename">自动重命名</option><option value="image_name_generation">后台图片命名</option><option value="text_embedding_generation">文本向量生成</option><option value="cache_generation">检索缓存</option><option value="metadata_repair">元数据修复</option></select></label>
+      <label>状态<select v-model="status" aria-label="按状态筛选" @change="loadTasks({ feedback: true })"><option value="">全部</option><option value="queued">排队中</option><option value="running">处理中</option><option value="succeeded">已完成</option><option value="failed">失败</option><option value="blocked">已阻止</option><option value="unknown_execution">执行状态未知</option></select></label>
+      <label>类型<select v-model="type" aria-label="按类型筛选" @change="loadTasks({ feedback: true })"><option value="">全部</option><option value="image_upload">图片上传</option><option value="meme_context_generation">图片语境分析</option><option value="visual_embedding_generation">视觉向量生成</option><option value="image_auto_rename">自动重命名</option><option value="image_name_generation">后台图片命名</option><option value="text_embedding_generation">文本向量生成</option><option value="cache_generation">检索缓存</option><option value="metadata_repair">元数据修复</option></select></label>
     </div>
     <div class="task-table" :class="{ loading }" role="table" aria-label="处理任务列表">
       <div class="task-head" role="row"><span role="columnheader">状态</span><span role="columnheader">类型</span><span role="columnheader">来源</span><span role="columnheader">关联图片</span><span role="columnheader">进度</span><span role="columnheader">创建时间</span></div>
@@ -361,7 +366,7 @@ onBeforeUnmount(() => {
       </template>
       <div v-if="!loading && !taskEntries.length" class="empty-state compact"><h2>没有匹配的任务</h2></div>
     </div>
-    <button v-if="cursor" class="quiet load-more" type="button" @click="loadTasks({ append: true })">加载更多</button>
+    <button v-if="cursor" class="quiet load-more" type="button" :disabled="loading" @click="loadTasks({ append: true, feedback: true })">加载更多</button>
     <TaskDrawer
       v-if="selectedTask"
       :task="selectedTask"

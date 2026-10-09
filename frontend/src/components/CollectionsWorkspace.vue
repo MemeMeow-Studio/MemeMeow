@@ -60,6 +60,7 @@ async function renameCollection(item: CollectionSummary): Promise<void> {
   const name = window.prompt('合集名称', item.name)
   if (!name || busy.value) return
   busy.value = true
+  notifications.show('开始重命名合集', 'info')
   try {
     await api.renameCollection(item.collection_id, { name })
     setNotice('合集已重命名')
@@ -78,6 +79,7 @@ async function renameCollection(item: CollectionSummary): Promise<void> {
 async function deleteCollection(item: CollectionSummary): Promise<void> {
   if (busy.value || !window.confirm('删除合集不会删除图片，确定继续吗？')) return
   busy.value = true
+  notifications.show('开始删除合集', 'info')
   try {
     await api.deleteCollection(item.collection_id)
     if (selectedCollection.value?.collection_id === item.collection_id) selectedCollection.value = null
@@ -94,6 +96,7 @@ async function deleteCollection(item: CollectionSummary): Promise<void> {
 async function openCollection(item: CollectionSummary): Promise<void> {
   if (busy.value) return
   busy.value = true
+  notifications.show('开始读取合集详情', 'info')
   try {
     selectedCollection.value = await api.collection(item.collection_id)
     members.value = selectedCollection.value?.members || []
@@ -107,6 +110,7 @@ async function openCollection(item: CollectionSummary): Promise<void> {
 /** 返回合集列表并刷新可能发生变化的统计。 */
 function backToCollections(): void {
   selectedCollection.value = null
+  notifications.show('开始刷新合集列表', 'info')
   void loadCollections()
 }
 
@@ -114,6 +118,7 @@ function backToCollections(): void {
 async function removeMember(item: MemeImage): Promise<void> {
   if (!selectedCollection.value || busy.value) return
   busy.value = true
+  notifications.show('开始从合集移除图片', 'info')
   try {
     await api.removeCollectionMember(selectedCollection.value.collection_id, item.meme_id)
     selectedCollection.value = await api.collection(selectedCollection.value.collection_id)
@@ -134,15 +139,19 @@ function openImagePreview(item: MemeImage, event: MouseEvent): void {
 
 /** 复制当前合集的动态导出地址，不创建额外的分享记录。 */
 async function copyCollectionLink(): Promise<void> {
-  if (!selectedCollection.value) return
+  if (!selectedCollection.value || busy.value) return
   const path = api.collectionExportUrl(selectedCollection.value.collection_id)
   const url = new URL(path, window.location.origin).toString()
   try {
     if (typeof navigator.clipboard?.writeText !== 'function') throw new Error('clipboard_unavailable')
+    busy.value = true
+    notifications.show('开始复制下载链接', 'info')
     await navigator.clipboard.writeText(url)
     setNotice('下载链接已复制')
   } catch {
     setNotice('无法复制下载链接，请手动复制浏览器地址', 'error')
+  } finally {
+    busy.value = false
   }
 }
 
@@ -162,7 +171,7 @@ onMounted(loadCollections)
         </p>
       </div>
       <div v-if="selectedCollection" class="collection-detail-actions" role="group" aria-label="合集管理操作">
-        <a class="quiet collection-export" :href="api.collectionExportUrl(selectedCollection.collection_id)" title="下载合集 ZIP" aria-label="下载合集 ZIP">下载 ZIP</a>
+        <a class="quiet collection-export" :href="api.collectionExportUrl(selectedCollection.collection_id)" title="下载合集 ZIP" aria-label="下载合集 ZIP" @click="notifications.show('已发起合集 ZIP 下载', 'info')">下载 ZIP</a>
         <button class="quiet collection-copy-link" type="button" :disabled="busy" title="复制动态下载链接" aria-label="复制动态下载链接" @click="copyCollectionLink">复制链接</button>
         <button class="quiet" type="button" :disabled="busy" aria-label="重命名合集" @click="renameCollection(selectedCollection)">重命名</button>
         <button class="quiet collection-danger" type="button" :disabled="busy" @click="deleteCollection(selectedCollection)">删除合集</button>

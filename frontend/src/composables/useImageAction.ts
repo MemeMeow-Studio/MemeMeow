@@ -40,7 +40,7 @@ export function useImageAction() {
   }
   const imageActionLabel = isAndroidApp ? '保存' : '复制'
 
-  /** 根据当前运行平台执行图片操作，保存期间防止重复点击。 */
+  /** 根据当前运行平台执行图片操作，复制或保存期间防止重复点击。 */
   async function performImageAction(url: string): Promise<void> {
     if (saving.value) return
     if (imageExportSize.value === null) {
@@ -49,8 +49,9 @@ export function useImageAction() {
     }
     try {
       const actionUrl = imageExportUrl(url, imageExportSize.value)
-      if (!isAndroidApp) return await copyImage(actionUrl)
       saving.value = true
+      if (!isAndroidApp) return await copyImage(actionUrl)
+      notifications.show('开始保存图片', 'info')
       await saveImageToAlbum(actionUrl)
       notifications.success('图片已保存到 MemeMeow 相册')
     } catch (reason) {

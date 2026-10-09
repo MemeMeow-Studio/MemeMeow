@@ -26,6 +26,21 @@ afterEach(async () => {
 })
 
 describe('ToastHost', () => {
+  it('开始提示和结果提示分别显示，并按普通提示的真实计时器自动关闭', async () => {
+    const { notifications } = mountHost()
+    const started = notifications.show('开始复制图片', 'info')
+    await flushPromises()
+    expect(document.querySelector('[data-sonner-toast][data-type="info"]')?.textContent).toContain('开始复制图片')
+    const completed = notifications.success('图片已复制')
+    await flushPromises()
+    expect(started).not.toBe(completed)
+    expect(document.querySelectorAll('[data-sonner-toast]')).toHaveLength(2)
+    expect(toast.getToasts().map((item) => 'duration' in item ? item.duration : undefined)).toEqual([3000, 3000])
+    await new Promise((resolve) => setTimeout(resolve, 3500))
+    await flushPromises()
+    expect(document.querySelectorAll('[data-sonner-toast]')).toHaveLength(0)
+  })
+
   it('成功提示在真实计时器到期后消失，错误及警告持续可关闭', async () => {
     const { notifications } = mountHost()
     notifications.success('图片已复制')

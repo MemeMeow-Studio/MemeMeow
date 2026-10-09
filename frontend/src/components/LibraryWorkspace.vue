@@ -150,6 +150,14 @@ async function loadLibrary(): Promise<void> {
 function applyFilter(): void {
   page.value = 1
   selectedImages.value = new Set()
+  notifications.show('开始读取筛选后的图片', 'info')
+  void loadLibrary()
+}
+
+/** 手动刷新当前图片列表，开始提示仅由用户操作产生。 */
+function refreshLibrary(): void {
+  if (busy.value) return
+  notifications.show('开始刷新图片库', 'info')
   void loadLibrary()
 }
 
@@ -179,6 +187,7 @@ function changePage(next: number): void {
   if (target === page.value) return
   page.value = target
   selectedImages.value = new Set()
+  notifications.show('开始读取图片分页', 'info')
   void loadLibrary()
 }
 
@@ -251,6 +260,7 @@ async function addSelectedToCollection(): Promise<void> {
 async function createCollectionAndAdd(): Promise<void> {
   if (!dialogCollectionName.value.trim() || !selectedIds.value.length || collectionBusy.value) return
   collectionBusy.value = true
+  notifications.show('开始创建合集并加入图片', 'info')
   try {
     const created = await api.createCollection({ name: dialogCollectionName.value })
     await api.addCollectionItems(created.collection_id, selectedIds.value)
@@ -269,6 +279,7 @@ async function retryStage(item: MemeImage, stage: 'visual' | 'agent' | 'auto_ren
   if (stageBusy.value || typeof api.submitImageStage !== 'function' || (stage === 'auto_rename' && !canRetryStandaloneAutoRename(item))) return
   stageBusy.value = `${item.meme_id}:${stage}`
   emit('clearError')
+  notifications.show(`开始提交${imageStageLabel(stage)}任务`, 'info')
   try {
     const request: Record<string, unknown> = { meme_id: item.meme_id, stage }
     if (stage !== 'visual') request.reverse_image_policy = 'forbid'
@@ -460,13 +471,19 @@ function retryPreviewStage(stage: ImageProcessingStageName): void {
 
 /** 调用稳定 meme_id 完成重命名并刷新图库。 */
 async function rename(item: MemeImage): Promise<void> {
+  if (imageActionsDisabled.value) return
   const name = window.prompt('新文件名', item.filename)
   if (!name) return
+  busy.value = true
+  notifications.show('开始重命名图片', 'info')
   try {
     await api.rename({ meme_id: item.meme_id, new_name: name })
+    notifications.success('图片已重命名')
     await loadLibrary()
   } catch (reason) {
     emit('error', errorMessage(reason))
+  } finally {
+    busy.value = false
   }
 }
 
@@ -487,7 +504,7 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
         <option value="updated_desc">最近更新</option>
       </select>
       <LibraryFilters :status="status" :page-size="pageSize" :disabled="imageActionsDisabled" @update:status="changeStatus" @update:page-size="changePageSize" />
-      <button ref="refreshTrigger" type="button" @click="loadLibrary">刷新</button>
+      <button ref="refreshTrigger" type="button" :disabled="busy" @click="refreshLibrary">刷新</button>
       <button class="quiet library-select-toggle" type="button" :disabled="imageActionsDisabled" :aria-pressed="selectionActive" @click="toggleSelectionMode">{{ selectionActive ? '结束选择' : '选择图片' }}</button>
       <span class="toolbar-spacer"></span>
       <div class="toolbar-group library-operations">

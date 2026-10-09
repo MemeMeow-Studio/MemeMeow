@@ -2,18 +2,27 @@
 /** 本次上传结果列表：按文件顺序展示传输、保存结果和可用操作。 */
 import type { UploadBatchItem } from '../composables/useUploadBatch'
 import { useUploadRecords } from '../composables/useUploadRecords'
+import { useToast } from '../composables/useToast'
 
 const props = withDefaults(defineProps<{ items: UploadBatchItem[]; busy: boolean; storageScope?: string }>(), { storageScope: 'local' })
 const emit = defineEmits<{ retryTransfer: [requestId: string] }>()
 const { rows, summary, error, loading, acting, begin, refresh, act } = useUploadRecords(() => props.items, props.storageScope)
+const notifications = useToast()
 defineExpose({ begin, refresh })
+
+/** 手动刷新本次上传结果，内部轮询保持原有页面状态反馈。 */
+function refreshResults(): void {
+  if (loading.value) return
+  notifications.show('开始刷新上传结果', 'info')
+  void refresh()
+}
 </script>
 
 <template>
   <section v-if="rows.length" class="upload-records" aria-label="本次上传结果">
     <div class="upload-records-heading">
       <h2>本次上传</h2>
-      <button class="quiet" type="button" :disabled="loading" @click="refresh()">刷新结果</button>
+      <button class="quiet" type="button" :disabled="loading" @click="refreshResults">刷新结果</button>
     </div>
     <p class="upload-records-summary" aria-live="polite">共 {{ summary.total }} 个，上传成功 {{ summary.success }} 个，失败 {{ summary.failed }} 个，取消 {{ summary.cancelled }} 个</p>
     <p v-if="error" role="alert">{{ error }}</p>

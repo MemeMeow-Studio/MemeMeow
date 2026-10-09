@@ -119,6 +119,7 @@ export function useImageClipboard() {
       if (!supportsImageClipboard()) throw new Error('image_clipboard_unsupported')
       if (typeof fetch !== 'function') throw new Error('image_fetch_unavailable')
 
+      notifications.show('开始复制图片', 'info')
       const bridge = desktopClipboard()
       if (bridge) {
         const blob = await fetchImageForClipboard(url, bridge.maxGifBytes)

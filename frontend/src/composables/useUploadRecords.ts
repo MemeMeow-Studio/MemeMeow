@@ -3,6 +3,7 @@ import { computed, onUnmounted, shallowRef, watch } from 'vue'
 import { api } from '../api'
 import type { UploadBatchItem, UploadItemStatus } from './useUploadBatch'
 import { uploadErrorMessage } from '../utils/presentation'
+import { useToast } from './useToast'
 
 interface UploadRecord {
   requestId: string
@@ -24,6 +25,7 @@ interface UploadStatus {
 
 /** 从实时文件项恢复传输状态，并按服务器记录确认图片保存结果。 */
 export function useUploadRecords(items: () => UploadBatchItem[], storageScope: string) {
+  const notifications = useToast()
   const storageKey = `mememeow:upload:${storageScope}`
   let serialized = sessionStorage.getItem(storageKey)
   const records = shallowRef<UploadRecord[]>(serialized ? JSON.parse(serialized) : [])
@@ -152,10 +154,14 @@ export function useUploadRecords(items: () => UploadBatchItem[], storageScope: s
     if (acting.value.has(task.task_id)) return
     const currentGeneration = generation
     acting.value = new Set([...acting.value, task.task_id])
+    notifications.show(operation === 'retry' ? '开始提交上传重试请求' : '开始取消上传', 'info')
     try {
       if (operation === 'retry') await api.retryTask(task.task_id)
       else await api.cancelTask(task.task_id)
-      if (currentGeneration === generation) await refresh()
+      if (isCurrent() && currentGeneration === generation) {
+        notifications.success(operation === 'retry' ? '上传重试请求已受理' : '上传取消请求已受理')
+        await refresh()
+      }
     } catch (reason) {
       if (isCurrent() && currentGeneration === generation) error.value = reason instanceof Error ? reason.message : String(reason)
     } finally {
