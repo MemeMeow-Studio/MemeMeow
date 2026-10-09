@@ -43,6 +43,7 @@ let disposed = false
 let listRequestId = 0
 let processingRequestId = 0
 let detailRequestId = 0
+let pendingTaskId: string | null = null
 const latestProcessingByMeme = new Map<string, ImageProcessingJob>()
 const fallbackCreatedAtByKey = new Map<string, string>()
 
@@ -213,6 +214,8 @@ async function loadTasks({ append = false, feedback = false }: { append?: boolea
 
 /** 打开任务详情，并记录列表触发按钮供关闭后恢复焦点。 */
 async function openTask(id: string, event?: MouseEvent): Promise<void> {
+  if (pendingTaskId === id) return
+  pendingTaskId = id
   const requestId = ++detailRequestId
   if (event?.currentTarget instanceof HTMLElement) taskTrigger.value = event.currentTarget
   if (event) notifications.show('开始读取任务详情', 'info')
@@ -221,6 +224,8 @@ async function openTask(id: string, event?: MouseEvent): Promise<void> {
     if (!disposed && requestId === detailRequestId) selectedTask.value = response
   } catch (reason) {
     if (!disposed && requestId === detailRequestId) emit('loadError', errorMessage(reason))
+  } finally {
+    if (requestId === detailRequestId) pendingTaskId = null
   }
 }
 
