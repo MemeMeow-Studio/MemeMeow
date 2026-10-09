@@ -28,6 +28,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from opentelemetry import trace
 from sqlalchemy import select
 from starlette.concurrency import run_in_threadpool
 
