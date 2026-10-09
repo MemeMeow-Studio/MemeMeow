@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Iterator, Mapping
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from loguru import logger
 from httpx import TimeoutException
@@ -212,7 +213,8 @@ class TelemetryRuntime:
         self.config = config
         self.closed = False
         headers = {"Authorization": config.authorization} if config.authorization else {}
-        resource = Resource.create({"service.name": config.service, "deployment.environment.name": config.environment})
+        self.instance_id = str(uuid4())
+        resource = Resource.create({"service.name": config.service, "service.instance.id": self.instance_id, "deployment.environment.name": config.environment})
         self.span_exporter = _ProtectedExporter(OTLPSpanExporter(endpoint=f"{config.endpoint}/v1/traces", timeout=5, headers=headers, session=otlp_session()))
         self.tracer_provider = TracerProvider(resource=resource, sampler=ALWAYS_ON, span_limits=SpanLimits(max_attributes=1024, max_events=1024, max_attribute_length=None))
         self.tracer_provider.add_span_processor(BatchSpanProcessor(self.span_exporter, max_queue_size=2048, max_export_batch_size=128, schedule_delay_millis=2000, export_timeout_millis=5000))
@@ -235,6 +237,13 @@ class TelemetryRuntime:
         self.logger_provider.shutdown()
         self.tracer_provider.shutdown()
         self.meter_provider.shutdown()
+
+
+def record_cache_decision(*, provider: str, result: str) -> None:
+    """在缓存选择完成时记录一次结果，Provider 执行保留独立计数。"""
+    if result not in {"hit", "miss", "refresh"}:
+        raise ValueError("cache_decision_result_invalid")
+    metrics.get_meter("mememeow.runtime").create_counter("runtime_cache_decisions", unit="{decision}").add(1, {"cache": "reverse_image", "provider": provider, "result": result})
 
 
 def start_telemetry(service: str = "mememeow-api") -> TelemetryRuntime | None:

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock, Thread
 from typing import Any, Callable, Mapping
+from uuid import uuid4
 
 from sqlalchemy import func, or_, select
 from opentelemetry import metrics
@@ -101,6 +103,9 @@ class PostgresTaskWorkerManager:
         self._scheduled: set[str] = set()
         self._queue_scan_lock = Lock()
         self._telemetry_queue_labels: set[tuple[str, str]] = set()
+        self._telemetry_snapshot: tuple[metrics.Observation, ...] = ()
+        self._telemetry_priority = int(uuid4().hex[:13], 16)
+        metrics.get_meter("mememeow.tasks").create_observable_gauge("task_scheduler_snapshot", callbacks=[self._observe_scheduler])
         self.owner = f"worker-{os.getpid()}-{id(self)}"
 
     def resource_capacity(self, resource_key: str | None) -> int:
@@ -474,14 +479,22 @@ class PostgresTaskWorkerManager:
         if self._stopped.is_set():
             return
         with self._queue_scan_lock:
-            task_ids = self._queued_snapshot()
+            try:
+                task_ids = self._queued_snapshot()
+            except Exception:
+                self._telemetry_snapshot = tuple(observation for observation in self._telemetry_snapshot if observation.attributes.get("measurement") != "source_error") + (metrics.Observation(1, {"scheduler_scope": "generic_tasks", "database_scope": "deployment", "measurement": "source_error"}),)
+                raise
         for task_id in task_ids:
             self.schedule(task_id)
+
+    def _observe_scheduler(self, options: Any) -> tuple[metrics.Observation, ...]:
+        """SDK 从一次不可变快照同时取得数量、成功时间与范围；不读取数据库。"""
+        return self._telemetry_snapshot
 
     def _queued_snapshot(self) -> list[str]:
         """读取已有队列扫描结果，按串行快照更新 gauge 并归还数据库连接。"""
         with self.resources.factory() as session:
-            queue_counts = list(session.execute(select(Task.task_type, Task.lane, func.count()).where(Task.status == "queued", _generic_task_filter()).group_by(Task.task_type, Task.lane)))
+            queue_counts = list(session.execute(select(Task.task_type, Task.lane, Task.status, func.count()).where(Task.status.in_(("queued", "running")), _generic_task_filter()).group_by(Task.task_type, Task.lane, Task.status)))
             task_ids = list(
                 session.scalars(
                     select(Task.id)
@@ -496,12 +509,20 @@ class PostgresTaskWorkerManager:
             )
         meter = metrics.get_meter("mememeow.tasks")
         queue_gauge = meter.create_gauge("task_queued", unit="{task}")
-        current_labels = {(task_type, lane) for task_type, lane, count in queue_counts}
-        for task_type, lane in self._telemetry_queue_labels - current_labels:
-            queue_gauge.set(0, {"task_type": task_type, "lane": lane})
-        for task_type, lane, count in queue_counts:
-            queue_gauge.set(count, {"task_type": task_type, "lane": lane})
-        self._telemetry_queue_labels = current_labels
+        current_labels = {(task_type, lane) for task_type, lane, status, count in queue_counts}
+        self._telemetry_queue_labels |= current_labels
+        counts = {(task_type, lane, status): count for task_type, lane, status, count in queue_counts}
+        scope = {"scheduler_scope": "generic_tasks", "database_scope": "deployment"}
+        observations = [metrics.Observation(time.time(), {**scope, "measurement": "observed_at"})]
+        observations.extend((metrics.Observation(self._telemetry_priority, {**scope, "measurement": "instance_priority"}), metrics.Observation(0, {**scope, "measurement": "source_error"})))
+        for status in ("queued", "running"):
+            observations.append(metrics.Observation(sum(count for (task_type, lane, state), count in counts.items() if state == status), {**scope, "measurement": status + "_total"}))
+        for task_type, lane in sorted(self._telemetry_queue_labels):
+            labels = {"task_type": task_type, "lane": lane}
+            queue_gauge.set(counts.get((task_type, lane, "queued"), 0), labels)
+            for status in ("queued", "running"):
+                observations.append(metrics.Observation(counts.get((task_type, lane, status), 0), {**scope, **labels, "measurement": status}))
+        self._telemetry_snapshot = tuple(observations)
         return task_ids
 
     def stop_claiming(self) -> None:

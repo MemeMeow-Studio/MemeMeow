@@ -45,7 +45,7 @@ from backend.callbacks import (
 from backend.database import DatabaseError, DatabaseResources, ReverseImageUsageEvent, ScopeContext, Task, utcnow
 from backend.operation_policy import AllowAllOperationPolicy, GrantAssociation, GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations, PolicyFailure, require_allowed
 from backend.operation_diagnostics import OperationDiagnostics
-from runtime_telemetry import observed_operation, record_content
+from runtime_telemetry import observed_operation, record_cache_decision, record_content
 
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
@@ -1086,6 +1086,8 @@ class ReverseImageService:
             diagnostics.phase("cache_read")
             record = self.cache.load(key)
             snapshot = _latest(record)
+            decision = "refresh" if request.refresh else "hit" if _reusable(snapshot, timestamp) else "miss"
+            record_cache_decision(provider=self.provider_name, result=decision)
             diagnostics.fields["cache_status"] = "refresh" if record else "miss"
             if not request.refresh and _reusable(snapshot, timestamp):
                 diagnostics.fields["cache_status"] = "hit"

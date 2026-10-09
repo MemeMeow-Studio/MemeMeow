@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from contextlib import closing
@@ -57,10 +58,11 @@ def read_saved_records(database: Path, *, directory: Path, session_id: str) -> l
         session_rows = connection.execute(f"SELECT id, time_created, time_updated, parent_id, title, version, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write FROM session WHERE id IN ({placeholders}) ORDER BY time_updated, id", identifiers)
         records = [{"kind": "session", "id": row[0], "session_id": row[0], "created_ms": row[1], "updated_ms": row[2], "data": dict(zip(("parent_id", "title", "version", "cost", "tokens_input", "tokens_output", "tokens_reasoning", "tokens_cache_read", "tokens_cache_write"), row[3:]))} for row in session_rows]
         for table in ("message", "part"):
-            rows = connection.execute(f"SELECT id, session_id, time_created, time_updated, data FROM {table} WHERE session_id IN ({placeholders}) ORDER BY time_updated, id", identifiers)
-            for identifier, bound_session, created, updated, data in rows:
+            message_column = "message_id" if table == "part" else "id"
+            rows = connection.execute(f"SELECT id, session_id, time_created, time_updated, data, {message_column} FROM {table} WHERE session_id IN ({placeholders}) ORDER BY time_updated, id", identifiers)
+            for identifier, bound_session, created, updated, data, message_id in rows:
                 content = SavedContent.model_validate_json(data).model_dump(exclude_none=True)
-                records.append({"kind": table, "id": identifier, "session_id": bound_session, "created_ms": created, "updated_ms": updated, "data": content})
+                records.append({"kind": table, "id": identifier, "message_id": message_id, "session_id": bound_session, "created_ms": created, "updated_ms": updated, "data": content})
         connection.rollback()
         return records
 
@@ -83,6 +85,9 @@ class SQLiteTelemetry:
         self.baseline = True
         self.failed_since: float | None = None
         self.last_success = 0.0
+        self.usage_values: dict[str, dict[str, float]] = {}
+        self.usage_baselines: set[str] = set()
+        self.message_models: dict[str, dict[str, str]] = {}
         meter = metrics.get_meter("mememeow.agent")
         self.success_time = meter.create_gauge("agent_sqlite_last_success", unit="s")
         self.failures = meter.create_counter("agent_sqlite_read_errors", unit="{error}")
@@ -90,6 +95,10 @@ class SQLiteTelemetry:
         self.active_sources = meter.create_up_down_counter("agent_sqlite_active_sources", unit="{source}")
         self.terminal_count = meter.create_counter("agent_saved_terminals", unit="{record}")
         self.duration = meter.create_histogram("agent_saved_duration", unit="s")
+        self.tokens = meter.create_counter("agent_saved_tokens", unit="{token}")
+        self.cost = meter.create_counter("agent_saved_cost", unit="USD")
+        self.usage_issues = meter.create_counter("agent_usage_issues", unit="{field}")
+        self.baseline_time = meter.create_gauge("agent_usage_baseline_time", unit="s")
 
     def start(self) -> None:
         """在进程外启动独立读取线程，业务执行不等待 SQLite 观测。"""
@@ -121,6 +130,10 @@ class SQLiteTelemetry:
                     raise ValueError("sqlite_session_binding_missing_at_attempt_end")
                 return
             records = read_saved_records(self.database, directory=self.directory, session_id=session_id)
+            self.message_models = {record["id"]: {label: record["data"][field] for label, field in (("provider", "providerID"), ("model", "modelID")) if isinstance(record["data"].get(field), str)} for record in records if record["kind"] == "message"}
+            if self.baseline:
+                self.baseline_time.set(observed_at)
+                emit_event("sqlite_diagnostics", {"event": "usage_baseline", "observed_at": observed_at, "started_at": self.started_at, "measurement_scope": "已有完成步骤建立基线；后续完成步骤及有效正向修订计数", **self.attributes})
             for record in records:
                 self._record(record, observed_at)
         except (sqlite3.Error, OSError, ValueError) as error:
@@ -144,14 +157,59 @@ class SQLiteTelemetry:
         self.success_time.set(observed_at)
         self.baseline = False
 
+    def _usage_issue(self, record: dict[str, Any], field: str, reason: str) -> None:
+        """用有限类别记录字段覆盖问题，来源标识只进入受控诊断。"""
+        self.usage_issues.add(1, {"field": field, "reason": reason})
+        emit_event("sqlite_diagnostics", {"event": "usage_issue", "field": field, "reason": reason, "record_id": record["id"], "session_id": record["session_id"], **self.attributes})
+
+    def _record_usage(self, record: dict[str, Any]) -> None:
+        """完成步骤提供唯一用量来源，按字段累计有效新增量并保存读取基线。"""
+        content = record["data"]
+        tokens = content.get("tokens")
+        tokens = tokens if isinstance(tokens, dict) else {}
+        cache = tokens.get("cache")
+        cache = cache if isinstance(cache, dict) else {}
+        values = {"input": tokens.get("input"), "output": tokens.get("output"), "reasoning": tokens.get("reasoning"), "cache_read": cache.get("read"), "cache_write": cache.get("write"), "cost": content.get("cost")}
+        labels = {"provider": "unknown", "model": "unknown", **self.message_models.get(record.get("message_id"), {})}
+        if "unknown" in labels.values():
+            self._usage_issue(record, "association", "message_model_missing")
+        previous = self.usage_values.setdefault(record["id"], {})
+        establish_baseline = self.baseline and (self.last_success > 0 or self.failed_since is not None or record["created_ms"] / 1000 < self.started_at)
+        if establish_baseline:
+            self.usage_baselines.add(record["id"])
+        for field, value in values.items():
+            if value is None:
+                self._usage_issue(record, field, "missing")
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0 or (field != "cost" and value != int(value)):
+                self._usage_issue(record, field, "invalid")
+                continue
+            before = previous.get(field, 0)
+            if value < before:
+                self._usage_issue(record, field, "decreased")
+                continue
+            missing_baseline = record["id"] in self.usage_baselines and field not in previous
+            previous[field] = value
+            if establish_baseline or missing_baseline:
+                if missing_baseline and not establish_baseline:
+                    self._usage_issue(record, field, "baseline_field_became_valid")
+                continue
+            delta = value - before
+            if field == "cost":
+                self.cost.add(delta, labels)
+            else:
+                self.tokens.add(delta, {**labels, "token_type": field})
+
     def _record(self, record: dict[str, Any], observed_at: float) -> None:
         """按来源 ID 识别更新，以消息、步骤、工具各自单位统计新的终态。"""
         identity = (record["kind"], record["id"])
         content = record["data"]
         version = (record["updated_ms"], json.dumps(content, sort_keys=True))
-        if self.versions.get(identity) == version:
+        if self.versions.get(identity) == version and not (self.baseline and content.get("type") == "step-finish"):
             return
         self.versions[identity] = version
+        if record["kind"] == "part" and content.get("type") == "step-finish":
+            self._record_usage(record)
         unit = "session" if record["kind"] == "session" else "message" if record["kind"] == "message" else "tool" if content.get("type") == "tool" else "step" if content.get("type") == "step-finish" else "content"
         clock = content.get("time") or (content.get("state") or {}).get("time") or {}
         terminal = (record["kind"] == "message" and content.get("role") == "assistant" and (clock.get("completed") is not None or content.get("error") is not None)) or (unit == "tool" and (content.get("state") or {}).get("status") in {"completed", "error"}) or unit == "step"
