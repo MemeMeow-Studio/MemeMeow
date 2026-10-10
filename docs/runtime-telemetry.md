@@ -31,6 +31,10 @@ executor 使用独立 attempt trace，并通过 W3C 上下文的 Span Link 关�
 
 后台每两秒读取，结束时读取一次最终内容。消息、步骤和工具分别统计；记录使用来源 ID 和保存内容识别更新，连续采集期间同一终态只统计一次。初次读取及错误恢复后的已有终态作为基线，只提供调查。记录时间不足以确认 attempt 时保留 Task/session，标明 `undetermined`。
 
+工具终态在 `agent_saved_terminals` 中增加 `tool` 标签，名称保留 OpenCode 的原始标识；`completed` 计为 `succeeded`，`error` 计为 `failed`，`pending` 和 `running` 不增加完成数量。Provider 与模型从所属消息取得。读到有效工具名称时建立成功、失败两个计数序列，已有终态基线只初始化零值；缺失或非法名称继续保留总体工具数量，并通过 `agent_tool_record_issues` 和 `sqlite_diagnostics` 报告 `missing` 或 `invalid`。工具名称未确认的记录不进入按名称查询。首次部署前的总体指标不具有工具名称标签。
+
+`agent.saved.tool` trace 提供 `tool.name`、`tool.status`，原始可用内容继续通过 `saved.record` 保存并过滤凭据。工具的执行终态与 Task、attempt 的最终结果分别统计。
+
 读取错误、恢复与已知中断区间进入 trace 和结构化日志；项目来源 metrics 记录成功时间、读取错误、活动来源及活动错误数量。组件接收、发送和队列状态由 Collector 自身指标提供。
 
 `emit_event` 从已有内存快照发送结构化日志，使用官方日志 SDK 与 OTLP exporter，独立队列最多 2048 条、每批 128 条、发送超时 5 秒。日志及 trace 导出错误分别保留实际原因与最后成功、错误时间。SDK 关闭后再次启动会明确报告进程生命周期错误。
@@ -44,3 +48,5 @@ executor 使用独立 attempt trace，并通过 W3C 上下文的 Span Link 关�
 ## 验证
 
 `tests/test_runtime_telemetry.py` 使用真实 SDK 和内存 exporter 验证内容保护与 W3C 解析。网络导出、真实 OpenCode 数据、数据库等待及跨进程关联需要在宿主既有开发环境执行，不能使用内存测试结果声称这些项目已经通过。
+
+`uv run --no-sync python -m scripts.verify_agent_tool_metrics --database <开发 OpenCode 数据库>` 使用 SQLite backup 在 `.local-real-test/agent-tools/` 创建独立验收副本，重放真实工具记录并核验按名称计数、零值序列、重复读取、子 session、恢复基线和 trace 属性。缺失名称、非法名称和绑定中断的故障检查仅修改验收副本或采集绑定，原始数据库保持只读；报告不包含调用正文。此检查验证 SDK 与保存记录的处理，网络导出和图表显示需要开发服务的真实调用另行验证。

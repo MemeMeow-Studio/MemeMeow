@@ -98,6 +98,7 @@ class SQLiteTelemetry:
         self.tokens = meter.create_counter("agent_saved_tokens", unit="{token}")
         self.cost = meter.create_counter("agent_saved_cost", unit="USD")
         self.usage_issues = meter.create_counter("agent_usage_issues", unit="{field}")
+        self.tool_issues = meter.create_counter("agent_tool_record_issues", unit="{record}")
         self.baseline_time = meter.create_gauge("agent_usage_baseline_time", unit="s")
 
     def start(self) -> None:
@@ -201,7 +202,7 @@ class SQLiteTelemetry:
                 self.tokens.add(delta, {**labels, "token_type": field})
 
     def _record(self, record: dict[str, Any], observed_at: float) -> None:
-        """按来源 ID 识别更新，以消息、步骤、工具各自单位统计新的终态。"""
+        """按来源 ID 统计新的终态；工具按保存名称分组，缺失名称进入诊断。"""
         identity = (record["kind"], record["id"])
         content = record["data"]
         version = (record["updated_ms"], json.dumps(content, sort_keys=True))
@@ -215,6 +216,18 @@ class SQLiteTelemetry:
         terminal = (record["kind"] == "message" and content.get("role") == "assistant" and (clock.get("completed") is not None or content.get("error") is not None)) or (unit == "tool" and (content.get("state") or {}).get("status") in {"completed", "error"}) or unit == "step"
         labels = {"unit": unit, "result": "failed" if content.get("error") or (content.get("state") or {}).get("status") == "error" else "succeeded"}
         labels.update({label: content[field] for label, field in (("provider", "providerID"), ("model", "modelID")) if isinstance(content.get(field), str)})
+        tool = content.get("tool") if unit == "tool" else None
+        if unit == "tool":
+            labels.update(self.message_models.get(record.get("message_id"), {}))
+            labels["result"] = "failed" if (content.get("state") or {}).get("status") == "error" else "succeeded"
+            if isinstance(tool, str) and tool.strip():
+                labels["tool"] = tool
+                for result in ("succeeded", "failed"):
+                    self.terminal_count.add(0, {**labels, "result": result})
+            else:
+                reason = "missing" if tool is None else "invalid"
+                self.tool_issues.add(1, {"field": "tool", "reason": reason})
+                emit_event("sqlite_diagnostics", {"event": "tool_record_issue", "field": "tool", "reason": reason, "record_id": record["id"], "session_id": record["session_id"], **self.attributes})
         if terminal and identity not in self.terminals:
             self.terminals.add(identity)
             if not self.baseline or (self.last_success == 0 and self.failed_since is None and record["created_ms"] / 1000 >= self.started_at):
@@ -228,6 +241,12 @@ class SQLiteTelemetry:
         if not associated:
             attributes.pop("attempt.id", None)
         attributes.update({"source": "opencode_sqlite", "observation.unit": unit, "record.id": record["id"], "session.id": record["session_id"], "source.observed_at": observed_at, "attempt.association": "confirmed" if associated else "undetermined"})
+        if unit == "tool":
+            if "tool" in labels:
+                attributes["tool.name"] = labels["tool"]
+            status = (content.get("state") or {}).get("status")
+            if isinstance(status, str):
+                attributes["tool.status"] = status
         with trace.get_tracer("mememeow.agent").start_as_current_span(f"agent.saved.{unit}", context=self.context if associated else Context(), attributes=attributes) as span:
             record_content(span, "saved.record", record, secrets=self.secrets)
             span.set_attribute("content.source", "opencode_sqlite")
