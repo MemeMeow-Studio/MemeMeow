@@ -185,9 +185,9 @@ function selectCurrentPageUnready(): void {
 function changePage(next: number): void {
   const target = Math.max(1, Math.min(pageCount.value, next))
   if (target === page.value) return
+  if (target < page.value) notifications.show('开始读取图片分页', 'info')
   page.value = target
   selectedImages.value = new Set()
-  notifications.show('开始读取图片分页', 'info')
   void loadLibrary()
 }
 
