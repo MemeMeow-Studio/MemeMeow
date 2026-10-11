@@ -29,7 +29,7 @@ executor 使用独立 attempt trace，并通过 W3C 上下文的 Span Link 关�
 
 `executor/sqlite_telemetry.py` 使用当前执行路径和 session 绑定读取 `session`、`message` 与 `part`。连接为只读，等待上限 250ms，查询使用短事务与进度检查。主 session 与子 session 的目录必须符合当前执行绑定；读取不修改数据库。
 
-后台每两秒读取，结束时读取一次最终内容。消息、步骤和工具分别统计；记录使用来源 ID 和保存内容识别更新，连续采集期间同一终态只统计一次。初次读取及错误恢复后的已有终态作为基线，只提供调查。记录时间不足以确认 attempt 时保留 Task/session，标明 `undetermined`。
+后台每六秒读取，结束时读取一次最终内容。消息、步骤和工具分别统计；记录使用来源 ID 和保存内容识别更新，连续采集期间同一终态只统计一次。初次读取及错误恢复后的已有终态作为基线，只提供调查。记录时间不足以确认 attempt 时保留 Task/session，标明 `undetermined`。
 
 工具终态在 `agent_saved_terminals` 中增加 `tool` 标签，名称保留 OpenCode 的原始标识；`completed` 计为 `succeeded`，`error` 计为 `failed`，`pending` 和 `running` 不增加完成数量。Provider 与模型从所属消息取得。读到有效工具名称时建立成功、失败两个计数序列，已有终态基线只初始化零值；缺失或非法名称继续保留总体工具数量，并通过 `agent_tool_record_issues` 和 `sqlite_diagnostics` 报告 `missing` 或 `invalid`。工具名称未确认的记录不进入按名称查询。首次部署前的总体指标不具有工具名称标签。
 

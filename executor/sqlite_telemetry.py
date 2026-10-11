@@ -115,10 +115,10 @@ class SQLiteTelemetry:
             self.active_failures.add(-1)
 
     def _loop(self) -> None:
-        """每两秒取得绑定快照，结束时读取最终保存的记录。"""
+        """每六秒取得绑定快照，结束时读取最终保存的记录。"""
         while not self.stop.is_set():
             self._poll()
-            self.stop.wait(2.0)
+            self.stop.wait(6.0)
         self._poll(final=True)
 
     def _poll(self, *, final: bool = False) -> None:
