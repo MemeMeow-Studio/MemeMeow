@@ -8,4 +8,4 @@
 
 在 `frontend` 执行 `npm run test -- src/components/library/LibraryPageJump.test.ts`、`npm run typecheck` 和 `npm run build`。
 
-真实浏览器验证使用 `node scripts/verify_library_page_jump.mjs <配置文件> [报告文件]`。配置字段为 `baseURL`、`prefix`，需要登录时提供测试账户的 `email`、`password`，可通过 `libraryPath` 指定图片库路径。仅使用开发服务及带 `test-library-filters-` 标识的图片，测试图片至少覆盖三页。验证包含桌面和手机、方块和列表、按钮和 Enter、页码边界、选中项清理及筛选结果为空时的页面状态。
+真实浏览器验证前创建工作区内的 `.local-real-test` 目录，执行 `TMPDIR="$PWD/.local-real-test" node scripts/verify_library_page_jump.mjs <配置文件> [报告文件]`。配置字段为 `baseURL`、`prefix`，需要登录时提供测试账户的 `email`、`password`，可通过 `libraryPath` 指定图片库路径。仅使用开发服务及带 `test-library-filters-` 标识的图片，测试图片至少覆盖三页，其中未就绪图片至少覆盖两页。验证包含桌面和手机、方块和列表、按钮和 Enter、页码边界、选中项清理及筛选结果为空时的页面状态。选中项清理覆盖桌面两种展示和手机列表。

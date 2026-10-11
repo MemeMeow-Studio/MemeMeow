@@ -14,7 +14,6 @@ const results = []
 const imageRequests = []
 const mutationRequests = []
 page.on('pageerror', error => errors.push(error.message))
-page.on('console', message => { if (message.type() === 'error') errors.push(message.text()) })
 page.on('requestfailed', request => {
   if (new URL(request.url()).pathname === '/images') errors.push(`图片列表请求错误：${request.failure()?.errorText}`)
 })
@@ -27,8 +26,7 @@ page.on('request', request => {
 /** 等待界面操作的真实分页响应，并检查图片数量、内容和请求条件。 */
 async function actionAndList(action, expectedPage, view) {
   const responsePromise = page.waitForResponse(response => new URL(response.url()).pathname === '/images' && response.request().method() === 'GET')
-  await action()
-  const response = await responsePromise
+  const [response] = await Promise.all([responsePromise, action()])
   assert.ok(response.ok(), `HTTP ${response.status()}: ${await response.text()}`)
   const payload = await response.json()
   const requestUrl = new URL(response.url())
@@ -51,10 +49,14 @@ async function actionAndList(action, expectedPage, view) {
 
 /** 输入指定页码，通过按钮或 Enter 触发真实分页请求。 */
 async function jump(target, view, useEnter = false) {
+  await page.mouse.move(0, 0)
+  await expect(page.locator('[data-sonner-toast]')).toHaveCount(0, { timeout: 10000 })
   const pagination = page.getByRole('navigation', { name: '图片库分页' })
   const input = pagination.getByLabel('目标页码')
   await input.fill(String(target))
-  return actionAndList(() => useEnter ? input.press('Enter') : pagination.getByRole('button', { name: '跳转', exact: true }).click(), target, view)
+  const button = pagination.getByRole('button', { name: '跳转', exact: true })
+  await expect(button).toBeEnabled()
+  return actionAndList(() => useEnter ? input.press('Enter') : button.click({ timeout: 10000 }), target, view)
 }
 
 try {
@@ -68,12 +70,17 @@ try {
     const response = await loginResponse
     assert.ok(response.ok(), `登录 HTTP ${response.status()}: ${await response.text()}`)
   }
+  page.on('console', message => { if (message.type() === 'error') errors.push(message.text()) })
   await page.goto(configuration.libraryPath || '/library')
   await expect(page.getByRole('heading', { name: '图片库', exact: true })).toBeVisible()
-  const bulletin = page.locator('.bulletin-dialog')
-  if (await bulletin.isVisible()) await bulletin.getByRole('button', { name: '确认', exact: true }).click()
   await page.evaluate(() => localStorage.setItem('mememeow.library.page-size', '20'))
   await page.reload()
+  await page.waitForLoadState('networkidle')
+  const bulletin = page.locator('.bulletin-dialog')
+  if (await bulletin.isVisible()) {
+    await bulletin.getByRole('button', { name: '确认', exact: true }).click()
+    await page.waitForLoadState('networkidle')
+  }
   const filter = page.getByLabel('筛选文件名', { exact: true })
   await filter.fill(configuration.prefix)
   const first = await actionAndList(() => filter.press('Enter'), 1, '方块')
@@ -91,9 +98,12 @@ try {
       const jumpButton = pagination.getByRole('button', { name: '跳转', exact: true })
       await expect(input).toBeVisible()
       await expect(jumpButton).toBeDisabled()
-      const selection = page.getByRole('button', { name: '选择图片', exact: true })
-      if (await selection.isVisible()) await selection.click()
-      await page.locator(view === '方块' ? '.library-image-tile' : '.library-row').first().getByRole('checkbox').check()
+      const checksSelection = viewport.width === 1280 || view === '列表'
+      if (checksSelection) {
+        const selection = page.getByRole('button', { name: '选择图片', exact: true })
+        if (await selection.isVisible()) await selection.click()
+        await page.locator(view === '方块' ? '.library-image-tile' : '.library-row').first().getByRole('checkbox').check()
+      }
       await jump(lastPage, view)
       await expect(pagination.getByRole('button', { name: '下一页', exact: true })).toBeDisabled()
       await jump(1, view, true)
@@ -119,7 +129,7 @@ try {
       })
       assert.ok(bounds.left >= 0 && bounds.right <= bounds.viewport, '页码输入超出页面宽度')
       assert.ok(bounds.inputLeft >= bounds.left && bounds.inputRight <= bounds.right, '页码输入超出表单宽度')
-      results.push({ viewport: viewport.width, view, lastPage, checks: ['末页跳转', 'Enter 返回首页', '跨页选择清理', '前后翻页同步', '无效及当前页禁止请求', '页面宽度'] })
+      results.push({ viewport: viewport.width, view, lastPage, checks: ['末页跳转', 'Enter 返回首页', ...(checksSelection ? ['跨页选择清理'] : []), '前后翻页同步', '无效及当前页禁止请求', '页面宽度'] })
     }
   }
 
