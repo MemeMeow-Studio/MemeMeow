@@ -14,6 +14,10 @@ const results = []
 const imageRequests = []
 const mutationRequests = []
 page.on('pageerror', error => errors.push(error.message))
+page.on('console', message => { if (message.type() === 'error') errors.push(message.text()) })
+page.on('requestfailed', request => {
+  if (new URL(request.url()).pathname === '/images') errors.push(`图片列表请求错误：${request.failure()?.errorText}`)
+})
 page.on('request', request => {
   const pathname = new URL(request.url()).pathname
   if (pathname === '/images' && request.method() === 'GET') imageRequests.push(request.url())
@@ -29,9 +33,10 @@ async function actionAndList(action, expectedPage, view) {
   const payload = await response.json()
   const requestUrl = new URL(response.url())
   assert.equal(requestUrl.searchParams.get('page'), String(expectedPage))
-  assert.equal(requestUrl.searchParams.get('page_size'), '20')
+  assert.equal(requestUrl.searchParams.get('page_size'), await page.getByLabel('每页图片数量').inputValue())
   assert.equal(requestUrl.searchParams.get('search'), configuration.prefix)
-  assert.equal(requestUrl.searchParams.get('sort'), 'name_asc')
+  assert.equal(requestUrl.searchParams.get('sort'), await page.getByLabel('图片排序方式').inputValue())
+  assert.equal(requestUrl.searchParams.get('status') || 'all', await page.getByLabel('图片状态类别').inputValue())
   assert.equal(payload.page, expectedPage)
   const pagination = page.getByRole('navigation', { name: '图片库分页' })
   await expect(pagination).toContainText(`第 ${expectedPage} /`)
@@ -72,6 +77,8 @@ try {
   const filter = page.getByLabel('筛选文件名', { exact: true })
   await filter.fill(configuration.prefix)
   const first = await actionAndList(() => filter.press('Enter'), 1, '方块')
+  const sort = page.getByLabel('图片排序方式')
+  if (await sort.inputValue() !== 'name_asc') await actionAndList(() => sort.selectOption('name_asc'), 1, '方块')
   const lastPage = Math.ceil(first.total / 20)
   assert.ok(lastPage >= 3, `验收需要至少三页测试图片，当前数量：${first.total}`)
 
@@ -107,13 +114,23 @@ try {
       await jump(1, view)
       const bounds = await pagination.locator('form').evaluate(form => {
         const rectangle = form.getBoundingClientRect()
-        return { left: rectangle.left, right: rectangle.right, viewport: innerWidth }
+        const inputRectangle = form.querySelector('input').getBoundingClientRect()
+        return { left: rectangle.left, right: rectangle.right, inputLeft: inputRectangle.left, inputRight: inputRectangle.right, viewport: innerWidth }
       })
       assert.ok(bounds.left >= 0 && bounds.right <= bounds.viewport, '页码输入超出页面宽度')
+      assert.ok(bounds.inputLeft >= bounds.left && bounds.inputRight <= bounds.right, '页码输入超出表单宽度')
       results.push({ viewport: viewport.width, view, lastPage, checks: ['末页跳转', 'Enter 返回首页', '跨页选择清理', '前后翻页同步', '无效及当前页禁止请求', '页面宽度'] })
     }
   }
 
+  const status = page.getByLabel('图片状态类别')
+  const unready = await actionAndList(() => status.selectOption('unready'), 1, '列表')
+  assert.ok(unready.total > 20, '状态筛选验收需要至少两页未就绪测试图片')
+  await jump(2, '列表')
+  await actionAndList(() => page.getByLabel('每页图片数量').selectOption('50'), 1, '列表')
+  await expect(page.getByLabel('目标页码')).toHaveAttribute('max', String(Math.ceil(unready.total / 50)))
+  await actionAndList(() => status.selectOption('all'), 1, '列表')
+  await actionAndList(() => page.getByLabel('每页图片数量').selectOption('20'), 1, '列表')
   await jump(lastPage, '列表')
   const missingFilter = `${configuration.prefix}-page-jump-no-match`
   await filter.fill(missingFilter)
@@ -129,7 +146,7 @@ try {
   await expect(page.getByLabel('目标页码')).toHaveAttribute('max', String(lastPage))
   assert.deepEqual(errors, [])
   assert.deepEqual(mutationRequests, [])
-  const report = { status: 'passed', total: first.total, results, emptyFilterReset: true, errors, mutationRequests }
+  const report = { status: 'passed', total: first.total, results, statusFilterRetained: true, pageSizeReset: true, emptyFilterReset: true, errors, mutationRequests }
   if (process.argv[3]) await writeFile(process.argv[3], JSON.stringify(report, null, 2))
   console.log(JSON.stringify(report, null, 2))
 } finally {
