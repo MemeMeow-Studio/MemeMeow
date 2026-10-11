@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import uuid
@@ -134,6 +135,52 @@ def test_runtime_init_rejects_unsafe_nodes_without_changing_outside_bytes(tmp_pa
     with pytest.raises(RuntimeInitError, match="runtime_storage_(symlink|special_node|hardlink)_forbidden"):
         initialize_storage(image_root, runtime_root, token_root, os.getuid(), os.getgid())
     assert hashlib.sha256(outside.read_bytes()).hexdigest() == outside_digest
+
+
+def test_analysis_socket(tmp_path: Path) -> None:
+    """真实通信 socket 在运行期间和关闭后都能保留，权限归一化为 0600。"""
+    image_root, runtime_root, token_root = _roots(tmp_path)
+    socket_root = runtime_root / "analysis-sockets"
+    socket_root.mkdir()
+    socket_path = socket_root / "a.sock"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(str(socket_path))
+        listener.listen(1)
+        _initialize(image_root, runtime_root, token_root)
+        assert stat.S_ISSOCK(socket_path.lstat().st_mode)
+        assert stat.S_IMODE(socket_path.stat().st_mode) == 0o600
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(socket_path))
+            listener.accept()[0].close()
+    _initialize(image_root, runtime_root, token_root)
+    assert stat.S_ISSOCK(socket_path.lstat().st_mode)
+
+
+def test_socket_scope(tmp_path: Path) -> None:
+    """图片、token 和 runtime 的其他目录仍拒绝真实 Unix socket，并报告路径。"""
+    image_root, runtime_root, token_root = _roots(tmp_path)
+    for root in (image_root, runtime_root, token_root):
+        socket_path = root / "a.sock"
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(str(socket_path))
+            with pytest.raises(RuntimeInitError, match="runtime_storage_special_node_forbidden") as error:
+                _initialize(image_root, runtime_root, token_root)
+            assert str(socket_path) in str(error.value)
+            assert "type=s" in str(error.value)
+        socket_path.unlink()
+
+
+def test_analysis_fifo(tmp_path: Path) -> None:
+    """通信目录只允许 Unix socket，真实 FIFO 继续在初始化前拒绝。"""
+    image_root, runtime_root, token_root = _roots(tmp_path)
+    socket_root = runtime_root / "analysis-sockets"
+    socket_root.mkdir()
+    fifo_path = socket_root / "a.sock"
+    os.mkfifo(fifo_path)
+    with pytest.raises(RuntimeInitError, match="runtime_storage_special_node_forbidden") as error:
+        _initialize(image_root, runtime_root, token_root)
+    assert str(fifo_path) in str(error.value)
+    assert "type=p" in str(error.value)
 
 
 def test_storage_root_fails_closed_on_symlink(tmp_path: Path) -> None:

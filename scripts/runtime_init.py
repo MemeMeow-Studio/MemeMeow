@@ -76,23 +76,24 @@ def _is_safe_npm_bin_symlink(path: Path) -> bool:
     return stat.S_ISREG(target_metadata.st_mode) and target_metadata.st_nlink == 1
 
 
-def _reject_unsafe_node(path: Path, metadata: os.stat_result, *, root: bool = False) -> None:
-    """拒绝符号链接、特殊节点和不安全的多链接普通文件。"""
+def _reject_unsafe_node(path: Path, metadata: os.stat_result, *, root: bool = False, socket_root: Path | None = None) -> None:
+    """校验受控节点，只允许指定通信目录直属的 Unix socket。"""
     mode = metadata.st_mode
     if stat.S_ISLNK(mode):
         if _is_safe_npm_bin_symlink(path):
             return
         raise RuntimeInitError("runtime_storage_symlink_forbidden")
-    if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
-        raise RuntimeInitError("runtime_storage_special_node_forbidden")
+    allowed_socket = stat.S_ISSOCK(mode) and socket_root is not None and path.parent == socket_root and path.suffix == ".sock" and not root
+    if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode) or allowed_socket):
+        raise RuntimeInitError(f"runtime_storage_special_node_forbidden: path={path}; type={stat.filemode(mode)[0]}")
     if stat.S_ISREG(mode) and metadata.st_nlink != 1:
         raise RuntimeInitError("runtime_storage_hardlink_forbidden")
     if root and not stat.S_ISDIR(mode):
         raise RuntimeInitError("runtime_storage_root_not_directory")
 
 
-def _scan_tree(root: Path) -> None:
-    """在修改任何节点前完整扫描一棵显式受控树。"""
+def _scan_tree(root: Path, *, socket_root: Path | None = None) -> None:
+    """扫描受控树，保留指定目录的通信 socket 并拒绝其他特殊节点。"""
     try:
         metadata = root.lstat()
     except OSError as exc:
@@ -111,9 +112,9 @@ def _scan_tree(root: Path) -> None:
             child_metadata = child.lstat()
         except OSError as exc:
             raise RuntimeInitError("runtime_storage_unreadable") from exc
-        _reject_unsafe_node(child, child_metadata)
+        _reject_unsafe_node(child, child_metadata, socket_root=socket_root)
         if stat.S_ISDIR(child_metadata.st_mode):
-            _scan_tree(child)
+            _scan_tree(child, socket_root=socket_root)
 
 
 def _set_metadata(path: Path, uid: int, gid: int, mode: int) -> None:
@@ -125,13 +126,13 @@ def _set_metadata(path: Path, uid: int, gid: int, mode: int) -> None:
         raise RuntimeInitError("runtime_storage_metadata_update_failed") from exc
 
 
-def _normalize_tree(root: Path, uid: int, gid: int) -> None:
-    """递归把目录设为 0700、普通文件设为 0600。"""
+def _normalize_tree(root: Path, uid: int, gid: int, *, socket_root: Path | None = None) -> None:
+    """归一化受控节点身份，目录设为 0700，文件和通信 socket 设为 0600。"""
     try:
         metadata = root.lstat()
     except OSError as exc:
         raise RuntimeInitError("runtime_storage_unreadable") from exc
-    _reject_unsafe_node(root, metadata)
+    _reject_unsafe_node(root, metadata, socket_root=socket_root)
     if stat.S_ISLNK(metadata.st_mode):
         # 合法 npm bin 链接只做完整性校验，不能对链接本身执行 chmod/chown。
         return
@@ -142,7 +143,7 @@ def _normalize_tree(root: Path, uid: int, gid: int) -> None:
         except OSError as exc:
             raise RuntimeInitError("runtime_storage_unreadable") from exc
         for entry in entries:
-            _normalize_tree(Path(entry.path), uid, gid)
+            _normalize_tree(Path(entry.path), uid, gid, socket_root=socket_root)
         _set_metadata(root, uid, gid, RUNTIME_DIRECTORY_MODE)
     else:
         _set_metadata(root, uid, gid, RUNTIME_FILE_MODE)
@@ -183,15 +184,16 @@ def initialize_storage(
 ) -> tuple[int, int]:
     """初始化图片、runtime 与 token 三个受控根并返回目标身份。
 
-    该函数先完整扫描现有节点，再创建固定业务目录并归一化所有权和模式；因此
-    发现链接、特殊节点或硬链接时不会先改写已存在图片，图片字节始终保持不变。
+    该函数先完整扫描现有节点，再创建固定业务目录并归一化所有权和模式。
+    指定通信目录内的 Unix socket 保留并归一化权限，其他危险节点在修改前拒绝。
     """
     target_uid, target_gid = parse_runtime_identity(uid, gid)
     roots = _prepare_roots((Path(image_root), Path(runtime_root), Path(token_root)))
+    socket_root = roots[1] / "analysis-sockets"
 
     # 先拒绝全部危险节点，再开始修改权限，避免部分迁移掩盖存储完整性错误。
     for root in roots:
-        _scan_tree(root)
+        _scan_tree(root, socket_root=socket_root)
 
     image_root, runtime_root, token_root = roots
     for path in (
@@ -211,9 +213,9 @@ def initialize_storage(
 
     # 固定目录创建后再次扫描，覆盖并发写入和新建节点的类型检查。
     for root in roots:
-        _scan_tree(root)
+        _scan_tree(root, socket_root=socket_root)
     for root in roots:
-        _normalize_tree(root, target_uid, target_gid)
+        _normalize_tree(root, target_uid, target_gid, socket_root=socket_root)
     return target_uid, target_gid
 
 
