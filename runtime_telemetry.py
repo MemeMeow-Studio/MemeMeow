@@ -33,7 +33,7 @@ from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import MetricExportResult, PeriodicExportingMetricReader
 from opentelemetry.sdk.metrics.view import ExplicitBucketHistogramAggregation, View
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import Event, ReadableSpan, SpanLimits, TracerProvider
+from opentelemetry.sdk.trace import Event, ReadableSpan, SpanLimits, SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExportResult, SpanExporter
 from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 from opentelemetry.trace import Status, StatusCode
@@ -206,6 +206,50 @@ class _LogExporter(OTLPLogExporter):
         return result
 
 
+class ExceptionRecordProcessor(SpanProcessor):
+    """将已保存的 SDK 异常事件按类型统计，日志保留单条记录的调查关联。"""
+
+    def __init__(self, meter_provider: MeterProvider, logger_provider: LoggerProvider, secrets: tuple[str, ...] = ()):
+        """在 SDK 初始化时取得内存测量与日志入口，不申请业务连接。"""
+        meter = meter_provider.get_meter("mememeow.exceptions")
+        self.counter = meter.create_counter("runtime_exceptions", unit="{record}")
+        self.last_seen: dict[tuple[tuple[str, str], ...], float] = {}
+        self.lock = Lock()
+        self.logger = logger_provider.get_logger("mememeow.exceptions")
+        self.secrets = secrets
+        meter.create_observable_gauge("runtime_exception_last_seen", unit="s", callbacks=[self.observations])
+
+    def observations(self, options) -> list[metrics.Observation]:
+        """后台导出读取事件时间快照，标签只包含异常类别和有限操作身份。"""
+        with self.lock:
+            return [metrics.Observation(timestamp, dict(labels)) for labels, timestamp in self.last_seen.items()]
+
+    def on_end(self, span: ReadableSpan) -> None:
+        """span 完成时计数每条 exception 事件，并发送经凭据过滤的调查日志。"""
+        attributes = span.attributes or {}
+        for event in span.events:
+            if event.name != "exception":
+                continue
+            exception_type = (event.attributes or {}).get("exception.type")
+            if not isinstance(exception_type, str) or not exception_type:
+                raise ValueError("telemetry_exception_type_missing: exception 事件缺少有效 exception.type")
+            labels = {
+                "exception_type": exception_type,
+                "operation": span.name,
+                "span_kind": span.kind.name,
+                "http_route": attributes.get("http.route", "unavailable"),
+                "http_request_method": attributes.get("http.request.method", attributes.get("http.method", "unavailable")),
+            }
+            self.counter.add(1, labels)
+            key = tuple(sorted(labels.items()))
+            observed_at = event.timestamp / 1_000_000_000
+            with self.lock:
+                self.last_seen[key] = max(observed_at, self.last_seen.get(key, observed_at))
+            context = span.context
+            content = {**labels, "trace_id": format(context.trace_id, "032x"), "span_id": format(context.span_id, "016x"), "observed_at": observed_at, "message": (event.attributes or {}).get("exception.message", "")}
+            self.logger.emit(timestamp=event.timestamp, context=trace.set_span_in_context(trace.NonRecordingSpan(context)), body=json.dumps(protected_content(content, self.secrets + environment_credentials()), ensure_ascii=False), attributes={"source": "exception_events"})
+
+
 class TelemetryRuntime:
     """管理 SDK 生命周期，提供内存测量与后台导出状态。"""
 
@@ -224,6 +268,7 @@ class TelemetryRuntime:
         self.log_exporter = _LogExporter(endpoint=f"{config.endpoint}/v1/logs", timeout=5, headers=headers, session=otlp_session())
         self.logger_provider = LoggerProvider(resource=resource, meter_provider=self.meter_provider)
         self.logger_provider.add_log_record_processor(BatchLogRecordProcessor(self.log_exporter, max_queue_size=2048, max_export_batch_size=128, schedule_delay_millis=2000, export_timeout_millis=5000))
+        self.tracer_provider.add_span_processor(ExceptionRecordProcessor(self.meter_provider, self.logger_provider, (config.authorization,)))
         meter = self.meter_provider.get_meter("mememeow.runtime")
         signals = {"traces": self.span_exporter, "metrics": self.metric_exporter, "logs": self.log_exporter}
         meter.create_observable_gauge("telemetry_export_last_success", unit="s", callbacks=[lambda options: [metrics.Observation(exporter.last_success, {"signal": signal}) for signal, exporter in signals.items()]])
@@ -234,8 +279,8 @@ class TelemetryRuntime:
         if self.closed:
             return
         self.closed = True
-        self.logger_provider.shutdown()
         self.tracer_provider.shutdown()
+        self.logger_provider.shutdown()
         self.meter_provider.shutdown()
 
 

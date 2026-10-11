@@ -41,6 +41,8 @@ executor 使用独立 attempt trace，并通过 W3C 上下文的 Span Link 关�
 
 ## 内容保护
 
+SDK 保存的 exception 事件由公共 SpanProcessor 生成 `runtime_exceptions` 和 `runtime_exception_last_seen`。单位为 span 中保存的一条异常记录；同一异常在多个 span 保存时各计数一次，HTTP 状态码和 Task 终态仍分别统计。标签包含异常类型、操作、span 类别及已知 route 模板和请求方法，缺少接口关联显示 `unavailable`。最近发生时间来自事件自身的 timestamp。`exception_events` 结构化日志保留经过凭据过滤的消息、时间和 trace/span ID；这些标识不进入 metrics 标签。统计从启用该采集的时间开始。
+
 专用 trace 内容允许已取得的业务文本，结构化认证字段、已知环境凭据值和认证文本经过过滤。自动 instrumentation 的属性、事件与状态在 exporter 边界再次处理。二进制内容只保存大小或业务文件关联。公开日志和用户响应保持各自原有内容规则。
 
 认证字段包括 `accessToken`、`refreshToken`、`sessionToken` 等 camelCase 名称；消息 `tokens.input`、`tokens.output` 用量保持可查询。
