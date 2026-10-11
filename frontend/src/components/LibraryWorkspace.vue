@@ -25,6 +25,7 @@ import ImageRetryDialog from './ImageRetryDialog.vue'
 import ResilientImage from './ResilientImage.vue'
 import LibraryImageGrid from './library/LibraryImageGrid.vue'
 import LibraryViewToggle from './library/LibraryViewToggle.vue'
+import LibraryPageJump from './library/LibraryPageJump.vue'
 
 const props = defineProps<{
   config: ServiceConfig | null
@@ -596,6 +597,7 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
       <button type="button" :disabled="busy || page <= 1" @click="changePage(page - 1)">上一页</button>
       <span>第 {{ page }} / {{ pageCount }} 页，共 {{ total }} 张</span>
       <button type="button" :disabled="busy || page >= pageCount" @click="changePage(page + 1)">下一页</button>
+      <LibraryPageJump :page="page" :page-count="pageCount" :disabled="busy" @change-page="changePage" />
     </nav>
   </section>
 
