@@ -222,7 +222,6 @@ async function openTask(id: string, event?: MouseEvent): Promise<void> {
   try {
     let promise = taskDetailPromises.get(id)
     if (!promise) {
-      if (event) notifications.show('开始读取任务详情', 'info')
       promise = api.task(id) as Promise<TaskItem>
       taskDetailPromises.set(id, promise)
     }
